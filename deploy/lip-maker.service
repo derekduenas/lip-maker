@@ -1,0 +1,21 @@
+[Unit]
+Description=INNAIT LIP Market-Maker — paper-mode validation
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/lip-maker
+Environment=PYTHONPATH=/root/lip-maker
+Environment=PYTHONUNBUFFERED=1
+Environment=LIP_PAPER=true
+Environment=LIP_SHADOW=true
+ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/run_paper.py --duration 2592000 --top-n 100
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/root/lip-maker/logs/lip-maker.log
+StandardError=append:/root/lip-maker/logs/lip-maker.log
+
+[Install]
+WantedBy=multi-user.target
