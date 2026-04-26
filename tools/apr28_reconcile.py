@@ -117,17 +117,19 @@ class InjectionTier:
     phase_action: str
 
 
+# 2026-04-26 REVISED: smaller inject + skip-to-P4. Compounding-dominated math.
+# See memory/project_apr28_action_plan.md for full reasoning.
 INJECTION_LADDER = [
     InjectionTier("NEGATIVE", float("-inf"), 0.0,
                   0.0, "HALT + audit"),
     InjectionTier("DIAGNOSE_FIRST", 0.0, 1500.0,
                   0.0, "Stay Phase 1 — diagnose"),
     InjectionTier("CONFIRM_BASELINE", 1500.0, 2500.0,
-                  10000.0, "Skip to Phase 2 immediately, then 5d→3, 5d→4"),
+                  5000.0, "Skip directly to Phase 4 (smaller inject, compounding will catch up)"),
     InjectionTier("STRONG_VALIDATION", 2500.0, 4000.0,
-                  15000.0, "Skip to Phase 3 immediately, then 5d→4"),
+                  10000.0, "Skip directly to Phase 4"),
     InjectionTier("MASSIVE_UPSIDE", 4000.0, float("inf"),
-                  22500.0, "SKIP DIRECTLY TO PHASE 4 (pre-approved)"),
+                  15000.0, "Phase 4 immediately, save $10k for week-2 re-inject if data confirms"),
 ]
 
 

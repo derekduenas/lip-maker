@@ -44,36 +44,37 @@ class TestInjectionLadder(unittest.TestCase):
         self.assertEqual(tier.inject_usd, 0.0)
 
     def test_1500_triggers_baseline_inject(self):
+        # 2026-04-26 REVISED: $5k smaller inject (compounding-dominated)
         tier = find_tier(1500.0)
         self.assertEqual(tier.label, "CONFIRM_BASELINE")
-        self.assertEqual(tier.inject_usd, 10000.0)
+        self.assertEqual(tier.inject_usd, 5000.0)
 
-    def test_2000_baseline_inject_10k(self):
+    def test_2000_baseline_inject_5k(self):
         # The deep-dive's expected number → expected default action
         tier = find_tier(2000.0)
         self.assertEqual(tier.label, "CONFIRM_BASELINE")
-        self.assertEqual(tier.inject_usd, 10000.0)
+        self.assertEqual(tier.inject_usd, 5000.0)
 
-    def test_2500_strong_validation_15k(self):
+    def test_2500_strong_validation_10k(self):
         tier = find_tier(2500.0)
         self.assertEqual(tier.label, "STRONG_VALIDATION")
-        self.assertEqual(tier.inject_usd, 15000.0)
+        self.assertEqual(tier.inject_usd, 10000.0)
 
     def test_3999_still_strong_validation(self):
         tier = find_tier(3999.99)
         self.assertEqual(tier.label, "STRONG_VALIDATION")
-        self.assertEqual(tier.inject_usd, 15000.0)
+        self.assertEqual(tier.inject_usd, 10000.0)
 
     def test_4000_massive_upside(self):
         tier = find_tier(4000.0)
         self.assertEqual(tier.label, "MASSIVE_UPSIDE")
-        self.assertEqual(tier.inject_usd, 22500.0)
+        self.assertEqual(tier.inject_usd, 15000.0)
 
-    def test_huge_actual_still_22500(self):
+    def test_huge_actual_still_15000(self):
         # Don't accidentally over-inject on a one-time fluke
         tier = find_tier(50000.0)
         self.assertEqual(tier.label, "MASSIVE_UPSIDE")
-        self.assertEqual(tier.inject_usd, 22500.0)
+        self.assertEqual(tier.inject_usd, 15000.0)
 
     def test_ladder_has_no_gaps_or_overlaps(self):
         # Walk the ladder; every point should match exactly one tier.
