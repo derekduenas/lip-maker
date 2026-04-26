@@ -91,6 +91,69 @@ class QuoteManager:
         self.inventory: dict[str, InventoryState] = {}     # ticker -> state
         self._last_balance_check = 0.0
         self._cached_balance = 0.0
+        # 2026-04-25 COLD-BOOT RECONCILIATION: rehydrate self.resting from
+        # Kalshi's actual order book on init. Without this, a service
+        # restart leaves us blind to live orders → next reconcile() places
+        # duplicate orders and we get filled twice. Live mode only.
+        self._cold_boot_reconcile()
+
+    def _cold_boot_reconcile(self) -> None:
+        """Query Kalshi for currently-resting orders and hydrate self.resting.
+
+        Idempotent + fail-safe: if API errors, we log and continue with
+        empty self.resting (same as previous behavior — no regression).
+        """
+        if self.paper or self.client is None:
+            return
+        try:
+            cursor = None
+            rehydrated = 0
+            while True:
+                params = {"status": "resting", "limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = self.client.get("/portfolio/orders", params=params)
+                for raw in resp.get("orders", []):
+                    if raw.get("status") != "resting":
+                        continue
+                    side = raw.get("side", "").lower()
+                    if side not in ("yes", "no"):
+                        continue
+                    # Kalshi v2 uses decimal strings: "remaining_count_fp"
+                    # and prices as "yes_price_dollars" / "no_price_dollars".
+                    price_field = "yes_price_dollars" if side == "yes" else "no_price_dollars"
+                    price_str = raw.get(price_field)
+                    if price_str is None:
+                        continue
+                    price = int(round(float(price_str) * 100))
+                    ticker = raw.get("ticker", "")
+                    order_id = raw.get("order_id", "")
+                    try:
+                        qty = int(float(raw.get("remaining_count_fp")
+                                        or raw.get("initial_count_fp", 0)))
+                    except (TypeError, ValueError):
+                        qty = 0
+                    if not ticker or not order_id or qty <= 0:
+                        continue
+                    self.resting.setdefault(ticker, []).append(
+                        RestingOrder(
+                            order_id=order_id,
+                            market_ticker=ticker,
+                            side=side,
+                            price_cents=int(price),
+                            size_contracts=qty,
+                            placed_at=time.time(),  # we don't know real placement time
+                            paper=False,
+                        )
+                    )
+                    rehydrated += 1
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+            _log.warning(f"cold-boot: rehydrated {rehydrated} resting orders "
+                         f"across {len(self.resting)} tickers from Kalshi")
+        except Exception as e:
+            _log.warning(f"cold-boot reconcile FAILED ({e}) — starting with empty resting state")
 
     # ── Inventory tracking ────────────────────────────────────────────
     def _refresh_inventory(self, market_ticker: str) -> None:
