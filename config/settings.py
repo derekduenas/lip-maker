@@ -203,3 +203,24 @@ SIZE_MULTIPLIER_BY_SERIES = {
     "KXWHEATW":  1.5,
 }
 DEFAULT_SIZE_MULTIPLIER = 1.0
+
+# ── 2026-04-28 PER-SERIES PER-MARKET DOLLAR CAP OVERRIDES (#126) ──────────
+# Per agent analysis: weekly commodity grains/softs (CORN/SOY/WHEAT/COCOA)
+# have target_size=300. At default $40 cap × $0.50 mid = ~80 contracts =
+# 27% of pool. At $90 cap = ~180 contracts = 60% of pool = ~2.3x rebate.
+# These series proved profitable Apr 21-26 ($30/market net). Per-series
+# cap raise concentrates capital where we WIN.
+#
+# Mechanics: when set, this override REPLACES MAX_GROSS_PER_MARKET_USD
+# for that series in _passes_safety. Series not in map use the default.
+# Series-level total cap (MAX_GROSS_PER_SERIES_USD) still applies.
+MAX_GROSS_PER_MARKET_BY_SERIES = {
+    "KXCORNW":     90.0,
+    "KXSOYBEANW":  90.0,
+    "KXWHEATW":    90.0,
+    "KXCOCOAW":    90.0,
+    "KXBRENTD":    90.0,   # daily Brent — also winner ($34 net Apr 21-26)
+    "KXCOPPERD":   75.0,   # smaller average market, modest bump
+    "KXGOLDD":     75.0,
+    "KXGOLDW":     90.0,
+}

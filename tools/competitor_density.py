@@ -37,9 +37,11 @@ Output: ranked table of (ticker, reward, share, qual, adverse, net_per_day).
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -53,6 +55,40 @@ DEFAULT_SHARE_PRIOR  = 0.20    # us + 4 effective competitors
 DEFAULT_QUAL_PRIOR   = 1.0     # absent data → assume reachable
 MIN_SNAPS_FOR_OBS    = 10      # need this many to trust observed share
 SETTLEMENT_LOOKBACK_DAYS = 7   # window for adverse cost averaging
+
+_MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+
+def _ticker_settled_already(ticker: str) -> bool:
+    """Parse YYMMMDD or YYMMMDDHH date from ticker name. Returns True if
+    the ticker's named close has already passed. Defensive: returns False
+    if can't parse (don't filter unknown formats).
+
+    Examples:
+      KXBRENTD-26APR2117-T103     → Apr 21 2026 17:00 ET → close=21:00 UTC
+      KXCORNW-26APR2417-T440      → Apr 24 2026 17:00 ET → close=21:00 UTC
+      KXTRUMPACT-26APR26-T3       → Apr 26 2026 (no hour, treat as end of day)
+    """
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{2})?", ticker)
+    if not m:
+        return False
+    yy, mmm, dd, hh = m.groups()
+    month = _MONTHS.get(mmm.upper())
+    if not month:
+        return False
+    try:
+        # If hour given (HH), treat as ET hour → UTC = +4 (EDT in Apr-Oct)
+        # If no hour, treat as 23:59 of named day (end of day, conservative)
+        if hh:
+            close_utc = datetime(2000 + int(yy), month, int(dd),
+                                 int(hh) + 4, tzinfo=timezone.utc)
+        else:
+            close_utc = datetime(2000 + int(yy), month, int(dd),
+                                 23, 59, tzinfo=timezone.utc)
+        return close_utc < datetime.now(timezone.utc)
+    except Exception:
+        return False
 
 
 def scan(db_path: str = settings.DB_PATH,
@@ -145,6 +181,11 @@ def scan(db_path: str = settings.DB_PATH,
         ticker, series, reward, target, df, end_date = r
         if not reward:
             continue
+        # Skip markets whose ticker-named close has already passed.
+        # The lip_programs.end_date filter is too coarse — Kalshi's program
+        # end_date can extend past individual market closes within the period.
+        if _ticker_settled_already(ticker):
+            continue
 
         # Pick best signal: per-market > per-series > prior
         m = market_stats.get(ticker, {})
@@ -200,6 +241,7 @@ def scan(db_path: str = settings.DB_PATH,
             "net_per_day":       round(net_per_day, 4),
             "confidence":        confidence,
             "target_size":       target,
+            "discount_factor":   df or 0.5,
             "end_date":          end_date,
         })
 

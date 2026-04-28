@@ -168,8 +168,38 @@ def backfill_rebates(db_path: str = settings.DB_PATH,
     }
 
 
+def _all_relevant_series(db_path: str) -> list[str]:
+    """#128 (2026-04-28): return union of FUTURES_MAP + all enrolled
+    series + any series we've actually traded on (fill_ledger). Without
+    this, settlement_log was COMMODITY-ONLY and our political/event PnL
+    was invisible.
+    """
+    series = set(FUTURES_MAP.keys())
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            # Currently enrolled
+            rows = conn.execute(
+                """SELECT DISTINCT series_ticker FROM lip_programs
+                   WHERE enrolled = 1 AND series_ticker IS NOT NULL"""
+            ).fetchall()
+            series.update(r[0] for r in rows if r[0])
+            # Historically traded (catches series that settled after enrollment ended)
+            rows = conn.execute(
+                """SELECT DISTINCT substr(ticker, 1, instr(ticker || '-', '-') - 1) AS s
+                   FROM fill_ledger WHERE ticker IS NOT NULL"""
+            ).fetchall()
+            series.update(r[0] for r in rows if r[0])
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        pass
+    return sorted(series)
+
+
 def find_recently_settled(hours_back: int = 24, db_path: str = settings.DB_PATH) -> list[dict]:
-    """Query Kalshi for markets that settled in last N hours.
+    """Query Kalshi for markets that settled in last N hours, across
+    ALL relevant series (commodity + political/event/macro).
 
     Staggered 0.5s between series calls + exponential-backoff retry on 429.
     """
@@ -179,7 +209,11 @@ def find_recently_settled(hours_back: int = 24, db_path: str = settings.DB_PATH)
     now = datetime.now(timezone.utc)
     cutoff_secs = hours_back * 3600
 
-    for i, prefix in enumerate(FUTURES_MAP):
+    series_list = _all_relevant_series(db_path)
+    _log.info(f"settlement scan: querying {len(series_list)} series "
+              f"({len(FUTURES_MAP)} commodity + {len(series_list)-len(FUTURES_MAP)} other)")
+
+    for i, prefix in enumerate(series_list):
         if i > 0:
             time.sleep(0.5)  # stagger to avoid 429
         # Retry with exponential backoff on 429

@@ -320,13 +320,19 @@ class QuoteManager:
         # Per-market gross — DOWNSIZE target to fit cap instead of rejecting.
         # 2026-04-22: was rejecting outright, leaving rebate on the table for
         # borderline markets (gross just over cap). Now size-reduces.
+        # 2026-04-28 (#126): per-series cap override allows grain weeklies
+        # to deploy 60%+ of pool instead of 27%. Default for everything else.
         per_mkt = sum(
             o.price_cents * o.size_contracts / 100.0
             for o in self.resting.get(target.market_ticker, [])
         )
-        remaining_cap = settings.MAX_GROSS_PER_MARKET_USD - per_mkt
+        series_for_cap = target.market_ticker.split("-", 1)[0]
+        per_market_cap = settings.MAX_GROSS_PER_MARKET_BY_SERIES.get(
+            series_for_cap, settings.MAX_GROSS_PER_MARKET_USD,
+        )
+        remaining_cap = per_market_cap - per_mkt
         if remaining_cap <= 0:
-            return False, f"per_mkt_gross ${per_mkt:.2f} > cap ${settings.MAX_GROSS_PER_MARKET_USD}"
+            return False, f"per_mkt_gross ${per_mkt:.2f} > cap ${per_market_cap}"
 
         # Cost per contract for both sides combined
         sides = 0
@@ -445,7 +451,20 @@ class QuoteManager:
             side=side, price_cents=price_cents, size_contracts=size_contracts,
             placed_at=time.time(), paper=self.paper,
         )
-        self.resting.setdefault(market_ticker, []).append(rest)
+        # #127 (2026-04-28) UPSERT semantics: drop any existing entry for
+        # this (ticker, side) before appending. Prevents accumulation when
+        # _cancel_order silently failed (network error returns False but
+        # leaves entry in self.resting). Closes the race that triggered
+        # premature per_mkt_gross safety gate hits in paper mode.
+        existing_lst = self.resting.setdefault(market_ticker, [])
+        stale_same_side = [o for o in existing_lst if o.side == side]
+        for o in stale_same_side:
+            existing_lst.remove(o)
+            # Mark stale entry's DB row cancelled so it doesn't double-count
+            # in any future reporting query.
+            self._update_quote_status(o.order_id, "cancelled",
+                                      notes="upsert_replaced_by_127")
+        existing_lst.append(rest)
         self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                               order_id, "resting", notes=f"coid={coid}")
         return rest

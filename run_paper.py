@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import settings
 from engine.lip_discovery import discover, top_n_to_quote
+from engine.sniper_select import top_n_by_ev
 from engine.lip_scorer import (
     OurQuotes, ProgramParams, score_snapshot,
 )
@@ -640,6 +641,10 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     # Refresh programs
     _log.info("refreshing LIP programs...")
     discover(save=True)
+    # 2026-04-28: rolled back sniper experiment (was too restrictive — only
+    # 1 market passed filter on a single bad day). Restored top_n_to_quote
+    # which uses priority-weighted ranking + #119 winner multipliers.
+    # Sniper scanner remains available as analysis tool (tools/competitor_density.py).
     markets = top_n_to_quote(top_n)
     if not markets:
         _log.warning("no enrolled markets")
@@ -692,7 +697,6 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                 new_tickers = fresh_tickers - current_tickers
                 if new_tickers:
                     _log.info(f"periodic_discover: {len(new_tickers)} new markets to subscribe")
-                    # Update runner state
                     for m in fresh:
                         tkr = m["market_ticker"]
                         if tkr in new_tickers:
@@ -703,7 +707,6 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                                 period_reward_usd=float(m["reward_per_day_usd"]),
                             )
                             runner.markets.append(m)
-                    # Subscribe new markets via existing WS
                     await ws.subscribe_orderbook(list(new_tickers))
                 else:
                     _log.debug("periodic_discover: no new markets")
