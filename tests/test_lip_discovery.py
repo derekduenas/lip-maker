@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engine.lip_discovery import _decide_enrol
+from engine.lip_discovery import _decide_enrol, top_n_to_quote
 
 
 def _program(**kw) -> dict:
@@ -132,6 +132,106 @@ class TestGateOrdering(unittest.TestCase):
         ))
         self.assertEqual(enrol, 0)
         self.assertIn("blocklist", reason)
+
+
+class TestTopNPriorityWeighting(unittest.TestCase):
+    """Pin the #100 priority-weighted ranking behavior (2026-04-28).
+
+    Verifies that:
+      1. Series in SIZE_MULTIPLIER_BY_SERIES get reward × priority lift
+      2. Default series (priority=1.0) ordered by raw reward
+      3. Higher priority can outrank a higher raw reward
+      4. End-date filter excludes settled markets
+    """
+
+    def setUp(self):
+        import tempfile, sqlite3
+        self.db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.db_file.close()
+        self.db_path = self.db_file.name
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            CREATE TABLE lip_programs (
+                id TEXT PRIMARY KEY, market_ticker TEXT, series_ticker TEXT,
+                start_date TEXT, end_date TEXT, period_reward_usd REAL,
+                discount_factor REAL, target_size REAL, paid_out INTEGER,
+                enrolled INTEGER, blocked_reason TEXT,
+                reward_per_day_usd REAL, last_seen TEXT
+            );
+            CREATE TABLE market_blacklist (
+                ticker TEXT PRIMARY KEY, expires_at TEXT, reason TEXT, added_at TEXT
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        import os
+        os.unlink(self.db_path)
+
+    def _insert(self, market, series, reward, *, end_date="2099-12-31",
+                target_size=500, paid_out=0, enrolled=1):
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """INSERT INTO lip_programs VALUES
+               (?, ?, ?, '2026-04-01', ?, ?, 0.5, ?, ?, ?, NULL, ?, '2026-04-28')""",
+            (market, market, series, end_date, reward, target_size,
+             paid_out, enrolled, reward),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_higher_priority_outranks_higher_reward(self):
+        # KXBRENTD is a 2.0x winner per SIZE_MULTIPLIER_BY_SERIES
+        self._insert("KXBOGUS-1", "KXBOGUS", 100.0)   # priority 1.0 → wtd 100
+        self._insert("KXBRENTD-1", "KXBRENTD", 60.0)  # priority 2.0 → wtd 120
+        markets = top_n_to_quote(n=2, db_path=self.db_path)
+        self.assertEqual(markets[0]["market_ticker"], "KXBRENTD-1")
+        self.assertEqual(markets[1]["market_ticker"], "KXBOGUS-1")
+
+    def test_default_priority_orders_by_raw_reward(self):
+        self._insert("A-1", "KXAAA", 50.0)
+        self._insert("B-1", "KXBBB", 100.0)
+        markets = top_n_to_quote(n=2, db_path=self.db_path)
+        self.assertEqual(markets[0]["market_ticker"], "B-1")
+        self.assertEqual(markets[1]["market_ticker"], "A-1")
+
+    def test_settled_markets_excluded(self):
+        # end_date in the past → must not appear
+        self._insert("STALE-1", "KXFOO", 200.0, end_date="2020-01-01")
+        self._insert("LIVE-1",  "KXFOO",  10.0)  # still live
+        markets = top_n_to_quote(n=10, db_path=self.db_path)
+        tickers = {m["market_ticker"] for m in markets}
+        self.assertIn("LIVE-1", tickers)
+        self.assertNotIn("STALE-1", tickers)
+
+    def test_blacklisted_markets_excluded(self):
+        import sqlite3
+        self._insert("BLOCKED-1", "KXFOO", 200.0)
+        self._insert("FINE-1", "KXFOO", 100.0)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """INSERT INTO market_blacklist VALUES
+               (?, '2099-12-31', 'test', '2026-04-28')""",
+            ("BLOCKED-1",),
+        )
+        conn.commit()
+        conn.close()
+        markets = top_n_to_quote(n=10, db_path=self.db_path)
+        tickers = {m["market_ticker"] for m in markets}
+        self.assertNotIn("BLOCKED-1", tickers)
+        self.assertIn("FINE-1", tickers)
+
+    def test_priority_field_present_and_correct(self):
+        self._insert("CORN-1", "KXCORNW", 50.0)   # 2.0x in table
+        self._insert("RAND-1", "KXNOPRI", 50.0)   # default 1.0
+        markets = top_n_to_quote(n=10, db_path=self.db_path)
+        by_ticker = {m["market_ticker"]: m for m in markets}
+        self.assertEqual(by_ticker["CORN-1"]["series_priority"], 2.0)
+        self.assertEqual(by_ticker["RAND-1"]["series_priority"], 1.0)
+        self.assertAlmostEqual(by_ticker["CORN-1"]["priority_weighted_reward"], 100.0)
+        self.assertAlmostEqual(by_ticker["RAND-1"]["priority_weighted_reward"],  50.0)
 
 
 if __name__ == "__main__":

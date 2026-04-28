@@ -147,57 +147,82 @@ def discover(*, status: str = "active", save: bool = True) -> list[dict]:
 
 def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                    db_path: str = settings.DB_PATH) -> list[dict]:
-    """Return top-N enrolled REACHABLE markets, excluding blacklisted ones.
+    """Return top-N enrolled REACHABLE markets ranked by PRIORITY-WEIGHTED reward.
 
-    Filters applied (in order):
-      1. enrolled=1 AND paid_out=0 (standard)
-      2. target_size <= max_target_size (reachable at our capital)
-      3. NOT in active market_blacklist entries
-      4. Rank by reward_per_day_usd descending
-      5. Take top N
+    2026-04-28 (#100 EV-PRIORITY V2):
+      First attempt used observed share (our_score/total_score) as an EV
+      multiplier, but the snapshot share metric understates true rebate
+      capture by 50-100x — it's per-second snapshot fraction, not
+      time-integrated $-flow. With share=6e-05, even MAMDANIEO ranked
+      below random political markets at the 0.20 prior. Net effect: would
+      have crowded out proven winners (BRENTD/CORNW/COPPERD per Apr 27
+      audit) for unproven Trump-time/endorsement markets.
 
-    2026-04-22: Raised default max_target_size 500→2500 (Kalshi series
-    expansion). Adds ~93 markets / $2,582/day pool, mostly California political
-    primaries + state govs. Phase 1 caps still limit active quoting; Phase 2+
-    unlocks meaningful share as per-market cap rises.
+      V2 ranks by reward × series_priority. Series priority comes from the
+      same SIZE_MULTIPLIER_BY_SERIES table that tier-2x's our quote sizes
+      (#119) — known winners get ranking lift, defaults to 1.0. Filters
+      (end_date past, blacklist, target_size cap) still apply.
+
+    Filters:
+      1. enrolled=1 AND paid_out=0
+      2. target_size <= max_target_size
+      3. NOT in active market_blacklist
+      4. end_date > today (don't quote settled markets)
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     try:
-        rows = conn.execute(
-            """SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
-                      p.target_size, p.discount_factor, p.start_date, p.end_date
-               FROM lip_programs p
-               LEFT JOIN market_blacklist b
-                 ON p.market_ticker = b.ticker AND datetime(b.expires_at) > datetime('now')
-               WHERE p.enrolled = 1 AND p.paid_out = 0
-                 AND p.target_size <= ?
-                 AND b.ticker IS NULL
-               ORDER BY p.reward_per_day_usd DESC
-               LIMIT ?""",
-            (max_target_size, n),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        # market_blacklist table doesn't exist yet — skip blacklist join
-        rows = conn.execute(
-            """SELECT market_ticker, series_ticker, reward_per_day_usd,
-                      target_size, discount_factor, start_date, end_date
-               FROM lip_programs
-               WHERE enrolled = 1 AND paid_out = 0
-                 AND target_size <= ?
-               ORDER BY reward_per_day_usd DESC
-               LIMIT ?""",
-            (max_target_size, n),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                """SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
+                          p.target_size, p.discount_factor, p.start_date, p.end_date
+                   FROM lip_programs p
+                   LEFT JOIN market_blacklist b
+                     ON p.market_ticker = b.ticker
+                     AND datetime(b.expires_at) > datetime('now')
+                   WHERE p.enrolled = 1 AND p.paid_out = 0
+                     AND p.target_size <= ?
+                     AND date(p.end_date) > date('now')
+                     AND b.ticker IS NULL
+                   ORDER BY p.reward_per_day_usd DESC
+                   LIMIT ?""",
+                (max_target_size, n * 3),  # over-fetch so priority can re-sort top-n
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                """SELECT market_ticker, series_ticker, reward_per_day_usd,
+                          target_size, discount_factor, start_date, end_date
+                   FROM lip_programs
+                   WHERE enrolled = 1 AND paid_out = 0
+                     AND target_size <= ?
+                   ORDER BY reward_per_day_usd DESC
+                   LIMIT ?""",
+                (max_target_size, n * 3),
+            ).fetchall()
     finally:
         conn.close()
-    return [
-        {
-            "market_ticker": r[0], "series_ticker": r[1],
-            "reward_per_day_usd": r[2], "target_size": r[3],
-            "discount_factor": r[4], "start_date": r[5], "end_date": r[6],
-        }
-        for r in rows
-    ]
+
+    # Re-rank by reward × series priority. Defaults to 1.0 when not in table.
+    multipliers = settings.SIZE_MULTIPLIER_BY_SERIES
+    default = settings.DEFAULT_SIZE_MULTIPLIER
+
+    enriched = []
+    for r in rows:
+        series = r[1] or ""
+        priority = multipliers.get(series, default)
+        weighted = (r[2] or 0.0) * priority
+        enriched.append({
+            "market_ticker":         r[0],
+            "series_ticker":         r[1],
+            "reward_per_day_usd":    r[2],
+            "target_size":           r[3],
+            "discount_factor":       r[4],
+            "start_date":            r[5],
+            "end_date":              r[6],
+            "series_priority":       priority,
+            "priority_weighted_reward": round(weighted, 4),
+        })
+    enriched.sort(key=lambda d: -d["priority_weighted_reward"])
+    return enriched[:n]
 
 
 def report_enrolled(db_path: str = settings.DB_PATH) -> None:
