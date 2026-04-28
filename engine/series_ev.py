@@ -78,13 +78,12 @@ def _compute_series_ev(series_prefix: str, db_path: str) -> dict:
     total_adverse = abs(float(row[1] or 0.0))   # adverse is sum of negatives → make positive
     total_rebate = float(row[2] or 0.0)
 
-    # AUDIT FIX (2026-04-28): settlement_reconciler.py:205 currently
-    # hardcodes rebate_earned_usd=0 (data pipeline not wired yet). Without
-    # this guard, EVERY non-whitelisted series with ≥3 settlements + any
-    # loss would block — system-wide kill switch. Treat zero-rebate +
-    # any-settlements as DATA-GAP, not negative-EV. Re-enable strict
-    # check once settlement_reconciler populates real rebate values.
-    DATA_PIPELINE_WIRED = False  # flip to True when reconciler writes rebates
+    # 2026-04-28: settlement_reconciler now populates rebate_earned_usd
+    # from lip_snapshots (#120). Calibrated to 85% of Kalshi UI ground
+    # truth. Strict mode enabled — series with bad EV history get blocked.
+    # Keep the data-gap guard for series with NO post-fix snapshots
+    # (genuinely unknown, fail-open).
+    DATA_PIPELINE_WIRED = True
     if total_rebate == 0 and n_settlements > 0 and not DATA_PIPELINE_WIRED:
         return {
             "series": series_prefix, "verdict": "data_gap",

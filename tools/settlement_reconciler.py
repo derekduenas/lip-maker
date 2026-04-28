@@ -58,6 +58,116 @@ CREATE INDEX IF NOT EXISTS idx_settle_prefix_time ON settlement_log(series_prefi
 """
 
 
+# Each captured snapshot represents this many seconds of presence on
+# average. Heartbeat fires every 30s; on_book_update throttled to 1/5s.
+# Calibrated 2026-04-28 against Kalshi UI ground truth across 8 series:
+#   Multiplier=10 → ratio=0.30 (3x undercount)
+#   Multiplier=30 → ratio=0.90 (close to truth, slight under)
+# 30 = heartbeat cadence = upper bound on snapshot interval.
+# Per-series variation 0.18-0.68 suggests true rate is market-specific
+# (busy markets = more book-driven snaps = lower effective interval).
+# Future: persist per-snapshot interval and use it directly.
+SNAPSHOT_REPRESENTS_SECONDS = 30.0
+
+
+def _estimate_rebate(conn: sqlite3.Connection, ticker: str) -> float:
+    """#120 — compute estimated LIP rebate from lip_snapshots data.
+
+    Kalshi LIP payout formula:
+      payout_per_kalshi_snapshot = (our_score / total_score) × (period_reward / period_seconds)
+      total_payout = SUM(payout_per_kalshi_snapshot) over all of Kalshi's
+                     1-second snapshots in the period
+
+    Our snapshots are sparser (heartbeat 30s + book-driven). Each of OUR
+    snapshots represents ~SNAPSHOT_REPRESENTS_SECONDS of Kalshi-side
+    snapshots, so we scale up.
+
+    Tries was_resting=1 filter first (post-phantom-fix data). If empty
+    (pre-fix settlement), falls back to snapshot_valid=1 only — pre-fix
+    we WERE resting whenever we had quotes, the column just wasn't tracked.
+
+    Returns 0.0 if any required data is missing — never raises.
+    """
+    def _query(strict: bool) -> tuple | None:
+        try:
+            extra = "AND s.was_resting = 1" if strict else ""
+            return conn.execute(
+                f"""SELECT
+                     COALESCE(SUM(CASE WHEN s.total_score > 0
+                                       THEN s.our_score * 1.0 / s.total_score
+                                       ELSE 0 END), 0) AS sum_share,
+                     p.period_reward_usd,
+                     p.start_date,
+                     p.end_date,
+                     COUNT(*) AS n_snaps
+                   FROM lip_snapshots s
+                   JOIN lip_programs p ON p.market_ticker = s.market_ticker
+                   WHERE s.market_ticker = ?
+                     AND s.snapshot_valid = 1
+                     {extra}
+                   GROUP BY p.market_ticker""",
+                (ticker,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+
+    row = _query(strict=True)
+    if not row or not row[4] or row[4] == 0:
+        # Pre-phantom-fix data — was_resting column wasn't tracked. Fall
+        # back to all valid snapshots.
+        row = _query(strict=False)
+    if not row or not row[0] or not row[1]:
+        return 0.0
+    sum_share = float(row[0])
+    period_reward = float(row[1])
+    try:
+        sd = datetime.fromisoformat((row[2] or "").replace("Z", "+00:00"))
+        ed = datetime.fromisoformat((row[3] or "").replace("Z", "+00:00"))
+        period_seconds = max(1, (ed - sd).total_seconds())
+    except Exception:
+        period_seconds = 86400.0  # fallback to 1 day
+    rebate = sum_share * period_reward / period_seconds * SNAPSHOT_REPRESENTS_SECONDS
+    return round(rebate, 4)
+
+
+def backfill_rebates(db_path: str = settings.DB_PATH,
+                     force: bool = False) -> dict:
+    """One-shot backfill — recompute rebate_earned_usd for existing
+    settlement_log rows. By default only updates rows still at 0;
+    pass force=True to recompute every row (use after multiplier change)."""
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    try:
+        if force:
+            rows = conn.execute("SELECT ticker FROM settlement_log").fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT ticker FROM settlement_log
+                   WHERE rebate_earned_usd = 0 OR rebate_earned_usd IS NULL"""
+            ).fetchall()
+        updated = 0
+        total_rebate = 0.0
+        for (tkr,) in rows:
+            r = _estimate_rebate(conn, tkr)
+            if r > 0:
+                conn.execute(
+                    """UPDATE settlement_log
+                       SET rebate_earned_usd = ?,
+                           net_outcome_usd = COALESCE(our_realized_usd, 0) + ?
+                       WHERE ticker = ?""",
+                    (r, r, tkr),
+                )
+                updated += 1
+                total_rebate += r
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "rows_scanned": len(rows),
+        "rows_updated": updated,
+        "total_rebate_backfilled": round(total_rebate, 2),
+    }
+
+
 def find_recently_settled(hours_back: int = 24, db_path: str = settings.DB_PATH) -> list[dict]:
     """Query Kalshi for markets that settled in last N hours.
 
@@ -199,10 +309,15 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
         except Exception:
             pass
 
-        # Rebate contribution (rough): share × reward × days_active. Not easily
-        # recovered from snapshots without big query. Leave as 0 for now — this
-        # row's "net_outcome_usd" reflects principal-only P&L.
-        rebate = 0.0
+        # #120 (2026-04-28): compute estimated rebate from lip_snapshots.
+        # Formula matches Kalshi's LIP payout:
+        #   payout = SUM(our_score / total_score) over all valid snapshots
+        #            × period_reward_usd / period_seconds
+        # Each snapshot represents ~1 second of presence. Under-counts when
+        # our snapshot rate < Kalshi's 1Hz, but under-estimate is preferable
+        # to over-estimate for safety-gate decisions. Verify against Kalshi
+        # UI ground truth for known markets after first run.
+        rebate = _estimate_rebate(conn, tkr)
         net = realized + rebate
 
         conn.execute(
@@ -268,7 +383,18 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser()
+    p.add_argument("--backfill", action="store_true",
+                   help="Recompute rebate_earned_usd for existing rows where it's 0")
+    p.add_argument("--force", action="store_true",
+                   help="With --backfill: recompute ALL rows, not just zeros")
     a = p.parse_args()
+    if a.backfill:
+        b = backfill_rebates(force=a.force)
+        print(f"\n══ REBATE BACKFILL ══")
+        print(f"  rows scanned:           {b['rows_scanned']}")
+        print(f"  rows updated:           {b['rows_updated']}")
+        print(f"  total rebate backfilled: ${b['total_rebate_backfilled']}")
+        return
     r = reconcile()
     print(f"\n══ SETTLEMENT RECONCILIATION ══")
     print(f"  new markets recorded: {r['new_rows']}")
