@@ -274,6 +274,12 @@ class QuoteManager:
         blocked, reason = is_blocked(target.market_ticker, self.db_path)
         if blocked:
             return False, f"BLACKLIST: {reason}"
+        # #103 Pre-trade EV check — refuse series with negative 7d EV
+        from engine.series_ev import check_series_ev
+        series_prefix = target.market_ticker.split("-", 1)[0]
+        ev_ok, ev_reason = check_series_ev(series_prefix, self.db_path)
+        if not ev_ok:
+            return False, ev_reason
         # Circuit breaker: halt all quoting if daily loss exceeds cap (live only)
         if not self.paper:
             daily_pnl = self._daily_realized_pnl()

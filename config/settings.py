@@ -89,6 +89,15 @@ DEFAULT_QUOTE_SIZE_CONTRACTS = 25
 # Reprice threshold: when best bid/ask moves by this many ticks, reprice.
 REPRICE_TICK_THRESHOLD    = 1
 
+# Unreliable-futures price-conviction gate (#102, 2026-04-28):
+# When fair-value confidence is "unreliable" (Cocoa/Sugar/HOIL) or "unknown",
+# we have no way to verify which side will settle. The orderbook itself is
+# the only signal: a bid ≥ this many cents on either side means strong
+# directional consensus we can't independently verify, so we'd be quoting
+# NO at 70c on a market that settles YES. Skip entirely. Set conservative
+# (65c) to avoid false positives on legitimate near-coin-flip markets.
+UNRELIABLE_FUTURES_MAX_BID = 65
+
 # Zombie cancel threshold (#114): heartbeat sweeps cancel any resting order
 # whose price is ≥this many cents below current best on its side. Catches
 # orders that drifted from best because reprice was blocked (safety gate,

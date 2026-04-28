@@ -217,6 +217,19 @@ class PaperRunner:
             return None
         confidence = FUTURES_MAP[prefix].get("confidence", "unknown")
         if confidence not in ("exact", "close"):
+            # #102 (2026-04-28): UNRELIABLE/UNKNOWN futures = no fair-value
+            # to lean on. Apply a price-conviction gate instead: if either
+            # side bids ≥ UNRELIABLE_FUTURES_MAX_BID, the orderbook itself
+            # is telling us the market has directional consensus we can't
+            # verify. KXCOFFEEW lost -$61 on Apr 25 because we quoted NO
+            # at 60-70c without any signal Coffee was actually moving up.
+            limit = settings.UNRELIABLE_FUTURES_MAX_BID
+            if yes_bid >= limit:
+                return (f"unreliable_futures_skip[{prefix}] yes_bid={yes_bid}c "
+                        f">= {limit}c, no fair-value to verify")
+            if no_bid >= limit:
+                return (f"unreliable_futures_skip[{prefix}] no_bid={no_bid}c "
+                        f">= {limit}c, no fair-value to verify")
             return None
         import re
         m = re.search(r"-T([\d.]+)$", ticker)
