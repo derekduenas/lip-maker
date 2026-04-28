@@ -116,6 +116,14 @@ INVENTORY_SKEW_FRACTION = 0.5
 VOLATILITY_WINDOW_SEC     = 10
 VOLATILITY_BACKOFF_TICKS  = 5
 
+# Pre-settlement cancel window (#104, 2026-04-28): cancel all quotes on a
+# market in the last X minutes before close. Friday W-series weekly
+# commodities lose $60-90 in last 30 min as informed flow piles in for
+# settlement. Last 30 min of rebate accrual is tiny ($1-2/market) vs
+# typical adverse fill cost ($5-30/market). Per Apr 27 audit estimate:
+# +$60/wk lift from this gate alone. 30 min default.
+PRE_SETTLEMENT_CANCEL_MIN = 30
+
 # Zombie cancel threshold (#114): heartbeat sweeps cancel any resting order
 # whose price is ≥this many cents below current best on its side. Catches
 # orders that drifted from best because reprice was blocked (safety gate,

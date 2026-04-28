@@ -159,6 +159,66 @@ def upcoming_events(lookhead_days: int = 60) -> List[MacroEvent]:
             ticker_prefixes=MACRO_BROAD,
         ))
 
+    # ── #94 (2026-04-28) Extended catalysts ─────────────────────────────
+    # PPI: ~13th of each month 8:30 ET = 12:30 UTC
+    ppi_dates = [
+        datetime(2026, 5, 14, 12, 30, tzinfo=timezone.utc),
+        datetime(2026, 6, 12, 12, 30, tzinfo=timezone.utc),
+    ]
+    for dt in ppi_dates:
+        if dt > cutoff: break
+        events.append(MacroEvent(
+            name="PPI", event_utc=dt, pre_min=30, post_min=45,
+            ticker_prefixes=MACRO_BROAD,
+        ))
+
+    # Retail Sales: ~16th of each month 8:30 ET = 12:30 UTC
+    retail_dates = [
+        datetime(2026, 5, 15, 12, 30, tzinfo=timezone.utc),
+        datetime(2026, 6, 17, 12, 30, tzinfo=timezone.utc),
+    ]
+    for dt in retail_dates:
+        if dt > cutoff: break
+        events.append(MacroEvent(
+            name="RetailSales", event_utc=dt, pre_min=30, post_min=45,
+            ticker_prefixes=MACRO_BROAD,
+        ))
+
+    # GDP advance: end of April / July / Oct / Jan, 8:30 ET = 12:30 UTC
+    gdp_dates = [
+        datetime(2026, 7, 30, 12, 30, tzinfo=timezone.utc),
+    ]
+    for dt in gdp_dates:
+        if dt > cutoff: break
+        events.append(MacroEvent(
+            name="GDP", event_utc=dt, pre_min=45, post_min=60,
+            ticker_prefixes=MACRO_BROAD,
+        ))
+
+    # ECB rate decision: every ~6 weeks Thursday 12:15 UTC + presser 12:45
+    ecb_dates = [
+        datetime(2026, 6, 11, 12, 15, tzinfo=timezone.utc),
+        datetime(2026, 7, 23, 12, 15, tzinfo=timezone.utc),
+    ]
+    for dt in ecb_dates:
+        if dt > cutoff: break
+        events.append(MacroEvent(
+            name="ECB", event_utc=dt, pre_min=30, post_min=120,
+            ticker_prefixes=PETROLEUM,  # mostly oil/EUR-cross sensitive
+        ))
+
+    # OPEC+ meetings: typically first Thursday of even months
+    opec_dates = [
+        datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc),
+        datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+    ]
+    for dt in opec_dates:
+        if dt > cutoff: break
+        events.append(MacroEvent(
+            name="OPEC", event_utc=dt, pre_min=60, post_min=180,
+            ticker_prefixes=PETROLEUM,
+        ))
+
     return sorted(events, key=lambda e: e.event_utc)
 
 

@@ -127,6 +127,67 @@ class PaperRunner:
         self.qm.cancel_all(market_ticker=ticker)
         _log.info(f"blacklist: cancelled quotes for {ticker}")
 
+    def _minutes_until_settle(self, ticker: str) -> float | None:
+        """#104 — parse close time from ticker name. Returns minutes until
+        settle, or None if can't parse. Used by pre-settlement closing.
+
+        Format examples:
+          KXBRENTD-26APR2817-T103     → Apr 28 2026 17:00 ET → 21:00 UTC
+          KXCORNW-26APR2417-T440      → Apr 24 2026 17:00 ET → 21:00 UTC
+          KXTRUMPACT-26APR26-T3       → Apr 26 2026 (no hour, treat as 23:59)
+        """
+        import re
+        m = re.match(r"^[A-Z]+-(\d{2})([A-Z]{3})(\d{2})(\d{2})?", ticker)
+        if not m:
+            return None
+        yy, mmm, dd, hh = m.groups()
+        months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                  "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+        month = months.get(mmm.upper())
+        if not month:
+            return None
+        try:
+            if hh:
+                close_utc = datetime(2000 + int(yy), month, int(dd),
+                                     int(hh) + 4, tzinfo=timezone.utc)
+            else:
+                close_utc = datetime(2000 + int(yy), month, int(dd),
+                                     23, 59, tzinfo=timezone.utc)
+            mins = (close_utc - datetime.now(timezone.utc)).total_seconds() / 60
+            return mins
+        except Exception:
+            return None
+
+    def _pre_settlement_cancel(self, ticker: str) -> int:
+        """#104 — T-X minutes before close, cancel all quotes on this market.
+
+        Rationale (Apr 27 audit): Friday W-series weekly commodities lose
+        $60-90 in last 30 min as informed flow piles in for settlement.
+        Last 30 min of rebate accrual is tiny ($1-2/market) vs typical
+        adverse fill cost ($5-30/market). Net: cancel quotes early.
+
+        Triggers when minutes_until_settle < PRE_SETTLEMENT_CANCEL_MIN AND
+        > 0 (don't process already-settled markets).
+        """
+        mins = self._minutes_until_settle(ticker)
+        if mins is None or mins <= 0:
+            return 0
+        if mins > settings.PRE_SETTLEMENT_CANCEL_MIN:
+            return 0
+        # Within the cancel window — drop all quotes
+        n_resting = len(self.qm.resting.get(ticker, []))
+        if n_resting == 0:
+            return 0
+        # Throttle log
+        now_ts = time.time()
+        last = self._fv_skip_log_ts.get(f"presettle:{ticker}", 0)
+        if now_ts - last > 600:  # log once per 10 min per ticker
+            _log.info(f"pre_settlement_cancel {ticker}: T-{mins:.1f}min, "
+                      f"cancelling {n_resting} resting orders")
+            self._fv_skip_log_ts[f"presettle:{ticker}"] = now_ts
+        self.qm.cancel_all(market_ticker=ticker)
+        return n_resting
+
     def _cancel_zombie_quotes(self, ticker: str, best_yes_cents: int,
                               best_no_cents: int, book_age_sec: float) -> int:
         """Task #114: cancel resting orders that fell ≥ZOMBIE_GAP cents below best.
@@ -292,6 +353,13 @@ class PaperRunner:
         best_yes = book.best_yes_bid()
         best_no  = book.best_no_bid()
         if best_yes is None or best_no is None:
+            return None
+
+        # #104 (2026-04-28) Pre-settlement skip: don't re-quote in last
+        # X min before close. Heartbeat already cancelled; this prevents
+        # a book update from immediately triggering a fresh placement.
+        mins_until = self._minutes_until_settle(book.market_ticker)
+        if mins_until is not None and 0 < mins_until <= settings.PRE_SETTLEMENT_CANCEL_MIN:
             return None
 
         # #98 Tick backoff: skip reprice when best is moving fast. Don't
@@ -523,6 +591,10 @@ class PaperRunner:
                     best_no = book.best_no_bid()
                     if best_yes is None or best_no is None:
                         continue
+                    # #104 (2026-04-28): pre-settlement cancel — kill quotes
+                    # in last X min before close to avoid adverse-fill bleed
+                    # on Friday W-series settlements.
+                    self._pre_settlement_cancel(tkr)
                     # Task #114: zombie sweep — cancel any resting order that
                     # drifted ≥ZOMBIE_GAP_CENTS below best. Frees capital,
                     # fresh quote will be placed at best on next book update.
