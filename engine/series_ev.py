@@ -93,6 +93,14 @@ def _compute_series_ev(series_prefix: str, db_path: str) -> dict:
 
     if n_settlements < MIN_SETTLEMENTS:
         verdict = "thin_data"
+    elif total_rebate == 0 and total_adverse > 0:
+        # AUDIT FIX 2026-04-28 (#128 regression): when settlement_reconciler
+        # extended coverage to non-commodity series, those rows have rebate=0
+        # because we have no pre-fix snapshot data to estimate from. Without
+        # this guard they'd flip from thin_data → block_negative_ev (any
+        # adverse + zero rebate = ratio 0). Treat zero-rebate-with-losses
+        # as data-gap (fail-open) until we accumulate snapshot history.
+        verdict = "data_gap"
     else:
         if total_adverse == 0:
             ratio = float("inf")

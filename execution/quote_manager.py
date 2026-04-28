@@ -510,15 +510,23 @@ class QuoteManager:
 
         Under normal operation reconcile maintains this, but WS re-subscribe
         or exceptions mid-reconcile can leave phantom entries. If any market
-        has >2 entries, keep the most-recent per side and drop the rest.
+        has any duplicate-side entries, keep the most-recent per side and
+        drop the rest.
+
+        AUDIT FIX 2026-04-28 (#127 follow-up): was `len(lst) <= 2` — that
+        allowed [yes, yes] state to slip past sanity check. Now cleans
+        any side that has >1 entry. Drains leaks from BEFORE #127 UPSERT
+        was deployed.
         """
         lst = self.resting.get(market_ticker, [])
-        if len(lst) <= 2:
+        if not lst:
             return
         yes_orders = sorted([o for o in lst if o.side == "yes"],
                             key=lambda o: o.placed_at, reverse=True)
         no_orders  = sorted([o for o in lst if o.side == "no"],
                             key=lambda o: o.placed_at, reverse=True)
+        if len(yes_orders) <= 1 and len(no_orders) <= 1:
+            return  # already clean
         kept = (yes_orders[:1] + no_orders[:1])
         stale = [o for o in lst if o not in kept]
         for o in stale:

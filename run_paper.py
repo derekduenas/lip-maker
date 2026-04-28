@@ -135,8 +135,21 @@ class PaperRunner:
           KXBRENTD-26APR2817-T103     → Apr 28 2026 17:00 ET → 21:00 UTC
           KXCORNW-26APR2417-T440      → Apr 24 2026 17:00 ET → 21:00 UTC
           KXTRUMPACT-26APR26-T3       → Apr 26 2026 (no hour, treat as 23:59)
+
+        AUDIT FIXES 2026-04-28:
+          - Use zoneinfo America/New_York for proper DST handling
+            (was hardcoded +4 EDT — breaks Nov 2 2026 when EST starts)
+          - Use timedelta for hour-add to handle hh ≥ 20 (was raising
+            ValueError on int(hh)+4 ≥ 24, silently returning None for
+            evening crypto markets like 20:00 ET close)
         """
         import re
+        from datetime import timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            ET = ZoneInfo("America/New_York")
+        except Exception:
+            ET = None
         m = re.match(r"^[A-Z]+-(\d{2})([A-Z]{3})(\d{2})(\d{2})?", ticker)
         if not m:
             return None
@@ -148,9 +161,19 @@ class PaperRunner:
             return None
         try:
             if hh:
-                close_utc = datetime(2000 + int(yy), month, int(dd),
-                                     int(hh) + 4, tzinfo=timezone.utc)
+                if ET is not None:
+                    # Construct ET-local time, convert to UTC (DST-aware)
+                    et_close = datetime(2000 + int(yy), month, int(dd),
+                                        int(hh), 0, tzinfo=ET)
+                    close_utc = et_close.astimezone(timezone.utc)
+                else:
+                    # Fallback if zoneinfo unavailable — use timedelta
+                    # to avoid the +4 overflow bug for hh ≥ 20.
+                    base = datetime(2000 + int(yy), month, int(dd),
+                                    0, 0, tzinfo=timezone.utc)
+                    close_utc = base + timedelta(hours=int(hh) + 4)
             else:
+                # No hour suffix — treat as end of named day (23:59 UTC)
                 close_utc = datetime(2000 + int(yy), month, int(dd),
                                      23, 59, tzinfo=timezone.utc)
             mins = (close_utc - datetime.now(timezone.utc)).total_seconds() / 60
