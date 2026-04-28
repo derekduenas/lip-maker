@@ -1,0 +1,11 @@
+[Unit]
+Description=Run dead-slot pruner every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+AccuracySec=1min
+Unit=dead-slot-pruner.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=INNAIT dead-slot pruner — auto-cancel zero-rebate markets after 48h
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+Environment="PYTHONPATH=/root/lip-maker"
+ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/tools/dead_slot_pruner.py
+StandardOutput=append:/root/lip-maker/logs/dead_slot_pruner.log
+StandardError=append:/root/lip-maker/logs/dead_slot_pruner.log
