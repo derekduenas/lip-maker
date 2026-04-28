@@ -74,8 +74,11 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
     conn.commit()
 
     now = datetime.now(timezone.utc)
-    cutoff = (now - timedelta(seconds=WINDOW_SEC)).isoformat()
-    dedup_cutoff = (now - timedelta(minutes=DEDUP_MIN)).isoformat()
+    # AUDIT FIX: normalize to Z suffix to match Kalshi created_at format
+    # ('YYYY-MM-DDTHH:MM:SS.fffZ'). Otherwise lexical comparison of '+00:00'
+    # vs 'Z' could fail at boundary moments (Z=0x5A > +=0x2B).
+    cutoff = (now - timedelta(seconds=WINDOW_SEC)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dedup_cutoff = (now - timedelta(minutes=DEDUP_MIN)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Group fills in last 60s by ticker, count per side. We require maker
     # fills (is_taker=0) since we're a market maker — taker fills shouldn't

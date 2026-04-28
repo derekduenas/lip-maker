@@ -96,10 +96,13 @@ def our_estimate_per_series(window_start: str, window_end: str,
 def calibration_report(observations: dict | None = None) -> dict:
     """Compare our estimates against ground truth, return calibration stats."""
     if observations is None:
-        # Use the frozen baseline
+        # Use the frozen baseline. AUDIT FIX: bounds use Z suffix to match
+        # Kalshi's close_time format ('YYYY-MM-DDTHH:MM:SSZ'). Without
+        # this, lexical comparison of bound vs row at exact same date+time
+        # was unreliable.
         truth = GROUND_TRUTH_APR_21_26
-        window_start = "2026-04-21T00:00:00"
-        window_end   = "2026-04-27T00:00:00"
+        window_start = "2026-04-21T00:00:00Z"
+        window_end   = "2026-04-27T00:00:00Z"
         label = "Apr 21-26 baseline"
     else:
         truth = observations

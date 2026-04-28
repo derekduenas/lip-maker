@@ -25,7 +25,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.chdir(str(Path(__file__).resolve().parent.parent))
 
 from config import settings
 
@@ -175,7 +174,9 @@ def render(k: dict, l: dict) -> None:
     if pnl:
         print(f"  {'day':<10s}  {'cum_realized':>12s}  {'daily_Δ':>10s}  {'positions':>9s}  {'balance':>8s}")
         for day, realized, delta, n_pos, bal in pnl:
-            print(f"  {day:<10s}  ${realized:>+11.2f}  ${delta or 0:>+9.2f}  {n_pos or 0:>9d}  ${bal or 0:>7.2f}")
+            # AUDIT FIX: realized may be None if daily_pnl_log row was
+            # incomplete; default to 0 for display.
+            print(f"  {day:<10s}  ${realized or 0:>+11.2f}  ${delta or 0:>+9.2f}  {n_pos or 0:>9d}  ${bal or 0:>7.2f}")
         weekly_delta = sum(d[2] or 0 for d in pnl[-7:])
         print(f"  {'─'*60}")
         print(f"  Weekly Δ realized: ${weekly_delta:+.2f}")
@@ -217,6 +218,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--json", action="store_true", help="machine-readable output")
     a = p.parse_args()
+
+    # AUDIT FIX: chdir at main() start (was module-level — would mutate cwd
+    # of any future importer). KalshiClient .env loader needs cwd here.
+    os.chdir(str(Path(__file__).resolve().parent.parent))
 
     k = _kalshi_state()
     l = _local_state()
