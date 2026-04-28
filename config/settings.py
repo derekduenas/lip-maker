@@ -118,6 +118,16 @@ SERIES_BLOCKLIST = {
     "KXPRES", "KXPREZ", "KXELEC",
     # Fed rate decision flagships ($120M+ contracts, prop-desk dominated)
     "KXFEDDECISION",
+    # 2026-04-27 PERMANENT BANS (audit-confirmed money-losers — Apr 21-26):
+    # Net PnL = rebate − settlement losses. These series consistently bled
+    # via adverse selection that exceeded any rebate captured.
+    "KXCOFFEEW",   # net -$61.61 — biggest single loser, unreliable futures feed
+    "KXSILVERD",   # net -$12.91 — $0 rebate captured, pure adverse selection
+    "KXSILVERMON", # ditto, monthly variant
+    "KXLITHIUMW",  # high toxicity flags, low rebate
+    "KXLCATTLEW",  # high toxicity flags
+    # Note: KXSUGARW (-$0.31), KXHOILW (+$11.63 net) excluded — borderline
+    # cases. Re-evaluate after a clean week of post-blocklist data.
 }
 
 # ── Quote pricing ─────────────────────────────────────────────────────────
@@ -143,3 +153,19 @@ MIN_MARKET_VOLUME_24H = 100
 # means we're contributing meaningfully to the size-at-best without
 # dominating (and hurting our normalized score via self-dilution).
 QUOTE_SIZE_AS_FRACTION_OF_TARGET = 0.20
+
+# ── 2026-04-27 PER-SERIES SIZE MULTIPLIERS (audit-driven) ────────────────
+# Concentrate cap on proven winners. Net PnL Apr 21-26 audit:
+#   KXBRENTD: +$39.72  KXCORNW: +$37.30  KXCOPPERD: +$25.28
+#   KXGOLDW:  +$21.48  KXCOCOAW: +$23.14
+# 2x size = 2x rebate at full share, capped by per-market USD limit anyway.
+SIZE_MULTIPLIER_BY_SERIES = {
+    "KXBRENTD":  2.0,
+    "KXCORNW":   2.0,
+    "KXCOPPERD": 2.0,
+    "KXGOLDW":   2.0,
+    "KXCOCOAW":  2.0,
+    "KXGOLDD":   1.5,
+    "KXWHEATW":  1.5,
+}
+DEFAULT_SIZE_MULTIPLIER = 1.0

@@ -239,6 +239,16 @@ class PaperRunner:
         size_no  = self.sizer.size_for(book.market_ticker, "no",  p.target_size)
         size = min(size_yes, size_no)
 
+        # 2026-04-27: per-series size multiplier (audit: KXBRENTD/CORNW/COPPERD/
+        # GOLDW/COCOAW are net-positive, deserve 2x cap allocation). Cap by
+        # _passes_safety per-market USD limit anyway.
+        series = book.market_ticker.split("-", 1)[0] if book.market_ticker else ""
+        mult = settings.SIZE_MULTIPLIER_BY_SERIES.get(
+            series, settings.DEFAULT_SIZE_MULTIPLIER,
+        )
+        if mult != 1.0:
+            size = int(size * mult)
+
         return QuoteTarget(
             market_ticker=book.market_ticker,
             yes_bid_cents=best_yes.price_cents,
