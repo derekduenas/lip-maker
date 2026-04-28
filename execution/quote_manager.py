@@ -297,7 +297,17 @@ class QuoteManager:
             if daily_pnl < -settings.MAX_DAILY_LOSS_USD:
                 return False, (f"CIRCUIT_BREAKER: daily_pnl ${daily_pnl:.2f} "
                                f"< -${settings.MAX_DAILY_LOSS_USD:.0f} (halting)")
-        if target.size_contracts < settings.MIN_QUOTE_SIZE_CONTRACTS:
+        # AUDIT FIX (2026-04-28): when #97 inventory skew sets per-side
+        # overrides, the asymmetric placement size can be up to 1.5×
+        # size_contracts. All downstream caps (per-mkt gross, total
+        # gross, series gross, bankroll share) must use the LARGER
+        # actual placement size to avoid undersized accounting.
+        effective_size = max(
+            target.size_contracts,
+            target.yes_size_override or 0,
+            target.no_size_override or 0,
+        )
+        if effective_size < settings.MIN_QUOTE_SIZE_CONTRACTS:
             return False, f"size<{settings.MIN_QUOTE_SIZE_CONTRACTS}"
 
         # Spread check
@@ -331,13 +341,33 @@ class QuoteManager:
             return True, "ok"   # nothing to place anyway
         cost_per_contract = price_sum / 100.0   # $ per contract across both sides
 
-        max_contracts_by_cap = int(remaining_cap / cost_per_contract) if cost_per_contract > 0 else target.size_contracts
-        if target.size_contracts > max_contracts_by_cap:
+        max_contracts_by_cap = int(remaining_cap / cost_per_contract) if cost_per_contract > 0 else effective_size
+        if effective_size > max_contracts_by_cap:
             if max_contracts_by_cap < settings.MIN_QUOTE_SIZE_CONTRACTS:
                 return False, (f"cap_too_tight remaining=${remaining_cap:.2f} "
                                f"allows {max_contracts_by_cap} < MIN {settings.MIN_QUOTE_SIZE_CONTRACTS}")
-            # Downsize in place
-            target.size_contracts = max_contracts_by_cap
+            # Downsize in place — scale BOTH base size AND any overrides
+            # proportionally so per-side asymmetry survives the downsize.
+            scale = max_contracts_by_cap / effective_size
+            target.size_contracts = max(
+                settings.MIN_QUOTE_SIZE_CONTRACTS,
+                int(target.size_contracts * scale),
+            )
+            if target.yes_size_override is not None:
+                target.yes_size_override = max(
+                    settings.MIN_QUOTE_SIZE_CONTRACTS,
+                    int(target.yes_size_override * scale),
+                )
+            if target.no_size_override is not None:
+                target.no_size_override = max(
+                    settings.MIN_QUOTE_SIZE_CONTRACTS,
+                    int(target.no_size_override * scale),
+                )
+            effective_size = max(
+                target.size_contracts,
+                target.yes_size_override or 0,
+                target.no_size_override or 0,
+            )
 
         # Per-market net inventory — refresh from fill_ledger first (Spread Master fix)
         self._refresh_inventory(target.market_ticker)
@@ -348,9 +378,9 @@ class QuoteManager:
             if net_usd > settings.MAX_NET_INVENTORY_USD:
                 return False, f"net_inv ${net_usd:.2f} > cap ${settings.MAX_NET_INVENTORY_USD}"
 
-        # Total gross — use the (possibly-downsized) target.size
+        # Total gross — use the LARGER of base + overrides (audit fix)
         total_gross = self._total_gross_exposure()
-        new_incr = (price_sum / 100.0) * target.size_contracts
+        new_incr = (price_sum / 100.0) * effective_size
         if total_gross + new_incr > settings.MAX_TOTAL_GROSS_USD:
             return False, f"total_gross ${total_gross+new_incr:.2f} > cap ${settings.MAX_TOTAL_GROSS_USD}"
 

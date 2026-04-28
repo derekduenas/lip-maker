@@ -78,6 +78,20 @@ def _compute_series_ev(series_prefix: str, db_path: str) -> dict:
     total_adverse = abs(float(row[1] or 0.0))   # adverse is sum of negatives → make positive
     total_rebate = float(row[2] or 0.0)
 
+    # AUDIT FIX (2026-04-28): settlement_reconciler.py:205 currently
+    # hardcodes rebate_earned_usd=0 (data pipeline not wired yet). Without
+    # this guard, EVERY non-whitelisted series with ≥3 settlements + any
+    # loss would block — system-wide kill switch. Treat zero-rebate +
+    # any-settlements as DATA-GAP, not negative-EV. Re-enable strict
+    # check once settlement_reconciler populates real rebate values.
+    DATA_PIPELINE_WIRED = False  # flip to True when reconciler writes rebates
+    if total_rebate == 0 and n_settlements > 0 and not DATA_PIPELINE_WIRED:
+        return {
+            "series": series_prefix, "verdict": "data_gap",
+            "ratio": None, "n_settlements": n_settlements,
+            "total_adverse": round(total_adverse, 2), "total_rebate": 0.0,
+        }
+
     if n_settlements < MIN_SETTLEMENTS:
         verdict = "thin_data"
     else:
@@ -115,7 +129,7 @@ def check_series_ev(series_prefix: str, db_path: str) -> tuple[bool, str]:
         _cache[series_prefix] = (verdict_dict, now)
 
     v = verdict_dict["verdict"]
-    if v in ("allow", "thin_data", "whitelist_winner"):
+    if v in ("allow", "thin_data", "whitelist_winner", "data_gap"):
         return True, ""
     if v == "block_negative_ev":
         return False, (f"ev_check[{series_prefix}] adverse=${verdict_dict['total_adverse']} "

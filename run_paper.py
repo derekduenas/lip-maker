@@ -295,9 +295,17 @@ class PaperRunner:
 
         # #98 Tick backoff: skip reprice when best is moving fast. Don't
         # chase a flickering market — protects against being the slow
-        # replacement quote that informed flow picks off.
+        # replacement quote that informed flow picks off. Throttle log so
+        # we can tell volatility-skips apart from other skip-reasons.
         if self._is_volatile(book.market_ticker, best_yes.price_cents,
                              best_no.price_cents):
+            now_ts = time.time()
+            last = self._fv_skip_log_ts.get(f"vol:{book.market_ticker}", 0)
+            if now_ts - last > 300:
+                _log.info(f"volatility_skip[{book.market_ticker}] "
+                          f"best moved >{settings.VOLATILITY_BACKOFF_TICKS}c "
+                          f"in last {settings.VOLATILITY_WINDOW_SEC}s")
+                self._fv_skip_log_ts[f"vol:{book.market_ticker}"] = now_ts
             return None
 
         # Quant audit: futures fair-value adverse-selection gate. Skip
