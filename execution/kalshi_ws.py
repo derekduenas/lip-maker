@@ -359,7 +359,24 @@ class KalshiWS:
             # Raised from >10 — most gaps are Kalshi coalescing, not real loss,
             # and re-subscribing causes more noise than it fixes.
             if book.last_seq and seq > book.last_seq + 50:
+                # 2026-04-28 FIX: throttle re-subscribe AND reset last_seq=0 so
+                # the next snapshot starts fresh. Without this, every subsequent
+                # delta triggers another gap → resubscribe loop (saw 4 in 1ms
+                # for KXTRUMPTIME-26MAY02-H2 burning rate-limit).
+                import time as _t
+                last_sub = getattr(self, "_last_resub_ts", {}).get(ticker, 0)
+                if _t.time() - last_sub < 10:
+                    # Throttle: silently apply and move on
+                    book.last_seq = seq
+                    self._apply_delta(book, m)
+                    for cb in self._callbacks:
+                        await cb(book)
+                    return
+                if not hasattr(self, "_last_resub_ts"):
+                    self._last_resub_ts = {}
+                self._last_resub_ts[ticker] = _t.time()
                 _log.info(f"seq gap {ticker}: {book.last_seq}→{seq} (gap={seq-book.last_seq-1})")
+                book.last_seq = 0  # reset — next snapshot will set fresh
                 await self.subscribe_orderbook([ticker])
                 return
             self._apply_delta(book, m)

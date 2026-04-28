@@ -166,6 +166,48 @@ class QuoteManager:
         except Exception as e:
             _log.warning(f"cold-boot reconcile FAILED ({e}) — starting with empty resting state")
 
+    def periodic_resync(self) -> dict:
+        """Reconcile self.resting against live Kalshi orders. Cures drift
+        from filled/cancelled orders that didn't get purged from memory.
+
+        Removes phantom entries (in memory but not on Kalshi) and ADDS any
+        live orders missing from memory (rare but happens after WS hiccup).
+
+        Run from heartbeat every ~5 min. Cheap (one /portfolio/orders call).
+        """
+        if self.paper or self.client is None:
+            return {"skipped": "paper_mode"}
+        try:
+            live_ids = set()
+            cursor = None
+            while True:
+                params = {"status": "resting", "limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = self.client.get("/portfolio/orders", params=params)
+                for raw in resp.get("orders", []):
+                    if raw.get("status") == "resting" and raw.get("order_id"):
+                        live_ids.add(raw["order_id"])
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+            # Purge phantoms
+            phantoms = 0
+            for ticker, orders in list(self.resting.items()):
+                kept = [o for o in orders if o.order_id in live_ids]
+                phantoms += len(orders) - len(kept)
+                if kept:
+                    self.resting[ticker] = kept
+                else:
+                    self.resting.pop(ticker, None)
+            if phantoms > 0:
+                _log.info(f"periodic_resync: purged {phantoms} phantom entries "
+                          f"from self.resting (cured drift)")
+            return {"phantoms_purged": phantoms, "live_count": len(live_ids)}
+        except Exception as e:
+            _log.warning(f"periodic_resync failed: {e}")
+            return {"error": str(e)}
+
     # ── Inventory tracking ────────────────────────────────────────────
     def _refresh_inventory(self, market_ticker: str) -> None:
         """Populate self.inventory[market_ticker] from fill_ledger.

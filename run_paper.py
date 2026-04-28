@@ -597,12 +597,20 @@ class PaperRunner:
         """
         import sqlite3
         from engine.lip_scorer import OurQuotes, score_snapshot
+        last_resync = 0.0
+        RESYNC_INTERVAL_SEC = 300  # 5 min — cheap (one Kalshi API call)
         while True:
             try:
                 await asyncio.sleep(interval_sec)
                 now = time.time()
                 # Refresh blacklist once per heartbeat cycle
                 self._refresh_blacklist()
+                # 2026-04-28: periodic re-sync of self.qm.resting against
+                # live Kalshi orders. Cures sizer drift where filled/cancelled
+                # orders weren't purged from memory → safety gate inflated cap.
+                if now - last_resync >= RESYNC_INTERVAL_SEC:
+                    last_resync = now
+                    self.qm.periodic_resync()
                 for tkr, params in self.params_by_ticker.items():
                     if self._is_blacklisted(tkr):
                         self._handle_blacklisted(tkr)
