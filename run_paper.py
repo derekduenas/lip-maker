@@ -85,6 +85,11 @@ class PaperRunner:
         # older than BLACKLIST_CACHE_SEC. Prevents DB hits on every book update.
         self._blacklist: set[str] = set()
         self._blacklist_ts: float = 0.0
+        # #98 (2026-04-28) Tick backoff: per-ticker rolling history of best
+        # bid changes. When best moves > VOLATILITY_BACKOFF_TICKS in
+        # VOLATILITY_WINDOW_SEC, we're in a hot market — back off.
+        from collections import deque
+        self._best_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
         self._blacklist_last_action: dict[str, float] = {}   # ticker → last-cancel ts
 
     BLACKLIST_CACHE_SEC = 10  # refresh cache every 10s
@@ -253,6 +258,31 @@ class PaperRunner:
                     f"yes_bid={yes_bid}c too high")
         return None
 
+    def _is_volatile(self, ticker: str, best_yes_cents: int,
+                     best_no_cents: int) -> bool:
+        """#98: detect rapid best-bid movement on either side.
+
+        Tracks last 20 (ts, best_yes, best_no) tuples per ticker. Returns
+        True when the range (max-min) on either side over the last
+        VOLATILITY_WINDOW_SEC exceeds VOLATILITY_BACKOFF_TICKS cents.
+
+        When True, the caller should skip this reprice cycle so we don't
+        cancel/replace into a fast-moving book where adverse selection
+        risk is high (informed traders move price first, hit our stale
+        replacement second).
+        """
+        now = time.time()
+        hist = self._best_history[ticker]
+        hist.append((now, best_yes_cents, best_no_cents))
+        cutoff = now - settings.VOLATILITY_WINDOW_SEC
+        recent = [h for h in hist if h[0] >= cutoff]
+        if len(recent) < 3:
+            return False
+        yes_range = max(h[1] for h in recent) - min(h[1] for h in recent)
+        no_range  = max(h[2] for h in recent) - min(h[2] for h in recent)
+        return (yes_range >= settings.VOLATILITY_BACKOFF_TICKS or
+                no_range  >= settings.VOLATILITY_BACKOFF_TICKS)
+
     def _quote_target_for(self, book: BookState) -> QuoteTarget | None:
         """Compute our desired quote using ADAPTIVE sizing to target 25% share."""
         p = self.params_by_ticker.get(book.market_ticker)
@@ -261,6 +291,13 @@ class PaperRunner:
         best_yes = book.best_yes_bid()
         best_no  = book.best_no_bid()
         if best_yes is None or best_no is None:
+            return None
+
+        # #98 Tick backoff: skip reprice when best is moving fast. Don't
+        # chase a flickering market — protects against being the slow
+        # replacement quote that informed flow picks off.
+        if self._is_volatile(book.market_ticker, best_yes.price_cents,
+                             best_no.price_cents):
             return None
 
         # Quant audit: futures fair-value adverse-selection gate. Skip
@@ -295,11 +332,35 @@ class PaperRunner:
         if mult != 1.0:
             size = int(size * mult)
 
+        # #97 (2026-04-28) Active inventory skew: when we hold a net position,
+        # bias quote sizes to absorb the offsetting side and let the long
+        # side bleed off naturally. Reduces time-to-flat from minutes
+        # (passive) to seconds (active recirculation).
+        yes_size_override = None
+        no_size_override = None
+        self.qm._refresh_inventory(book.market_ticker)
+        inv = self.qm.inventory.get(book.market_ticker)
+        if inv and inv.net_yes_contracts != 0:
+            net = inv.net_yes_contracts
+            skew_amount = min(int(size * settings.INVENTORY_SKEW_FRACTION),
+                              abs(net))
+            min_size = settings.MIN_QUOTE_SIZE_CONTRACTS
+            if net > 0:
+                # Long YES — boost NO bid to absorb shorts, shrink YES bid
+                no_size_override  = size + skew_amount
+                yes_size_override = max(min_size, size - skew_amount)
+            else:
+                # Long NO — boost YES bid to absorb longs, shrink NO bid
+                yes_size_override = size + skew_amount
+                no_size_override  = max(min_size, size - skew_amount)
+
         return QuoteTarget(
             market_ticker=book.market_ticker,
             yes_bid_cents=best_yes.price_cents,
             no_bid_cents=best_no.price_cents,
             size_contracts=size,
+            yes_size_override=yes_size_override,
+            no_size_override=no_size_override,
         )
 
     async def on_book_update(self, book: BookState):

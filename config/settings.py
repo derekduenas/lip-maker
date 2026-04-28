@@ -98,6 +98,24 @@ REPRICE_TICK_THRESHOLD    = 1
 # (65c) to avoid false positives on legitimate near-coin-flip markets.
 UNRELIABLE_FUTURES_MAX_BID = 65
 
+# Active inventory skew (#97): when holding a net position, bias the
+# offset-side quote LARGER and the same-side quote SMALLER, by up to this
+# fraction of base size. 0.5 means a fully-sized base (25 contracts) can
+# skew ±12 contracts (NO=37, YES=13 if we're long YES). Keeps top-of-book
+# presence on both sides for LIP scoring while accelerating inventory
+# unwind. Cap also bounded by abs(net_yes) so we don't over-skew on
+# small inventory imbalances.
+INVENTORY_SKEW_FRACTION = 0.5
+
+# Tick backoff in volatile periods (#98): skip reprice cycles when best
+# bid moves > VOLATILITY_BACKOFF_TICKS within VOLATILITY_WINDOW_SEC.
+# In hot markets, our replacement quote is always the slow-second-mouse
+# — informed flow moves first, hits our stale quote second. Backing off
+# 1-2 cycles lets the market settle before we re-engage. 5c over 10s
+# is the threshold (FOMC-style move = 8-15c in seconds, normal = 1-2c).
+VOLATILITY_WINDOW_SEC     = 10
+VOLATILITY_BACKOFF_TICKS  = 5
+
 # Zombie cancel threshold (#114): heartbeat sweeps cancel any resting order
 # whose price is ≥this many cents below current best on its side. Catches
 # orders that drifted from best because reprice was blocked (safety gate,

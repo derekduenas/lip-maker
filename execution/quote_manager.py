@@ -51,7 +51,18 @@ class QuoteTarget:
     market_ticker:   str
     yes_bid_cents:   Optional[int]  # None = no yes quote
     no_bid_cents:    Optional[int]  # None = no no quote
-    size_contracts:  int            # applied to both sides
+    size_contracts:  int            # default size for both sides
+    # #97 (2026-04-28) optional per-side overrides for inventory skew. When
+    # we're long YES, set no_size_override > yes_size_override to lean into
+    # absorbing offsetting fills. None = use size_contracts.
+    yes_size_override: Optional[int] = None
+    no_size_override:  Optional[int] = None
+
+    def yes_size(self) -> int:
+        return self.yes_size_override if self.yes_size_override is not None else self.size_contracts
+
+    def no_size(self) -> int:
+        return self.no_size_override if self.no_size_override is not None else self.size_contracts
 
 
 @dataclass
@@ -500,7 +511,8 @@ class QuoteManager:
 
         actions = {"cancelled": 0, "placed": 0, "kept": 0, "reason": reason}
 
-        # Yes side
+        # Yes side (#97: respects yes_size_override for inventory skew)
+        yes_size = target.yes_size()
         if target.yes_bid_cents is None:
             for o in current_yes:
                 if self._cancel_order(o):
@@ -509,20 +521,21 @@ class QuoteManager:
             need_replace = False
             if len(current_yes) != 1:
                 need_replace = True
-            elif current_yes[0].price_cents != target.yes_bid_cents or current_yes[0].size_contracts != target.size_contracts:
+            elif current_yes[0].price_cents != target.yes_bid_cents or current_yes[0].size_contracts != yes_size:
                 need_replace = True
             if need_replace:
                 for o in current_yes:
                     if self._cancel_order(o):
                         actions["cancelled"] += 1
                 r = self._place_order(target.market_ticker, "yes",
-                                       target.yes_bid_cents, target.size_contracts)
+                                       target.yes_bid_cents, yes_size)
                 if r:
                     actions["placed"] += 1
             else:
                 actions["kept"] += 1
 
-        # No side
+        # No side (#97: respects no_size_override for inventory skew)
+        no_size = target.no_size()
         if target.no_bid_cents is None:
             for o in current_no:
                 if self._cancel_order(o):
@@ -531,14 +544,14 @@ class QuoteManager:
             need_replace = False
             if len(current_no) != 1:
                 need_replace = True
-            elif current_no[0].price_cents != target.no_bid_cents or current_no[0].size_contracts != target.size_contracts:
+            elif current_no[0].price_cents != target.no_bid_cents or current_no[0].size_contracts != no_size:
                 need_replace = True
             if need_replace:
                 for o in current_no:
                     if self._cancel_order(o):
                         actions["cancelled"] += 1
                 r = self._place_order(target.market_ticker, "no",
-                                       target.no_bid_cents, target.size_contracts)
+                                       target.no_bid_cents, no_size)
                 if r:
                     actions["placed"] += 1
             else:
