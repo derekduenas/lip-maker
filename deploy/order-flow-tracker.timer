@@ -1,0 +1,11 @@
+[Unit]
+Description=Run order flow tracker every 60 seconds (fast directional flow detection)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60sec
+AccuracySec=10sec
+Unit=order-flow-tracker.service
+
+[Install]
+WantedBy=timers.target

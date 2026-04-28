@@ -1,0 +1,12 @@
+[Unit]
+Description=INNAIT order flow direction tracker — proactive toxicity detection
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+Environment="PYTHONPATH=/root/lip-maker"
+ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/tools/order_flow_tracker.py
+StandardOutput=append:/root/lip-maker/logs/order_flow.log
+StandardError=append:/root/lip-maker/logs/order_flow.log
