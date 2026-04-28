@@ -122,7 +122,7 @@ class PaperRunner:
         _log.info(f"blacklist: cancelled quotes for {ticker}")
 
     def _cancel_zombie_quotes(self, ticker: str, best_yes_cents: int,
-                              best_no_cents: int) -> int:
+                              best_no_cents: int, book_age_sec: float) -> int:
         """Task #114: cancel resting orders that fell ≥ZOMBIE_GAP cents below best.
 
         When the book moves but our reprice is blocked (safety gate, WS lag,
@@ -132,7 +132,14 @@ class PaperRunner:
 
         Heartbeat-cadence cleanup: if our resting price < best - threshold,
         cancel. Reprice loop will re-place at best on next book update.
+
+        Audit fix R1 (2026-04-28): require fresh book before cancelling.
+        A stale book may show transient wide-spread state; cancelling on
+        that would kill perfectly-placed quotes whose price was at the
+        prior best.
         """
+        if book_age_sec > settings.STALE_DATA_PULL_SECONDS:
+            return 0  # don't trust stale book data for cancellation decisions
         gap_threshold = settings.ZOMBIE_GAP_CENTS
         cancelled = 0
         for o in list(self.qm.resting.get(ticker, [])):
@@ -436,8 +443,9 @@ class PaperRunner:
                     # Task #114: zombie sweep — cancel any resting order that
                     # drifted ≥ZOMBIE_GAP_CENTS below best. Frees capital,
                     # fresh quote will be placed at best on next book update.
+                    book_age = now - (book.last_update_ts or now)
                     self._cancel_zombie_quotes(tkr, best_yes.price_cents,
-                                               best_no.price_cents)
+                                               best_no.price_cents, book_age)
                     # Construct augmented book with our hypothetical quote
                     size_yes = self.sizer.size_for(tkr, "yes", params.target_size)
                     size_no  = self.sizer.size_for(tkr, "no",  params.target_size)

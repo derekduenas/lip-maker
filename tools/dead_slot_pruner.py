@@ -90,6 +90,11 @@ def _near_settle(ticker: str) -> bool:
 
 
 def scan(db_path: str = settings.DB_PATH) -> dict:
+    # Audit fix R4 (2026-04-28): ensure market_blacklist exists before
+    # we INSERT into it. Don't depend on quote_manager init ordering.
+    from execution.market_blacklist import init_schema as _init_bl
+    _init_bl(db_path)
+
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.executescript(SCHEMA)
     conn.commit()

@@ -187,7 +187,12 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                    LIMIT ?""",
                 (max_target_size, n * 3),  # over-fetch so priority can re-sort top-n
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            # Audit fix R2 (2026-04-28): log loudly. Previously a SQL bug
+            # silently fell through and the system used the no-filter fallback.
+            _log.warning(f"top_n_to_quote primary query failed ({e}); using "
+                         f"fallback path WITHOUT end_date or blacklist filters. "
+                         f"Investigate the SQL above.")
             rows = conn.execute(
                 """SELECT market_ticker, series_ticker, reward_per_day_usd,
                           target_size, discount_factor, start_date, end_date
