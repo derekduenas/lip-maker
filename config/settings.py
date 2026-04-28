@@ -89,6 +89,13 @@ DEFAULT_QUOTE_SIZE_CONTRACTS = 25
 # Reprice threshold: when best bid/ask moves by this many ticks, reprice.
 REPRICE_TICK_THRESHOLD    = 1
 
+# Zombie cancel threshold (#114): heartbeat sweeps cancel any resting order
+# whose price is ≥this many cents below current best on its side. Catches
+# orders that drifted from best because reprice was blocked (safety gate,
+# WS lag, stale book between updates). At gap=3¢, DF=0.5 score is
+# 0.5^3 = 0.125 — already 87.5% degraded vs at-best. Worth freeing capital.
+ZOMBIE_GAP_CENTS          = 3
+
 # Cancel on stale data: if WS hasn't updated for this many seconds, pull quotes.
 STALE_DATA_PULL_SECONDS   = 10
 

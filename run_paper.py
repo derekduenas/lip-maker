@@ -121,6 +121,32 @@ class PaperRunner:
         self.qm.cancel_all(market_ticker=ticker)
         _log.info(f"blacklist: cancelled quotes for {ticker}")
 
+    def _cancel_zombie_quotes(self, ticker: str, best_yes_cents: int,
+                              best_no_cents: int) -> int:
+        """Task #114: cancel resting orders that fell ≥ZOMBIE_GAP cents below best.
+
+        When the book moves but our reprice is blocked (safety gate, WS lag,
+        stale book between updates), our resting price can drift far from best.
+        At that point we score 0 (DF^big_gap → 0) AND occupy capacity that
+        a fresh quote at best could be earning on.
+
+        Heartbeat-cadence cleanup: if our resting price < best - threshold,
+        cancel. Reprice loop will re-place at best on next book update.
+        """
+        gap_threshold = settings.ZOMBIE_GAP_CENTS
+        cancelled = 0
+        for o in list(self.qm.resting.get(ticker, [])):
+            best = best_yes_cents if o.side == "yes" else best_no_cents
+            if best is None:
+                continue
+            if o.price_cents < best - gap_threshold:
+                if self.qm._cancel_order(o):
+                    cancelled += 1
+                    _log.warning(f"zombie cancel {ticker} {o.side} "
+                                 f"@{o.price_cents}¢ vs best {best}¢ "
+                                 f"(gap {best - o.price_cents}¢)")
+        return cancelled
+
     def _actually_resting(self, ticker: str, target) -> bool:
         """Check if we have qualifying two-sided quotes resting on this market.
 
@@ -407,6 +433,11 @@ class PaperRunner:
                     best_no = book.best_no_bid()
                     if best_yes is None or best_no is None:
                         continue
+                    # Task #114: zombie sweep — cancel any resting order that
+                    # drifted ≥ZOMBIE_GAP_CENTS below best. Frees capital,
+                    # fresh quote will be placed at best on next book update.
+                    self._cancel_zombie_quotes(tkr, best_yes.price_cents,
+                                               best_no.price_cents)
                     # Construct augmented book with our hypothetical quote
                     size_yes = self.sizer.size_for(tkr, "yes", params.target_size)
                     size_no  = self.sizer.size_for(tkr, "no",  params.target_size)
