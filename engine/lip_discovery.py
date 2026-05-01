@@ -93,29 +93,37 @@ def _decide_enrol(p: dict) -> tuple[int, str]:
     return 1, "ok"
 
 
-def discover(*, status: str = "active", save: bool = True) -> list[dict]:
-    """Fetch + persist LIP programs. Returns parsed list."""
+def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
+    """Fetch + persist LIP programs. Returns parsed list.
+
+    2026-04-30: pull ALL status flavors (active, closed, pending, paid)
+    so settlement_log → lip_programs JOIN works for already-settled markets.
+    Previously pulled only active → closed programs got purged after settle
+    → _estimate_rebate returned $0 silently. Bug fixed.
+    """
     c = KalshiClient()
     programs: list[dict] = []
-    cursor = None
+    statuses = ("active", "closed", "pending", "paid") if status is None else (status,)
 
-    while True:
-        params = {"status": status, "type": "liquidity", "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            resp = c.get_unauth("/incentive_programs", params=params)
-        except Exception as e:
-            _log.warning(f"/incentive_programs call failed: {e}")
-            break
-        batch = resp.get("incentive_programs", [])
-        for raw in batch:
-            if raw.get("incentive_type") != "liquidity":
-                continue
-            programs.append(_parse_program(raw))
-        cursor = resp.get("next_cursor")
-        if not cursor:
-            break
+    for s in statuses:
+        cursor = None
+        while True:
+            params = {"status": s, "type": "liquidity", "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                resp = c.get_unauth("/incentive_programs", params=params)
+            except Exception as e:
+                _log.warning(f"/incentive_programs status={s} failed: {e}")
+                break
+            batch = resp.get("incentive_programs", [])
+            for raw in batch:
+                if raw.get("incentive_type") != "liquidity":
+                    continue
+                programs.append(_parse_program(raw))
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
 
     # Decide enrolment and persist
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -206,15 +214,110 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
     finally:
         conn.close()
 
-    # Re-rank by reward × series priority. Defaults to 1.0 when not in table.
+    # Re-rank by reward × series priority × COMPETITION × REALIZED YIELD.
+    # NEXUS Ship 1 (2026-04-29): per-series realized rebate from settlement_log
+    # over last 14d as ground-truth multiplier. Markets that ACTUALLY paid us
+    # rank higher than markets that look good on paper. Avoids the "theoretical
+    # EV" trap where competition_mult understates and pool_reward overstates.
     multipliers = settings.SIZE_MULTIPLIER_BY_SERIES
     default = settings.DEFAULT_SIZE_MULTIPLIER
+
+    density_map: dict[str, dict] = {}
+    try:
+        from tools.competitor_density import scan as _density_scan
+        for d in _density_scan(db_path=db_path):
+            tkr = d.get("market_ticker") if isinstance(d, dict) else None
+            if tkr:
+                density_map[tkr] = d
+    except Exception as _e:
+        logging.getLogger(__name__).debug(f"competitor_density unavailable: {_e}")
+
+    # Per-series realized rebate density (last 14d)
+    realized_series: dict[str, dict] = {}
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as rconn:
+            for r in rconn.execute("""
+                SELECT series_prefix,
+                       COUNT(*)                                AS n,
+                       COALESCE(SUM(rebate_earned_usd), 0)     AS rebate,
+                       COALESCE(SUM(our_realized_usd), 0)      AS realized,
+                       COALESCE(SUM(net_outcome_usd), 0)       AS net
+                FROM settlement_log
+                WHERE datetime(close_time) > datetime('now','-14 days')
+                GROUP BY series_prefix
+            """).fetchall():
+                realized_series[r[0]] = {
+                    "n": r[1], "rebate": r[2], "realized": r[3], "net": r[4],
+                }
+    except Exception as _e:
+        logging.getLogger(__name__).debug(f"realized_series unavailable: {_e}")
+
+    # 2026-04-30: import unified yield equation for cross-venue parity
+    try:
+        from engine.yield_equation import MarketYield
+        _have_yield_eq = True
+    except Exception:
+        _have_yield_eq = False
+
+    from datetime import datetime as _dt, timezone as _tz
 
     enriched = []
     for r in rows:
         series = r[1] or ""
         priority = multipliers.get(series, default)
-        weighted = (r[2] or 0.0) * priority
+        d = density_map.get(r[0], {})
+        observed_share = d.get("share") if isinstance(d, dict) else None
+        if observed_share is not None and observed_share > 0:
+            comp_mult = max(0.25, min(3.0, observed_share / 0.20))
+        else:
+            comp_mult = 1.0
+        # Realized yield multiplier
+        rs = realized_series.get(series, {})
+        n_settled = rs.get("n", 0)
+        series_net = rs.get("net", 0.0)
+        if n_settled >= 3:
+            net_per_settle = series_net / n_settled
+            realized_mult = max(0.3, min(2.0, 1.0 + net_per_settle / 4.0))
+        else:
+            realized_mult = 1.0
+        # Legacy weighted (existing behavior, used for sort)
+        weighted = (r[2] or 0.0) * priority * comp_mult * realized_mult
+
+        # NEW: parallel Unified Yield Equation projection (audit/visibility)
+        # Approximations: our_size from settings, top_book = 50% of target.
+        # Real precision would require per-market book lookup (expensive in
+        # this hot path); current proxies match Kalshi calibration empirics.
+        unified_rebate = 0.0
+        if _have_yield_eq:
+            try:
+                target_size = int(r[3] or 1000)
+                df_value = float(r[4] or 0.50)
+                end_iso = r[6] or ""
+                hours = 24.0
+                try:
+                    ed = _dt.fromisoformat(end_iso.replace("Z", "+00:00"))
+                    hours = max(0.5, (ed - _dt.now(_tz.utc)).total_seconds() / 3600)
+                except Exception:
+                    pass
+                our_size = int(getattr(settings, "DEFAULT_QUOTE_SIZE_CONTRACTS",
+                                       getattr(settings, "MIN_QUOTE_SIZE_CONTRACTS", 100)))
+                top_book_estimate = max(int(target_size * 0.5), our_size)
+                y = MarketYield(
+                    market_id=r[0],
+                    pool_per_day=float(r[2] or 0),
+                    our_size=our_size,
+                    top_book_size=top_book_estimate,
+                    target_size=target_size,
+                    discount_factor=df_value,
+                    hours_to_settle=hours,
+                    midpoint=0.5,
+                    calibration=0.25,
+                    series_priority=priority * comp_mult * realized_mult,
+                    observed_share=observed_share,
+                )
+                unified_rebate = y.expected_daily_rebate
+            except Exception:
+                pass
         enriched.append({
             "market_ticker":         r[0],
             "series_ticker":         r[1],
@@ -224,9 +327,22 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
             "start_date":            r[5],
             "end_date":              r[6],
             "series_priority":       priority,
+            "competition_mult":      round(comp_mult, 3),
+            "observed_share":        observed_share,
+            "realized_mult":         round(realized_mult, 3),
+            "unified_rebate":        round(unified_rebate, 4),
+            "series_realized_net_14d": round(series_net, 2),
+            "series_settlements_14d": n_settled,
             "priority_weighted_reward": round(weighted, 4),
         })
-    enriched.sort(key=lambda d: -d["priority_weighted_reward"])
+    # 2026-04-30: SORT BY UNIFIED_REBATE (physics equation) when populated.
+    # Fall back to legacy weighted when unified_rebate is 0 (e.g. data missing).
+    # Unified equation factors in time_decay + adverse_cost + qualify_prob —
+    # same math as PM. Side-by-side A/B for next 7d, then drop legacy.
+    def _rank_key(d):
+        u = d.get("unified_rebate", 0) or 0
+        return -(u if u > 0 else d.get("priority_weighted_reward", 0) / 100)
+    enriched.sort(key=_rank_key)
     return enriched[:n]
 
 

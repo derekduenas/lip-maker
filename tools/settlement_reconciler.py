@@ -265,7 +265,7 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
     conn.executescript(SCHEMA)
     conn.commit()
 
-    recent = find_recently_settled(hours_back=30, db_path=db_path)
+    recent = find_recently_settled(hours_back=72, db_path=db_path)  # #128b 2026-04-29: bump 30→72 to survive 2-day reconciler outages
     new_rows = 0
     correct = 0
     predicted_count = 0   # only rows where we had futures data
@@ -282,9 +282,13 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
         m = re.search(r"-T([\d.]+)$", tkr)
         strike = float(m.group(1)) if m else None
 
-        # Our position at settle time (from fill_ledger cumulative)
+        # Our position at settle time (from fill_ledger cumulative).
+        # 2026-04-29 #143: prefer count_real (REAL preserves Kalshi's
+        # fractional count_fp, e.g. 12.87) over legacy count INTEGER.
+        # ~20% of fills are fractional; int() truncation lifetime-
+        # understated PnL by ~10x on a $700 gap.
         fills = conn.execute(
-            """SELECT side, SUM(count) FROM fill_ledger
+            """SELECT side, SUM(COALESCE(count_real, count)) FROM fill_ledger
                WHERE ticker = ? GROUP BY side""",
             (tkr,),
         ).fetchall()
@@ -297,7 +301,8 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
         # If settles opposite: cost is total loss
         # Cost = sum(count × price) per side
         cost_rows = conn.execute(
-            """SELECT side, SUM(count * (CASE WHEN side='yes' THEN yes_price_cents ELSE no_price_cents END))
+            """SELECT side, SUM(COALESCE(count_real, count) *
+                                (CASE WHEN side='yes' THEN yes_price_cents ELSE no_price_cents END))
                FROM fill_ledger WHERE ticker=? GROUP BY side""",
             (tkr,),
         ).fetchall()

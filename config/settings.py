@@ -63,12 +63,12 @@ if PAPER_MODE:
     MAX_TOTAL_NET_USD         = 500.0
 else:
     # Per-market: 5% of the total gross budget (spread across ~20 focused markets)
-    MAX_GROSS_PER_MARKET_USD  = max(15.0, _total_gross_budget * 0.05)
+    MAX_GROSS_PER_MARKET_USD  = max(50.0, _total_gross_budget * 0.20)  # 2026-04-30: 5%→20% — concentrate to win share. Was 21 markets x $7 = invisible.
     # 2026-04-22 (Skeptic audit): Per-series cap caps single-underlying flash
     # crash damage. Brent moves through 5+ strikes simultaneously — without
     # this cap, we could hit MAX_GROSS_PER_MARKET × 5+ on one event. 30% of
     # total budget = max 4-6 markets full-size on one underlying.
-    MAX_GROSS_PER_SERIES_USD  = max(60.0, _total_gross_budget * 0.30)
+    MAX_GROSS_PER_SERIES_USD  = max(60.0, _total_gross_budget * 0.20)  # 2026-04-29 #123: 30%→20% per concentration audit
     MAX_NET_INVENTORY_USD     = MAX_GROSS_PER_MARKET_USD * 0.5
     MAX_TOTAL_GROSS_USD       = _total_gross_budget
     MAX_TOTAL_NET_USD         = _total_gross_budget * 0.25
@@ -82,9 +82,9 @@ MAX_SESSION_LOSS_USD      = BANKROLL_USD * 0.10  # 10% of bankroll total
 MAX_SINGLE_LOSS_USD       = BANKROLL_USD * 0.02  # 2% of bankroll per trade
 
 # Minimum quote size per side (below this, LIP likely won't qualify us).
-MIN_QUOTE_SIZE_CONTRACTS  = 10
+MIN_QUOTE_SIZE_CONTRACTS  = 25  # 2026-04-30 concentration: was 10, bumped for bigger share
 # Target size per side (tuned per market; this is the default).
-DEFAULT_QUOTE_SIZE_CONTRACTS = 25
+DEFAULT_QUOTE_SIZE_CONTRACTS = 75  # 2026-04-30 concentration: was 25, 3x bigger to materially move share
 
 # Reprice threshold: when best bid/ask moves by this many ticks, reprice.
 REPRICE_TICK_THRESHOLD    = 1
@@ -138,7 +138,7 @@ STALE_DATA_PULL_SECONDS   = 10
 # Ignore markets where TimePeriodReward is too small to bother with.
 # Tuned from initial discovery (1,077 programs): $10/day is the natural
 # breakpoint — below that, WS/compute overhead isn't worth it.
-MIN_REWARD_PER_DAY_USD    = 10.0
+MIN_REWARD_PER_DAY_USD    = 15.0  # 2026-04-30: REVERTED 3→15 — over-diversification crushed our share-per-market. Concentration wins (Apr 22-26 = +/payout @ 10 markets vs Apr 29 = /payout @ 115 markets).
 # Ignore markets with TargetSize we can't reasonably meet (we're small).
 # 2026-04-22: raised 10000→19999 per Kalshi LIP spec ("Target Size will be
 # greater than 100 contracts and less than 20,000 contracts"). Markets in
@@ -166,8 +166,11 @@ SERIES_BLOCKLIST = {
     "KXCOFFEEW",   # net -$61.61 — biggest single loser, unreliable futures feed
     "KXSILVERD",   # net -$12.91 — $0 rebate captured, pure adverse selection
     "KXSILVERMON", # ditto, monthly variant
-    "KXLITHIUMW",  # high toxicity flags, low rebate
+    # KXLITHIUMW: UNBLOCKED 2026-04-29 — backfill shows 7d NET +$6.36 (rebate $15.96 covers realized -$9.60)
     "KXLCATTLEW",  # high toxicity flags
+    # 2026-04-28 BANS (unrealized -$21 audit, slow political binaries):
+    "KXVOTEHUBTRUMPUPDOWN", # Trump approval, -$11.25 unreal directional drift
+    "KXRECSSNBER", # Recession-by-2027 binary, -$9.90 unreal mean-reversion trap
     # Note: KXSUGARW (-$0.31), KXHOILW (+$11.63 net) excluded — borderline
     # cases. Re-evaluate after a clean week of post-blocklist data.
 }
@@ -202,13 +205,47 @@ QUOTE_SIZE_AS_FRACTION_OF_TARGET = 0.20
 #   KXGOLDW:  +$21.48  KXCOCOAW: +$23.14
 # 2x size = 2x rebate at full share, capped by per-market USD limit anyway.
 SIZE_MULTIPLIER_BY_SERIES = {
-    "KXBRENTD":  2.0,
-    "KXCORNW":   2.0,
-    "KXCOPPERD": 2.0,
-    "KXGOLDW":   2.0,
-    "KXCOCOAW":  2.0,
-    "KXGOLDD":   1.5,
-    "KXWHEATW":  1.5,
+    # 2026-04-29 Ship A: Niche Owner strategy. Boost commodities where we
+    # have proven edge (futures_feed.py fair-value model). Goliaths skip
+    # these pools (ops cost > yield); we own them. 7d settlement_log shows
+    # CORNW $40, SOYBEANW $30, WHEATW $26, COCOAW $17, HOILW $8 — all NET+.
+    "KXCORNW":      2.5,   # +$40 NET 7d (top earner)
+    "KXSOYBEANW":   2.5,   # +$30 NET 7d
+    "KXWHEATW":     2.5,   # +$26 NET 7d
+    "KXCOCOAW":     2.5,   # +$17 NET 7d
+    "KXBRENTD":     2.0,
+    "KXBRENTW":     2.0,
+    "KXCOPPERD":    2.0,
+    "KXGOLDW":      2.0,
+    "KXGOLDD":      1.5,
+    # New additions — proven futures-fair models, low SIG presence:
+    "KXHOILW":      1.8,   # heating oil, +$8 NET 7d
+    "KXNATGASW":    1.8,   # natural gas — NEW, futures-tracked
+    "KXNATGASD":    1.5,
+    "KXDXYW":       1.5,   # dollar index — NEW, FX feed
+    "KXTREASURIES": 1.5,   # rate markets — NEW
+    "KXSILVERW":    1.3,   # silver weekly (KXSILVERD blocked separately)
+    # ── ECONOMICS/MACRO — public data settlement (BLS/BEA/Fed) ──
+    "KXCPI":        2.0,   # CPI prints, monthly
+    "KXNFP":        2.0,   # nonfarm payrolls, monthly
+    "KXGDP":        1.8,   # GDP releases
+    "KXUNEMPLOY":   1.8,   # unemployment rate
+    "KXPPI":        1.5,   # producer price index
+    "KXFEDCHAIR":   1.5,   # confirmation outcomes (already on book)
+    "KXFEDBALANCE": 1.5,   # balance sheet
+    # ── CLIMATE — Kalshi weather variants (NYC/PHX/CHI daily highs) ──
+    "KXHIGHTNY":    1.5,   # NYC high temp
+    "KXHIGHTPHX":   1.5,   # PHX
+    "KXHIGHTCHI":   1.5,   # CHI
+    "KXHIGHTLA":    1.5,   # LA
+    "KXLOWTNY":     1.5,
+    "KXLOWTPHX":    1.5,
+    "KXRAIN":       1.4,   # rainfall over threshold
+    # ── NICHE POLICY/NEWS one-shots (proven) ──
+    "KXMAMDANIEO":  1.8,   # +$12 NET 7d (one-shot political winner)
+    "KXTRUMPACT":   1.5,   # +$5.59 NET 7d
+    "KXKIMMELAPOLOGY": 1.3,
+    "KXBILLSCOUNT": 1.3,
 }
 DEFAULT_SIZE_MULTIPLIER = 1.0
 

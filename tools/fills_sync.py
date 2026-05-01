@@ -94,17 +94,18 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
             np_ = float(f.get("no_price_dollars", "0") or 0)
             yp_c = int(round(yp * 100))
             np_c = int(round(np_ * 100))
-            cnt = int(float(f.get("count_fp", "0") or 0))
+            cnt_real = float(f.get("count_fp", "0") or 0)
+            cnt = int(cnt_real)  # legacy column kept for back-compat
             side = f.get("side", "?")
             ticker = f.get("ticker", f.get("market_ticker", "?"))
 
             conn.execute(
                 """INSERT INTO fill_ledger
-                   (trade_id, order_id, ticker, side, count,
+                   (trade_id, order_id, ticker, side, count, count_real,
                     yes_price_cents, no_price_cents, is_taker,
                     created_at, synced_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (trade_id, order_id, ticker, side, cnt,
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (trade_id, order_id, ticker, side, cnt, cnt_real,
                  yp_c, np_c, 1 if f.get("is_taker") else 0,
                  f.get("created_time", now_iso), now_iso),
             )

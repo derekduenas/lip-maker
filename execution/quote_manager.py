@@ -461,6 +461,11 @@ class QuoteManager:
     ) -> Optional[RestingOrder]:
         """Place a single resting limit order."""
         coid = f"LIP-{uuid.uuid4().hex[:16]}"
+        # 2026-04-30 audit fix: skip edge-priced orders (Kalshi rejects 0 and 100
+        # cent prices as "invalid price"). Avoids ERROR-log spam + rate-limit hits.
+        if price_cents <= 0 or price_cents >= 100:
+            _log.debug(f"[SKIP] {market_ticker} {side}@{price_cents}c — edge price (Kalshi rejects)")
+            return None
         if self.paper:
             order_id = "PAPER-" + coid
             _log.info(f"[PAPER] PLACE {market_ticker} {side}@{price_cents}c size={size_contracts}")
@@ -471,6 +476,7 @@ class QuoteManager:
                 "action": "buy",
                 "type":   "limit",
                 "count":  size_contracts,
+                "post_only": True,  # NEXUS-OMNI V4 D1: never accidentally cross — pure maker
                 "client_order_id": coid,
             }
             # yes_price for yes side, no_price for no side

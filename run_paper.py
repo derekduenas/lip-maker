@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import settings
 from engine.lip_discovery import discover, top_n_to_quote
-from engine.sniper_select import top_n_by_ev
+# from engine.sniper_select import top_n_by_ev  # archived 2026-04-29 (audit: unused)
 from engine.lip_scorer import (
     OurQuotes, ProgramParams, score_snapshot,
 )
@@ -706,6 +706,56 @@ class PaperRunner:
                             conn.close()
                     except Exception as e:
                         _log.debug(f"heartbeat persist failed {tkr}: {e}")
+
+                # NEXUS port (2026-04-30): Tiered breaker awareness in heartbeat log.
+                # quote_manager._passes_safety has BINARY halt-at-MAX_DAILY_LOSS gate;
+                # we ALSO emit a tier indicator so operator sees pressure building
+                # before the binary trip. No behavior change in this loop — the
+                # binary safety still runs. This is observability + early warning.
+                try:
+                    daily_pnl = self.qm._daily_realized_pnl() if hasattr(self.qm, '_daily_realized_pnl') else 0
+                    cap = settings.MAX_DAILY_LOSS_USD
+                    if cap > 0 and daily_pnl < 0:
+                        loss_pct = abs(daily_pnl) / cap * 100
+                        if loss_pct >= 100:
+                            tier = "🔴 HALT"
+                        elif loss_pct >= 60:
+                            tier = "🟠 throttle"
+                        elif loss_pct >= 30:
+                            tier = "🟡 warn"
+                        else:
+                            tier = "🟢 normal"
+                        if loss_pct >= 30:  # only log when worth attention
+                            _log.info(f"BREAKER_TIER {tier}: daily_pnl=${daily_pnl:.2f} "
+                                      f"({loss_pct:.0f}% of cap ${cap:.0f})")
+                except Exception:
+                    pass
+
+                # NEXUS V4 D-misc port (2026-04-30): Money-Print line for Kalshi.
+                # Theoretical max: sum(reward_per_day_usd) of markets we currently quote.
+                # Calibration factor: empirical haircut (Kalshi calibrated_predictor
+                # showed actual ≈ 0.20-0.30x of theoretical).
+                try:
+                    KALSHI_CALIB = 0.25
+                    qm_summary = self.qm.summary() if hasattr(self.qm, "summary") else {}
+                    # Kalshi summary key is total_gross_usd (not gross_usd)
+                    cap_deployed = (qm_summary.get("total_gross_usd")
+                                    or qm_summary.get("gross_usd") or 0)
+                    quoted_tickers = set(self.qm.resting.keys()) if hasattr(self.qm, "resting") else set()
+                    proj_max = sum(
+                        m["reward_per_day_usd"] for m in self.markets
+                        if m["market_ticker"] in quoted_tickers
+                    )
+                    proj_real = proj_max * KALSHI_CALIB
+                    yield_pct = (proj_real / cap_deployed * 100) if cap_deployed > 0 else 0.0
+                    _log.info(
+                        f"💰 MONEY_PRINT: cap=${cap_deployed:.2f} "
+                        f"proj_daily=${proj_real:.2f} (theo_max=${proj_max:.0f}, calib={KALSHI_CALIB:.2f}) "
+                        f"proj_monthly=${proj_real*30:.0f} "
+                        f"yield={yield_pct:.2f}%/d"
+                    )
+                except Exception:
+                    pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
