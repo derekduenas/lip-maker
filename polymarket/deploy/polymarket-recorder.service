@@ -1,0 +1,17 @@
+[Unit]
+Description=INNAIT Polymarket public recorder — gamma-api polling
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-maker
+Environment="PYTHONPATH=/root/polymarket-maker"
+ExecStart=/root/polymarket-maker/venv/bin/python /root/polymarket-maker/tools/public_recorder.py --interval 60
+Restart=always
+RestartSec=15
+StandardOutput=append:/root/polymarket-maker/logs/public_recorder.log
+StandardError=append:/root/polymarket-maker/logs/public_recorder.log
+
+[Install]
+WantedBy=multi-user.target

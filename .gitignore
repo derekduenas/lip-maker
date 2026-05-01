@@ -2,10 +2,17 @@
 *.pem
 *.key
 *.p12
+*.b64
 .env
 .env.*
 !.env.example
 config/kalshi_private_key.pem
+polymarket/config/polymarket_secret_key.b64
+polymarket/.env
+polymarket/data/*.db
+polymarket/data/*.db-shm
+polymarket/data/*.db-wal
+polymarket/logs/*.log
 
 # Trading data — production-only
 data/*.db

@@ -1,0 +1,21 @@
+[Unit]
+Description=INNAIT Polymarket auto-quoter
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-maker
+Environment="PYTHONPATH=/root/polymarket-maker"
+Environment="PYTHONUNBUFFERED=1"
+Environment="PM_PAPER=true"
+Environment="PM_BANKROLL=270"
+Environment="PM_PHASE=1"
+ExecStart=/root/polymarket-maker/venv/bin/python /root/polymarket-maker/run_pm.py --top 5 --max-per-market 5 --total-cap 25 --cycle 30
+Restart=always
+RestartSec=15
+StandardOutput=append:/root/polymarket-maker/logs/polymarket_maker.log
+StandardError=append:/root/polymarket-maker/logs/polymarket_maker.log
+
+[Install]
+WantedBy=multi-user.target
