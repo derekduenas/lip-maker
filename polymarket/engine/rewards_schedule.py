@@ -16,6 +16,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
+
+# 2026-04-30 added: tripwire constant. Bump this every time you verify
+# docs.polymarket.us hasn't changed pool/TS/DF values OR add new categories.
+# Startup check in run_pm.py warns if (today - LAST_VERIFIED) > 14 days.
+LAST_VERIFIED = date(2026, 4, 30)
+DRIFT_WARN_DAYS = 14
 
 
 @dataclass

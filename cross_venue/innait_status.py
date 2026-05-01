@@ -52,21 +52,30 @@ def kalshi_state() -> dict:
     except Exception as e:
         out["api_error"] = str(e)[:100]
 
-    # 7-day NET from settlement_log
+    # Multi-window NET from settlement_log
     try:
         conn = sqlite3.connect(LIP_DB, timeout=5.0)
         try:
+            for label, window in (("24h", "1 day"), ("7d", "7 days"),
+                                   ("30d", "30 days")):
+                r = conn.execute(f"""
+                    SELECT COALESCE(SUM(our_realized_usd),0),
+                           COALESCE(SUM(rebate_earned_usd),0),
+                           COALESCE(SUM(net_outcome_usd),0)
+                    FROM settlement_log
+                    WHERE datetime(close_time) > datetime('now','-{window}')
+                """).fetchone()
+                out[f"{label}_realized"] = round(r[0], 2)
+                out[f"{label}_rebate"]   = round(r[1], 2)
+                out[f"{label}_net"]      = round(r[2], 2)
+            # Month-to-date
             r = conn.execute("""
-                SELECT COALESCE(SUM(our_realized_usd),0),
-                       COALESCE(SUM(rebate_earned_usd),0),
-                       COALESCE(SUM(net_outcome_usd),0)
+                SELECT COALESCE(SUM(net_outcome_usd),0)
                 FROM settlement_log
-                WHERE datetime(close_time) > datetime('now','-7 days')
+                WHERE date(close_time) >= date('now','start of month')
             """).fetchone()
-            out["7d_realized"] = round(r[0], 2)
-            out["7d_rebate"]   = round(r[1], 2)
-            out["7d_net"]      = round(r[2], 2)
-            # Active runtime blacklist from market_blacklist (if exists)
+            out["mtd_net"] = round(r[0], 2)
+            # Active runtime blacklist
             try:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM market_blacklist WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')"
@@ -134,6 +143,24 @@ print(json.dumps({
                 "SELECT COALESCE(SUM(payout_usd),0) FROM pm_payouts WHERE payout_usd > 0"
             ).fetchone()
             out["lifetime_payouts"] = round(r2[0], 4)
+            # Windowed PM payouts
+            for label, window in (("24h", "1 day"), ("7d", "7 days"),
+                                   ("30d", "30 days")):
+                r = conn.execute(f"""
+                    SELECT COALESCE(SUM(payout_usd), 0)
+                    FROM pm_payouts
+                    WHERE datetime(snapshot_at) > datetime('now','-{window}')
+                      AND payout_usd > 0
+                """).fetchone()
+                out[f"{label}_payouts"] = round(r[0], 2)
+            # MTD
+            r = conn.execute("""
+                SELECT COALESCE(SUM(payout_usd), 0)
+                FROM pm_payouts
+                WHERE date(snapshot_at) >= date('now','start of month')
+                  AND payout_usd > 0
+            """).fetchone()
+            out["mtd_payouts"] = round(r[0], 2)
         finally:
             conn.close()
     except Exception as e:
@@ -153,13 +180,23 @@ def render(k: dict, p: dict) -> None:
     p_bal = p.get("balance_usd", 0)
     total_capital = k_bal + k_exp + p_bal
     print(f"💰 TOTAL CAPITAL DEPLOYED: ${total_capital:>9.2f}")
-    weekly_net_kalshi = k.get("7d_net", 0) or 0
-    weekly_net_pm     = p.get("lifetime_payouts", 0) or 0  # PM payouts cumulative for now
-    weekly_net_total  = weekly_net_kalshi + weekly_net_pm
-    monthly_run = weekly_net_total * 30.0 / 7.0
-    progress_pct = monthly_run / TARGET_MO * 100
-    print(f"📈 7d NET (Kalshi+PM):     ${weekly_net_total:>9.2f}")
-    print(f"📊 EXTRAP MONTHLY RUN:     ${monthly_run:>9.2f}  →  {progress_pct:5.1f}% of $20k/mo target")
+    print()
+
+    # 🎯 UNIFIED P&L vs $20K/MO TARGET
+    print(f"━━━ 🎯 UNIFIED NET PnL vs $20k/mo target ━━━")
+    print(f"  {'window':<12} {'Kalshi':>10} {'PM':>10} {'TOTAL':>10} {'monthly_run':>14} {'% goal':>8}")
+    for label, days in (("24h", 1), ("7d", 7), ("30d", 30)):
+        k_v = k.get(f"{label}_net", 0) or 0
+        p_v = p.get(f"{label}_payouts", 0) or 0
+        total = k_v + p_v
+        monthly_run = total * 30.0 / days
+        pct = monthly_run / TARGET_MO * 100
+        print(f"  {label:<12} ${k_v:>8.2f}  ${p_v:>8.2f}  ${total:>8.2f}  ${monthly_run:>11.2f}  {pct:>5.1f}%")
+    k_mtd = k.get("mtd_net", 0) or 0
+    p_mtd = p.get("mtd_payouts", 0) or 0
+    mtd_total = k_mtd + p_mtd
+    mtd_pct = mtd_total / TARGET_MO * 100
+    print(f"  {'MTD':<12} ${k_mtd:>8.2f}  ${p_mtd:>8.2f}  ${mtd_total:>8.2f}  {' '*14}  {mtd_pct:>5.1f}% of $20k MTD")
     print()
 
     # Kalshi card

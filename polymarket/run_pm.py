@@ -549,6 +549,44 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    # 2026-04-30: tripwire — warn if rewards_schedule hasn't been verified
+    try:
+        from datetime import date
+        from engine.rewards_schedule import LAST_VERIFIED, DRIFT_WARN_DAYS
+        days_stale = (date.today() - LAST_VERIFIED).days
+        if days_stale > DRIFT_WARN_DAYS:
+            _log.warning(f"⚠️  PM rewards_schedule LAST_VERIFIED={LAST_VERIFIED} "
+                         f"is {days_stale}d old (warn at >{DRIFT_WARN_DAYS}d). "
+                         f"Re-check docs.polymarket.us for pool/TS/DF changes.")
+        else:
+            _log.info(f"PM rewards_schedule fresh (verified {days_stale}d ago)")
+    except Exception as e:
+        _log.warning(f"rewards_schedule freshness check failed: {e}")
+
+    # 2026-04-30: bankroll divergence check — env var vs live USDC.
+    # Was: if you deposit $5k to PM but forget to bump PM_BANKROLL,
+    # caps stay at $260 baseline (footgun). Now it screams.
+    try:
+        _key_id = os.getenv("PM_API_KEY_ID")
+        _secret = (PROJECT_ROOT / "config" / "polymarket_secret_key.b64").read_text().strip()
+        _c = PolymarketUS(key_id=_key_id, secret_key=_secret)
+        _b = _c.account.balances().get("balances", [{}])[0]
+        live_usdc = float(_b.get("currentBalance", 0))
+        env_bankroll = settings.BANKROLL_USD
+        if env_bankroll <= 0:
+            _log.warning(f"⚠️  PM_BANKROLL env=0 but live USDC=${live_usdc:.2f}. "
+                         f"Caps will be at minimum. systemctl set-environment "
+                         f"PM_BANKROLL={int(live_usdc)} && systemctl restart polymarket-maker")
+        elif abs(live_usdc - env_bankroll) > max(50, env_bankroll * 0.20):
+            _log.warning(f"⚠️  PM_BANKROLL env=${env_bankroll:.0f} diverges from "
+                         f"live USDC=${live_usdc:.2f} by >20%. "
+                         f"Update env: systemctl set-environment "
+                         f"PM_BANKROLL={int(live_usdc)} && systemctl restart polymarket-maker")
+        else:
+            _log.info(f"bankroll check OK: env=${env_bankroll:.0f} ≈ live=${live_usdc:.2f}")
+    except Exception as e:
+        _log.warning(f"bankroll divergence check failed: {e}")
+
     print(f"\n══════════════════════════════════════════════════════════════")
     print(f"  POLYMARKET AUTO-QUOTER")
     print(f"  mode:           {'PAPER' if settings.PAPER_MODE else '🔴 LIVE'}")
