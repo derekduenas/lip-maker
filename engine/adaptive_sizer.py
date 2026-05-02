@@ -73,6 +73,61 @@ class AdaptiveSizer:
         self.target_share = target_share
         self.yes_stats: dict[str, MarketStats] = defaultdict(MarketStats)
         self.no_stats:  dict[str, MarketStats] = defaultdict(MarketStats)
+        # 2026-05-02 PREDATOR K4: per-market target overrides from realized
+        # share over last 7d. Falls back to global self.target_share when
+        # not present. Refreshed hourly via update_target_shares_from_db().
+        self.per_market_target: dict[str, float] = {}
+
+    def get_target_share(self, market_ticker: str) -> float:
+        """Per-market target if known, else global default."""
+        return self.per_market_target.get(market_ticker, self.target_share)
+
+    def update_target_shares_from_db(self, db_path: str, days: int = 7,
+                                      lo: float = 0.10, hi: float = 0.50) -> int:
+        """Pull rolling realized share per market from lip_snapshots.
+
+        For each market with ≥10 valid snapshots in the window, compute
+        median(our_score / total_score) and clamp to [lo, hi]. Sets
+        self.per_market_target so size_for() respects realized capacity.
+
+        Returns the number of markets updated. Called hourly from runner.
+        """
+        import sqlite3
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+        except Exception:
+            return 0
+        try:
+            rows = conn.execute(
+                f"""SELECT market_ticker,
+                           our_score * 1.0 / total_score AS share
+                   FROM lip_snapshots
+                   WHERE total_score > 0
+                     AND snapshot_valid = 1
+                     AND datetime(captured_at) > datetime('now','-{int(days)} days')
+                """
+            ).fetchall()
+        except Exception:
+            conn.close()
+            return 0
+        conn.close()
+
+        # Group by ticker, compute median
+        from collections import defaultdict as _dd
+        per_mkt: dict[str, list[float]] = _dd(list)
+        for tkr, share in rows:
+            if tkr and share is not None:
+                per_mkt[tkr].append(float(share))
+
+        updated = 0
+        for tkr, shares in per_mkt.items():
+            if len(shares) < 10:
+                continue
+            shares_sorted = sorted(shares)
+            mid = shares_sorted[len(shares_sorted) // 2]
+            self.per_market_target[tkr] = max(lo, min(hi, mid))
+            updated += 1
+        return updated
 
     def observe(
         self,
@@ -125,10 +180,12 @@ class AdaptiveSizer:
         s_competition = stats.estimated_competition()
         # Solve: our_size / (our_size + S) = target_share
         #        our_size = S × target_share / (1 - target_share)
-        if self.target_share >= 0.99:
+        # K4: use per-market realized target if available, else global default
+        target_share = self.get_target_share(market_ticker)
+        if target_share >= 0.99:
             computed = 1e6
         else:
-            computed = s_competition * self.target_share / (1.0 - self.target_share)
+            computed = s_competition * target_share / (1.0 - target_share)
         computed_size = int(round(computed))
 
         # Floor at MIN_QUOTE_SIZE

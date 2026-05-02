@@ -44,6 +44,7 @@ orders = r.get('orders', [])
 now = time.time()
 stale = []
 cancelled = 0
+cancelled_tkrs = []
 errors = 0
 
 for o in orders:
@@ -89,6 +90,7 @@ for o in orders:
             try:
                 c.delete(f'/portfolio/orders/{{oid}}')
                 cancelled += 1
+                cancelled_tkrs.append(tkr)
             except Exception as e:
                 errors += 1
 
@@ -97,6 +99,7 @@ print(json.dumps({{
     'orders_checked': len(orders),
     'stale_found': len(stale),
     'cancelled': cancelled,
+    'cancelled_tkrs': cancelled_tkrs,
     'errors': errors,
     'samples': stale[:5],
 }}))
@@ -128,6 +131,7 @@ o_resp = c.orders.list({{'limit':100}})
 orders = o_resp.get('orders', []) if isinstance(o_resp, dict) else o_resp
 stale = []
 cancelled = 0
+cancelled_slugs = []
 errors = 0
 now = time.time()
 
@@ -180,6 +184,7 @@ for ord_ in orders:
             try:
                 c.orders.cancel(oid, {{'marketSlug': slug}})
                 cancelled += 1
+                cancelled_slugs.append(slug)
             except Exception as e:
                 errors += 1
 
@@ -188,6 +193,7 @@ print(json.dumps({{
     'orders_checked': len(orders),
     'stale_found': len(stale),
     'cancelled': cancelled,
+    'cancelled_slugs': cancelled_slugs,
     'errors': errors,
     'samples': stale[:5],
 }}))
@@ -210,6 +216,19 @@ def main() -> int:
 
     k = reap_kalshi(a.dry_run)
     p = reap_pm(a.dry_run)
+
+    # 2026-05-02 PREDATOR K1: enqueue cancelled keys so runners can immediately
+    # re-quote instead of waiting up to 30 min for the next discovery cycle.
+    # Skipped on dry-run (no cancellations actually happened).
+    if not a.dry_run:
+        try:
+            from cross_venue.requote_queue import enqueue
+            for tkr in k.get("cancelled_tkrs", []) or []:
+                enqueue("kalshi", tkr, reason="reaper_stale")
+            for slug in p.get("cancelled_slugs", []) or []:
+                enqueue("pm", slug, reason="reaper_stale")
+        except Exception as e:
+            print(f"[K1] requote_queue write failed: {e}")
 
     out = {"ts": datetime.now(timezone.utc).isoformat(),
            "dry_run": a.dry_run, "kalshi": k, "pm": p}

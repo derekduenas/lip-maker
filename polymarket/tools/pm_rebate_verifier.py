@@ -104,6 +104,33 @@ def main() -> int:
     delta = cur_balance - prior_balance
     out["delta"] = round(delta, 4)
 
+    # 2026-05-02 BUG FIX: subtract any deposits/withdrawals from delta before
+    # classifying as "payout". Without this, a $750 deposit gets logged as
+    # a $750 LIP payout → fake $23k/mo dashboard PnL. Activities API tells
+    # us cash-flow events between yesterday and now.
+    deposits_offset = 0.0
+    try:
+        a_resp = c.portfolio.activities({"limit": 100})
+        acts = a_resp.get("activities", []) if isinstance(a_resp, dict) else a_resp
+        cutoff_iso = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for x in acts:
+            if not isinstance(x, dict): continue
+            t = x.get("type", "")
+            if "DEPOSIT" not in t and "WITHDRAW" not in t: continue
+            bc = x.get("accountBalanceChange", {}) or {}
+            ts = bc.get("createTime", "")
+            if not ts or ts < cutoff_iso: continue
+            amt = float((bc.get("amount", {}) or {}).get("value", 0) or 0)
+            deposits_offset += amt  # signed; deposits +, withdrawals -
+        if abs(deposits_offset) > 0.01:
+            adjusted = delta - deposits_offset
+            out["raw_delta"] = round(delta, 4)
+            out["deposits_offset"] = round(deposits_offset, 4)
+            out["delta"] = round(adjusted, 4)
+            delta = adjusted  # use adjusted for downstream logic
+    except Exception as e:
+        out["deposit_check_err"] = str(e)[:80]
+
     # Persist payout row
     conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
     try:

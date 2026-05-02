@@ -80,6 +80,11 @@ class PaperRunner:
         # Futures fair-value cache (Quant audit): {prefix: (price, fetched_ts)}
         # Refreshed every 60s to match futures-feed.timer cadence.
         self._futures_cache: dict[str, tuple[float, float]] = {}
+        # 2026-05-02 PREDATOR C1: per-market reconcile lock so concurrent book
+        # updates for the same ticker can't issue overlapping API calls
+        # (which would cause double-cancel/double-place races). Created on
+        # first use to avoid pre-allocating for markets we never touch.
+        self._reconcile_locks: dict[str, asyncio.Lock] = {}
         self._futures_cache_ts: float = 0.0
         self._fv_skip_log_ts: dict[str, float] = {}  # per-ticker log throttle
         # Blacklist cache — refreshed from market_blacklist on each call
@@ -585,9 +590,23 @@ class PaperRunner:
                 ts=now,
             )
 
-        # Reconcile paper quotes
-        self.qm.reconcile(target)
-        self.reconciles[book.market_ticker] += 1
+        # 2026-05-02 PREDATOR C1: offload reconcile to thread executor.
+        # Was: sync HTTP POST + sqlite I/O inside async WS callback,
+        # blocking event loop 200-500ms per call. Result: 0 fills/hr in
+        # observation — competing MMs reprice during our blocked window
+        # and pick us off. Now: WS keeps draining book updates for OTHER
+        # markets while this one's API call resolves in the threadpool.
+        # Per-market lock prevents concurrent reconciles on the SAME
+        # ticker (would double-cancel/double-place).
+        ticker = book.market_ticker
+        lock = self._reconcile_locks.get(ticker)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._reconcile_locks[ticker] = lock
+        async with lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.qm.reconcile, target)
+        self.reconciles[ticker] += 1
 
     async def heartbeat_snapshot_loop(self, ws, interval_sec: int = 30):
         """Periodically snapshot all quoted markets even if book hasn't updated.
@@ -599,18 +618,60 @@ class PaperRunner:
         from engine.lip_scorer import OurQuotes, score_snapshot
         last_resync = 0.0
         RESYNC_INTERVAL_SEC = 300  # 5 min — cheap (one Kalshi API call)
+        # 2026-05-02 PREDATOR K4: hourly refresh of per-market target_share
+        # from realized 7d snapshot share so sizer chases REAL capacity not
+        # a hardcoded 0.35.
+        last_target_share_refresh = 0.0
+        TARGET_SHARE_REFRESH_SEC = 3600  # 1 hour
         while True:
             try:
                 await asyncio.sleep(interval_sec)
                 now = time.time()
                 # Refresh blacklist once per heartbeat cycle
                 self._refresh_blacklist()
+                # 2026-05-02 PREDATOR K1: drain requote queue from capital_reaper.
+                # Each entry = (venue, ticker) cancelled by the reaper. We
+                # force-trigger an immediate book-update reconcile on those
+                # tickers so the snapshot gap closes within ~30s instead of
+                # waiting up to 30 min for the next periodic_discover.
+                try:
+                    from cross_venue.requote_queue import drain as _drain_requote
+                    requotes = _drain_requote(venue_filter="kalshi")
+                    if requotes:
+                        _log.info(f"K1 drained {len(requotes)} reaper-cancelled "
+                                  f"tickers; forcing immediate reconcile")
+                        for entry in requotes:
+                            tkr = entry.get("key", "")
+                            book = ws.books.get(tkr)
+                            if tkr and book is not None and tkr in self.params_by_ticker:
+                                # bypass last_score_ts throttle so on_book_update
+                                # actually fires instead of returning early
+                                self.last_score_ts[tkr] = 0
+                                await self.on_book_update(book)
+                except Exception as e:
+                    _log.warning(f"K1 requote drain failed: {e}")
                 # 2026-04-28: periodic re-sync of self.qm.resting against
                 # live Kalshi orders. Cures sizer drift where filled/cancelled
                 # orders weren't purged from memory → safety gate inflated cap.
                 if now - last_resync >= RESYNC_INTERVAL_SEC:
                     last_resync = now
-                    self.qm.periodic_resync()
+                    # PREDATOR C1: periodic_resync makes Kalshi API calls →
+                    # offload from heartbeat loop so other markets keep firing.
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, self.qm.periodic_resync
+                    )
+                # K4: hourly refresh of per-market sizer targets from DB
+                if now - last_target_share_refresh >= TARGET_SHARE_REFRESH_SEC:
+                    last_target_share_refresh = now
+                    try:
+                        n = await asyncio.get_running_loop().run_in_executor(
+                            None, self.sizer.update_target_shares_from_db,
+                            settings.DB_PATH,
+                        )
+                        if n:
+                            _log.info(f"K4 refreshed sizer target_share for {n} markets")
+                    except Exception as e:
+                        _log.warning(f"K4 sizer target refresh failed: {e}")
                 for tkr, params in self.params_by_ticker.items():
                     if self._is_blacklisted(tkr):
                         self._handle_blacklisted(tkr)
@@ -781,6 +842,45 @@ class PaperRunner:
         print(f"  Quote manager: {self.qm.summary()}")
 
 
+def _compute_saturated_tickers(saturation_threshold: float = 0.80) -> set[str]:
+    """Return tickers where existing position OR resting orders consume
+    >= threshold * per-market cap, so the ranker can skip re-surfacing them.
+
+    Two saturation dimensions checked:
+      1. market_exposure_dollars (live position) >= threshold × per-market cap
+      2. market_exposure_dollars >= threshold × bankroll_share cap
+
+    Either trip → ticker is saturated → ranker should pick a fresh market
+    instead. Defensive: any API failure returns empty set (safe default).
+    """
+    try:
+        from execution.kalshi_auth import KalshiClient
+        c = KalshiClient()
+        positions = c.get("/portfolio/positions", params={"limit": 200}).get("market_positions", [])
+        balance = float(c.get_balance())
+    except Exception as e:
+        _log.warning(f"saturation check failed (returning empty set): {e}")
+        return set()
+
+    bankroll_cap = balance * settings.MAX_BANKROLL_SHARE_PCT
+    saturated: set[str] = set()
+    for p in positions:
+        exp = float(p.get("market_exposure_dollars", 0))
+        if exp <= 0:
+            continue
+        ticker = p.get("ticker", "")
+        series = ticker.split("-", 1)[0]
+        per_mkt_cap = settings.MAX_GROSS_PER_MARKET_BY_SERIES.get(
+            series, settings.MAX_GROSS_PER_MARKET_USD
+        )
+        if exp >= per_mkt_cap * saturation_threshold or exp >= bankroll_cap * saturation_threshold:
+            saturated.add(ticker)
+    if saturated:
+        _log.info(f"saturated tickers ({len(saturated)} markets at >={int(saturation_threshold*100)}% cap): "
+                  f"{sorted(saturated)[:10]}{'...' if len(saturated)>10 else ''}")
+    return saturated
+
+
 async def main(duration_sec: int = 300, top_n: int = 50):
     logging.basicConfig(
         level=logging.INFO,
@@ -798,7 +898,11 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     # 1 market passed filter on a single bad day). Restored top_n_to_quote
     # which uses priority-weighted ranking + #119 winner multipliers.
     # Sniper scanner remains available as analysis tool (tools/competitor_density.py).
-    markets = top_n_to_quote(top_n)
+    # 2026-05-01 PREDATOR: pass saturated tickers so ranker skips markets
+    # where existing positions already exhaust per-market cap. Without this
+    # the ranker keeps surfacing the same stuck markets at top-N.
+    saturated = _compute_saturated_tickers()
+    markets = top_n_to_quote(top_n, exclude_tickers=saturated)
     if not markets:
         _log.warning("no enrolled markets")
         return
@@ -844,7 +948,10 @@ async def main(duration_sec: int = 300, top_n: int = 50):
         while not stop.is_set():
             try:
                 discover(save=True)
-                fresh = top_n_to_quote(top_n)
+                # PREDATOR: refresh saturated set per cycle so newly-saturated
+                # markets get filtered + freshly-drained ones get re-included.
+                saturated = _compute_saturated_tickers()
+                fresh = top_n_to_quote(top_n, exclude_tickers=saturated)
                 current_tickers = set(runner.params_by_ticker.keys())
                 fresh_tickers = {m["market_ticker"] for m in fresh}
                 new_tickers = fresh_tickers - current_tickers

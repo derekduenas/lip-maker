@@ -75,6 +75,10 @@ class RestingOrder:
     size_contracts: int
     placed_at:      float          # unix ts
     paper:          bool = True
+    # 2026-05-02 PREDATOR C2: cancel was requested but API call failed.
+    # Flag prevents placing a duplicate same-side order until next reconcile
+    # cycle clears the in-memory state via periodic_resync.
+    pending_cancel: bool = False
 
 
 @dataclass
@@ -214,7 +218,7 @@ class QuoteManager:
 
         2026-04-22 (Spread Master audit): self.inventory was declared but
         never populated → MAX_NET_INVENTORY_USD cap was theatrical. This
-        method computes net position from unsettled fills, cached 30s
+        method computes net position from unsettled fills, cached
         per-ticker to avoid DB spam (similar to balance cache pattern).
 
         Net YES = (yes fills count) − (no fills count), since buying NO
@@ -222,10 +226,15 @@ class QuoteManager:
 
         Excludes tickers already in settlement_log (settled = realized PnL,
         not exposure).
+
+        2026-05-01 PREDATOR: cache TTL 30s → 5s. The 30s window was hiding
+        offsetting fills from the #97 inventory skew, killing recirculation.
+        At 5s we react within ~6 book-update cycles instead of ~36, turning
+        passive position decay into active inventory cycling.
         """
         existing = self.inventory.get(market_ticker)
         now = time.time()
-        if existing and (now - existing.last_updated) < 30:
+        if existing and (now - existing.last_updated) < 5:
             return  # cached
         try:
             conn = sqlite3.connect(self.db_path, timeout=5.0)
@@ -358,6 +367,18 @@ class QuoteManager:
             spread = implied_yes_ask - target.yes_bid_cents
             if spread > settings.MAX_SPREAD_CENTS or spread < 0:
                 return False, f"spread={spread}c"
+
+        # 2026-05-01 TWO-SIDED LIQUIDITY GATE — fixes adverse-selection trap
+        # where we enter markets with bid on only ONE side. 40 of 96 stranded
+        # positions today were stuck because the side we'd need to exit had
+        # no buyers. Min 5c bid required on BOTH sides to confirm two-sided
+        # demand. If we can't exit, we shouldn't enter.
+        if target.yes_bid_cents is not None and target.no_bid_cents is not None:
+            if (target.yes_bid_cents < settings.MIN_TWO_SIDED_BID_CENTS or
+                target.no_bid_cents < settings.MIN_TWO_SIDED_BID_CENTS):
+                return False, (f"one_sided_book: yes_bid={target.yes_bid_cents}c "
+                               f"no_bid={target.no_bid_cents}c "
+                               f"(need ≥{settings.MIN_TWO_SIDED_BID_CENTS} both)")
 
         # Per-market gross — DOWNSIZE target to fit cap instead of rejecting.
         # 2026-04-22: was rejecting outright, leaving rebate on the table for
@@ -629,13 +650,30 @@ class QuoteManager:
             elif current_yes[0].price_cents != target.yes_bid_cents or current_yes[0].size_contracts != yes_size:
                 need_replace = True
             if need_replace:
+                # 2026-05-02 PREDATOR C2: place ONLY if all cancels succeeded.
+                # Was: cancel returns False → we still place → two same-side
+                # orders co-exist → safety caps drift, double exposure. Now:
+                # any cancel failure marks the order pending_cancel and skips
+                # placement until next reconcile cycle (periodic_resync clears).
+                all_cancelled = True
                 for o in current_yes:
                     if self._cancel_order(o):
                         actions["cancelled"] += 1
-                r = self._place_order(target.market_ticker, "yes",
-                                       target.yes_bid_cents, yes_size)
-                if r:
-                    actions["placed"] += 1
+                    else:
+                        o.pending_cancel = True
+                        all_cancelled = False
+                        _log.warning(f"C2 cancel-failed yes {target.market_ticker} "
+                                     f"oid={o.order_id[:12]} — marking pending_cancel, "
+                                     f"skipping placement to avoid duplicate")
+                if all_cancelled:
+                    r = self._place_order(target.market_ticker, "yes",
+                                           target.yes_bid_cents, yes_size)
+                    if r:
+                        actions["placed"] += 1
+                else:
+                    actions["pending_cancel_yes"] = sum(
+                        1 for o in current_yes if o.pending_cancel
+                    )
             else:
                 actions["kept"] += 1
 
@@ -652,13 +690,26 @@ class QuoteManager:
             elif current_no[0].price_cents != target.no_bid_cents or current_no[0].size_contracts != no_size:
                 need_replace = True
             if need_replace:
+                # 2026-05-02 PREDATOR C2: same race fix as yes side above.
+                all_cancelled = True
                 for o in current_no:
                     if self._cancel_order(o):
                         actions["cancelled"] += 1
-                r = self._place_order(target.market_ticker, "no",
-                                       target.no_bid_cents, no_size)
-                if r:
-                    actions["placed"] += 1
+                    else:
+                        o.pending_cancel = True
+                        all_cancelled = False
+                        _log.warning(f"C2 cancel-failed no {target.market_ticker} "
+                                     f"oid={o.order_id[:12]} — marking pending_cancel, "
+                                     f"skipping placement to avoid duplicate")
+                if all_cancelled:
+                    r = self._place_order(target.market_ticker, "no",
+                                           target.no_bid_cents, no_size)
+                    if r:
+                        actions["placed"] += 1
+                else:
+                    actions["pending_cancel_no"] = sum(
+                        1 for o in current_no if o.pending_cancel
+                    )
             else:
                 actions["kept"] += 1
 

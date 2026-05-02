@@ -154,8 +154,18 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
 
 
 def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
-                   db_path: str = settings.DB_PATH) -> list[dict]:
+                   db_path: str = settings.DB_PATH,
+                   exclude_tickers: set[str] | None = None) -> list[dict]:
     """Return top-N enrolled REACHABLE markets ranked by PRIORITY-WEIGHTED reward.
+
+    2026-05-01 PREDATOR — Saturation-aware filtering:
+      Pass `exclude_tickers` (set of saturated tickers from runner) to skip
+      markets where existing positions/orders consume >80% of per-market cap
+      OR existing exposure is already >= bankroll_share_cap. Without this
+      filter, the ranker keeps surfacing the same saturated markets at top,
+      blocking access to lower-ranked markets that have room. Result: 4 of
+      30 top picks attacked, 26 starved. With filter: ranker output IS the
+      attack list.
 
     2026-04-28 (#100 EV-PRIORITY V2):
       First attempt used observed share (our_score/total_score) as an EV
@@ -196,21 +206,25 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                 (max_target_size, n * 3),  # over-fetch so priority can re-sort top-n
             ).fetchall()
         except sqlite3.OperationalError as e:
-            # Audit fix R2 (2026-04-28): log loudly. Previously a SQL bug
-            # silently fell through and the system used the no-filter fallback.
-            _log.warning(f"top_n_to_quote primary query failed ({e}); using "
-                         f"fallback path WITHOUT end_date or blacklist filters. "
-                         f"Investigate the SQL above.")
-            rows = conn.execute(
-                """SELECT market_ticker, series_ticker, reward_per_day_usd,
-                          target_size, discount_factor, start_date, end_date
-                   FROM lip_programs
-                   WHERE enrolled = 1 AND paid_out = 0
-                     AND target_size <= ?
-                   ORDER BY reward_per_day_usd DESC
-                   LIMIT ?""",
-                (max_target_size, n * 3),
-            ).fetchall()
+            # 2026-05-02 PREDATOR K5: FAIL-LOUD instead of falling back.
+            # The fallback path silently quoted SETTLED + BLACKLISTED markets
+            # for hours when the primary SQL had a typo. Better to skip ONE
+            # quoting cycle (returning [] = quote loop pauses) than to dump
+            # capital into known-bad markets undetected. Same philosophy
+            # as the recent pm_rebate_verifier deposit bug — silent failures
+            # cost real money over real time.
+            _log.error(f"🔴 top_n_to_quote PRIMARY QUERY FAILED — failing closed: {e}")
+            try:
+                from monitor.alerts import alert as _alert
+                _alert(
+                    "ERROR",
+                    "lip_discovery",
+                    f"top_n_to_quote SQL failed: {e}. Returned EMPTY list this "
+                    f"cycle. Quoting paused until SQL fixed.",
+                )
+            except Exception as _alert_err:
+                _log.warning(f"alert dispatch failed: {_alert_err}")
+            return []
     finally:
         conn.close()
 
@@ -343,6 +357,16 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
         u = d.get("unified_rebate", 0) or 0
         return -(u if u > 0 else d.get("priority_weighted_reward", 0) / 100)
     enriched.sort(key=_rank_key)
+    # 2026-05-01 PREDATOR: filter saturated markets BEFORE truncating to n.
+    # Logs what was filtered so we can verify the gate is doing right work.
+    if exclude_tickers:
+        before = len(enriched)
+        filtered = [m for m in enriched if m["market_ticker"] not in exclude_tickers]
+        skipped = before - len(filtered)
+        if skipped > 0:
+            _log.info(f"top_n_to_quote: saturation filter removed {skipped} "
+                      f"market(s) from {before} → {len(filtered)} candidates")
+        return filtered[:n]
     return enriched[:n]
 
 

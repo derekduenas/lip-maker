@@ -63,7 +63,7 @@ if PAPER_MODE:
     MAX_TOTAL_NET_USD         = 500.0
 else:
     # Per-market: 5% of the total gross budget (spread across ~20 focused markets)
-    MAX_GROSS_PER_MARKET_USD  = max(50.0, _total_gross_budget * 0.20)  # 2026-04-30: 5%→20% — concentrate to win share. Was 21 markets x $7 = invisible.
+    MAX_GROSS_PER_MARKET_USD  = max(50.0, _total_gross_budget * 0.20)  # 2026-04-30: 5%→20%
     # 2026-04-22 (Skeptic audit): Per-series cap caps single-underlying flash
     # crash damage. Brent moves through 5+ strikes simultaneously — without
     # this cap, we could hit MAX_GROSS_PER_MARKET × 5+ on one event. 30% of
@@ -173,6 +173,12 @@ SERIES_BLOCKLIST = {
     "KXRECSSNBER", # Recession-by-2027 binary, -$9.90 unreal mean-reversion trap
     # Note: KXSUGARW (-$0.31), KXHOILW (+$11.63 net) excluded — borderline
     # cases. Re-evaluate after a clean week of post-blocklist data.
+    # 2026-05-01 BANS (24h audit, govt-bill binaries with $0 rebate capture):
+    "KXDHSFUND",      # net -$12.15 in single day, $0 rebate, directional bleed
+    "KXDHSCOMPONENT", # net -$10.44, TSA/agency confirmation binaries
+    # 2026-05-02 BANS (per-series auto-prune scan, 7d net < -$5):
+    "KXWH",           # net -$17.40 over 8 settlements (whale-watch binary)
+    "KXNICKELMON",    # net -$8.68 over 40 settlements (nickel monthly strikes — high-freq small bleed)
 }
 
 # ── Quote pricing ─────────────────────────────────────────────────────────
@@ -189,6 +195,14 @@ QUOTE_PLACEMENT = "join"
 # 10→25 after agent audit found 27k rejections at spread 14-22c on otherwise-
 # legit markets. Toxicity filter V2 provides the adverse-selection backstop.
 MAX_SPREAD_CENTS = 25
+
+# 2026-05-01 Two-sided liquidity gate — minimum bid required on BOTH yes
+# and no sides to enter. Prevents adverse-selection trap where we enter a
+# market with one-sided sentiment (e.g., yes_bid=0.40 + no_bid=0c means
+# nobody wants NO) and then can't exit because the other side has no
+# buyers. 5c default = real two-sided demand confirmed.
+# Predator gate: if we can't exit, we shouldn't enter.
+MIN_TWO_SIDED_BID_CENTS = 5
 
 # Minimum volume_24h to consider enrolling in a market.
 MIN_MARKET_VOLUME_24H = 100

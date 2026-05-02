@@ -88,8 +88,41 @@ class Runner:
         self._cap_multiplier   = 1.0
         self._breaker_tier     = "normal"
 
+        # 2026-05-01 PREDATOR: per-slug net YES position cache for inventory
+        # skew. Refreshed once per cycle. Maps slug → int(net_yes_qty).
+        # outcome="Yes" netPos = +n (long YES), outcome="No" netPos = +n (long NO = short YES).
+        self._positions_cache: dict[str, int] = {}
+        self._positions_cache_at = 0.0
+
     def request_stop(self) -> None:
         self._stop = True
+
+    def _refresh_positions_cache(self) -> None:
+        """Pull live positions, compute net_yes per slug. 5s TTL cache."""
+        now = time.time()
+        if (now - self._positions_cache_at) < 5.0:
+            return
+        try:
+            r = self.client.portfolio.positions()
+            positions = r.get("positions", {}) if isinstance(r, dict) else {}
+            new_cache: dict[str, int] = {}
+            for slug, p in positions.items():
+                try:
+                    net = int(float(p.get("netPosition", 0)))
+                    if net == 0:
+                        continue
+                    outcome = (p.get("marketMetadata", {}) or {}).get("outcome", "Yes")
+                    # outcome="Yes" + long = long YES; outcome="No" + long = long NO (= short YES)
+                    if outcome == "Yes":
+                        new_cache[slug] = net
+                    else:
+                        new_cache[slug] = -net
+                except Exception:
+                    continue
+            self._positions_cache = new_cache
+            self._positions_cache_at = now
+        except Exception as e:
+            _log.debug(f"positions refresh failed: {e}")
 
     def _persist_snapshots(self, rows: list[dict]) -> None:
         """Write per-market scoring snapshots to pm_snapshots (#2 observability)."""
@@ -195,11 +228,32 @@ class Runner:
         qty = max(self.min_qty, max_qty)
         if qty < self.min_qty:
             return None, f"qty<{self.min_qty}"
+
+        # 2026-05-01 PREDATOR — Active inventory skew (mirror of Kalshi #97).
+        # When holding net YES position, boost NO-side qty to absorb shorts
+        # and bleed off the long. Skew bounded by abs(net) so we don't
+        # over-skew on small imbalances.
+        yes_qty_override = None
+        no_qty_override  = None
+        net_yes = self._positions_cache.get(slug, 0)
+        if net_yes != 0:
+            skew = min(int(qty * settings.INVENTORY_SKEW_FRACTION), abs(net_yes))
+            if net_yes > 0:
+                # Long YES — boost NO bid, shrink YES bid
+                no_qty_override  = qty + skew
+                yes_qty_override = max(self.min_qty, qty - skew)
+            else:
+                # Long NO — boost YES bid, shrink NO bid
+                yes_qty_override = qty + skew
+                no_qty_override  = max(self.min_qty, qty - skew)
+
         return QuoteTarget(
             slug=slug,
             yes_price=round(yes_bid, 3),
             no_price=round(no_bid_implied, 3),
             quantity=qty,
+            yes_qty_override=yes_qty_override,
+            no_qty_override=no_qty_override,
         ), f"ok({src})"
 
     def _check_circuit_breaker(self) -> bool:
@@ -414,6 +468,30 @@ class Runner:
             _log.warning("breaker tripped — skipping new orders this cycle")
             return
 
+        # 2026-05-01 PREDATOR: refresh per-slug net YES position cache for
+        # inventory skew. Cheap (1 API call), 5s TTL inside the function.
+        self._refresh_positions_cache()
+
+        # 2026-05-02 PREDATOR K1: drain requote queue from capital_reaper.
+        # If reaper cancelled a PM order since the last cycle, log it so we
+        # know to re-prioritize that slug. Discovery below will re-include
+        # it if it still ranks well; this just makes the loop aware.
+        try:
+            import sys as _sys
+            # APPEND (don't insert at 0) so PM's local tools/ takes precedence
+            # over Kalshi's tools/. Bug discovered when path-insert hid PM's
+            # tools/us_scanner from discover_targets().
+            if "/root/lip-maker" not in _sys.path:
+                _sys.path.append("/root/lip-maker")
+            from cross_venue.requote_queue import drain as _drain_requote
+            requotes = _drain_requote(venue_filter="pm")
+            if requotes:
+                slugs_drained = [e.get("key", "") for e in requotes]
+                _log.info(f"K1 drained {len(requotes)} reaper-cancelled "
+                          f"slugs: {slugs_drained[:5]}")
+        except Exception as e:
+            _log.debug(f"K1 requote drain skipped: {e}")
+
         try:
             targets = self.discover_targets()
         except Exception as e:
@@ -451,7 +529,12 @@ class Runner:
             target, build_reason = self.build_target(market, book)
             if not target:
                 src_counts["rejected"] += 1
-                _log.debug(f"skip {market.get('slug','?')}: {build_reason}")
+                # 2026-05-02: bumped from DEBUG to INFO so we can see WHY we
+                # only quote 1-2 of 8 candidates per cycle. Without this it's
+                # invisible — masquerading as just "rejected: 7" in the cycle
+                # summary. Real reasons like "no book", "spread > max",
+                # "degenerate book" need to surface.
+                _log.info(f"  skip {market.get('slug','?')[:50]}: {build_reason}")
                 continue
             if "ws(" in build_reason:
                 src_counts["ws"] += 1
@@ -564,8 +647,11 @@ def main() -> int:
         _log.warning(f"rewards_schedule freshness check failed: {e}")
 
     # 2026-04-30: bankroll divergence check — env var vs live USDC.
-    # Was: if you deposit $5k to PM but forget to bump PM_BANKROLL,
-    # caps stay at $260 baseline (footgun). Now it screams.
+    # 2026-05-01 PREDATOR: now AUTO-UPDATES the runtime bankroll (and all
+    # derived caps) when divergence detected. Old behavior just warned —
+    # cost us 8 hours of zero quoting overnight when $750 deposit landed
+    # but PM_BANKROLL env stayed at $270, so MAX_DAILY_LOSS=$13.50 and
+    # WARN tier tripped at $4.67 MTM swing → 50% throttle stuck on.
     try:
         _key_id = os.getenv("PM_API_KEY_ID")
         _secret = (PROJECT_ROOT / "config" / "polymarket_secret_key.b64").read_text().strip()
@@ -573,15 +659,16 @@ def main() -> int:
         _b = _c.account.balances().get("balances", [{}])[0]
         live_usdc = float(_b.get("currentBalance", 0))
         env_bankroll = settings.BANKROLL_USD
-        if env_bankroll <= 0:
-            _log.warning(f"⚠️  PM_BANKROLL env=0 but live USDC=${live_usdc:.2f}. "
-                         f"Caps will be at minimum. systemctl set-environment "
-                         f"PM_BANKROLL={int(live_usdc)} && systemctl restart polymarket-maker")
-        elif abs(live_usdc - env_bankroll) > max(50, env_bankroll * 0.20):
-            _log.warning(f"⚠️  PM_BANKROLL env=${env_bankroll:.0f} diverges from "
-                         f"live USDC=${live_usdc:.2f} by >20%. "
-                         f"Update env: systemctl set-environment "
-                         f"PM_BANKROLL={int(live_usdc)} && systemctl restart polymarket-maker")
+        if abs(live_usdc - env_bankroll) > max(50, env_bankroll * 0.20):
+            # AUTO-PATCH: recompute settings constants in place
+            settings.BANKROLL_USD       = live_usdc
+            settings.MAX_DAILY_LOSS_USD = live_usdc * 0.05
+            settings.MAX_SESSION_LOSS_USD = live_usdc * 0.10
+            settings.MAX_SINGLE_LOSS_USD  = live_usdc * 0.02
+            _log.warning(f"⚠️  PM_BANKROLL env=${env_bankroll:.0f} ≠ live=${live_usdc:.2f}. "
+                         f"AUTO-PATCHED runtime: bankroll=${live_usdc:.0f}, "
+                         f"daily_loss_cap=${live_usdc*0.05:.2f}. "
+                         f"Persist via: systemctl set-environment PM_BANKROLL={int(live_usdc)}")
         else:
             _log.info(f"bankroll check OK: env=${env_bankroll:.0f} ≈ live=${live_usdc:.2f}")
     except Exception as e:

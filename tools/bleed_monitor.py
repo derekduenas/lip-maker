@@ -158,6 +158,26 @@ def main() -> int:
         # Loss ratio: (cost_basis - market_exposure) / cost_basis. If a
         # series has aggregate MTM loss > 30% of cost basis AND > $10
         # absolute, ban its open tickers for 6h.
+        # 2026-05-01 PREDATOR: data-driven MTM whitelist. Any series with
+        # POSITIVE 7d net (rebate − realized loss) is currently a net
+        # earner — strike-ladder MTM swings on these series are mid-cycle
+        # noise, not adverse selection. Auto-adapts to whatever's printing
+        # (commodities one week, weather the next, politics the next).
+        mtm_whitelist: set[str] = set()
+        try:
+            for r in conn.execute(
+                "SELECT substr(ticker, 1, instr(ticker||'-','-')-1) AS series, "
+                "ROUND(SUM(rebate_earned_usd) + SUM(our_realized_usd), 2) net "
+                "FROM settlement_log "
+                "WHERE datetime(close_time) > datetime('now','-7 days') "
+                "GROUP BY series "
+                "HAVING net > 5"  # >$5 net 7d = proven earner
+            ).fetchall():
+                mtm_whitelist.add(r[0])
+            if mtm_whitelist:
+                _log.info(f"  MTM whitelist (7d net > $5): {sorted(mtm_whitelist)}")
+        except Exception as e:
+            _log.warning(f"MTM whitelist query failed: {e}")
         try:
             from execution.kalshi_auth import KalshiClient
             kc = KalshiClient()
@@ -193,6 +213,9 @@ def main() -> int:
                 if loss_ratio < 0.30 or loss < 10:
                     continue
                 if series in blocklist:
+                    continue
+                if series in mtm_whitelist:
+                    _log.info(f"  MTM {series}: whitelisted (7d net positive — MTM swing is mid-cycle noise)")
                     continue
                 if _recently_banned(conn, series, COOLDOWN_HOURS):
                     _log.info(f"  MTM {series}: in cooldown")

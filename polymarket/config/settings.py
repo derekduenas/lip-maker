@@ -80,6 +80,15 @@ MAX_DAILY_LOSS_USD   = BANKROLL_USD * 0.05
 MAX_SESSION_LOSS_USD = BANKROLL_USD * 0.10
 MAX_SINGLE_LOSS_USD  = BANKROLL_USD * 0.02
 
+# 2026-05-01 PREDATOR — Active inventory skew (mirror of Kalshi #97).
+# When holding net YES position, bias the offset-side qty LARGER and
+# same-side qty SMALLER, by up to this fraction of base qty. 0.5 means
+# a base-50 quote can skew ±25 (NO=75, YES=25 if long YES). Keeps
+# top-of-book presence on both sides for LIP scoring while accelerating
+# inventory unwind. Cap also bounded by abs(net_yes) so we don't
+# over-skew on small imbalances.
+INVENTORY_SKEW_FRACTION = 0.5
+
 # ── Quoting parameters ────────────────────────────────────────────────────
 # Polymarket scoring is QUADRATIC in spread distance — being 1c off mid
 # costs us 4x what Kalshi did. Default to JOIN best (0c off mid).

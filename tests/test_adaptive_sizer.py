@@ -96,12 +96,13 @@ class TestAdaptiveSizerMath(unittest.TestCase):
 
     def test_target_25pct_share_with_thick_competition(self):
         # Competition = 3000; target_share = 0.25
-        # Expected: 3000 × 0.33 = 1000, but cap = MIN_QUOTE × 20 = 200
+        # Expected: 3000 × 0.33 = 1000, but cap = MIN_QUOTE_SIZE_CONTRACTS × 20
+        # 2026-05-02: was hardcoded to 200; uses settings now (MIN bumped 10→25)
+        from config import settings
         sizer = AdaptiveSizer(target_share=0.25)
         self._warm_up(sizer, "KX-THICK", yes_competition=3000.0, no_competition=3000.0)
         size = sizer.size_for("KX-THICK", "yes", target_size_program=2500)
-        # Capped at MIN_QUOTE_SIZE × 20 = 200
-        self.assertEqual(size, 200)
+        self.assertEqual(size, settings.MIN_QUOTE_SIZE_CONTRACTS * 20)
 
     def test_higher_target_share_increases_size(self):
         thin = AdaptiveSizer(target_share=0.10)

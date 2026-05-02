@@ -31,6 +31,11 @@ class QuoteTarget:
     yes_price:   Optional[float]  # None = no yes quote
     no_price:    Optional[float]  # None = no no quote
     quantity:    int
+    # 2026-05-01 PREDATOR: per-side overrides for inventory skew (mirror of
+    # Kalshi #97). When holding net YES position, set no_qty_override > qty
+    # and yes_qty_override < qty to absorb shorts and bleed off the long.
+    yes_qty_override: Optional[int] = None
+    no_qty_override:  Optional[int] = None
 
 
 @dataclass
@@ -254,44 +259,50 @@ class PMQuoteManager:
 
         actions = {"placed": 0, "cancelled": 0, "kept": 0}
 
+        # 2026-05-01 PREDATOR: per-side qty (mirrors Kalshi #97). When inventory
+        # skew is set, YES and NO use different sizes to absorb offsetting flow
+        # while bleeding off existing position.
+        yes_qty = target.yes_qty_override if target.yes_qty_override is not None else target.quantity
+        no_qty  = target.no_qty_override  if target.no_qty_override  is not None else target.quantity
+
         # YES side reconciliation
         existing_yes = self._existing_for_intent(target.slug, "ORDER_INTENT_BUY_LONG")
-        if target.yes_price is None:
+        if target.yes_price is None or yes_qty <= 0:
             if existing_yes and self._cancel_order(existing_yes):
                 actions["cancelled"] += 1
         else:
             need_replace = (
                 existing_yes is None
                 or abs(existing_yes.price - target.yes_price) > 0.001
-                or existing_yes.quantity != target.quantity
+                or existing_yes.quantity != yes_qty
             )
             if need_replace:
                 if existing_yes:
                     if self._cancel_order(existing_yes):
                         actions["cancelled"] += 1
                 if self._place_order(target.slug, "ORDER_INTENT_BUY_LONG",
-                                     target.yes_price, target.quantity):
+                                     target.yes_price, yes_qty):
                     actions["placed"] += 1
             else:
                 actions["kept"] += 1
 
         # NO side reconciliation
         existing_no = self._existing_for_intent(target.slug, "ORDER_INTENT_BUY_SHORT")
-        if target.no_price is None:
+        if target.no_price is None or no_qty <= 0:
             if existing_no and self._cancel_order(existing_no):
                 actions["cancelled"] += 1
         else:
             need_replace = (
                 existing_no is None
                 or abs(existing_no.price - target.no_price) > 0.001
-                or existing_no.quantity != target.quantity
+                or existing_no.quantity != no_qty
             )
             if need_replace:
                 if existing_no:
                     if self._cancel_order(existing_no):
                         actions["cancelled"] += 1
                 if self._place_order(target.slug, "ORDER_INTENT_BUY_SHORT",
-                                     target.no_price, target.quantity):
+                                     target.no_price, no_qty):
                     actions["placed"] += 1
             else:
                 actions["kept"] += 1

@@ -35,13 +35,22 @@ _log = logging.getLogger(__name__)
 
 
 def record_balance_snapshot(db_path: str = settings.DB_PATH) -> float:
-    """Record a balance observation. Returns the balance in USD."""
+    """Record a balance observation. Returns the balance in USD.
+
+    2026-05-02 PREDATOR: now logs cash + portfolio_value + total_nav so daily
+    P&L math is honest. Cash-only was misleading: $400 deployed into open
+    positions looked like a -$400 loss until those settled. True NAV =
+    cash + portfolio_value (Kalshi's MTM of open positions).
+    """
     c = KalshiClient()
     if not c.authenticated:
         _log.warning("Kalshi not authenticated — cannot record balance")
         return 0.0
     try:
-        balance = c.get_balance()
+        b = c.get('/portfolio/balance')
+        cash = float(b.get('balance', 0)) / 100
+        port_val = float(b.get('portfolio_value', 0)) / 100
+        balance = cash  # backward-compat: callers expect cash from this fn
     except Exception as e:
         _log.warning(f"balance fetch failed: {e}")
         return 0.0
@@ -56,9 +65,17 @@ def record_balance_snapshot(db_path: str = settings.DB_PATH) -> float:
                 recorded_at     TEXT NOT NULL
             )
         """)
+        # Add new columns idempotently (zero downtime — old rows = NULL)
+        existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(balance_log)").fetchall()}
+        if "portfolio_value_usd" not in existing_cols:
+            conn.execute("ALTER TABLE balance_log ADD COLUMN portfolio_value_usd REAL")
+        if "total_nav_usd" not in existing_cols:
+            conn.execute("ALTER TABLE balance_log ADD COLUMN total_nav_usd REAL")
         conn.execute(
-            "INSERT INTO balance_log (balance_usd, recorded_at) VALUES (?, ?)",
-            (balance, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO balance_log (balance_usd, portfolio_value_usd, "
+            "total_nav_usd, recorded_at) VALUES (?, ?, ?, ?)",
+            (cash, port_val, cash + port_val,
+             datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
     finally:

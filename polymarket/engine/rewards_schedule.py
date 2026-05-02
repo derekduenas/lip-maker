@@ -320,8 +320,19 @@ def current_period(schedule: CategorySchedule, hours_to_close: float | None) -> 
 def expected_daily_reward(slug: str,
                           hours_to_close: float | None,
                           our_size: int,
-                          top_of_book_size: int) -> dict:
+                          top_of_book_size: int,
+                          our_distance_cents: float = 0.0,
+                          max_spread_cents: float = 2.0) -> dict:
     """Compute expected reward for our quote on this market.
+
+    2026-05-02 PREDATOR Y5: respect spread position when computing share.
+    PM's actual scoring is `spread_score = ((max_spread - distance)/max_spread)^2`.
+    Previously we credited our full size regardless of distance from best,
+    overstating EV by 4-100x when not at top-of-book. New behavior:
+      our_distance_cents = 0   → factor 1.0  (at best)
+      ≤ max_spread             → factor (1 - d/max)^2 (quadratic decay)
+      > max_spread             → factor 0.0  (NO rebate eligible)
+    Default args preserve old behavior for callers that don't pass distance.
 
     Returns dict with: category, period, qualifies, our_share, expected_usd.
     """
@@ -357,10 +368,20 @@ def expected_daily_reward(slug: str,
             "reason": f"target {period.target_size} not met (~{aggregate_estimate})",
         }
 
-    # We're at-best (ticks=0), so our_score = our_size × DF^0 = our_size.
+    # If at best, our_score = our_size × DF^0 = our_size.
     # Aggregate score at best = top_of_book_size + our_size.
-    # (Discounted scores from levels behind us are generally smaller.)
-    our_share = our_size / max(1, top_of_book_size + our_size)
+    raw_share = our_size / max(1, top_of_book_size + our_size)
+
+    # 2026-05-02 PREDATOR Y5: spread-position factor (quadratic decay).
+    # Penalize quotes not at top of book. Outside max_spread → 0.
+    if max_spread_cents <= 0 or our_distance_cents < 0:
+        spread_factor = 1.0  # malformed input, preserve old behavior
+    elif our_distance_cents >= max_spread_cents:
+        spread_factor = 0.0  # outside max_spread = no rebate eligible
+    else:
+        spread_factor = ((max_spread_cents - our_distance_cents) / max_spread_cents) ** 2
+
+    our_share = raw_share * spread_factor
     expected = our_share * period.pool_usd
 
     return {
@@ -372,6 +393,8 @@ def expected_daily_reward(slug: str,
         "discount_factor": period.discount_factor,
         "aggregate_size_est": aggregate_estimate,
         "qualifies": True,
+        "raw_share": round(raw_share, 4),
+        "spread_factor": round(spread_factor, 4),
         "our_share": round(our_share, 4),
         "expected_usd": round(expected, 2),
     }
