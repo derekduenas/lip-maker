@@ -50,8 +50,15 @@ BANKROLL_USD = float(os.getenv("LIP_BANKROLL", "80"))
 RAMP_PHASE = int(os.getenv("LIP_RAMP_PHASE", "4"))  # paper=full
 _ramp_fraction = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40}[max(1, min(4, RAMP_PHASE))]
 
-MAX_BANKROLL_SHARE_PCT = _ramp_fraction
-_total_gross_budget = BANKROLL_USD * MAX_BANKROLL_SHARE_PCT
+# 2026-05-02 PREDATOR: split per-market cap from total-budget multiplier.
+# Was: same _ramp_fraction served BOTH the per-market gate AND the total
+# gross multiplier. At PHASE 4 (40%) per-market = $682 cap on $1.7k cash,
+# meaning 8 markets need $5.5k = impossible with our bankroll. Result:
+# top-N rank picks like KXF1DELAY ($500/d pool) got blocked by per-market
+# cap and we missed them. New: per-market cap = 12% (≈$200 of $1.7k cash,
+# fits 8-10 markets), total budget multiplier stays at ramp_fraction.
+MAX_BANKROLL_SHARE_PCT = 0.18  # per-market cap (was 40% blocking everything; 12% too tight for sizer)
+_total_gross_budget = BANKROLL_USD * _ramp_fraction
 
 # Paper mode overrides stay generous to exercise all markets.
 # Live mode: derived from bankroll + ramp.
