@@ -49,7 +49,7 @@ from config import settings
 
 LIP_DB = "/root/lip-maker/data/lip_maker.db"
 SKIP_NEAR_SETTLE_MIN = 30   # don't liquidate within 30min of close — settlement handles
-SKIP_FAR_FROM_SETTLE_HOURS = 720  # skip positions > 30d out (long-dated political can ride)
+SKIP_FAR_FROM_SETTLE_HOURS = 8760  # bumped 720->8760 2026-05-09 to free stranded   # skip positions > 30d out (long-dated political can ride)
 MIN_POSITION_TO_LIQ = 1     # ignore dust positions
 EXIT_TICK_OFFSET = 0        # 0 = join best, -1 = inside, +1 = behind (price ladder)
 
@@ -162,10 +162,10 @@ def main() -> int:
         if ticker in resting_tickers:
             out["skipped"].append({"ticker": ticker, "reason": "has_resting_order"})
             continue
-        # Skip if blacklisted (we blocked for a reason)
+        # 2026-05-09 godmode fix: blacklist gates ENTRIES not EXITS.
+        # Held inventory in banned markets should be PRIORITIZED for exit.
         if ticker in blacklist:
-            out["skipped"].append({"ticker": ticker, "reason": "in_blacklist"})
-            continue
+            out.setdefault("notes", []).append({"ticker": ticker, "info": "exit_via_blacklist_allowed"})
 
         m = _market_status(c, ticker)
         if not m:
