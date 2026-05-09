@@ -345,3 +345,10 @@ MAX_GROSS_PER_MARKET_BY_SERIES = {
     "KXHYPEMAXMON": 90.0, "KXHYPEMINMON": 90.0,
     "KXZECMAXMON":  90.0, "KXZECMINMON":  90.0,
 }
+
+# ── Prong 3: Cross-Venue Dislocation Harvester ───────────────────────────
+# All scanner config lives in dislocation/config.py to keep prongs decoupled.
+# Read it via `from dislocation.config import ...` (do NOT alias here — the
+# prong has its own bankroll envelope so a Kalshi LIP draw-down doesn't
+# implicitly pause convergence trades).
+DISLOCATION_PRONG_ENABLED = os.getenv("DISLOCATION_ENABLED", "false").lower() == "true"
