@@ -1,0 +1,83 @@
+{
+  "overall_brier": 0.17631876067861577,
+  "overall_naive_brier": 0.25,
+  "edge_over_naive": 0.07368123932138423,
+  "n_predictions": 2906,
+  "per_group": {
+    "zuckerberg|meta_earnings": {
+      "brier": 0.1763729675817014,
+      "n": 146,
+      "naive": 0.25
+    },
+    "cook|aapl_earnings": {
+      "brier": 0.19526623987011435,
+      "n": 193,
+      "naive": 0.25
+    },
+    "pichai|googl_earnings": {
+      "brier": 0.17326936651668204,
+      "n": 185,
+      "naive": 0.25
+    },
+    "mcmillon|wmt_earnings": {
+      "brier": 0.19791486517963885,
+      "n": 205,
+      "naive": 0.25
+    },
+    "huang|nvda_earnings": {
+      "brier": 0.13810891285791765,
+      "n": 184,
+      "naive": 0.25
+    },
+    "subramaniam|fdx_earnings": {
+      "brier": 0.1857259528554345,
+      "n": 307,
+      "naive": 0.25
+    },
+    "musk|tsla_earnings": {
+      "brier": 0.16205102175471217,
+      "n": 348,
+      "naive": 0.25
+    },
+    "dimon|jpm_earnings": {
+      "brier": 0.19441228904747943,
+      "n": 200,
+      "naive": 0.25
+    },
+    "jassy|amzn_earnings": {
+      "brier": 0.17932799612271683,
+      "n": 179,
+      "naive": 0.25
+    },
+    "|nflx_earnings": {
+      "brier": 0.15320231043723923,
+      "n": 137,
+      "naive": 0.25
+    },
+    "nadella|msft_earnings": {
+      "brier": 0.12115483291957455,
+      "n": 196,
+      "naive": 0.25
+    },
+    "lyft|lyft_earnings": {
+      "brier": 0.1434899026795288,
+      "n": 147,
+      "naive": 0.25
+    },
+    "brown|ally_earnings": {
+      "brier": 0.2071386329650801,
+      "n": 183,
+      "naive": 0.25
+    },
+    "ortberg|ba_earnings": {
+      "brier": 0.17622348163754117,
+      "n": 148,
+      "naive": 0.25
+    },
+    "mcd|mcd_earnings": {
+      "brier": 0.24795097319738305,
+      "n": 148,
+      "naive": 0.25
+    }
+  }
+}

@@ -1,0 +1,27 @@
+[Unit]
+Description=Sovereign Watchdog — restarts main service if heartbeat stale
+After=sovereign.service
+Requires=sovereign.service
+
+[Service]
+Type=oneshot
+User=sovereign
+WorkingDirectory=/home/sovereign/app
+
+ExecStart=/bin/bash -c '\
+  HEARTBEAT="/home/sovereign/app/logs/heartbeat"; \
+  if [ ! -f "$HEARTBEAT" ]; then \
+    echo "No heartbeat file — restarting sovereign"; \
+    systemctl restart sovereign; \
+    exit 0; \
+  fi; \
+  AGE=$(( $(date +%%s) - $(date -r "$HEARTBEAT" +%%s) )); \
+  if [ "$AGE" -gt 7200 ]; then \
+    echo "Heartbeat stale (${AGE}s) — restarting sovereign"; \
+    systemctl restart sovereign; \
+  else \
+    echo "Heartbeat OK (${AGE}s old)"; \
+  fi'
+
+[Install]
+WantedBy=multi-user.target

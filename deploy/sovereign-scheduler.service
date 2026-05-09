@@ -1,0 +1,16 @@
+[Unit]
+Description=Sovereign event scheduler — fires prep milestones for FOMC/CPI/NFP/SCOTUS events
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/sovereign
+Environment="PYTHONPATH=/root/sovereign"
+# Bankroll is read here; update via scale_caps-style helper later.
+Environment="SOV_BANKROLL=5000"
+ExecStart=/usr/bin/python3 /root/sovereign/prep/scheduler.py --once --bankroll 5000
+StandardOutput=append:/root/sovereign/logs/scheduler.log
+StandardError=append:/root/sovereign/logs/scheduler.log
+
+# Intentionally NOT a persistent service — we drive via a .timer below.

@@ -1,0 +1,15 @@
+[Unit]
+Description=Run Sovereign scheduler every 30 minutes
+Requires=sovereign-scheduler.service
+
+[Timer]
+# Every 30 minutes, aligned to :00 and :30. Picks up prep milestones for any
+# upcoming event (FOMC, CPI, NFP, SCOTUS) and auto-runs the corresponding
+# prep step (T-72h/T-24h/T-2h/T+24h). Each milestone runs exactly once per
+# event via scheduler_log idempotency table.
+OnCalendar=*:0/30
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,33 @@
+[Unit]
+Description=Sovereign Mention Market Trading Engine — Daily Scan Mode
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/sovereign
+EnvironmentFile=/root/sovereign/.env
+
+# Schedule-based: 6am/noon/8pm scans. No --interval flag.
+ExecStart=/usr/bin/python3 loop/monitor.py
+
+Restart=always
+RestartSec=30
+TimeoutStopSec=60
+
+MemoryMax=1200M
+MemorySwapMax=0
+
+StandardOutput=append:/root/sovereign/logs/sovereign.log
+StandardError=append:/root/sovereign/logs/errors.log
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TZ=America/New_York
+
+[Install]
+WantedBy=multi-user.target

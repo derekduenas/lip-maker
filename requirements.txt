@@ -1,0 +1,9 @@
+anthropic>=0.92.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+schedule>=1.2.0
+python-dotenv>=1.0.0
+lxml>=5.0.0
+PyMuPDF>=1.24.0
+cryptography>=42.0.0
+pytest>=8.0.0
