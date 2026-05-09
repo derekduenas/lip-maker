@@ -45,6 +45,7 @@ from engine.lip_discovery import discover, top_n_to_quote
 # greedy yield-per-dollar fill. N becomes OUTPUT not INPUT — adapts to
 # opportunity quality + budget. Toggle via LIP_USE_CAPITAL_ALLOC env (default true).
 from engine.capital_allocator import select_optimal_portfolio
+from engine.depth_probe import filter_by_depth
 from engine.lip_scorer import (
     OurQuotes, ProgramParams, score_snapshot,
 )
@@ -967,6 +968,18 @@ async def main(duration_sec: int = 300, top_n: int = 50):
         )
         _log.info(f"capital-aware ranker: {len(markets)} markets, "
                   f"E[net]=${sum(m.get('expected_net_per_day',0) for m in markets):.2f}/d")
+        # Sprint 4 #2: pre-deploy depth gate (reject <5% projected share)
+        if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
+            try:
+                from execution.kalshi_auth import KalshiClient as _KC_dg
+                _dg_client = _KC_dg()
+                pre_n = len(markets)
+                markets = filter_by_depth(markets, _dg_client,
+                                          min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")))
+                _log.info(f"depth_gate: {pre_n} -> {len(markets)} markets "
+                          f"({100*(pre_n-len(markets))/max(1,pre_n):.0f}% rejected)")
+            except Exception as e:
+                _log.warning(f"depth_gate skipped due to error: {e}")
     else:
         markets = top_n_to_quote(top_n, exclude_tickers=saturated)
     if not markets:
@@ -1022,6 +1035,17 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                         budget_usd=settings.MAX_TOTAL_GROSS_USD,
                         exclude_tickers=saturated,
                     )
+                    # Sprint 4 #2: depth gate on refresh
+                    if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
+                        try:
+                            from execution.kalshi_auth import KalshiClient as _KC_dg2
+                            _dg_client2 = _KC_dg2()
+                            pre_n = len(fresh)
+                            fresh = filter_by_depth(fresh, _dg_client2,
+                                                    min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")))
+                            _log.info(f"depth_gate refresh: {pre_n} -> {len(fresh)}")
+                        except Exception as e:
+                            _log.warning(f"depth_gate refresh skipped: {e}")
                 else:
                     fresh = top_n_to_quote(top_n, exclude_tickers=saturated)
                 current_tickers = set(runner.params_by_ticker.keys())
