@@ -1,0 +1,10 @@
+[Unit]
+Description=VPIN Gate — adverse-flow blacklist scanner
+After=lip-maker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/root/lip-maker/venv/bin/python tools/vpin_gate.py
+StandardOutput=append:/root/lip-maker/logs/vpin_gate.log
+StandardError=append:/root/lip-maker/logs/vpin_gate.log

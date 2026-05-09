@@ -29,6 +29,7 @@ import asyncio
 import logging
 import signal
 import sqlite3
+import os
 import sys
 import time
 from collections import defaultdict
@@ -40,12 +41,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import settings
 from engine.lip_discovery import discover, top_n_to_quote
 # from engine.sniper_select import top_n_by_ev  # archived 2026-04-29 (audit: unused)
+# 2026-05-03 GOLDEN-FUNNEL: capital-aware ranker. Replaces fixed top-N with
+# greedy yield-per-dollar fill. N becomes OUTPUT not INPUT — adapts to
+# opportunity quality + budget. Toggle via LIP_USE_CAPITAL_ALLOC env (default true).
+from engine.capital_allocator import select_optimal_portfolio
 from engine.lip_scorer import (
     OurQuotes, ProgramParams, score_snapshot,
 )
 from engine.adaptive_sizer import AdaptiveSizer
 from execution.kalshi_ws import KalshiWS, BookState, BookLevel
 from execution.quote_manager import QuoteManager, QuoteTarget
+
+
+
+def _hydra_skew_for(ticker: str) -> tuple:
+    """HYDRA-SKEW (2026-05-06): proactive directional bias from LLM swarm.
+    Reads market_skew_hint table populated by tools/hydra_skew_predictor.py.
+    Returns (skew_yes_float, confidence_float) or (None, None) if no fresh hint."""
+    try:
+        conn = sqlite3.connect(settings.DB_PATH, timeout=5)
+        now = datetime.now(timezone.utc).isoformat()
+        row = conn.execute(
+            "SELECT skew_yes, confidence FROM market_skew_hint "
+            "WHERE ticker=? AND expires_at > ?",
+            (ticker, now),
+        ).fetchone()
+        conn.close()
+        if not row: return (None, None)
+        return (float(row[0]), float(row[1]))
+    except Exception:
+        return (None, None)
 
 _log = logging.getLogger("lip_maker")
 
@@ -60,6 +85,13 @@ class PaperRunner:
                 discount_factor=float(m["discount_factor"]),
                 period_reward_usd=float(m["reward_per_day_usd"]),
             )
+            for m in markets
+        }
+        # 2026-05-03 GOLDEN-FUNNEL: per-market size FLOOR from capital_allocator.
+        # Ensures we always quote enough to cross the qualify cliff. Sizer can
+        # size larger if observed competition demands; never smaller than this.
+        self.optimal_size_floors: dict[str, int] = {
+            m["market_ticker"]: int(m.get("optimal_size_per_side", 0) or 0)
             for m in markets
         }
         # 2026-04-21: paper flag now controlled by LIP_PAPER env via settings.
@@ -426,6 +458,12 @@ class PaperRunner:
         size_yes = self.sizer.size_for(book.market_ticker, "yes", p.target_size)
         size_no  = self.sizer.size_for(book.market_ticker, "no",  p.target_size)
         size = min(size_yes, size_no)
+        # 2026-05-03 GOLDEN-FUNNEL: enforce qualify-cliff floor from capital_allocator.
+        # Sizer's adaptive output may be sub-qualifying; floor lifts it to where
+        # rebate is actually earned. Capped by safety gates downstream.
+        floor = self.optimal_size_floors.get(book.market_ticker, 0)
+        if floor > size:
+            size = floor
 
         # 2026-04-27: per-series size multiplier (audit: KXBRENTD/CORNW/COPPERD/
         # GOLDW/COCOAW are net-positive, deserve 2x cap allocation). Cap by
@@ -441,6 +479,9 @@ class PaperRunner:
         # bias quote sizes to absorb the offsetting side and let the long
         # side bleed off naturally. Reduces time-to-flat from minutes
         # (passive) to seconds (active recirculation).
+        # NOTE 2026-05-06: HYDRA-skew layer reverted — was costing /mo API
+        # without proven value. Pure inventory-skew restored. Helper function
+        # _hydra_skew_for() retained for future use but no longer called.
         yes_size_override = None
         no_size_override = None
         self.qm._refresh_inventory(book.market_ticker)
@@ -528,7 +569,15 @@ class PaperRunner:
         # snapshot honestly (our_score=0, snapshot_valid=0) and DON'T feed sizer.
         is_resting = self._actually_resting(book.market_ticker, target)
         if is_resting:
-            persist_our_score = r.our_total_score
+            # 2026-05-03 UNIT-FIX: persist RAW our_score (not normalized 0-2).
+            # Was: r.our_total_score (= sum of normalized shares, max 2.0)
+            # Now: actual sum of (size × DF^N) raw units, comparable with total_score.
+            # Without this, our_score/total_score produced meaningless ~0.001 ratios
+            # that EST_REBATE_1H interpreted as 0.1% share when real share was ~50%.
+            persist_our_score = (
+                (r.our_yes_normalized * (r.yes_total_qualifying_score or 0)) +
+                (r.our_no_normalized  * (r.no_total_qualifying_score  or 0))
+            )
             persist_yes_qual  = 1 if r.yes_qualified else 0
             persist_no_qual   = 1 if r.no_qualified  else 0
             persist_valid     = 1 if r.snapshot_valid else 0
@@ -697,6 +746,10 @@ class PaperRunner:
                     size_yes = self.sizer.size_for(tkr, "yes", params.target_size)
                     size_no  = self.sizer.size_for(tkr, "no",  params.target_size)
                     size = min(size_yes, size_no)
+                    # GOLDEN-FUNNEL qualify-cliff floor (heartbeat path)
+                    floor = self.optimal_size_floors.get(tkr, 0)
+                    if floor > size:
+                        size = floor
                     ours = OurQuotes(
                         yes_bids=[BookLevel(price_cents=best_yes.price_cents, size=size)],
                         no_bids=[BookLevel(price_cents=best_no.price_cents,  size=size)],
@@ -729,7 +782,11 @@ class PaperRunner:
                         size_contracts = size
                     is_resting = self._actually_resting(tkr, _T())
                     if is_resting:
-                        persist_our_score = r.our_total_score
+                        # GOLDEN-FUNNEL UNIT-FIX: persist RAW score, not normalized.
+                        persist_our_score = (
+                            (r.our_yes_normalized * (r.yes_total_qualifying_score or 0)) +
+                            (r.our_no_normalized  * (r.no_total_qualifying_score  or 0))
+                        )
                         persist_yes_qual = 1 if r.yes_qualified else 0
                         persist_no_qual  = 1 if r.no_qualified  else 0
                         persist_valid    = 1 if r.snapshot_valid else 0
@@ -902,7 +959,16 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     # where existing positions already exhaust per-market cap. Without this
     # the ranker keeps surfacing the same stuck markets at top-N.
     saturated = _compute_saturated_tickers()
-    markets = top_n_to_quote(top_n, exclude_tickers=saturated)
+    use_capital_alloc = os.getenv("LIP_USE_CAPITAL_ALLOC", "true").lower() == "true"
+    if use_capital_alloc:
+        markets = select_optimal_portfolio(
+            budget_usd=settings.MAX_TOTAL_GROSS_USD,
+            exclude_tickers=saturated,
+        )
+        _log.info(f"capital-aware ranker: {len(markets)} markets, "
+                  f"E[net]=${sum(m.get('expected_net_per_day',0) for m in markets):.2f}/d")
+    else:
+        markets = top_n_to_quote(top_n, exclude_tickers=saturated)
     if not markets:
         _log.warning("no enrolled markets")
         return
@@ -951,7 +1017,13 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                 # PREDATOR: refresh saturated set per cycle so newly-saturated
                 # markets get filtered + freshly-drained ones get re-included.
                 saturated = _compute_saturated_tickers()
-                fresh = top_n_to_quote(top_n, exclude_tickers=saturated)
+                if use_capital_alloc:
+                    fresh = select_optimal_portfolio(
+                        budget_usd=settings.MAX_TOTAL_GROSS_USD,
+                        exclude_tickers=saturated,
+                    )
+                else:
+                    fresh = top_n_to_quote(top_n, exclude_tickers=saturated)
                 current_tickers = set(runner.params_by_ticker.keys())
                 fresh_tickers = {m["market_ticker"] for m in fresh}
                 new_tickers = fresh_tickers - current_tickers
@@ -965,6 +1037,9 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                                 target_size=int(m["target_size"]),
                                 discount_factor=float(m["discount_factor"]),
                                 period_reward_usd=float(m["reward_per_day_usd"]),
+                            )
+                            runner.optimal_size_floors[tkr] = int(
+                                m.get("optimal_size_per_side", 0) or 0
                             )
                             runner.markets.append(m)
                     await ws.subscribe_orderbook(list(new_tickers))

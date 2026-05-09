@@ -1,0 +1,10 @@
+[Unit]
+Description=Series auto-prune — auto-blacklist bleeders -$5+ over 3 settles
+After=lip-maker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/root/lip-maker/venv/bin/python tools/series_auto_prune.py
+StandardOutput=append:/root/lip-maker/logs/series_auto_prune.log
+StandardError=append:/root/lip-maker/logs/series_auto_prune.log

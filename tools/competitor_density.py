@@ -169,7 +169,7 @@ def scan(db_path: str = settings.DB_PATH,
                  AND datetime(b.expires_at) > datetime('now')
                WHERE p.enrolled = 1 AND p.paid_out = 0
                  AND p.target_size <= ?
-                 AND date(p.end_date) > date('now')
+                 AND datetime(p.end_date) > datetime('now')
                  AND b.ticker IS NULL""",
             (max_target_size,),
         ).fetchall()

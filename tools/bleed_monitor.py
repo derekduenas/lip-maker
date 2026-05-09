@@ -28,6 +28,16 @@ USAGE:
 """
 from __future__ import annotations
 
+
+# === heartbeat (auto-injected, atexit) ===
+import atexit as _atexit, sys as _sys
+_sys.path.insert(0, "/root/lip-maker")
+try:
+    from tools._heartbeat import write_heartbeat as _wh
+    _atexit.register(_wh, "bleed_monitor")
+except Exception:
+    pass
+
 import argparse
 import logging
 import sqlite3
@@ -165,17 +175,28 @@ def main() -> int:
         # (commodities one week, weather the next, politics the next).
         mtm_whitelist: set[str] = set()
         try:
+            # Existing: 7d net-positive series (proven earners)
             for r in conn.execute(
                 "SELECT substr(ticker, 1, instr(ticker||'-','-')-1) AS series, "
                 "ROUND(SUM(rebate_earned_usd) + SUM(our_realized_usd), 2) net "
                 "FROM settlement_log "
                 "WHERE datetime(close_time) > datetime('now','-7 days') "
                 "GROUP BY series "
-                "HAVING net > 5"  # >$5 net 7d = proven earner
+                "HAVING net > 5"
+            ).fetchall():
+                mtm_whitelist.add(r[0])
+            # 2026-05-06 NEW: any series with ACTIVE LIP earning >=$25/d
+            # gets whitelisted from MTM bans. Future rebate income covers
+            # MTM mid-cycle swings. Without this, fresh markets get banned
+            # before they accumulate $5 net-positive history (chicken/egg).
+            for r in conn.execute(
+                "SELECT series_ticker FROM lip_programs "
+                "WHERE end_date > date('now') AND paid_out=0 "
+                "AND reward_per_day_usd >= 10 GROUP BY series_ticker"
             ).fetchall():
                 mtm_whitelist.add(r[0])
             if mtm_whitelist:
-                _log.info(f"  MTM whitelist (7d net > $5): {sorted(mtm_whitelist)}")
+                _log.info(f"  MTM whitelist ({len(mtm_whitelist)} series): proven 7d net>$5 OR active LIP >=$25/d")
         except Exception as e:
             _log.warning(f"MTM whitelist query failed: {e}")
         try:

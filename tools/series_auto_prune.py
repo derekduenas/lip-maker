@@ -18,6 +18,16 @@ USAGE:
 """
 from __future__ import annotations
 
+
+# === heartbeat (auto-injected, atexit) ===
+import atexit as _atexit, sys as _sys
+_sys.path.insert(0, "/root/lip-maker")
+try:
+    from tools._heartbeat import write_heartbeat as _wh
+    _atexit.register(_wh, "series_auto_prune")
+except Exception:
+    pass
+
 import argparse
 import json
 import logging
@@ -103,7 +113,7 @@ def main() -> int:
             tickers = [r[0] for r in conn.execute(
                 "SELECT DISTINCT market_ticker FROM lip_programs "
                 "WHERE substr(market_ticker,1,instr(market_ticker||'-','-')-1) = ? "
-                "AND date(end_date) > date('now')",
+                "AND datetime(end_date) > datetime('now')",
                 (series,),
             ).fetchall()]
 

@@ -23,6 +23,16 @@ Cron: daily at 09:00 UTC.
 """
 from __future__ import annotations
 
+
+# === heartbeat (auto-injected, atexit) ===
+import atexit as _atexit, sys as _sys
+_sys.path.insert(0, "/root/lip-maker")
+try:
+    from tools._heartbeat import write_heartbeat as _wh
+    _atexit.register(_wh, "ramp_controller")
+except Exception:
+    pass
+
 import logging
 import os
 import sqlite3

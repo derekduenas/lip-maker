@@ -211,7 +211,61 @@ def render(k: dict, l: dict) -> None:
     # ── Blacklist ──
     print(f"\n🛑 ACTIVE BLACKLIST: {l['active_blacklist']} markets")
 
+    _aegis_brain_recommendations("/root/lip-maker/data/lip_maker.db")
+
     print()
+
+
+
+def _aegis_brain_recommendations(db_path: str) -> None:
+    """AEGIS latest brain decision + recommendations + needs-approval items."""
+    import sqlite3, json as _json
+    print("\n🛡️  AEGIS BRAIN — latest cycle:")
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT ts, trigger_type, reasoning, actions_proposed, actions_executed, cost_usd "
+            "FROM decision_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        print(f"  (brain log unavailable: {e})")
+        return
+    if not row:
+        print("  (no brain cycles yet)")
+        return
+    ts, trigger, reasoning, actions_p, actions_e, cost = row
+    print(f"  ts: {ts[:19]}  trigger: {trigger}  cost: ${cost:.4f}")
+    # Try parse reasoning JSON for diagnosis
+    try:
+        r = _json.loads(reasoning) if reasoning else {}
+        diag = r.get("diagnosis", "")[:280]
+        if diag:
+            print(f"  diagnosis: {diag}")
+        confidence = r.get("confidence", "")
+        if confidence:
+            print(f"  confidence: {confidence}")
+    except Exception:
+        if reasoning:
+            print(f"  reasoning: {reasoning[:280]}")
+    try:
+        executed = _json.loads(actions_e or "[]")
+        proposed = _json.loads(actions_p or "[]")
+        if executed:
+            names = [a.get("action") or a.get("step") for a in executed if isinstance(a, dict)]
+            print(f"  executed: {names}")
+        unexec = [a for a in proposed if isinstance(a, dict) and (
+            a.get("safety") == "HUMAN-APPROVE" or
+            a.get("action") not in [e.get("action") for e in executed if isinstance(e, dict)]
+        )]
+        if unexec:
+            print("  ⚡ AEGIS RECOMMENDATIONS (needs your approval):")
+            for a in unexec[:3]:
+                desc = a.get("expected_value") or a.get("details") or a.get("expected_impact") or ""
+                act = a.get("action", "?")
+                print(f"    - {act}: {str(desc)[:160]}")
+    except Exception:
+        pass
 
 
 def main() -> int:

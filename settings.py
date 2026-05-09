@@ -50,15 +50,8 @@ BANKROLL_USD = float(os.getenv("LIP_BANKROLL", "80"))
 RAMP_PHASE = int(os.getenv("LIP_RAMP_PHASE", "4"))  # paper=full
 _ramp_fraction = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40}[max(1, min(4, RAMP_PHASE))]
 
-# 2026-05-02 PREDATOR: split per-market cap from total-budget multiplier.
-# Was: same _ramp_fraction served BOTH the per-market gate AND the total
-# gross multiplier. At PHASE 4 (40%) per-market = $682 cap on $1.7k cash,
-# meaning 8 markets need $5.5k = impossible with our bankroll. Result:
-# top-N rank picks like KXF1DELAY ($500/d pool) got blocked by per-market
-# cap and we missed them. New: per-market cap = 12% (≈$200 of $1.7k cash,
-# fits 8-10 markets), total budget multiplier stays at ramp_fraction.
-MAX_BANKROLL_SHARE_PCT = 0.50  # 2026-05-03 funnel-driven fix: code applies this as TOTAL (not per-market as comment claimed). Was 18% binding at $298 = blocked all but 3 markets. MAX_TOTAL_GROSS_USD is the real total cap; this ceiling now backstops it (50% × bankroll > total gross budget).
-_total_gross_budget = BANKROLL_USD * _ramp_fraction
+MAX_BANKROLL_SHARE_PCT = _ramp_fraction
+_total_gross_budget = BANKROLL_USD * MAX_BANKROLL_SHARE_PCT
 
 # Paper mode overrides stay generous to exercise all markets.
 # Live mode: derived from bankroll + ramp.
@@ -70,12 +63,12 @@ if PAPER_MODE:
     MAX_TOTAL_NET_USD         = 500.0
 else:
     # Per-market: 5% of the total gross budget (spread across ~20 focused markets)
-    MAX_GROSS_PER_MARKET_USD  = max(50.0, _total_gross_budget * 0.20)  # 2026-04-30: 5%→20%
+    MAX_GROSS_PER_MARKET_USD  = max(50.0, _total_gross_budget * 0.20)  # 2026-04-30: 5%→20% — concentrate to win share. Was 21 markets x $7 = invisible.
     # 2026-04-22 (Skeptic audit): Per-series cap caps single-underlying flash
     # crash damage. Brent moves through 5+ strikes simultaneously — without
     # this cap, we could hit MAX_GROSS_PER_MARKET × 5+ on one event. 30% of
     # total budget = max 4-6 markets full-size on one underlying.
-    MAX_GROSS_PER_SERIES_USD  = max(400.0, _total_gross_budget * 0.50)  # 2026-05-03 funnel-driven: was $160 binding on KXBTCMINMON/XRPMAXMON ($178 > cap). Strikes need ~$210 to qualify; new cap allows 2 strikes per series.
+    MAX_GROSS_PER_SERIES_USD  = max(60.0, _total_gross_budget * 0.20)  # 2026-04-29 #123: 30%→20% per concentration audit
     MAX_NET_INVENTORY_USD     = MAX_GROSS_PER_MARKET_USD * 0.5
     MAX_TOTAL_GROSS_USD       = _total_gross_budget
     MAX_TOTAL_NET_USD         = _total_gross_budget * 0.25
@@ -89,14 +82,17 @@ MAX_SESSION_LOSS_USD      = BANKROLL_USD * 0.10  # 10% of bankroll total
 MAX_SINGLE_LOSS_USD       = BANKROLL_USD * 0.02  # 2% of bankroll per trade
 
 # Minimum quote size per side (below this, LIP likely won't qualify us).
-MIN_QUOTE_SIZE_CONTRACTS  = 25  # 2026-04-30 concentration: was 10, bumped for bigger share
+MIN_QUOTE_SIZE_CONTRACTS  = 25
 
 # === Sprint 4 #1 — Kelly fractional sizing ===
+# Quarter-Kelly multiplier on _optimal_size based on edge proxy.
+# Edge proxy = priority × series_calibration² × setup_mult (KNN score).
+# High edge → press 1.5x. Low edge → shrink to 0.5x. Blind probes always 0.5x.
 KELLY_SIZING_ENABLED = True
-KELLY_FRACTION = 0.25
+KELLY_FRACTION = 0.25  # 0.25 = quarter-Kelly. Conservative at $1k.
 KELLY_MIN_MULT = 0.5
 KELLY_MAX_MULT = 1.5
-KELLY_TARGET_HEADROOM = 1.5
+KELLY_TARGET_HEADROOM = 1.5  # never size beyond 1.5× LIP target_size  # 2026-04-30 concentration: was 10, bumped for bigger share
 # Target size per side (tuned per market; this is the default).
 DEFAULT_QUOTE_SIZE_CONTRACTS = 75  # 2026-04-30 concentration: was 25, 3x bigger to materially move share
 
@@ -152,7 +148,7 @@ STALE_DATA_PULL_SECONDS   = 10
 # Ignore markets where TimePeriodReward is too small to bother with.
 # Tuned from initial discovery (1,077 programs): $10/day is the natural
 # breakpoint — below that, WS/compute overhead isn't worth it.
-MIN_REWARD_PER_DAY_USD    = 5.0  # 2026-05-03 ceiling-break: capital_allocator picks by yield-per-$, not raw pool — small pools with low comp still rank well. Lowering 15→5 unlocks ~600 more candidates the allocator can choose from. Total throughput ceiling lifts from $3.3k to ~$6-8k/mo.
+MIN_REWARD_PER_DAY_USD    = 15.0  # 2026-04-30: REVERTED 3→15 — over-diversification crushed our share-per-market. Concentration wins (Apr 22-26 = +/payout @ 10 markets vs Apr 29 = /payout @ 115 markets).
 # Ignore markets with TargetSize we can't reasonably meet (we're small).
 # 2026-04-22: raised 10000→19999 per Kalshi LIP spec ("Target Size will be
 # greater than 100 contracts and less than 20,000 contracts"). Markets in
@@ -163,22 +159,13 @@ MAX_TARGET_SIZE_CONTRACTS = 19999
 # forces us to quote at best-bid to score — which matches our strategy.
 # Below 0.50 means the market is asking for depth-layering which we can't
 # provide at our capital.
-MIN_DISCOUNT_FACTOR       = 0.20  # 2026-05-06: 0.50→0.20 unlocks KXMIDTERMMOV ($52k/d pool, 2082 markets) + KXMAKARY + KXLAMAYOR. Bleed monitor + capital allocator still gate per-market.
+MIN_DISCOUNT_FACTOR       = 0.50
 
 # ── Blocklist — markets where SIG/designated MMs dominate ────────────────
 # Revisit after paper week; start with NFL/NBA/election flagships excluded.
 SERIES_BLOCKLIST = {
     # Sports flagships (SIG has dedicated desk)
-    # 2026-05-05 SURGICAL: family bans replaced with specific SIG-dominated subseries.
-    # Removed KXNFL/KXNBA/KXCFB/KXMLB/KXUFC family bans — they excluded $5-7k/day
-    # in legitimate low-comp prop pools (KXNBAMENTION, KXNBACOACH, KXMLBMANAGEROUT,
-    # Anthony Edwards, Aaron Boone, IPL, EPL, etc.). Auto-prune still active as
-    # safety net (-$5 over 3 settles) — anything that bleeds gets caught fast.
-    "KXNBAMVP", "KXNBAFINALS", "KXNBACHAMP", "KXNBAROY", "KXNBASIXTHMAN",
-    "KXMLBWS", "KXMLBMVP", "KXMLBCYY",
-    "KXNFLSB", "KXNFLMVP", "KXNFLCONFCHAMP",
-    "KXCFBNATL", "KXCFBHEISMAN",
-    "KXUFCCHAMP",
+    "KXNFL", "KXNBA", "KXCFB", "KXMLB", "KXUFC",
     # Presidential/major political flagships
     "KXPRES", "KXPREZ", "KXELEC",
     # Fed rate decision flagships ($120M+ contracts, prop-desk dominated)
@@ -199,18 +186,6 @@ SERIES_BLOCKLIST = {
     # 2026-05-01 BANS (24h audit, govt-bill binaries with $0 rebate capture):
     "KXDHSFUND",      # net -$12.15 in single day, $0 rebate, directional bleed
     "KXDHSCOMPONENT", # net -$10.44, TSA/agency confirmation binaries
-    # 2026-05-02 BANS (per-series auto-prune scan, 7d net < -$5):
-    "KXWH",           # net -$17.40 over 8 settlements (whale-watch binary)
-    "KXNICKELMON",    # net -$8.68 over 40 settlements (nickel monthly strikes — high-freq small bleed)
-    "KXAAAGAS",       # net -$98 in single day 2026-05-04, biggest weekly loser (unreliable AAA gas feed)
-    "KXHIGHLAX",      # net -$90 in 7d (LA HIGH temp — NWS-anchored adverse selection)
-    "KXLOWTLAX",      # net -$45 in 7d (LA LOW temp — same NWS bleed)
-    "KXHIGHLA",       # no-T variant (same family)
-    "KXLOWLA",        # no-T variant
-    "KXLOWTMIA",      # net -$18 in 12h post-LAX-block (Miami LOW temp — same NWS adverse-selection family)
-    "KXLOWMIA",       # no-T variant
-    "KXMETGALA",      # net -$65 in 6h 2026-05-05 (Met Gala — entertainment prop, sharp insider edge)
-    "KXEOWEEK",       # net -$48 in 6h 2026-05-05 (executive orders weekly — political insider edge)
 }
 
 # ── Quote pricing ─────────────────────────────────────────────────────────
@@ -292,24 +267,6 @@ SIZE_MULTIPLIER_BY_SERIES = {
     "KXTRUMPACT":   1.5,   # +$5.59 NET 7d
     "KXKIMMELAPOLOGY": 1.3,
     "KXBILLSCOUNT": 1.3,
-    # ── 2026-05-02 GAP FIX: crypto MAX/MIN monthly + rain monthly ──
-    # Audit found 17 enrolled $400/d-pool series with ZERO snapshots.
-    # Root cause: MarketYield.time_factor penalty (0.73 for 28-day) +
-    # top_book_estimate=target*0.5=150 (real comp ~69) ranked them below
-    # top-20 cutoff in production. Boost series_priority to clear the
-    # gate. KXXRPMAXMON is the proven low-comp template (snaps confirmed).
-    "KXBTCMAXMON":  2.5, "KXBTCMINMON":  2.5,
-    "KXETHMAXMON":  2.5, "KXETHMINMON":  2.5,
-    "KXSOLMAXMON":  2.5, "KXSOLMINMON":  2.5,
-    "KXXRPMAXMON":  2.5, "KXXRPMINMON":  2.5,
-    "KXBNBMAXMON":  2.5, "KXBNBMINMON":  2.5,
-    "KXDOGEMAXMON": 2.5, "KXDOGEMINMON": 2.5,
-    "KXHYPEMAXMON": 2.5, "KXHYPEMINMON": 2.5,
-    "KXZECMAXMON":  2.5, "KXZECMINMON":  2.5,
-    # Rain monthly cities — same low-comp greenfield pattern
-    "KXRAINAUSM":   2.0, "KXRAINCHIM":   2.0, "KXRAINDALM":   2.0,
-    "KXRAINDENM":   2.0, "KXRAINHOUM":   2.0, "KXRAINLAXM":   2.0,
-    "KXRAINMIAM":   2.0, "KXRAINSEAM":   2.0, "KXRAINSFOM":   2.0,
 }
 DEFAULT_SIZE_MULTIPLIER = 1.0
 
@@ -324,24 +281,23 @@ DEFAULT_SIZE_MULTIPLIER = 1.0
 # for that series in _passes_safety. Series not in map use the default.
 # Series-level total cap (MAX_GROSS_PER_SERIES_USD) still applies.
 MAX_GROSS_PER_MARKET_BY_SERIES = {
-    "KXCORNW":     90.0,
-    "KXSOYBEANW":  90.0,
-    "KXWHEATW":    90.0,
-    "KXCOCOAW":    90.0,
-    "KXBRENTD":    90.0,   # daily Brent — also winner ($34 net Apr 21-26)
-    "KXCOPPERD":   75.0,   # smaller average market, modest bump
-    "KXGOLDD":     75.0,
-    "KXGOLDW":     90.0,
-    # ── 2026-05-02 GAP FIX: crypto MAX/MIN monthly per-market caps ──
-    # Need ~150 contracts/side @ $0.50 = $75/market to materially shift
-    # share when actual comp is 69 (XRP). Cap $90 fits 5 markets within
-    # MAX_GROSS_PER_SERIES_USD budget, leaves room for layering.
-    "KXBTCMAXMON":  90.0, "KXBTCMINMON":  90.0,
-    "KXETHMAXMON":  90.0, "KXETHMINMON":  90.0,
-    "KXSOLMAXMON":  90.0, "KXSOLMINMON":  90.0,
-    "KXXRPMAXMON":  90.0, "KXXRPMINMON":  90.0,
-    "KXBNBMAXMON":  90.0, "KXBNBMINMON":  90.0,
-    "KXDOGEMAXMON": 90.0, "KXDOGEMINMON": 90.0,
-    "KXHYPEMAXMON": 90.0, "KXHYPEMINMON": 90.0,
-    "KXZECMAXMON":  90.0, "KXZECMINMON":  90.0,
+    # 2026-05-09 TIER1I — Sonnet sized for share. $60-80/side targets ~15-30%% pool share
+    # at thin weather/macro books vs ~3%% at $10/side. Bigger size = nonlinear rebate gain.
+    # Tier 1: WEATHER DAILIES (settle daily, capital recycles fast)
+    "KXHIGHTNY":   80.0, "KXHIGHTPHX":  80.0, "KXHIGHTCHI":  80.0, "KXHIGHTLA":   80.0,
+    "KXHIGHTLAX":  80.0, "KXHIGHTMIA":  80.0, "KXHIGHTAUS":  80.0, "KXHIGHTSEA":  80.0,
+    "KXHIGHTSFO":  80.0, "KXHIGHTOKC":  80.0, "KXHIGHTPHIL": 80.0, "KXHIGHTBOS":  80.0,
+    "KXHIGHTHOU":  80.0, "KXHIGHTMIN":  80.0, "KXHIGHTDEN":  80.0, "KXHIGHTSATX": 80.0,
+    "KXLOWTNY":    80.0, "KXLOWTPHX":   80.0, "KXLOWTLAX":   80.0, "KXLOWTMIA":   80.0,
+    "KXLOWTAUS":   80.0, "KXLOWTNYC":   80.0, "KXLOWTPHIL":  80.0, "KXLOWTDEN":   80.0,
+    "KXRAIN":      80.0, "KXRAINHOUM":  80.0, "KXRAINLAXM":  80.0, "KXRAINDALM":  80.0,
+    # Tier 2: MACRO RELEASES (quote aggressively pre-settle)
+    "KXCPI":       100.0, "KXNFP":       100.0, "KXGDP":       100.0,
+    "KXUSPPI":     100.0, "KXUNEMPLOY":  100.0, "KXPPI":       100.0,
+    # Tier 2b: COMMODITIES weeklies (proven winners)
+    "KXCORNW":     90.0, "KXSOYBEANW":  90.0, "KXWHEATW":    90.0, "KXCOCOAW":    90.0,
+    "KXBRENTD":    90.0, "KXBRENTW":    90.0, "KXCOPPERD":   75.0, "KXGOLDD":     75.0,
+    "KXGOLDW":     90.0, "KXHOILW":     80.0, "KXNATGASW":   80.0,
+    # Tier 2c: GEOPOLITICAL recurring (rules-based settle)
+    "KXHORMUZWEEKLY": 80.0, "KXMAMDANIEO": 80.0,
 }

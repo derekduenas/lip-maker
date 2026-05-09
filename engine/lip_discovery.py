@@ -153,6 +153,41 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
     return programs
 
 
+def _build_series_capture_ratios(db_path: str) -> dict:
+    """TIER 2A: per-series (capture_pct, fill_rate) from historical data."""
+    import sqlite3 as _sq
+    out = {}
+    try:
+        conn = _sq.connect(db_path, timeout=5.0)
+        rb = conn.execute("""
+            SELECT series_prefix, COUNT(*) AS n,
+                   ROUND(AVG(rebate_earned_usd), 4) AS avg_r
+            FROM settlement_log
+            WHERE datetime(close_time) > datetime('now','-14 days')
+            GROUP BY series_prefix
+        """).fetchall()
+        fr = conn.execute("""
+            SELECT substr(market_ticker,1,instr(market_ticker||'-','-')-1) AS s,
+                   COUNT(*) AS placed,
+                   SUM(CASE WHEN status='filled' THEN 1 ELSE 0 END) AS filled
+            FROM quotes
+            WHERE paper=0 AND placed_at > datetime('now','-14 days')
+            GROUP BY s HAVING placed > 0
+        """).fetchall()
+        fmap = {r[0]: (r[2] / r[1] if r[1] > 0 else 0) for r in fr}
+        for sp, n, avg_r in rb:
+            out[sp] = {
+                "capture": min(1.0, (avg_r or 0) / 6.0),
+                "fill_rate": fmap.get(sp, 0),
+                "avg_rebate": avg_r or 0,
+                "n": n,
+            }
+        conn.close()
+    except Exception:
+        pass
+    return out
+
+
 def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                    db_path: str = settings.DB_PATH,
                    exclude_tickers: set[str] | None = None) -> list[dict]:
@@ -187,6 +222,117 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
       3. NOT in active market_blacklist
       4. end_date > today (don't quote settled markets)
     """
+
+    # 2026-05-08 TIER1E: ATTACK_TARGETS as primary source. Uses live Kalshi
+    # /incentive_programs API + competitor_density + auto-prune blacklist.
+    # This is THE source-of-truth — no more algorithmic ranker drift.
+    # Falls back to legacy SQL path if attack_targets fails.
+    try:
+        from tools.attack_targets import compute_attack_targets
+        targets = compute_attack_targets(top_n=n * 5, db_path=db_path,
+                                         max_target_size=max_target_size)
+        if targets:
+            ex = exclude_tickers or set()
+            tconn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                out_rows = []
+                for t in targets:
+                    tk = t.get("market_ticker") or ""
+                    if not tk or tk in ex:
+                        continue
+                    row = tconn.execute(
+                        "SELECT market_ticker, series_ticker, reward_per_day_usd, "
+                        "target_size, discount_factor, start_date, end_date "
+                        "FROM lip_programs WHERE market_ticker = ? AND enrolled = 1 "
+                        "AND paid_out = 0 AND datetime(end_date) > datetime('now') "
+                        "AND target_size <= ?",
+                        (tk, max_target_size),
+                    ).fetchone()
+                    if not row:
+                        continue
+                    out_rows.append({
+                        "market_ticker":         row[0],
+                        "series_ticker":         row[1],
+                        "reward_per_day_usd":    row[2],
+                        "target_size":           row[3],
+                        "discount_factor":       row[4],
+                        "start_date":            row[5],
+                        "end_date":              row[6],
+                        "series_priority":       1.0,
+                        "competition_mult":      1.0,
+                        "observed_share":        t.get("observed_share"),
+                        "realized_mult":         1.0,
+                        "unified_rebate":        round(t.get("expected_net_per_day", 0), 4),
+                        "series_realized_net_14d": 0.0,
+                        "series_settlements_14d": 0,
+                        "priority_weighted_reward": round(t.get("attack_score", 0), 4),
+                        "attack_priority":       t.get("attack_priority", "?"),
+                        "expected_net_per_day":  round(t.get("expected_net_per_day", 0), 4),
+                    })
+                    # don't break early — let TIER1F prune from full set
+                    if len(out_rows) >= n * 4:  # cap at 4n for memory
+                        break
+                if out_rows:
+                    # 2026-05-09 TIER 2A: tag each market with capture_score
+                    capture_map = _build_series_capture_ratios(db_path)
+                    for m in out_rows:
+                        s = m.get("series_ticker", "")
+                        info = capture_map.get(s, {})
+                        cap = info.get("capture", 0.10)  # default 10% for unproven
+                        fr = info.get("fill_rate", 0.10)
+                        m["_capture_score"] = (m.get("reward_per_day_usd", 0) or 0) * \
+                                              max(0.05, cap) * max(0.10, fr)
+                        m["_capture_pct"] = cap
+                        m["_fill_rate"] = fr
+                    # 2026-05-08 TIER1G SNIPER MODE
+                    # 1. Drop low-reward variants within each series (top-K + 60% threshold)
+                    # 2. Apply $25/d reward floor
+                    # 3. Re-rank by capture_score (TIER 2A) — proven > theoretical
+                    PER_SERIES_TOP_K = 3
+                    REWARD_DOMINANCE_THRESHOLD = 0.60
+                    MIN_REWARD_PER_DAY = 25.0
+                    from collections import defaultdict as _dd
+                    by_series = _dd(list)
+                    for m in out_rows:
+                        by_series[m.get("series_ticker", "")].append(m)
+                    pruned = []
+                    dropped_var = 0
+                    dropped_floor = 0
+                    for series, mkts in by_series.items():
+                        if len(mkts) > 1:
+                            max_r = max((m["reward_per_day_usd"] or 0) for m in mkts)
+                            if max_r > 0:
+                                sb = sorted(mkts, key=lambda m: -(m["reward_per_day_usd"] or 0))
+                                kept = []
+                                for i, m in enumerate(sb):
+                                    r = m["reward_per_day_usd"] or 0
+                                    if i < PER_SERIES_TOP_K or r >= max_r * REWARD_DOMINANCE_THRESHOLD:
+                                        kept.append(m)
+                                    else:
+                                        dropped_var += 1
+                                mkts = kept
+                        for m in mkts:
+                            if (m.get("reward_per_day_usd") or 0) < MIN_REWARD_PER_DAY:
+                                dropped_floor += 1
+                            else:
+                                pruned.append(m)
+                    pruned.sort(key=lambda m: -(m.get("_capture_score", 0) or 0))
+                    out_rows = pruned[:n]
+                    top_rwd = (out_rows[0].get("reward_per_day_usd", 0) if out_rows else 0)
+                    top_cap = (out_rows[0].get("_capture_score", 0) if out_rows else 0)
+                    top_series = (out_rows[0].get("series_ticker", "?") if out_rows else "?")
+                    _log.info(
+                        f"TIER 2A CAPTURE: {len(out_rows)} mkts "
+                        f"(low_var={dropped_var}, below_floor={dropped_floor}); "
+                        f"top={top_series} reward=${top_rwd:.2f}/d capture=${top_cap:.2f}"
+                    )
+                    return out_rows
+            finally:
+                tconn.close()
+    except Exception as _e:
+        _log.warning(f"attack_targets path failed, falling back to legacy: {_e}")
+
+
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
         try:
@@ -199,7 +345,7 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                      AND datetime(b.expires_at) > datetime('now')
                    WHERE p.enrolled = 1 AND p.paid_out = 0
                      AND p.target_size <= ?
-                     AND date(p.end_date) > date('now')
+                     AND datetime(p.end_date) > datetime('now')
                      AND b.ticker IS NULL
                    ORDER BY p.reward_per_day_usd DESC
                    LIMIT ?""",
@@ -289,12 +435,28 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
         rs = realized_series.get(series, {})
         n_settled = rs.get("n", 0)
         series_net = rs.get("net", 0.0)
+        # 2026-05-08 TIER1D: ATTACK MODE — only EXCLUDE proven LOSERS;
+        # unproven HIGH-REWARD markets are the actual money makers
+        # (KXMAKARYOUT $50/d, KXUSPPI $30/d, KXMEDIARELEASEICEMAN — all
+        # unproven but low-comp + high-pool = our share is huge).
+        # Auto-prune cron handles known losers (already in market_blacklist).
         if n_settled >= 3:
             net_per_settle = series_net / n_settled
-            realized_mult = max(0.3, min(2.0, 1.0 + net_per_settle / 4.0))
+            # Proven LOSER (n>=3 + negative net): EXCLUDE.
+            # Whitelist override: commodities allowed even if -ve (physics edge).
+            if series_net < 0 and series not in multipliers:
+                continue
+            realized_mult = max(0.5, min(2.0, 1.0 + net_per_settle / 4.0))
         else:
-            realized_mult = 1.0
-        # Legacy weighted (existing behavior, used for sort)
+            # Unproven: take it but at 0.7x penalty so proven winners win ties.
+            realized_mult = 0.7
+        # 2026-05-08 TIER1C-FIX: REMOVED time-weight (was dividing by
+        # days_to_settle, which kicked out the actual rebate machine —
+        # commodity weeklies + episodic events that settle in 5-7d but
+        # pay big on settle day). Empirical evidence (Apr 24 = $207 rebates
+        # from commodity weeklies, May 5 = $48 from Met Gala) showed
+        # weekly settles ARE the income, not intraday churn.
+        # Keep proven gate, drop time-weight.
         weighted = (r[2] or 0.0) * priority * comp_mult * realized_mult
 
         # NEW: parallel Unified Yield Equation projection (audit/visibility)
@@ -353,9 +515,48 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
     # Fall back to legacy weighted when unified_rebate is 0 (e.g. data missing).
     # Unified equation factors in time_decay + adverse_cost + qualify_prob —
     # same math as PM. Side-by-side A/B for next 7d, then drop legacy.
+    # 2026-05-08 TIER1F: Per-contract reward dominance within series.
+    # Iceman insight: a series can have 4-10x reward variance per contract
+    # (HANTACOUNTRY GER/UK/USA $90/d vs CAN/CHI/IND/JAP $20/d). The
+    # comp_mult was DOWN-weighting high-reward thin-liquidity contracts
+    # (the OPPOSITE of what we want). Fix: drop low-reward variants
+    # within each series, keep only top-K by raw reward_per_day_usd.
+    PER_SERIES_TOP_K = 3
+    REWARD_DOMINANCE_THRESHOLD = 0.60  # keep contracts with reward >= 60% of series max
+    from collections import defaultdict
+    by_series = defaultdict(list)
+    for m in enriched:
+        by_series[m.get("series_ticker", "")].append(m)
+    pruned = []
+    dropped_low_variants = 0
+    for series, mkts in by_series.items():
+        if len(mkts) <= 1:
+            pruned.extend(mkts)
+            continue
+        max_reward = max(m["reward_per_day_usd"] or 0 for m in mkts)
+        if max_reward <= 0:
+            pruned.extend(mkts)
+            continue
+        # Keep TOP-K AND any contract with reward >= threshold of series max
+        sorted_by_reward = sorted(mkts, key=lambda m: -(m["reward_per_day_usd"] or 0))
+        kept = []
+        for i, m in enumerate(sorted_by_reward):
+            r = m["reward_per_day_usd"] or 0
+            if i < PER_SERIES_TOP_K or r >= max_reward * REWARD_DOMINANCE_THRESHOLD:
+                kept.append(m)
+            else:
+                dropped_low_variants += 1
+        pruned.extend(kept)
+    if dropped_low_variants > 0:
+        _log.info(f"TIER1F: dropped {dropped_low_variants} low-reward variants within series "
+                  f"(kept top-{PER_SERIES_TOP_K} or >={int(REWARD_DOMINANCE_THRESHOLD*100)}% of series max)")
+    enriched = pruned
+
     def _rank_key(d):
         u = d.get("unified_rebate", 0) or 0
-        return -(u if u > 0 else d.get("priority_weighted_reward", 0) / 100)
+        # 2026-05-08 TIER1F: Within same composite score, prefer higher raw reward.
+        return (-(u if u > 0 else d.get("priority_weighted_reward", 0) / 100),
+                -(d.get("reward_per_day_usd", 0) or 0))
     enriched.sort(key=_rank_key)
     # 2026-05-01 PREDATOR: filter saturated markets BEFORE truncating to n.
     # Logs what was filtered so we can verify the gate is doing right work.
