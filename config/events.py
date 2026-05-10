@@ -110,13 +110,37 @@ UPCOMING_EVENTS = [
         "scan_at": "2026-05-06T10:00:00",
     },
     # --- May/June earnings ---
+    # 2026-05-10: HIMS earnings 24h out — markets verified live on Kalshi
+    # (KXEARNINGSMENTIONHIMS-26MAY11-* in active status). Speaker key "hims"
+    # has zero corpus → thin-corpus gate should REJECT all HIMS edges.
+    {
+        "event_type": "hims_earnings",
+        "event_date": "2026-05-11",
+        "speaker": "hims",
+        "kalshi_category": "mentions",
+        "terms": None,
+        "scan_at": "2026-05-11T10:00:00",
+    },
+    # 2026-05-10: NVDA date corrected from 5/28 → 5/21 per user spec
+    # (Sovereign #5 task). Speaker "huang" corpus n=8 ✓.
     {
         "event_type": "nvda_earnings",
-        "event_date": "2026-05-28",
+        "event_date": "2026-05-21",
         "speaker": "huang",
         "kalshi_category": "mentions",
         "terms": None,
-        "scan_at": "2026-05-27T10:00:00",
+        "scan_at": "2026-05-20T10:00:00",
+    },
+    # 2026-05-10: WMT added per user spec (Sovereign #5 task).
+    # Speaker "mcmillon" corpus n=8 ✓. Kalshi /events shows
+    # KXEARNINGSMENTIONWMT-26JUN30 (markets initialize closer to call).
+    {
+        "event_type": "wmt_earnings",
+        "event_date": "2026-05-21",
+        "speaker": "mcmillon",
+        "kalshi_category": "mentions",
+        "terms": None,
+        "scan_at": "2026-05-20T10:00:00",
     },
     {
         "event_type": "fomc_presser",
