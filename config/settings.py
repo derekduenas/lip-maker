@@ -245,6 +245,19 @@ MIN_MARKET_VOLUME_24H = 100
 # dominating (and hurting our normalized score via self-dilution).
 QUOTE_SIZE_AS_FRACTION_OF_TARGET = 0.20
 
+# 2026-05-10 Phase 4: Pre-deploy depth probe gate. When True, top_n_to_quote
+# probes each candidate's bid book via /markets/{ticker}/orderbook and
+# rejects markets where rank_percentile > 0.50 on BOTH yes+no sides.
+#
+# DEFAULT FALSE: smoke test 2026-05-10 on 5 top earners (KXTRUMPPHOTO,
+# KXMAMDANIEO, KXCHAICUTS, KXCANHOUSTART, KXCANUSTRIPS) showed percentiles
+# 237%–2486% — Kalshi orderbooks carry far more total depth than LIP
+# target_size (300), so spec thresholds (0.30/0.50) would reject 100% of
+# top-earning markets and stop the live engine. Threshold model needs
+# recalibration vs real book distribution before this gate is safe to enable.
+# Function code is shipped + tested; flip to True after calibration.
+DEPTH_PROBE_ENABLED = False
+
 # ── 2026-04-27 PER-SERIES SIZE MULTIPLIERS (audit-driven) ────────────────
 # Concentrate cap on proven winners. Net PnL Apr 21-26 audit:
 #   KXBRENTD: +$39.72  KXCORNW: +$37.30  KXCOPPERD: +$25.28

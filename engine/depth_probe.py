@@ -63,6 +63,83 @@ def probe(client, ticker: str) -> dict:
                 "yes_price": 0, "yes_size": 0, "no_price": 0, "no_size": 0}
 
 
+def get_book_rank(client, market_ticker: str, our_price_cents: int,
+                  our_size: int, target_size: int | None = None,
+                  side: str = "yes") -> dict:
+    """Pre-deploy queue-rank check for a LIP candidate market.
+
+    Fetches /markets/{ticker}/orderbook, sums contracts ahead of us at the
+    relevant price level (BID semantics: ahead = price >= our_price_cents),
+    and returns rank info + verdict.
+
+    Pass our_price_cents <= 0 to mean "join current best bid" (the function
+    infers our_price from book top-of-book). Useful in pre-deploy gating
+    when actual quote price not yet decided.
+
+    Verdict thresholds (rank_percentile = contracts_ahead / target_size):
+        <= 0.30  → "deploy"   (top third)
+        <= 0.50  → "marginal" (allow but flagged)
+        >  0.50  → "reject"   (deep queue, rebate share too small)
+
+    On API error: verdict="unknown", FAIL-OPEN — caller decides.
+    """
+    out = {
+        "ticker":                  market_ticker,
+        "our_price":               our_price_cents,
+        "our_size":                our_size,
+        "side":                    side,
+        "contracts_ahead":         0,
+        "our_projected_rank_low":  0,
+        "our_projected_rank_high": 0,
+        "target_size":             target_size or 0,
+        "rank_percentile":         0.0,
+        "verdict":                 "unknown",
+    }
+    try:
+        raw = client.get(f"/markets/{market_ticker}/orderbook")
+        ob  = raw.get("orderbook_fp") or raw.get("orderbook") or {}
+        book = ob.get(f"{side}_dollars") or ob.get(side) or []
+        norm: list[tuple[int, int]] = []
+        for e in book:
+            try:
+                p = int(round(float(e[0]) * 100))
+                s = int(float(e[1]))
+                norm.append((p, s))
+            except (ValueError, TypeError, IndexError):
+                continue
+
+        if not norm:
+            # Empty book → we'd be alone at top
+            out["contracts_ahead"] = 0
+            out["our_price"]       = our_price_cents if our_price_cents > 0 else 1
+        else:
+            best_bid        = max(p for p, _ in norm)
+            effective_price = our_price_cents if our_price_cents > 0 else best_bid
+            out["our_price"]       = effective_price
+            out["contracts_ahead"] = sum(s for p, s in norm if p >= effective_price)
+
+        out["our_projected_rank_low"]  = out["contracts_ahead"] + 1
+        out["our_projected_rank_high"] = out["contracts_ahead"] + our_size
+
+        ts = target_size or 0
+        if ts > 0:
+            pct = out["contracts_ahead"] / ts
+            out["rank_percentile"] = round(pct, 4)
+            if pct <= 0.30:
+                out["verdict"] = "deploy"
+            elif pct <= 0.50:
+                out["verdict"] = "marginal"
+            else:
+                out["verdict"] = "reject"
+        else:
+            # No target_size → can't normalize. Conservative deploy if empty.
+            out["verdict"] = "deploy" if out["contracts_ahead"] == 0 else "unknown"
+    except Exception as e:
+        _log.warning(f"get_book_rank({market_ticker}) error: {e}")
+        out["verdict"] = "unknown"
+    return out
+
+
 def filter_by_depth(
     candidates: list[dict],
     client,
