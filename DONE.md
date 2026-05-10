@@ -1,5 +1,26 @@
 # DONE.md — Completed Tasks Log
 
+## 2026-05-10 — NVDA earnings is 5/20 not 5/21
+
+Verified via NVIDIA IR + multiple sources:
+- NVDA Q1 FY2027 — Wed **2026-05-20**, 2pm PT call (5pm ET / 21:00 UTC)
+- WMT FY2027 Q1 — Thu **2026-05-21**, 7am CT release (13:00 UTC)
+
+Earlier 5/21 entry for NVDA was an operator estimate. WMT call follows
+~16 hours later on 5/21 morning. T-24h prep alerts now fire correctly:
+5/19 21:00 UTC for NVDA, 5/20 13:00 UTC for WMT. Had we kept 5/21 for
+NVDA we'd have missed the prep window entirely.
+
+Schema added: `call_time` field (UTC ISO timestamp) on event entries.
+Existing fields (`event_date`, `scan_at`) unchanged and still authoritative
+for scheduler logic; `call_time` is documentation + future-proof for
+time-of-day-aware downstream tools.
+
+Order in events list (chronological, scheduler --check confirmed):
+- hims_earnings  2026-05-11  scan_at 5/11 10:00 UTC
+- nvda_earnings  2026-05-20  call 21:00 UTC  scan_at 5/19 21:00 UTC
+- wmt_earnings   2026-05-21  call 13:00 UTC  scan_at 5/20 13:00 UTC
+
 ## SESSION 1 COMPLETE — 2026-04-15
 
 ### TASK 1.1 — Project Scaffold

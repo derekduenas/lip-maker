@@ -121,26 +121,31 @@ UPCOMING_EVENTS = [
         "terms": None,
         "scan_at": "2026-05-11T10:00:00",
     },
-    # 2026-05-10: NVDA date corrected from 5/28 → 5/21 per user spec
-    # (Sovereign #5 task). Speaker "huang" corpus n=8 ✓.
+    # 2026-05-10 (corrected): NVDA Q1 FY2027 — Wed May 20, 2026, 2pm PT call
+    # = 5pm ET = 21:00 UTC. Verified via NVIDIA IR + multiple sources.
+    # (Earlier 5/21 was operator estimate; real call is 5/20.)
+    # Speaker "huang" corpus n=8 ✓.
     {
         "event_type": "nvda_earnings",
-        "event_date": "2026-05-21",
+        "event_date": "2026-05-20",
+        "call_time":  "2026-05-20T21:00:00",
         "speaker": "huang",
         "kalshi_category": "mentions",
         "terms": None,
-        "scan_at": "2026-05-20T10:00:00",
+        "scan_at": "2026-05-19T21:00:00",
     },
-    # 2026-05-10: WMT added per user spec (Sovereign #5 task).
-    # Speaker "mcmillon" corpus n=8 ✓. Kalshi /events shows
-    # KXEARNINGSMENTIONWMT-26JUN30 (markets initialize closer to call).
+    # 2026-05-10: WMT FY2027 Q1 — Thu May 21, 2026, 7am CT release = 13:00 UTC.
+    # Verified via Walmart IR. Speaker "mcmillon" corpus n=8 ✓.
+    # Kalshi /events shows KXEARNINGSMENTIONWMT-26JUN30 cycle (markets
+    # initialize closer to call).
     {
         "event_type": "wmt_earnings",
         "event_date": "2026-05-21",
+        "call_time":  "2026-05-21T13:00:00",
         "speaker": "mcmillon",
         "kalshi_category": "mentions",
         "terms": None,
-        "scan_at": "2026-05-20T10:00:00",
+        "scan_at": "2026-05-20T13:00:00",
     },
     {
         "event_type": "fomc_presser",
