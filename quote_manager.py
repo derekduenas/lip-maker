@@ -674,6 +674,23 @@ class QuoteManager:
             else:
                 actions["kept"] += 1
 
+        # 2026-05-10 audit #3: both-sides integrity. If placement intent was
+        # both-sided but we ended up one-sided (one place succeeded, other
+        # failed silently), cancel the orphan to avoid naked exposure.
+        if target.yes_bid_cents is not None and target.no_bid_cents is not None:
+            post = self.resting.get(target.market_ticker, [])
+            n_yes = sum(1 for o in post if o.side == "yes")
+            n_no = sum(1 for o in post if o.side == "no")
+            if (n_yes > 0) != (n_no > 0):  # XOR — exactly one side has orders
+                orphan_side = "yes" if n_yes > 0 else "no"
+                for o in [x for x in post if x.side == orphan_side]:
+                    if self._cancel_order(o):
+                        actions["cancelled"] += 1
+                _log.warning(
+                    f"both-sides integrity: cancelled orphan {orphan_side} on "
+                    f"{target.market_ticker} (intended both-sided)"
+                )
+
         return actions
 
     def cancel_all(self, market_ticker: Optional[str] = None):

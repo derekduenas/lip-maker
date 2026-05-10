@@ -155,26 +155,55 @@ def simulated_period_reward(period_start: str, period_end: str,
 
 def reconcile_period(period_start: str, period_end: str,
                      db_path: str = settings.DB_PATH) -> dict:
-    """Compare simulated vs actual for a completed period."""
+    """Compare simulated vs actual for a completed period.
+
+    LIVE-MODE NETTING (audit fix 2026-05-09):
+      balance_delta = LIP_rebate + trading_PnL + fees + (deposits/withdrawals)
+      We pull rebate + trading_PnL from settlement_log per ticker, then:
+        actual_rebate = SUM(rebate_earned_usd)            ← truth source
+        trading_pnl   = SUM(our_realized_usd)             ← informational
+        drift_usd     = balance_delta - (rebate + pnl)    ← sanity check
+      Ratio = actual_rebate / simulated_rebate (no PnL contamination)
+    """
     sim = simulated_period_reward(period_start, period_end, db_path=db_path)
     bal_before = balance_at(period_start, db_path=db_path)
     bal_after  = balance_at(period_end,   db_path=db_path)
 
-    actual = None
-    if bal_before is not None and bal_after is not None:
-        # Naive: assume balance delta is mostly LIP rebate (paper mode trades
-        # aren't real, so no trading PnL contamination). In LIVE mode we'd
-        # need to net out filled-trade PnL separately.
-        actual = bal_after - bal_before
+    # Pull netting components from settlement_log (per-ticker truth)
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    try:
+        row = conn.execute(
+            """SELECT
+                 COALESCE(SUM(rebate_earned_usd), 0.0) AS rebate,
+                 COALESCE(SUM(our_realized_usd),  0.0) AS trading_pnl,
+                 COUNT(*)                              AS n_settlements
+               FROM settlement_log
+               WHERE close_time >= ? AND close_time < ?""",
+            (period_start, period_end),
+        ).fetchone()
+    finally:
+        conn.close()
+    rebate_from_log, trading_pnl, n_settled = row
+
+    bal_delta = (bal_after - bal_before) if (bal_before is not None
+                                              and bal_after is not None) else None
+    expected_delta = rebate_from_log + trading_pnl
+    drift = (bal_delta - expected_delta) if bal_delta is not None else None
+
+    actual = rebate_from_log  # NOW NETTED — was bal_after - bal_before
 
     result = {
-        "period_start":   period_start,
-        "period_end":     period_end,
-        "simulated_usd":  sim,
-        "actual_usd":     actual,
-        "ratio":          (actual / sim) if (actual and sim and sim > 0) else None,
-        "balance_before": bal_before,
-        "balance_after":  bal_after,
+        "period_start":      period_start,
+        "period_end":        period_end,
+        "simulated_usd":     sim,
+        "actual_usd":        actual,
+        "trading_pnl_usd":   trading_pnl,
+        "balance_delta_usd": bal_delta,
+        "drift_usd":         drift,
+        "n_settlements":     n_settled,
+        "ratio":             (actual / sim) if (actual and sim and sim > 0) else None,
+        "balance_before":    bal_before,
+        "balance_after":     bal_after,
     }
 
     # Persist
