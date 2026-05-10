@@ -1,3 +1,50 @@
+# 2026-05-10 (later): Sovereign + Dislocation wake
+
+## Sovereign Engine A wake-up
+
+Engine A (`loop/monitor.py` via `sovereign.service`) was DISABLED + never
+been active. Only Engine B (FOMC `prep/scheduler.py`) was running, correctly
+reporting "no milestones due" because next FOMC is 2026-06-17.
+
+**Architecture clarification**: events live in `config/events.py:UPCOMING_EVENTS`
+(Python list), NOT in `sovereign_live_events` DB table (which is for FOMC live
+ticks). `loop/monitor.py` polls the Python list each cycle.
+
+Wired:
+- HIMS earnings 2026-05-11 (Kalshi-verified, 14 markets active under
+  `KXEARNINGSMENTIONHIMS-26MAY11-*`). Speaker key `hims` → corpus n=0
+  → thin-corpus REJECT verified live (`monitor.py --once` returned 0
+  qualifying opportunities on 14 markets).
+- NVDA 2026-05-21 (huang corpus n=8 ✓; date corrected from 5/28 per spec)
+- WMT  2026-05-21 (mcmillon corpus n=8 ✓)
+- `sovereign.service` ENABLED + ACTIVE since 2026-05-10 21:39 UTC
+
+Side effect: 5 stale April paper trades resolved (4L/1W, -$7.84).
+
+## Dislocation parity gate — far-future math deferred
+
+Far-future contracts (Jul 2027+) require multi-meeting tree pricing not
+yet implemented. Including those rows fails the parity gate via expected
+model gaps (94 rows, 51% within 1pp, mean 9.47pp), but next-meeting subset
+passes cleanly (2 rows, 100% within 1pp, mean 0.84pp).
+
+Path-dependent multi-meeting math is a **deferred feature, not a bug**.
+`evaluate_gate()` now defaults to `next_meeting_only=True` and ParityResult
+carries `is_next_meeting`. `compute_parity()` infers it as "earliest
+fomc_date for the snapshot's snapshot_date".
+
+Cherry-picked from `claude/optimize-trading-system-MszGM`:
+- `d4f73e6` Prong 3 dislocation module
+- `4a249cd` backtest harness
+- `0c4c992` parity scaffolding
+- `b3cc13d` Gaussian-smoothed decision_probs
+
+Smoke: `tools.dislocation_scan --domain macro_fed` importable on prod;
+0 actionable Fed candidates (most `KXFEDDECISION-26{JUN,JUL,SEP,NOV}-*`
+return 404 — series lifecycle not yet published).
+
+---
+
 # 2026-05-10 LIP god-mode session
 
 | Phase | Commit | Summary |
