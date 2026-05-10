@@ -94,9 +94,51 @@ def term_mentioned(text, term):
     return bool(re.search(pattern, text.lower()))
 
 
-def compute_base_rate_recency_weighted(ticker, term):
-    """v3: each transcript weighted by recency: 0.5^(months_old/6).
-    Recent calls count more. Returns (prob, k_weighted, n_weighted, n_raw, conf)."""
+def count_mentions(text, term):
+    """v3+poisson: count ALL stem-matched occurrences of term in text."""
+    if not text or not term: return 0
+    pattern = r"\b" + re.escape(term.lower()) + r"\w*"
+    return len(re.findall(pattern, text.lower()))
+
+
+def poisson_at_least(k: int, lam: float) -> float:
+    """P(X >= k) for X ~ Poisson(lam).  Handles k<=0 and lam<=0 edge cases."""
+    if k <= 0: return 1.0
+    if lam <= 0: return 0.0
+    import math
+    cum = math.exp(-lam)
+    term = cum
+    for i in range(1, k):
+        term *= lam / i
+        cum += term
+    return max(0.0, min(1.0, 1.0 - cum))
+
+
+def parse_threshold_from_rule(rules_text: str) -> int:
+    """Extract count threshold k from market rule text. Defaults to k=1
+    (binary mention).  Catches patterns like 'at least N times', '>= N times'."""
+    if not rules_text:
+        return 1
+    import re as _re
+    txt = rules_text.lower()
+    # 'at least N times' / 'N or more times'
+    m = _re.search(r"at\s+least\s+(\d{1,3})(?:\s+times)?", txt)
+    if m: return int(m.group(1))
+    m = _re.search(r"(\d{1,3})\s+or\s+more\s+times", txt)
+    if m: return int(m.group(1))
+    m = _re.search(r"(?:>=|\u2265)\s*(\d{1,3})", txt)
+    if m: return int(m.group(1))
+    return 1
+
+
+def compute_base_rate_recency_weighted(ticker, term, threshold: int = 1):
+    """v3+poisson: each transcript recency-weighted (half-life 6mo).
+    Returns Poisson-modeled P(X >= threshold) using lambda = recency-weighted
+    mean count per call.  Backward-compatible: threshold=1 ≈ binary 'mentioned at all'.
+
+    Returns dict: prob, prob_binary (legacy), lambda_w, k_w (binary count weighted),
+    sum_count_w (sum of weighted mention counts), n_w, threshold, n_raw, conf.
+    """
     conn = _conn()
     rows = conn.execute(
         "SELECT raw_text, event_date FROM transcripts WHERE event_type=? ORDER BY event_date DESC",
@@ -105,26 +147,35 @@ def compute_base_rate_recency_weighted(ticker, term):
     conn.close()
     if not rows: return None
     now = datetime.now(timezone.utc)
-    k_weighted = 0.0
-    n_weighted = 0.0
+    sum_count_w = 0.0   # weighted sum of mention COUNTS  (Poisson model)
+    k_binary_w  = 0.0   # weighted binary "mentioned at least once" (legacy)
+    n_w         = 0.0
     for txt, ed in rows:
         try:
             event_dt = datetime.strptime(ed[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
             months_old = (now - event_dt).days / 30.44
-            weight = 0.5 ** (months_old / 6.0)   # half-life 6 months
+            weight = 0.5 ** (months_old / 6.0)
         except Exception:
             weight = 1.0
-        n_weighted += weight
-        if term_mentioned(txt, term):
-            k_weighted += weight
-    # Laplace smoothing in weighted space
-    prob = (k_weighted + 1) / (n_weighted + 2)
+        n_w += weight
+        m = count_mentions(txt, term)
+        sum_count_w += weight * m
+        if m >= 1:
+            k_binary_w += weight
+    # Lambda: gentle Laplace smoothing in count space (1 prior obs)
+    lam = (sum_count_w + 1.0) / (n_w + 1.0)
+    # Poisson P(X >= threshold)
+    prob = poisson_at_least(threshold, lam)
+    # Legacy binary prob (kept for comparison + backward-compat callers)
+    prob_binary = (k_binary_w + 1) / (n_w + 2)
     n_raw = len(rows)
     if n_raw >= 6: conf = "HIGH"
     elif n_raw >= 3: conf = "MED"
     else: conf = "LOW"
-    return {"prob": prob, "k_w": round(k_weighted, 2), "n_w": round(n_weighted, 2),
-            "n_raw": n_raw, "conf": conf}
+    return {"prob": prob, "prob_binary": round(prob_binary, 4),
+            "lambda_w": round(lam, 3), "threshold": threshold,
+            "k_w": round(k_binary_w, 2), "sum_count_w": round(sum_count_w, 2),
+            "n_w": round(n_w, 2), "n_raw": n_raw, "conf": conf}
 
 
 def fee_dollars(price):
@@ -226,7 +277,10 @@ def score_kalshi_event(ticker):
         sub = m.get("subtitle") or m.get("yes_sub_title") or ""
         if not sub:
             drops["no_corpus"].append((m["ticker"], "no_term")); continue
-        br = compute_base_rate_recency_weighted(ticker, sub)
+        # #1 Poisson: parse count threshold k from rule (default k=1 binary)
+        rule_txt = m.get("rules_primary") or ""
+        threshold = parse_threshold_from_rule(rule_txt)
+        br = compute_base_rate_recency_weighted(ticker, sub, threshold=threshold)
         if br is None:
             drops["no_corpus"].append((m["ticker"], "no_transcripts")); continue
         funnel["L5_corpus_pass"] += 1
@@ -243,6 +297,11 @@ def score_kalshi_event(ticker):
             side, edge, price = "YES", ye, ya
         if ne is not None and (edge is None or ne > edge):
             side, edge, price = "NO", ne, na
+        # #3 Thin-corpus hard gate: if recency-weighted obs < 3, demand 20pp+ edge
+        if br["n_w"] < 3.0 and (edge or 0) < 0.20:
+            drops.setdefault("thin_corpus", []).append(
+                (m["ticker"], f"n_w={br['n_w']:.1f} edge={(edge or 0)*100:.1f}%")
+            ); continue
         if edge is None or edge < MIN_EDGE_THRESHOLD:
             drops["low_edge"].append((m["ticker"], f"edge_{(edge or 0)*100:.1f}%")); continue
         funnel["L6_edge_pass"] += 1
