@@ -36,6 +36,7 @@ import sqlite3
 from typing import Optional
 
 from config import settings
+from engine.lip_discovery import is_active_clause
 try:
     from cross_venue.yield_equation import MarketYield, KALSHI_CALIB
 except ImportError:
@@ -125,16 +126,15 @@ def _enrolled_universe(db_path: str, max_target_size: int) -> list[tuple]:
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
         return conn.execute(
-            """SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
-                      p.target_size, p.discount_factor, p.end_date
-               FROM lip_programs p
-               LEFT JOIN market_blacklist b
-                 ON p.market_ticker = b.ticker
-                 AND datetime(b.expires_at) > datetime('now')
-               WHERE p.enrolled = 1 AND p.paid_out = 0
-                 AND p.target_size <= ?
-                 AND datetime(p.end_date) > datetime('now')
-                 AND b.ticker IS NULL""",
+            f"""SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
+                       p.target_size, p.discount_factor, p.end_date
+                FROM lip_programs p
+                LEFT JOIN market_blacklist b
+                  ON p.market_ticker = b.ticker
+                  AND datetime(b.expires_at) > datetime('now')
+                WHERE {is_active_clause('p')}
+                  AND p.target_size <= ?
+                  AND b.ticker IS NULL""",
             (max_target_size,),
         ).fetchall()
     finally:

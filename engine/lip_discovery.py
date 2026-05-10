@@ -72,7 +72,23 @@ def _parse_program(raw: dict) -> dict:
     }
 
 
-def _decide_enrol(p: dict) -> tuple[int, str]:
+def is_active_clause(alias: str = "") -> str:
+    """SQL fragment: row represents a CURRENTLY active enrolled market.
+
+    Single source of truth for quotability gating. Use as:
+        f"SELECT ... FROM lip_programs WHERE {is_active_clause()}"
+    Or with a table alias:
+        f"SELECT ... FROM lip_programs p WHERE {is_active_clause('p')}"
+
+    Three gates: enrolled (our decision), paid_out (Kalshi's done flag),
+    end_date (program window). All three must hold for "currently quotable".
+    """
+    pre = f"{alias}." if alias else ""
+    return (f"{pre}enrolled = 1 AND {pre}paid_out = 0 "
+            f"AND datetime({pre}end_date) > datetime('now')")
+
+
+def _decide_enrol(p: dict, now_iso: str | None = None) -> tuple[int, str]:
     """Our quoting decision for a program. Returns (enrol 0/1, reason)."""
     series = p["series_ticker"] or ""
     # 2026-04-22: prefix-match (startswith) instead of exact. Kalshi spawns
@@ -90,6 +106,13 @@ def _decide_enrol(p: dict) -> tuple[int, str]:
         return 0, f"discount_too_low:{p['discount_factor']:.2f}"
     if p["paid_out"]:
         return 0, "already_paid_out"
+    # 2026-05-10 Phase 3: end_date gate at write-time. Kalshi's API returns
+    # programs past end_date until they flip paid_out=1 (lag of hours/days).
+    # Without this check, callers see ~10% stale enrolled rows that aren't
+    # actually quotable. Belt-and-suspenders with daily lip_state_hygiene cron.
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    if p["end_date"] and p["end_date"] <= now_iso:
+        return 0, "expired"
     return 1, "ok"
 
 
@@ -155,7 +178,7 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
         try:
             for p in programs:
                 n_total += 1
-                enrol, reason = _decide_enrol(p)
+                enrol, reason = _decide_enrol(p, now_iso=now_iso)
                 if enrol:
                     n_enrolled += 1
                 else:
