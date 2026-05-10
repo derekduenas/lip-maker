@@ -107,6 +107,10 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
 
     for s in statuses:
         cursor = None
+        page_n = 0
+        status_total = 0
+        status_kept = 0
+        first_5_tickers = []
         while True:
             params = {"status": s, "type": "liquidity", "limit": 200}
             if cursor:
@@ -117,21 +121,49 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
                 _log.warning(f"/incentive_programs status={s} failed: {e}")
                 break
             batch = resp.get("incentive_programs", [])
+            page_n += 1
+            status_total += len(batch)
             for raw in batch:
+                tk = raw.get("market_ticker") or ""
+                if len(first_5_tickers) < 5 and tk:
+                    first_5_tickers.append(tk[:30])
                 if raw.get("incentive_type") != "liquidity":
                     continue
+                status_kept += 1
                 programs.append(_parse_program(raw))
             cursor = resp.get("next_cursor")
             if not cursor:
                 break
+        _log.info(
+            f"CHECKPOINT-1 status={s}  pages={page_n}  raw_returned={status_total}  "
+            f"kept_as_liquidity={status_kept}  first_5={first_5_tickers}"
+        )
+
+    _log.info(f"CHECKPOINT-1-TOTAL programs_after_status_loop={len(programs)}")
 
     # Decide enrolment and persist
     now_iso = datetime.now(timezone.utc).isoformat()
+    # CHECKPOINT-2: drop counts per filter + 3 sample victims each
+    drop_buckets: dict[str, list] = {
+        "blocklist": [], "reward_too_small": [], "target_too_large": [],
+        "discount_too_low": [], "already_paid_out": [],
+    }
+    n_enrolled = 0
+    n_total = 0
     if save and programs:
         conn = sqlite3.connect(settings.DB_PATH)
         try:
             for p in programs:
+                n_total += 1
                 enrol, reason = _decide_enrol(p)
+                if enrol:
+                    n_enrolled += 1
+                else:
+                    bucket_key = reason.split(":", 1)[0]
+                    drop_buckets.setdefault(bucket_key, []).append(
+                        f"{p['market_ticker'][:35]}|{reason}|rew=${p['reward_per_day_usd']:.2f}|"
+                        f"tgt={p['target_size']:.0f}|df={p['discount_factor']:.2f}"
+                    )
                 conn.execute(
                     """INSERT OR REPLACE INTO lip_programs
                        (id, market_ticker, series_ticker, start_date, end_date,
@@ -149,6 +181,18 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
             conn.commit()
         finally:
             conn.close()
+
+    # CHECKPOINT-2: filter drop summary
+    for bucket, victims in drop_buckets.items():
+        _log.info(
+            f"CHECKPOINT-2 filter={bucket:<22} dropped={len(victims):>5}  "
+            f"sample3={victims[:3]}"
+        )
+    # CHECKPOINT-3: final tallies
+    _log.info(
+        f"CHECKPOINT-3 total_processed={n_total}  enrolled={n_enrolled}  "
+        f"dropped={n_total-n_enrolled}  saved_to_db={n_total}"
+    )
 
     return programs
 
