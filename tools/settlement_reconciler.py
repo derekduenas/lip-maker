@@ -306,8 +306,8 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
                FROM fill_ledger WHERE ticker=? GROUP BY side""",
             (tkr,),
         ).fetchall()
-        yes_cost = sum(v / 100.0 for side, v in cost_rows if side == "yes") if cost_rows else 0
-        no_cost  = sum(v / 100.0 for side, v in cost_rows if side == "no")  if cost_rows else 0
+        yes_cost = sum((v or 0) / 100.0 for side, v in cost_rows if side == "yes") if cost_rows else 0
+        no_cost  = sum((v or 0) / 100.0 for side, v in cost_rows if side == "no")  if cost_rows else 0
 
         settle_val = s["settle_value"]
         kalshi_result = s["result"]  # "yes" or "no"
