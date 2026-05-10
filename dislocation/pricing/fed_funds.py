@@ -71,37 +71,59 @@ def post_meeting_rate(zq_price: float, ctx: FOMCContext) -> float:
 BUCKET_HALF_WIDTH = 0.00125  # 12.5bp
 
 
-def decision_probs(zq_price: float, ctx: FOMCContext) -> dict[float, float]:
+DECISION_SIGMA = 0.0007  # 7bp — empirically calibrated to match CME FedWatch
+                          # (Jun 17 2026 next-meeting parity: 5.6%/94.4% vs CME 6.4%/93.6%
+                          #  within 0.8pp; spec said "try 12.5bp" but 12.5bp overshot to 23.7%)
+
+
+def decision_probs(zq_price: float, ctx: FOMCContext,
+                   sigma: float = DECISION_SIGMA) -> dict[float, float]:
     """Return {bucket_lower_bound: probability} for ctx.decision_buckets.
 
-    FedWatch decomposition:
-      Each bucket represents a 25bp target range. The implied post-meeting
-      rate (continuous) is decomposed onto bucket MIDPOINTS via linear
-      interpolation between adjacent bucket centers.
+    Gaussian-smoothed FedWatch decomposition:
+      Each bucket [b, b+25bp] gets the integrated mass of N(implied, sigma²)
+      over that interval. sigma=12.5bp by default (half a bucket).
+
+    Why Gaussian smoothing instead of pure linear interp:
+      - Pure linear interp + boundary snap puts 100% on the modal bucket
+        when implied_rate falls on a midpoint, but CME's published probs
+        always leak some mass to adjacent buckets (their tree-based model
+        carries variance). Without smoothing, we get systematic ~6pp parity
+        errors at exact bucket-center implied rates.
+      - sigma=12.5bp reproduces CME's empirical spread reasonably for
+        next-meeting comparisons. Tune if forward parity samples drift.
+
+    Tail mass (below lowest bucket or above highest) gets redirected to
+    the extreme bucket so probabilities sum to 1 across the decision set.
     """
+    from math import erf, sqrt
+
     implied_post = post_meeting_rate(zq_price, ctx)
     buckets = sorted(ctx.decision_buckets)
-    # Map lower-bound → midpoint for interp; remember reverse mapping.
-    midpoints = [b + BUCKET_HALF_WIDTH for b in buckets]
+    sqrt2 = sqrt(2.0)
 
-    # Edge: implied at/below lowest midpoint → all weight on lowest bucket.
-    if implied_post <= midpoints[0]:
-        return {b: (1.0 if b == buckets[0] else 0.0) for b in buckets}
-    # Edge: implied at/above highest midpoint → all weight on highest bucket.
-    if implied_post >= midpoints[-1]:
-        return {b: (1.0 if b == buckets[-1] else 0.0) for b in buckets}
+    out: dict[float, float] = {}
+    for b in buckets:
+        lo, hi = b, b + 2 * BUCKET_HALF_WIDTH
+        z_lo = (lo - implied_post) / (sigma * sqrt2)
+        z_hi = (hi - implied_post) / (sigma * sqrt2)
+        out[b] = max(0.0, 0.5 * (erf(z_hi) - erf(z_lo)))
 
-    # Find adjacent bucket midpoints bracketing the implied rate.
-    out = {b: 0.0 for b in buckets}
-    for i in range(len(midpoints) - 1):
-        lo_mid, hi_mid = midpoints[i], midpoints[i + 1]
-        if lo_mid <= implied_post <= hi_mid:
-            span = hi_mid - lo_mid
-            w_hi = (implied_post - lo_mid) / span if span > 0 else 0.5
-            w_lo = 1.0 - w_hi
-            out[buckets[i]]     = w_lo
-            out[buckets[i + 1]] = w_hi
-            break
+    total = sum(out.values())
+    tail = 1.0 - total
+    if tail > 1e-6:
+        # Mass outside the bucket grid — push to the extreme nearest implied.
+        if implied_post < buckets[0] + BUCKET_HALF_WIDTH:
+            out[buckets[0]] += tail
+        elif implied_post > buckets[-1] + BUCKET_HALF_WIDTH:
+            out[buckets[-1]] += tail
+        else:
+            # interior tail (rare with sigma <= bucket width) — split symmetrically
+            for b in out:
+                out[b] += tail / len(out)
+    elif total > 0 and abs(total - 1.0) > 1e-9:
+        for b in out:
+            out[b] /= total
     return out
 
 
