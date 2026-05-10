@@ -61,6 +61,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="Comma-sep lookback days for decomposition (default 1,7,30).")
     ap.add_argument("--convergence", action="store_true",
                     help="Also run convergence backtest (requires Kalshi CSV).")
+    ap.add_argument("--parity", action="store_true",
+                    help="Also run FedWatch parity backtest (requires CME FedWatch CSV).")
+    ap.add_argument("--fedwatch", type=Path,
+                    default=Path("data/historical/cme_fedwatch_history.csv"),
+                    help="Path to CME FedWatch published probability history CSV.")
+    ap.add_argument("--parity-threshold", type=float, default=1.0,
+                    help="Max |our - cme| in pp to count as 'within' parity (default 1.0).")
     ap.add_argument("--decomposition-only", action="store_true",
                     help="Only run decomposition (default if --convergence not set).")
     ap.add_argument("--json", action="store_true")
@@ -102,6 +109,32 @@ def main(argv: list[str] | None = None) -> int:
         if args.show_meetings:
             output["decomposition"][f"T-{lb}_meetings"] = [r.explain() for r in results]
 
+    # ── FedWatch parity (optional, math-only validation) ─────────────
+    if args.parity and not args.decomposition_only:
+        from dislocation.backtest.fedwatch_parity import (
+            load_fedwatch_csv, compute_parity, evaluate_gate as parity_gate,
+        )
+        snaps = load_fedwatch_csv(args.fedwatch)
+        if not snaps:
+            output["parity"] = {"error": f"no FedWatch history at {args.fedwatch}"}
+        else:
+            presults = compute_parity(snaps, zq)
+            output["parity"] = {
+                **parity_gate(presults, threshold_pp=args.parity_threshold),
+                "n_snapshots": len(snaps),
+            }
+            if args.show_meetings:
+                output["parity_pairs"] = [
+                    {
+                        "snapshot_date": r.snapshot_date.isoformat(),
+                        "fomc_date": r.fomc_date.isoformat(),
+                        "target_lower": r.target_lower,
+                        "cme_prob": round(r.cme_prob, 4),
+                        "our_prob": round(r.our_prob, 4),
+                        "abs_err_pp": round(r.abs_err_pp, 3),
+                    } for r in presults
+                ]
+
     # ── Convergence (optional) ───────────────────────────────────────
     if args.convergence and not args.decomposition_only:
         kalshi = load_kalshi_history(args.kalshi)
@@ -138,6 +171,14 @@ def _print_human(out: dict) -> None:
               f"MAE={stats['mean_abs_err_pp']:>5.2f}pp  "
               f"brier={stats['brier']:.4f}")
 
+    if "parity" in out and "error" not in out["parity"]:
+        p = out["parity"]
+        print()
+        print("FEDWATCH PARITY:")
+        print(f"  snapshots={p['n_snapshots']}  comparisons={p['n']}  "
+              f"within {p['threshold_pp']}pp: {p['pct_within']:.1f}%  "
+              f"MAE={p['mae_pp']:.3f}pp  max={p['max_err_pp']:.3f}pp")
+
     if "convergence" in out and "error" not in out["convergence"]:
         c = out["convergence"]
         print()
@@ -169,6 +210,15 @@ def _evaluate_gate(out: dict) -> int:
         print("✗ DECOMPOSITION GATE NOT YET MET")
         print(f"   need: T-1 n≥30, hit≥80%, MAE≤5pp")
         print(f"   have: T-1 n={t1['n_meetings']}, hit={t1['hit_rate_%']:.1f}%, MAE={t1['mean_abs_err_pp']:.2f}pp")
+
+    if "parity" in out and "n" in out["parity"]:
+        p = out["parity"]
+        if p["passes"]:
+            print(f"✓ FEDWATCH PARITY GATE PASSED ({p['pct_within']:.1f}% within {p['threshold_pp']}pp)")
+        else:
+            print(f"✗ FEDWATCH PARITY GATE NOT YET MET")
+            print(f"   need: ≥90% comparisons within {p['threshold_pp']}pp")
+            print(f"   have: n={p['n']}, within={p['pct_within']:.1f}%, MAE={p['mae_pp']:.3f}pp")
 
     if "convergence" in out and "n_pairs" in out["convergence"]:
         c = out["convergence"]
