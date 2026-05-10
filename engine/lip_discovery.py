@@ -255,55 +255,6 @@ def _build_series_capture_ratios(db_path: str) -> dict:
     return out
 
 
-def _depth_probe_filter(out_rows: list[dict]) -> list[dict]:
-    """Phase 4 pre-deploy depth probe gate.
-
-    Probes each candidate's bid book; rejects markets where rank_percentile
-    > 0.50 on BOTH sides (deep queue, our share would be tiny). Keeps
-    'marginal' (allow but log) and 'unknown' (API error → fail-open).
-    Gated by settings.DEPTH_PROBE_ENABLED (default True).
-    """
-    if not getattr(settings, "DEPTH_PROBE_ENABLED", True):
-        return out_rows
-    try:
-        from engine.depth_probe import get_book_rank
-        from execution.kalshi_auth import KalshiClient
-        import time as _time
-    except Exception as e:
-        _log.warning(f"DEPTH_PROBE: import failed, skipping ({e})")
-        return out_rows
-    client = KalshiClient()
-    keep: list[dict] = []
-    n_dep = n_marg = n_unk = n_rej = 0
-    for m in out_rows:
-        ts = int(m.get("target_size") or 0)
-        our_size = max(1, int(ts * settings.QUOTE_SIZE_AS_FRACTION_OF_TARGET))
-        ry = get_book_rank(client, m["market_ticker"], 0, our_size,
-                           target_size=ts, side="yes")
-        rn = get_book_rank(client, m["market_ticker"], 0, our_size,
-                           target_size=ts, side="no")
-        verdicts = {ry["verdict"], rn["verdict"]}
-        # Reject only if BOTH sides verdict==reject. Fail-open on unknown.
-        if "deploy" in verdicts:
-            n_dep += 1
-        elif "marginal" in verdicts:
-            n_marg += 1
-        elif "unknown" in verdicts:
-            n_unk += 1
-        if verdicts == {"reject"}:
-            n_rej += 1
-            continue
-        m["_depth_yes"] = {"verdict": ry["verdict"], "pct": ry["rank_percentile"]}
-        m["_depth_no"]  = {"verdict": rn["verdict"], "pct": rn["rank_percentile"]}
-        keep.append(m)
-        _time.sleep(0.05)  # gentle pacing
-    _log.info(
-        f"DEPTH_PROBE: probed={len(out_rows)} kept={len(keep)} "
-        f"rejected={n_rej} (deploy={n_dep} marginal={n_marg} unknown={n_unk})"
-    )
-    return keep
-
-
 def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                    db_path: str = settings.DB_PATH,
                    exclude_tickers: set[str] | None = None) -> list[dict]:
@@ -442,7 +393,6 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                         f"(low_var={dropped_var}, below_floor={dropped_floor}); "
                         f"top={top_series} reward=${top_rwd:.2f}/d capture=${top_cap:.2f}"
                     )
-                    out_rows = _depth_probe_filter(out_rows)
                     return out_rows
             finally:
                 tconn.close()

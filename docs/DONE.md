@@ -1,47 +1,30 @@
-# 2026-05-10 LIP god-mode session — 4 phases, 4 commits
+# 2026-05-10 LIP god-mode session
 
 | Phase | Commit | Summary |
 |---|---|---|
 | 1 | `ec00824` | settlement_reconciler null-guard + 168h backfill — capture 27.5% → 58.6% MTD |
 | 2 | `0d6dad3` | blocklist_review.py weekly cron with accrual fold-in — 0 unbans flagged |
-| 3 | `01bba7a` | enrolment hygiene + `is_active_clause()` helper + write-time end_date gate — 46 stale → 0 |
-| 4 | this   | `get_book_rank()` + lip_discovery filter (gated DISABLED) |
+| 3 | `01bba7a` | enrolment hygiene + `is_active_clause()` helper — 46 stale → 0 |
+| 4 | `b47c4fb` → reverted | depth_probe `get_book_rank()` — duplicate logic |
 
-## Phase 4 calibration finding (2026-05-10)
+## Phase 4: REVERTED
 
-`engine/depth_probe.get_book_rank()` shipped per spec, with 6 unit tests
-passing. Wired into `top_n_to_quote()` behind `settings.DEPTH_PROBE_ENABLED`.
+`filter_by_depth()` already implemented projected_share with `min_share=0.05`
+at `run_paper.py:977,1044`. Phase 4's `get_book_rank()` was duplicate logic
+with the wrong metric (`contracts_ahead / target_size` instead of pro-rata
+share). Reverted, no functional change.
 
-**Default is False.** Smoke test on 5 top-earning live markets:
+**Audit takeaway**: `lip_discovery` filter layer not needed; `run_paper.py`
+is the right enforcement point — closer to the actual deploy decision.
 
-| Ticker | target_size | yes pct | no pct | verdict |
-|---|---|---|---|---|
-| KXTRUMPPHOTO-26MAY16 | 300 | 369% | 238% | reject |
-| KXMAMDANIEO-26MAY16-T0 | 300 | 809% | 747% | reject |
-| KXCHAICUTS-26JUN04-T1 | 300 | 1616% | 771% | reject |
-| KXCANHOUSTART-27JAN18-T275 | 300 | 2486% | 517% | reject |
-| KXCANUSTRIPS-27FEB23-T20 | 300 | 1774% | 2318% | reject |
+**Follow-up for tomorrow** (do NOT ship without scope confirmation):
+Consider enhancing `filter_by_depth()` with:
+- "marginal" tier (1–5% share) + structured logging
+- Verbose return dict for observability
+- Configurable thresholds in `config/settings.py`
 
-The spec's verdict thresholds (`<= 0.30 deploy / <= 0.50 marginal`) assume
-percentile in [0, 1] — i.e., contracts_ahead bounded by target_size. Real
-Kalshi orderbooks carry orders of magnitude more depth than LIP target.
-Enabling the gate as specified would reject 100% of top earners and stop
-the live engine.
-
-**Follow-up before flipping ENABLED=True**:
-- Calibrate thresholds against real percentile distribution (sample
-  100+ active markets, fit thresholds to e.g. p50/p90 boundaries)
-- Or change the metric: `our_size / (contracts_ahead + our_size)` matches
-  the existing `filter_by_depth` pro-rata-share semantics
-- Or normalize against per-market book depth instead of LIP target_size
-
-## Tomorrow's queue (per session sign-off)
-
-- Migrate 2 remaining callers (`macro_blackout_sync`, `news_kill`) to
-  `is_active_clause()`
-- Wire `depth_probe` re-probe loop into `run_paper.py` main loop
-  (every 60s, watermark drift detection)
-- Investigate KXSILVERMON +$3.88 (closest unban candidate)
+These would be cosmetic/diagnostic improvements on top of the existing
+correct logic, not a new filter.
 
 ---
 
