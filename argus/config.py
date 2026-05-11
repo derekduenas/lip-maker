@@ -29,7 +29,16 @@ LIVE_MODE    = os.getenv("ARGUS_LIVE",   "false").lower() == "true"
 BANKROLL_USD = float(os.getenv("ARGUS_BANKROLL", "1000"))
 
 # ── Validation gates ──────────────────────────────────────────────────────
-BRIER_LIVE_GATE = 0.20    # brain must hit Test Brier <= this to graduate
+# 2026-05-10 (Phase 3): replaced raw Brier gate with Brier Skill Score (BSS).
+# Why: with heavy class imbalance (~5-10% YES base rate on Music markets),
+# naive "predict base_rate for every market" gives Brier ~0.05 — a 0.20
+# threshold passes any model, including ones strictly worse than naive.
+# BSS measures *improvement over the base-rate model*:
+#     BSS = 1 - (model_brier / naive_brier)
+#     0    → no improvement
+#     0.15 → meaningful skill (live gate)
+#     0.30 → exceptional
+BSS_LIVE_GATE   = 0.15
 MIN_BACKTEST_N  = 20      # need >= this many test samples for the gate
 
 # ── Edge thresholds (scanner) ─────────────────────────────────────────────

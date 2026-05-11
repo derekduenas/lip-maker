@@ -36,6 +36,33 @@ class BrierResult:
         }
 
 
+def naive_baseline_brier(outcomes: list[int]) -> float:
+    """Brier of the naive 'predict base_rate for every market' model.
+
+    base_rate = mean(outcomes); naive_brier = base_rate * (1 - base_rate).
+    This is the floor any honest model must beat. Critical when class
+    imbalance is heavy (e.g. 5-10% YES base rate → naive brier ~0.05;
+    a raw "Brier <= 0.20" gate passes models strictly worse than naive).
+    """
+    if not outcomes:
+        return 0.0
+    base_rate = sum(outcomes) / len(outcomes)
+    return base_rate * (1.0 - base_rate)
+
+
+def brier_skill_score(model_brier: float, outcomes: list[int]) -> float:
+    """Brier Skill Score: 1 - (model_brier / naive_brier).
+
+    > 0  model beats predicting base rate for every case
+    = 0  no improvement
+    < 0  worse than naive
+    """
+    nb = naive_baseline_brier(outcomes)
+    if nb <= 0:
+        return 0.0
+    return 1.0 - (model_brier / nb)
+
+
 def brier_score(pred_probs: list[float], outcomes: list[int]) -> BrierResult:
     """Compute Brier score + skill-vs-baseline."""
     if len(pred_probs) != len(outcomes):

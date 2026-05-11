@@ -21,10 +21,16 @@ class BacktestResult:
     calibration: list[dict] = field(default_factory=list)
     notes:       list[str]  = field(default_factory=list)
 
-    def passes_gate(self, gate: float, min_n: int) -> bool:
+    def passes_gate(self, bss_gate: float, min_n: int) -> bool:
+        """Live-graduation gate: model BSS >= bss_gate AND n_test >= min_n.
+
+        2026-05-10 (Phase 3): switched from raw Brier to BSS — naive
+        base-rate predictor passes Brier 0.20 trivially under heavy class
+        imbalance, so raw-Brier gate gives false confidence.
+        """
         if self.test_brier is None:
             return False
-        return self.test_brier.brier <= gate and self.n_test >= min_n
+        return self.test_brier.skill >= bss_gate and self.n_test >= min_n
 
 
 def run_backtest(brain: DomainBrain, settled_markets: list[dict]) -> BacktestResult:
