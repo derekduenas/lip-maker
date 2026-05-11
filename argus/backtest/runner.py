@@ -66,6 +66,7 @@ class BacktestResult:
     feature_importance: dict[str, float] = field(default_factory=dict)
     notes:          list[str] = field(default_factory=list)
     method:         str = ""
+    full_weights:   dict[str, float] = field(default_factory=dict)    # full-corpus retrain
 
     def passes_gate(self, bss_gate: float, min_n: int) -> bool:
         return self.test_bss >= bss_gate and self.n_test >= min_n
@@ -349,4 +350,5 @@ def run_backtest(
             f"corpus base rate (rebuilt examples) = {base_rate_examples:.4f}",
         ],
         method=method,
+        full_weights=full_weights,
     )

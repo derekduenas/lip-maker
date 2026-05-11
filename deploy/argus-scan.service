@@ -1,0 +1,12 @@
+[Unit]
+Description=ARGUS paper-mode scanner — daily Music brain candidate sweep
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+Environment="PYTHONPATH=/root/lip-maker"
+ExecStart=/root/lip-maker/venv/bin/python -m tools.argus_scan
+StandardOutput=append:/root/lip-maker/logs/argus_scan.log
+StandardError=append:/root/lip-maker/logs/argus_scan.log

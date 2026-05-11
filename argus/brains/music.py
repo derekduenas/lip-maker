@@ -304,16 +304,31 @@ class MusicModel:
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "MusicModel":
+        """Load weights. Supports two on-disk shapes:
+          legacy: {"weights": {...}, "n_train": int, "trained_at": str, "notes": str}
+          v1:     {"version": "v1", "weights": {...}, "n_training_examples": int,
+                   "trained_at": iso, "test_metrics": {...}, ...}
+        """
         path = path or MODEL_PATH()
         if not path.exists():
             return cls()
         with open(path) as f:
             d = json.load(f)
+        weights = d.get("weights", dict(DEFAULT_WEIGHTS))
+        n_train = d.get("n_train") or d.get("n_training_examples", 0)
+        trained_at = d.get("trained_at")
+        version = d.get("version", "")
+        tm = d.get("test_metrics", {}) or {}
+        notes = d.get("notes") or (
+            f"version={version}  bss={tm.get('bss')}  brier={tm.get('brier')}  "
+            f"n_test={tm.get('n_test')}"
+            if version else ""
+        )
         return cls(
-            weights=d.get("weights", dict(DEFAULT_WEIGHTS)),
-            n_train=d.get("n_train", 0),
-            trained_at=d.get("trained_at"),
-            notes=d.get("notes", ""),
+            weights=weights,
+            n_train=n_train,
+            trained_at=trained_at,
+            notes=notes,
         )
 
 

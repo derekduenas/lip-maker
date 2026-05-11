@@ -1,0 +1,11 @@
+[Unit]
+Description=ARGUS paper-mode scanner — surface Music brain candidates daily
+
+[Timer]
+OnCalendar=*-*-* 23:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=argus-scan.service
+
+[Install]
+WantedBy=timers.target

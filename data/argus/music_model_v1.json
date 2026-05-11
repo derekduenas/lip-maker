@@ -1,0 +1,31 @@
+{
+  "version": "v1",
+  "trained_at": "2026-05-11T01:51:19.083853+00:00",
+  "n_training_examples": 46,
+  "base_rate": 0.173913,
+  "weights": {
+    "intercept": -2.483287,
+    "top_rank_lift": 0.216599,
+    "streams_velocity_norm_today": -0.223324,
+    "days_factor": 2.018207,
+    "historical_no1_rate_12mo": 2.949011,
+    "streams_7d_velocity_sign": 0.502926,
+    "peer_gap_norm": -0.298698
+  },
+  "feature_order": [
+    "intercept",
+    "top_rank_lift",
+    "streams_velocity_norm_today",
+    "days_factor",
+    "historical_no1_rate_12mo",
+    "streams_7d_velocity_sign",
+    "peer_gap_norm"
+  ],
+  "test_metrics": {
+    "method": "LOO",
+    "n_test": 46,
+    "brier": 0.081849,
+    "bss": 0.430286,
+    "naive_brier": 0.143667
+  }
+}

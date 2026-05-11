@@ -45,6 +45,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--brain", required=True, choices=list(SERIES_BY_BRAIN.keys()))
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--save-model", action="store_true",
+                    help="After backtest, persist full-corpus-trained weights "
+                         "+ test metrics to data/argus/{brain}_model_v1.json")
     a = ap.parse_args()
 
     series = SERIES_BY_BRAIN[a.brain]
@@ -93,6 +96,31 @@ def main() -> int:
         print("  notes:")
         for n in res.notes:
             print(f"    - {n}")
+
+    if a.save_model and res.full_weights:
+        import datetime as _dt
+        from argus.config import DATA_DIR
+        from argus.backtest.runner import FEATURE_KEYS as RUN_FEATURE_KEYS
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATA_DIR / f"{a.brain}_model_v1.json"
+        payload = {
+            "version":              "v1",
+            "trained_at":           _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "n_training_examples":  res.n_total,
+            "base_rate":            round(res.base_rate, 6),
+            "weights":              {k: round(v, 6) for k, v in res.full_weights.items()},
+            "feature_order":        ["intercept"] + list(RUN_FEATURE_KEYS),
+            "test_metrics": {
+                "method":      res.method,
+                "n_test":      res.n_test,
+                "brier":       round(res.test_brier.brier, 6) if res.test_brier else None,
+                "bss":         round(res.test_bss, 6),
+                "naive_brier": round(res.naive_brier, 6),
+            },
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\n  ✓ saved trained model → {path}")
     return 0
 
 
