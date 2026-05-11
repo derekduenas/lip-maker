@@ -230,12 +230,12 @@ def log_to_db(conn: sqlite3.Connection, rows: list[ParityRow]) -> int:
             conn.execute("""
                 INSERT OR REPLACE INTO parity_log
                   (snapshot_date, fomc_date, contract, zq_settle, target_lower,
-                   cme_prob, our_prob, abs_err_pp, is_next_meeting)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                   cme_prob, our_prob, abs_err_pp, is_next_meeting, is_path_dependent)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
             """, (
                 r.snapshot_date.isoformat(), r.fomc_date.isoformat(), r.contract,
                 r.zq_settle, r.target_lower, r.cme_prob, r.our_prob,
-                r.abs_err_pp, int(r.is_next_meeting),
+                r.abs_err_pp, int(r.is_next_meeting), int(not r.is_next_meeting),
             ))
             n += 1
         except Exception as e:
