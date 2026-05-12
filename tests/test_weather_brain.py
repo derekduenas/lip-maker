@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from argus.brains.weather import (
-    parse_market, p_yes_for, _stdev_for_lead,
+    parse_market, p_yes_for, p_yes_for_range, _stdev_for_lead,
     WeatherBrain, ALL_PREFIXES,
 )
 
@@ -72,13 +72,39 @@ class TestTickerParsing(unittest.TestCase):
         })
         self.assertIsNone(m)
 
-    def test_range_markets_skipped(self):
-        # B prefix on the strike means "between" — not yet supported
+    def test_range_market_parsed(self):
+        # B-strike: "Will the min be 63°-64°?" — Phase 1 supports this.
         m = parse_market({
             "ticker": "KXLOWTAUS-26MAY12-B63.5",
             "yes_sub_title": "63° to 64°",
         })
-        self.assertIsNone(m, "B-range tickers should be skipped (parser only handles T-threshold)")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.market_type, "range")
+        self.assertEqual(m.bucket_lo, 63.0)
+        self.assertEqual(m.bucket_hi, 64.0)
+        self.assertEqual(m.city_token, "AUS")
+        self.assertIsNone(m.direction)   # range has no direction
+        self.assertIsNone(m.yes_value)
+
+    def test_range_market_high(self):
+        m = parse_market({
+            "ticker": "KXHIGHTPHX-26MAY12-B107.5",
+            "yes_sub_title": "107° to 108°",
+        })
+        self.assertIsNotNone(m)
+        self.assertEqual(m.market_type, "range")
+        self.assertTrue(m.is_high)
+        self.assertEqual(m.bucket_lo, 107.0)
+        self.assertEqual(m.bucket_hi, 108.0)
+
+    def test_threshold_market_type_set(self):
+        m = parse_market({
+            "ticker": "KXLOWTLAX-26MAY12-T60",
+            "yes_sub_title": "61° or above",
+        })
+        self.assertEqual(m.market_type, "threshold")
+        self.assertIsNone(m.bucket_lo)
+        self.assertIsNone(m.bucket_hi)
 
 
 class TestProbabilityMath(unittest.TestCase):
@@ -109,6 +135,32 @@ class TestProbabilityMath(unittest.TestCase):
         p_hi = p_yes_for("above", forecast_temp=200, yes_value=100, sigma=2.0)
         self.assertGreaterEqual(p_lo, 0.001)
         self.assertLessEqual(p_hi, 0.999)
+
+
+class TestRangeProbability(unittest.TestCase):
+    def test_bucket_around_forecast(self):
+        # Forecast 63, bucket [63, 64], σ=1.5 → moderate probability
+        # P(62.5 < N(63, 1.5) < 64.5) = Φ(1) - Φ(-0.33) ≈ 0.84 - 0.37 = 0.47
+        p = p_yes_for_range(forecast_temp=63, bucket_lo=63, bucket_hi=64, sigma=1.5)
+        self.assertGreater(p, 0.40)
+        self.assertLess(p, 0.55)
+
+    def test_bucket_far_from_forecast(self):
+        # Forecast 63, bucket [80, 81] → very low probability
+        p = p_yes_for_range(forecast_temp=63, bucket_lo=80, bucket_hi=81, sigma=2.0)
+        self.assertLess(p, 0.001 + 1e-9)   # clamped near floor
+
+    def test_bucket_inverted_input_normalized(self):
+        # If caller passes lo>hi, the function should handle it
+        p1 = p_yes_for_range(forecast_temp=63, bucket_lo=64, bucket_hi=63, sigma=1.5)
+        p2 = p_yes_for_range(forecast_temp=63, bucket_lo=63, bucket_hi=64, sigma=1.5)
+        self.assertAlmostEqual(p1, p2)
+
+    def test_wide_bucket_higher_p(self):
+        # A wider bucket around the forecast should be higher prob
+        p_narrow = p_yes_for_range(forecast_temp=63, bucket_lo=63, bucket_hi=63, sigma=2.0)
+        p_wide   = p_yes_for_range(forecast_temp=63, bucket_lo=60, bucket_hi=66, sigma=2.0)
+        self.assertGreater(p_wide, p_narrow)
 
 
 class TestStdevByLead(unittest.TestCase):

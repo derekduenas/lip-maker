@@ -92,22 +92,33 @@ def _stdev_for_lead(lead_days: int) -> float:
 
 
 # ── Ticker + market parsing ───────────────────────────────────────────────
-_RX_TICKER = re.compile(
+# T-strike: above/below a single threshold ("Will min be >60°?")
+_RX_TICKER_THRESHOLD = re.compile(
     r"^(?P<prefix>KX(?:HIGHT|HIGH|LOWT|LOW))"
     r"(?P<city>[A-Z]+)-"
     r"(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<dd>\d{2})-"
     r"T(?P<strike>\d+(?:\.\d+)?)$"
+)
+# B-strike: range bucket between two integer degrees ("63° to 64°")
+_RX_TICKER_RANGE = re.compile(
+    r"^(?P<prefix>KX(?:HIGHT|HIGH|LOWT|LOW))"
+    r"(?P<city>[A-Z]+)-"
+    r"(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<dd>\d{2})-"
+    r"B(?P<strike>\d+(?:\.\d+)?)$"
 )
 MONTH_ABBR = {
     "JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
     "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12,
 }
 
-# yes_sub_title canonical patterns. Direction "above" = YES when actual >=
-# the strike value in the title (typically strike + 1); "below" = YES when
-# actual <= the strike value (typically strike - 1).
-_RX_YES_SUB = re.compile(
+# T yes_sub_title patterns: "61° or above" / "52° or below"
+_RX_YES_SUB_THRESHOLD = re.compile(
     r"(?P<value>-?\d+(?:\.\d+)?)\s*°?\s*or\s+(?P<dir>above|below)",
+    re.IGNORECASE,
+)
+# B yes_sub_title patterns: "63° to 64°"
+_RX_YES_SUB_RANGE = re.compile(
+    r"(?P<lo>-?\d+(?:\.\d+)?)\s*°?\s*to\s+(?P<hi>-?\d+(?:\.\d+)?)\s*°?",
     re.IGNORECASE,
 )
 
@@ -118,56 +129,89 @@ class WeatherMeta:
     series_prefix: str        # e.g. "KXLOWT"
     city_token:    str        # e.g. "LAX"
     settle_date:   dt.date    # the measurement date
-    strike_temp:   float      # threshold from ticker
-    yes_value:     float      # canonical YES boundary from yes_sub_title
-    direction:     str        # "above" or "below"
+    strike_temp:   float      # the midpoint/threshold from ticker
+    market_type:   str        # 'threshold' | 'range'
     is_high:       bool       # high-temp market vs low-temp
     nws_station:   str
-    chart_region:  str        # for stats parity with MusicBrain — "WEATHER"
+    chart_region:  str        # parity with MusicBrain — "WEATHER"
+    # Threshold-only fields (None for range markets)
+    yes_value:     Optional[float] = None      # canonical YES boundary
+    direction:     Optional[str]   = None      # 'above' | 'below'
+    # Range-only fields (None for threshold markets)
+    bucket_lo:     Optional[float] = None      # inclusive lower bound, °F
+    bucket_hi:     Optional[float] = None      # inclusive upper bound, °F
 
 
-def parse_market(market: dict) -> Optional[WeatherMeta]:
-    ticker = market.get("ticker", "")
-    m = _RX_TICKER.match(ticker)
-    if not m:
-        return None
-    prefix    = m.group("prefix")
-    city      = m.group("city")
-    is_high   = prefix.startswith("KXHIGH")
-    strike    = float(m.group("strike"))
-
-    # Reject non-temperature siblings (KXHIGHINFLATION etc.)
+def _parse_common(prefix: str, city: str, yy: str, mon_str: str, dd: str) -> Optional[tuple]:
+    """Shared validation for both T and B tickers."""
     if _NON_TEMP_KEYWORDS_RX.search(city):
         return None
-
-    # Date
-    mon = MONTH_ABBR.get(m.group("mon"))
+    mon = MONTH_ABBR.get(mon_str)
     if not mon:
         return None
     try:
-        settle_date = dt.date(2000 + int(m.group("yy")), mon, int(m.group("dd")))
+        settle_date = dt.date(2000 + int(yy), mon, int(dd))
     except ValueError:
         return None
-
-    # Direction + canonical YES boundary from yes_sub_title
-    sub = market.get("yes_sub_title", "") or ""
-    sm = _RX_YES_SUB.search(sub)
-    if not sm:
-        return None
-    yes_value = float(sm.group("value"))
-    direction = sm.group("dir").lower()
-
     info = KALSHI_CITY_TO_NWS.get(city.upper())
     if info is None:
         return None
-    station = info[0]
+    return (settle_date, info[0])
 
-    return WeatherMeta(
-        ticker=ticker, series_prefix=prefix, city_token=city,
-        settle_date=settle_date, strike_temp=strike,
-        yes_value=yes_value, direction=direction, is_high=is_high,
-        nws_station=station, chart_region="WEATHER",
-    )
+
+def parse_market(market: dict) -> Optional[WeatherMeta]:
+    """Parse either T-strike (threshold) or B-strike (range) tickers."""
+    ticker = market.get("ticker", "")
+    sub = market.get("yes_sub_title", "") or ""
+
+    # Try threshold first
+    m = _RX_TICKER_THRESHOLD.match(ticker)
+    if m:
+        common = _parse_common(m.group("prefix"), m.group("city"),
+                               m.group("yy"), m.group("mon"), m.group("dd"))
+        if common is None:
+            return None
+        settle_date, station = common
+        sm = _RX_YES_SUB_THRESHOLD.search(sub)
+        if not sm:
+            return None
+        return WeatherMeta(
+            ticker=ticker, series_prefix=m.group("prefix"),
+            city_token=m.group("city"), settle_date=settle_date,
+            strike_temp=float(m.group("strike")),
+            market_type="threshold",
+            yes_value=float(sm.group("value")),
+            direction=sm.group("dir").lower(),
+            is_high=m.group("prefix").startswith("KXHIGH"),
+            nws_station=station, chart_region="WEATHER",
+        )
+
+    # Then range
+    m = _RX_TICKER_RANGE.match(ticker)
+    if m:
+        common = _parse_common(m.group("prefix"), m.group("city"),
+                               m.group("yy"), m.group("mon"), m.group("dd"))
+        if common is None:
+            return None
+        settle_date, station = common
+        sm = _RX_YES_SUB_RANGE.search(sub)
+        if not sm:
+            return None
+        lo = float(sm.group("lo"))
+        hi = float(sm.group("hi"))
+        if hi < lo:
+            lo, hi = hi, lo
+        return WeatherMeta(
+            ticker=ticker, series_prefix=m.group("prefix"),
+            city_token=m.group("city"), settle_date=settle_date,
+            strike_temp=float(m.group("strike")),
+            market_type="range",
+            bucket_lo=lo, bucket_hi=hi,
+            is_high=m.group("prefix").startswith("KXHIGH"),
+            nws_station=station, chart_region="WEATHER",
+        )
+
+    return None
 
 
 # ── Probability core ──────────────────────────────────────────────────────
@@ -178,7 +222,7 @@ def _normal_cdf(x: float) -> float:
 
 def p_yes_for(direction: str, *, forecast_temp: float,
               yes_value: float, sigma: float) -> float:
-    """Compute P(actual matches YES condition).
+    """Compute P(actual matches YES condition) for THRESHOLD markets.
 
     The yes_value is the canonical YES boundary from yes_sub_title:
       "61° or above" → direction='above', yes_value=61, YES iff actual ≥ 61
@@ -197,6 +241,25 @@ def p_yes_for(direction: str, *, forecast_temp: float,
         z = (yes_value + 0.5 - forecast_temp) / sigma
         return max(0.001, min(0.999, _normal_cdf(z)))
     return 0.5
+
+
+def p_yes_for_range(forecast_temp: float, *, bucket_lo: float,
+                    bucket_hi: float, sigma: float) -> float:
+    """Compute P(actual ∈ [bucket_lo, bucket_hi]) for RANGE (B-strike) markets.
+
+    Kalshi settles on integer-degree °F readings from the NWS daily report.
+    A bucket [lo, hi] means actual ∈ {lo, lo+1, ..., hi}. With Normal
+    approximation + continuity correction:
+        P = Φ((hi + 0.5 - forecast) / σ) - Φ((lo - 0.5 - forecast) / σ)
+    """
+    if sigma <= 0:
+        sigma = 0.5
+    if bucket_hi < bucket_lo:
+        bucket_lo, bucket_hi = bucket_hi, bucket_lo
+    z_hi = (bucket_hi + 0.5 - forecast_temp) / sigma
+    z_lo = (bucket_lo - 0.5 - forecast_temp) / sigma
+    p = _normal_cdf(z_hi) - _normal_cdf(z_lo)
+    return max(0.001, min(0.999, p))
 
 
 # ── Brain ─────────────────────────────────────────────────────────────────
@@ -245,8 +308,15 @@ class WeatherBrain(DomainBrain):
             # Climatology has much wider uncertainty than a forecast
             sigma = max(sigma, 7.0)
 
-        p = p_yes_for(meta.direction, forecast_temp=float(forecast_temp),
-                      yes_value=meta.yes_value, sigma=sigma)
+        if meta.market_type == "range":
+            p = p_yes_for_range(
+                forecast_temp=float(forecast_temp),
+                bucket_lo=meta.bucket_lo, bucket_hi=meta.bucket_hi,
+                sigma=sigma,
+            )
+        else:
+            p = p_yes_for(meta.direction, forecast_temp=float(forecast_temp),
+                          yes_value=meta.yes_value, sigma=sigma)
 
         return Prediction(
             p_yes=p,
@@ -256,8 +326,11 @@ class WeatherBrain(DomainBrain):
                 "nws_station":       meta.nws_station,
                 "settle_date":       meta.settle_date.isoformat(),
                 "is_high":           meta.is_high,
+                "market_type":       meta.market_type,
                 "direction":         meta.direction,
                 "yes_value":         meta.yes_value,
+                "bucket_lo":         meta.bucket_lo,
+                "bucket_hi":         meta.bucket_hi,
                 "strike_temp":       meta.strike_temp,
                 "forecast_temp":     float(forecast_temp),
                 "forecast_source":   forecast_source,

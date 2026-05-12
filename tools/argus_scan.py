@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS argus_paper_positions (
     confidence     REAL NOT NULL,
     brain_id       TEXT NOT NULL,
     model_version  TEXT NOT NULL,
-    chart_region   TEXT,                     -- GLOBAL | USA (NULL for non-music)
+    chart_region   TEXT,                     -- GLOBAL | USA | WEATHER
+    market_type    TEXT,                     -- 'threshold' | 'range' (2026-05-12)
     status         TEXT NOT NULL,            -- 'open' | 'resolved' | 'aborted'
     settled_at     TEXT,                     -- ISO UTC of settle (resolved only)
     outcome        TEXT,                     -- 'yes' | 'no' | NULL
@@ -122,11 +123,14 @@ def _get_db() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(str(CANDIDATES_DB()), timeout=10.0)
     conn.executescript(SCHEMA)
-    # Best-effort migration: add chart_region to old argus_candidates rows.
+    # Best-effort migrations on long-lived tables.
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(argus_candidates)")]
         if "chart_region" not in cols:
             conn.execute("ALTER TABLE argus_candidates ADD COLUMN chart_region TEXT")
+        pcols = [r[1] for r in conn.execute("PRAGMA table_info(argus_paper_positions)")]
+        if "market_type" not in pcols:
+            conn.execute("ALTER TABLE argus_paper_positions ADD COLUMN market_type TEXT")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -379,6 +383,7 @@ def _emit_paper_position(
     market: dict, mid: float, edge_pp: float,
     bankroll: float, deployed_usd: float,
     chart_region: Optional[str], model_version: str,
+    market_type: Optional[str] = None,
 ) -> Optional[dict]:
     """Size + insert one paper position. Returns row dict or None if rejected."""
     sd = size_prediction(pred, market_p=mid,
@@ -390,12 +395,12 @@ def _emit_paper_position(
         """INSERT INTO argus_paper_positions (
               ticker, side, entry_price, size_usd, entry_ts,
               model_p, market_p, edge_pp, confidence,
-              brain_id, model_version, chart_region, status, notes
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
+              brain_id, model_version, chart_region, market_type, status, notes
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
         (
             pred.market_ticker, sd.side, mid, sd.final_usd, ts,
             pred.p_yes, mid, edge_pp, pred.confidence,
-            pred.brain_id, model_version, chart_region,
+            pred.brain_id, model_version, chart_region, market_type,
             "; ".join(sd.rationale)[:500],
         ),
     )
@@ -499,6 +504,7 @@ def _scan_one_brain(
                     conn, pred=pred, market=m, mid=mid, edge_pp=edge_pp,
                     bankroll=paper_bankroll, deployed_usd=deployed_now,
                     chart_region=chart_region, model_version=model_version,
+                    market_type=feat.get("market_type"),
                 )
                 if emitted:
                     paper_emitted.append(emitted)
