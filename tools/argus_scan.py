@@ -1,28 +1,25 @@
-"""ARGUS paper-mode scanner — surface tradeable Music brain candidates AND
-record paper positions for them.
+"""ARGUS paper-mode scanner — multi-brain (Music + Weather as of 2026-05-12).
+
+Why multi-brain: Music settles monthly → first paper reconciliation ~June 1
+(too slow to validate model). Weather settles DAILY → first reconciliations
+within 24-48h, so the paper track record builds 10× faster. Same paper
+machinery (table, sizer, reconciler, stats) — brains plug in via the
+DomainBrain interface.
 
 Pipeline (paper-only — no real orders):
   STEP 0 (reconcile FIRST): for every status='open' position in
          argus_paper_positions, ask Kalshi whether the market settled.
          If yes → score paper_pnl, mark resolved.
-  STEP 1: Load trained MusicModel from data/argus/music_model_v1.json
-          (raises if file missing — operator must run argus_backtest
-          --save-model first; never silently use heuristic priors)
-  STEP 2: Pull all currently-active KXRANKLISTSONGSPOTGLOBAL-* AND
-          KXRANKLISTSONGSPOTUSA-* markets from Kalshi (USA chart region added
-          2026-05-10 — same model, separate Brier tracking via chart_region
-          column to monitor calibration transfer).
-  STEP 3: For each, run MusicBrain.predict() (live chart, true daily delta)
-  STEP 4: Compute edge_pp = (our_p - market_p) × 100   (signed)
-          (market_p from yes mid: (yes_bid + yes_ask) / 2)
-  STEP 5: actionable = |edge_pp| ≥ MIN_EDGE_PP AND confidence ≥ MIN_CONFIDENCE
-  STEP 6: Persist EVERY prediction to argus_candidates (needed for the live-
-          vs-backtest velocity-feature monitor)
-  STEP 7: For actionable predictions where we have NO open paper position on
-          the same ticker, size with quarter-Kelly via argus.execution.sizer
-          and INSERT a row into argus_paper_positions
-  STEP 8: Print top 10 candidates with full feature breakdown + paper-track
-          stats by model_version × chart_region
+  STEP 1: Load trained MusicModel; instantiate WeatherBrain (NWS-driven,
+          no separate trained-model file).
+  STEP 2: Pull all active KXRANKLISTSONGSPOT{GLOBAL,USA}-* (music) AND
+          KX{HIGH,LOW,HIGHT,LOWT}{CITY}-* (weather) markets from Kalshi.
+  STEP 3: For each market, route to its brain via _scan_one_brain helper.
+  STEP 4-7: edge_pp, actionable gate, persist row, emit paper position
+            (quarter-Kelly via argus.execution.sizer) — same as before.
+  STEP 8: Print combined per-brain summary + paper-track stats by
+          (model_version, chart_region). chart_region values:
+          GLOBAL/USA (music) and WEATHER (weather).
 
 Cron: deploy/argus-scan.{timer,service} → daily 23:00 UTC.
 
@@ -49,12 +46,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from execution.kalshi_auth import KalshiClient
 from argus.brains.music import (
-    MusicBrain, MusicModel, MARKET_PREFIXES, MODEL_PATH, parse_ticker,
+    MusicBrain, MusicModel, MARKET_PREFIXES as MUSIC_PREFIXES,
+    MODEL_PATH, parse_ticker as parse_music_ticker,
+)
+from argus.brains.weather import (
+    WeatherBrain, ALL_PREFIXES as WEATHER_PREFIXES, parse_market as parse_weather_market,
 )
 from argus.config import (
     DATA_DIR, MIN_EDGE_PP, MIN_CONFIDENCE, ensure_dirs,
 )
 from argus.data.spotify_charts import SpotifyChartsClient
+from argus.data.nws import NWSClient
 from argus.execution.sizer import size_prediction
 
 _log = logging.getLogger(__name__)
@@ -187,12 +189,79 @@ def pull_active_markets(series_ticker: str) -> list[dict]:
 
 
 def pull_active_markets_all_prefixes(prefixes: list[str]) -> list[dict]:
-    """Pull markets for each Music series prefix and combine."""
+    """Pull markets for each EXACT series_ticker and combine."""
     combined: list[dict] = []
     seen: set[str] = set()
     for p in prefixes:
         markets = pull_active_markets(p)
         _log.info(f"pulled {len(markets)} active for {p}")
+        for m in markets:
+            tk = m.get("ticker")
+            if tk and tk not in seen:
+                seen.add(tk); combined.append(m)
+    return combined
+
+
+def discover_series_starting_with(prefix: str, *,
+                                  drop_keywords: tuple[str, ...] = ()) -> list[str]:
+    """Enumerate all open Kalshi series whose ticker startswith prefix.
+
+    Used for prefix families (KXHIGHT*, KXLOWT*) where the underlying series
+    are city-specific (KXHIGHTNY, KXHIGHTPHX, ...). Kalshi's
+    /markets?series_ticker filter wants exact matches, so we have to expand
+    the prefix to a list first via /series.
+    """
+    c = KalshiClient()
+    series_out: list[str] = []
+    for status in ("active", "open"):
+        cursor = None
+        pages = 0
+        while pages < 30:
+            params = {"status": status, "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                r = c.get_unauth("/series", params=params)
+            except Exception as e:
+                _log.warning(f"series enum failed (status={status}): {e}")
+                break
+            ss = r.get("series", [])
+            for s in ss:
+                t = s.get("ticker", "")
+                if not t.startswith(prefix):
+                    continue
+                if any(k in t.upper() for k in drop_keywords):
+                    continue
+                if t not in series_out:
+                    series_out.append(t)
+            cursor = r.get("cursor")
+            pages += 1
+            if not cursor or not ss:
+                break
+        if series_out:
+            break
+    return series_out
+
+
+def pull_active_markets_for_weather(prefix_families: list[str]) -> list[dict]:
+    """Resolve each weather prefix family to concrete city series, then pull
+    markets per series. Filters out non-temperature siblings whose tickers
+    happen to share the prefix (KXHIGHINFLATION, KXLOWESTRATE, etc.).
+    """
+    DROP = ("INFLATION", "RATE", "MOV", "MOVDJT", "MOVKH", "YIELD", "VIX",
+            "UMICH", "DXY")
+    all_series: list[str] = []
+    for fam in prefix_families:
+        seen_in_family = discover_series_starting_with(fam, drop_keywords=DROP)
+        for s in seen_in_family:
+            if s not in all_series:
+                all_series.append(s)
+    _log.info(f"weather: resolved {len(prefix_families)} prefix families to "
+              f"{len(all_series)} series")
+    combined: list[dict] = []
+    seen: set[str] = set()
+    for s in all_series:
+        markets = pull_active_markets(s)
         for m in markets:
             tk = m.get("ticker")
             if tk and tk not in seen:
@@ -346,6 +415,105 @@ def _open_deployed_total(conn: sqlite3.Connection) -> float:
     return float(r[0] or 0)
 
 
+# ── Per-brain scan helper ────────────────────────────────────────────────
+def _chart_region_for(brain_id: str, market: dict) -> Optional[str]:
+    """Resolve chart_region per brain — used for separate Brier tracking."""
+    if brain_id == "music":
+        meta = parse_music_ticker(market.get("ticker", ""), market.get("yes_sub_title"))
+        return meta.chart_region if meta else None
+    if brain_id == "weather":
+        meta = parse_weather_market(market)
+        return meta.chart_region if meta else None
+    return None
+
+
+def _scan_one_brain(
+    *, conn: sqlite3.Connection, brain, brain_id: str, model_version: str,
+    markets: list[dict], min_edge: float, min_conf: float, no_paper: bool,
+    ts_now: str, deployed_now: float, paper_bankroll: float,
+) -> dict:
+    """Run one brain over its market universe. Mutates DB. Returns summary."""
+    rows: list[tuple] = []
+    candidates: list[dict] = []
+    paper_emitted: list[dict] = []
+    n_no_pred = n_no_mid = 0
+
+    for m in markets:
+        tk = m.get("ticker", "")
+        chart_region = _chart_region_for(brain_id, m)
+        try:
+            pred = brain.predict(m)
+        except Exception as e:
+            _log.warning(f"{brain_id}.predict({tk}) failed: {e}")
+            n_no_pred += 1
+            continue
+        if pred is None:
+            n_no_pred += 1
+            continue
+        mid = _market_mid(m)
+        if mid is None:
+            n_no_mid += 1
+            edge_pp = None
+        else:
+            edge_pp = (pred.p_yes - mid) * 100.0
+
+        actionable = (
+            edge_pp is not None
+            and abs(edge_pp) >= min_edge
+            and pred.confidence >= min_conf
+        )
+
+        feat = pred.key_features
+        # Pull the brain-agnostic surrogate fields the candidates table
+        # expects (artist + resolution_month). For weather, use city +
+        # settle_date so the row is still self-describing.
+        surrogate_artist = feat.get("artist_name") or feat.get("city")
+        surrogate_window = feat.get("resolution_month") or feat.get("settle_date")
+        rows.append((
+            ts_now, brain_id, model_version, tk,
+            surrogate_artist, surrogate_window, chart_region,
+            round(pred.p_yes, 4), round(mid, 4) if mid else None,
+            round(edge_pp, 4) if edge_pp is not None else None,
+            round(pred.confidence, 4), 1 if actionable else 0,
+            float(m.get("yes_bid_dollars") or 0) or None,
+            float(m.get("yes_ask_dollars") or 0) or None,
+            json.dumps(feat, default=str),
+        ))
+
+        if actionable:
+            candidates.append({
+                "ticker":          tk,
+                "brain_id":        brain_id,
+                "chart_region":    chart_region,
+                "label":           surrogate_artist,
+                "window":          surrogate_window,
+                "our_p":           round(pred.p_yes, 4),
+                "market_p":        round(mid, 4) if mid else None,
+                "edge_pp":         round(edge_pp, 4) if edge_pp is not None else None,
+                "confidence":      round(pred.confidence, 4),
+                "side":            "YES" if (edge_pp or 0) > 0 else "NO",
+                "feature_audit":   feat,
+            })
+            if (not no_paper) and (not _has_open_position(conn, tk)):
+                emitted = _emit_paper_position(
+                    conn, pred=pred, market=m, mid=mid, edge_pp=edge_pp,
+                    bankroll=paper_bankroll, deployed_usd=deployed_now,
+                    chart_region=chart_region, model_version=model_version,
+                )
+                if emitted:
+                    paper_emitted.append(emitted)
+                    deployed_now += emitted["size_usd"]
+
+    return {
+        "rows":          rows,
+        "candidates":    candidates,
+        "paper_emitted": paper_emitted,
+        "n_no_pred":     n_no_pred,
+        "n_no_mid":      n_no_mid,
+        "deployed_now":  deployed_now,
+    }
+
+
 # ── Stats ───────────────────────────────────────────────────────────────────
 def paper_stats(conn: sqlite3.Connection) -> list[dict]:
     """One row per (model_version, chart_region) bucket."""
@@ -439,89 +607,45 @@ def main() -> int:
         return 2
     model = MusicModel.load(mp)
     model_version = "v1"
-    _log.info(f"loaded model n_train={model.n_train} trained_at={model.trained_at}")
+    _log.info(f"loaded music model n_train={model.n_train} trained_at={model.trained_at}")
 
-    brain = MusicBrain(client=SpotifyChartsClient(), model=model)
+    music_brain   = MusicBrain(client=SpotifyChartsClient(), model=model)
+    weather_brain = WeatherBrain(client=NWSClient())
 
-    markets = pull_active_markets_all_prefixes(MARKET_PREFIXES)
-    _log.info(f"pulled {len(markets)} active across {len(MARKET_PREFIXES)} prefixes")
-    if not markets:
-        print("\nNo active markets returned by Kalshi for any music series.")
+    music_markets = pull_active_markets_all_prefixes(MUSIC_PREFIXES)
+    _log.info(f"music: pulled {len(music_markets)} active across {MUSIC_PREFIXES}")
+    weather_markets = pull_active_markets_for_weather(list(WEATHER_PREFIXES))
+    _log.info(f"weather: pulled {len(weather_markets)} active markets")
+
+    if not music_markets and not weather_markets:
+        print("\nNo active markets returned by Kalshi for any series.")
         conn.close()
         return 0
 
     ts_now = dt.datetime.now(dt.timezone.utc).isoformat()
-    rows_to_persist: list[tuple] = []
-    candidates: list[dict] = []
-    n_no_pred = n_no_mid = 0
-    paper_emitted: list[dict] = []
     deployed_now = _open_deployed_total(conn)
 
-    for m in markets:
-        tk = m.get("ticker", "")
-        meta = parse_ticker(tk, m.get("yes_sub_title"))
-        chart_region = meta.chart_region if meta else None
+    music_res = _scan_one_brain(
+        conn=conn, brain=music_brain, brain_id="music", model_version=model_version,
+        markets=music_markets, min_edge=a.min_edge, min_conf=a.min_conf,
+        no_paper=a.no_paper, ts_now=ts_now, deployed_now=deployed_now,
+        paper_bankroll=PAPER_BANKROLL,
+    )
+    deployed_now = music_res["deployed_now"]
 
-        pred = brain.predict(m)
-        if pred is None:
-            n_no_pred += 1
-            continue
-        mid = _market_mid(m)
-        if mid is None:
-            n_no_mid += 1
-            edge_pp = None
-        else:
-            edge_pp = (pred.p_yes - mid) * 100.0    # signed
+    weather_res = _scan_one_brain(
+        conn=conn, brain=weather_brain, brain_id="weather", model_version="v1",
+        markets=weather_markets, min_edge=a.min_edge, min_conf=a.min_conf,
+        no_paper=a.no_paper, ts_now=ts_now, deployed_now=deployed_now,
+        paper_bankroll=PAPER_BANKROLL,
+    )
+    deployed_now = weather_res["deployed_now"]
 
-        actionable = (
-            edge_pp is not None
-            and abs(edge_pp) >= a.min_edge
-            and pred.confidence >= a.min_conf
-        )
+    all_rows = music_res["rows"] + weather_res["rows"]
+    all_candidates = music_res["candidates"] + weather_res["candidates"]
+    all_paper_emitted = music_res["paper_emitted"] + weather_res["paper_emitted"]
 
-        feat = pred.key_features
-        rows_to_persist.append((
-            ts_now, "music", model_version, tk,
-            feat.get("artist_name"), feat.get("resolution_month"),
-            chart_region,
-            round(pred.p_yes, 4), round(mid, 4) if mid else None,
-            round(edge_pp, 4) if edge_pp is not None else None,
-            round(pred.confidence, 4), 1 if actionable else 0,
-            float(m.get("yes_bid_dollars") or 0) or None,
-            float(m.get("yes_ask_dollars") or 0) or None,
-            json.dumps(feat, default=str),
-        ))
-
-        if actionable:
-            candidates.append({
-                "ticker":          tk,
-                "chart_region":    chart_region,
-                "artist":          feat.get("artist_name"),
-                "month":           feat.get("resolution_month"),
-                "our_p":           round(pred.p_yes, 4),
-                "market_p":        round(mid, 4) if mid else None,
-                "edge_pp":         round(edge_pp, 4) if edge_pp is not None else None,
-                "confidence":      round(pred.confidence, 4),
-                "side":            "YES" if (edge_pp or 0) > 0 else "NO",
-                "top_rank_lift":   feat.get("top_rank_lift"),
-                "days_factor":     feat.get("days_factor"),
-                "historical_no1_rate_12mo": feat.get("historical_no1_rate_12mo"),
-                "streams_velocity_norm_today": feat.get("streams_velocity_norm_today"),
-                "current_top_track_rank":      feat.get("current_top_track_rank"),
-            })
-
-            # Emit paper position if no existing open & paper writes enabled
-            if (not a.no_paper) and (not _has_open_position(conn, tk)):
-                emitted = _emit_paper_position(
-                    conn, pred=pred, market=m, mid=mid, edge_pp=edge_pp,
-                    bankroll=PAPER_BANKROLL, deployed_usd=deployed_now,
-                    chart_region=chart_region, model_version=model_version,
-                )
-                if emitted:
-                    paper_emitted.append(emitted)
-                    deployed_now += emitted["size_usd"]
-
-    # Persist all (even non-actionable — needed for velocity-feature monitor)
+    # Persist candidates
     try:
         conn.executemany(
             """INSERT INTO argus_candidates (
@@ -529,16 +653,14 @@ def main() -> int:
                 chart_region, our_p, market_p, edge_pp, confidence, actionable,
                 yes_bid, yes_ask, feature_audit_json
               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            rows_to_persist,
+            all_rows,
         )
         conn.commit()
     except sqlite3.OperationalError as e:
-        # If migration hadn't yet added chart_region (very old DB), retry
-        # without that column for forward-compat.
         _log.warning(f"insert failed ({e}); retrying without chart_region")
         compat = [(r[0], r[1], r[2], r[3], r[4], r[5],
                    r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14])
-                  for r in rows_to_persist]
+                  for r in all_rows]
         conn.executemany(
             """INSERT INTO argus_candidates (
                 ts, brain_id, model_version, ticker, artist, resolution_month,
@@ -549,50 +671,67 @@ def main() -> int:
         )
         conn.commit()
 
-    candidates.sort(key=lambda c: -abs(c.get("edge_pp") or 0))
-    top = candidates[:10]
+    all_candidates.sort(key=lambda c: -abs(c.get("edge_pp") or 0))
+    top = all_candidates[:10]
     stats = paper_stats(conn)
 
     if a.json:
+        def _bsum(res, key):
+            return res[key] if isinstance(res[key], int) else len(res[key])
         print(json.dumps({
-            "ts":            ts_now,
-            "model_version": model_version,
-            "n_markets":     len(markets),
-            "n_predictions": len(rows_to_persist),
-            "n_no_pred":     n_no_pred,
-            "n_no_mid":      n_no_mid,
-            "n_actionable":  len(candidates),
+            "ts":             ts_now,
+            "model_version":  model_version,
+            "music":   {
+                "n_markets":     len(music_markets),
+                "n_predictions": len(music_res["rows"]),
+                "n_no_pred":     music_res["n_no_pred"],
+                "n_no_mid":      music_res["n_no_mid"],
+                "n_actionable":  len(music_res["candidates"]),
+                "paper_emitted": music_res["paper_emitted"],
+            },
+            "weather": {
+                "n_markets":     len(weather_markets),
+                "n_predictions": len(weather_res["rows"]),
+                "n_no_pred":     weather_res["n_no_pred"],
+                "n_no_mid":      weather_res["n_no_mid"],
+                "n_actionable":  len(weather_res["candidates"]),
+                "paper_emitted": weather_res["paper_emitted"],
+            },
             "paper_bankroll": PAPER_BANKROLL,
-            "paper_emitted": paper_emitted,
-            "reconcile":     rec,
-            "paper_stats":   stats,
-            "top10":         top,
+            "reconcile":      rec,
+            "paper_stats":    stats,
+            "top10":          top,
         }, indent=2, default=str))
         conn.close()
         return 0
 
-    print(f"\n━━━ ARGUS SCAN — music ━━━")
-    print(f"  ts:            {ts_now}")
-    print(f"  model:         v1  (n_train={model.n_train})")
-    print(f"  markets:       {len(markets)} ({'+'.join(MARKET_PREFIXES)})  "
-          f"preds={len(rows_to_persist)}  no_pred={n_no_pred}  no_mid={n_no_mid}")
-    print(f"  actionable:    {len(candidates)}  (edge≥{a.min_edge}pp, conf≥{a.min_conf})")
-    print(f"  reconcile:     resolved={rec['resolved']}  still_open={rec['still_open']}  "
+    print(f"\n━━━ ARGUS SCAN — multi-brain ━━━")
+    print(f"  ts:           {ts_now}")
+    print(f"  reconcile:    resolved={rec['resolved']}  still_open={rec['still_open']}  "
           f"realized=${rec['pnl_resolved_usd']:+.2f}")
-    print(f"  paper_book:    bankroll=${PAPER_BANKROLL:.0f}  "
-          f"deployed=${deployed_now:.2f}  emitted_this_scan={len(paper_emitted)}")
-    if paper_emitted:
-        for e in paper_emitted[:5]:
-            print(f"    + {e['ticker']:<48} {e['side']:<3} "
+    print(f"  paper_book:   bankroll=${PAPER_BANKROLL:.0f}  "
+          f"deployed=${deployed_now:.2f}  emitted_this_scan={len(all_paper_emitted)}")
+    print()
+    for label, res, prefixes in (
+        ("music",   music_res,   MUSIC_PREFIXES),
+        ("weather", weather_res, list(WEATHER_PREFIXES)),
+    ):
+        n_markets = len(music_markets) if label == "music" else len(weather_markets)
+        print(f"  [{label.upper():<7}] markets={n_markets:>3}  "
+              f"preds={len(res['rows']):>3}  no_pred={res['n_no_pred']:>3}  "
+              f"no_mid={res['n_no_mid']:>3}  actionable={len(res['candidates']):>3}  "
+              f"new_paper={len(res['paper_emitted']):>2}")
+        for e in res["paper_emitted"][:5]:
+            print(f"    + {e['ticker'][:48]:<48} {e['side']:<3} "
                   f"${e['size_usd']:>6.2f} @ {e['entry_price']:.3f}")
     print()
 
     if stats:
         print(f"  PAPER TRACK RECORD by (version, region):")
-        for s in sorted(stats, key=lambda x: (x["model_version"], x["chart_region"])):
+        for s in sorted(stats, key=lambda x: (x["model_version"], x["chart_region"] or "")):
             wins = s["wins"]; loss = s["losses"]; n_rez = wins + loss
             wr = (wins / n_rez * 100.0) if n_rez > 0 else 0.0
-            print(f"    {s['model_version']}/{s['chart_region']:<7s}  "
+            print(f"    {s['model_version']}/{(s['chart_region'] or '?'):<8s} "
                   f"open={s['open']:>3d} (${s['size_open_usd']:>7.2f})  "
                   f"resolved={s['resolved']:>3d}  "
                   f"WR={wr:>5.1f}%  realized=${s['pnl_resolved_usd']:+.2f}")
@@ -602,15 +741,14 @@ def main() -> int:
         print("  (no actionable candidates)")
         conn.close()
         return 0
-    print(f"  TOP {len(top)} CANDIDATES:")
-    print(f"  {'ticker':<48} {'reg':<6} {'side':<3} {'edge':>6} {'our':>5} {'mkt':>5} "
-          f"{'conf':>5} {'rank':>4} {'days':>5} {'hist':>5}")
+    print(f"  TOP {len(top)} CANDIDATES (by |edge_pp|):")
+    print(f"  {'ticker':<48} {'brain':<7} {'reg':<7} {'side':<3} {'edge':>6} "
+          f"{'our':>5} {'mkt':>5} {'conf':>5}")
     for c in top:
-        print(f"  {c['ticker'][:48]:<48} {(c['chart_region'] or '?')[:6]:<6} "
-              f"{c['side']:<3} {c['edge_pp']:>+6.2f} {c['our_p']:>5.2f} "
-              f"{c['market_p']:>5.2f} {c['confidence']:>5.2f} "
-              f"{int(c['current_top_track_rank']):>4} "
-              f"{c['days_factor']:>5.2f} {c['historical_no1_rate_12mo']:>5.2f}")
+        print(f"  {c['ticker'][:48]:<48} {c['brain_id'][:7]:<7} "
+              f"{(c['chart_region'] or '?')[:7]:<7} {c['side']:<3} "
+              f"{c['edge_pp']:>+6.2f} {c['our_p']:>5.2f} "
+              f"{c['market_p']:>5.2f} {c['confidence']:>5.2f}")
     print()
     print("  (full feature audit per candidate persisted to "
           f"{CANDIDATES_DB().name})")
