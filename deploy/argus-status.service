@@ -1,0 +1,12 @@
+[Unit]
+Description=ARGUS validation dashboard — daily paper-book health summary
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+Environment="PYTHONPATH=/root/lip-maker"
+ExecStart=/root/lip-maker/venv/bin/python -m tools.argus_status
+StandardOutput=append:/root/lip-maker/logs/argus_status.log
+StandardError=append:/root/lip-maker/logs/argus_status.log

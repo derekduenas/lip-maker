@@ -1,0 +1,11 @@
+[Unit]
+Description=ARGUS daily status — fires 14:00 UTC after 13:20 scan + reconciler
+
+[Timer]
+OnCalendar=*-*-* 14:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=argus-status.service
+
+[Install]
+WantedBy=timers.target
