@@ -974,8 +974,13 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                 from execution.kalshi_auth import KalshiClient as _KC_dg
                 _dg_client = _KC_dg()
                 pre_n = len(markets)
-                markets = filter_by_depth(markets, _dg_client,
-                                          min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")))
+                markets = filter_by_depth(
+                    markets, _dg_client,
+                    min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
+                    exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
+                    min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
+                    min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
+                )
                 _log.info(f"depth_gate: {pre_n} -> {len(markets)} markets "
                           f"({100*(pre_n-len(markets))/max(1,pre_n):.0f}% rejected)")
             except Exception as e:
@@ -1041,8 +1046,13 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                             from execution.kalshi_auth import KalshiClient as _KC_dg2
                             _dg_client2 = _KC_dg2()
                             pre_n = len(fresh)
-                            fresh = filter_by_depth(fresh, _dg_client2,
-                                                    min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")))
+                            fresh = filter_by_depth(
+                                fresh, _dg_client2,
+                                min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
+                                exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
+                                min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
+                                min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
+                            )
                             _log.info(f"depth_gate refresh: {pre_n} -> {len(fresh)}")
                         except Exception as e:
                             _log.warning(f"depth_gate refresh skipped: {e}")

@@ -235,6 +235,22 @@ SERIES_BLOCKLIST = {
 # event binaries we haven't manually banned.
 EVENT_BINARY_MAX_DAYS = 60
 
+# 2026-05-12 EXIT-LIQUIDITY GATE: depth_probe previously checked only
+# projected SHARE at entry, missing markets where the opposite-side bid
+# vanished after we filled. Diagnosed: 38 stranded positions sitting at
+# "no_bid_to_sell_into" — engine had no exit path so they held to settle,
+# costing $570-1140 of expected loss over 2-3 weeks.
+#
+# Gate: BOTH opposite-side bids must satisfy
+#   bid_size  >= MIN_EXIT_CONTRACTS  AND
+#   bid_price >= MIN_EXIT_PRICE_CENTS
+# (LIP makers post both YES and NO; either side could fill, so both must
+#  have an exit path.) Override per env: EXIT_GATE_ENABLED, MIN_EXIT_CONTRACTS,
+# MIN_EXIT_PRICE_CENTS — read in run_paper.py at filter_by_depth call sites.
+EXIT_GATE_ENABLED       = True
+MIN_EXIT_CONTRACTS      = 50
+MIN_EXIT_PRICE_CENTS    = 5
+
 # ── Quote pricing ─────────────────────────────────────────────────────────
 # Where to place our quote relative to best bid/ask:
 #   "join"    = match best bid/ask exactly
