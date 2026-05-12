@@ -58,7 +58,13 @@ from argus.data.spotify_charts import SpotifyChartsClient, ChartEntry
 _log = logging.getLogger(__name__)
 
 
-MARKET_PREFIX = "KXRANKLISTSONGSPOTGLOBAL"
+MARKET_PREFIX = "KXRANKLISTSONGSPOTGLOBAL"   # legacy alias (Phase 3)
+# Series suffix → kworb chart slug. Add new region: append here only.
+CHART_REGIONS = {
+    "GLOBAL": "global",
+    "USA":    "us",
+}
+MARKET_PREFIXES = [f"KXRANKLISTSONGSPOT{s}" for s in CHART_REGIONS]
 MODEL_PATH    = lambda: Path(DATA_DIR) / "music_model_v1.json"
 
 MONTH_ABBR = {
@@ -83,7 +89,7 @@ DEFAULT_WEIGHTS = {
 
 # ── Ticker parsing ────────────────────────────────────────────────────────
 _RX_TICKER = re.compile(
-    r"^KXRANKLISTSONGSPOTGLOBAL-"
+    r"^KXRANKLISTSONGSPOT(?P<region>" + "|".join(CHART_REGIONS) + r")-"
     r"(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<dd>\d{2})-"
     r"(?P<artist_code>[A-Z]+)$"
 )
@@ -97,6 +103,7 @@ class MarketMeta:
     resolution_year:  int
     resolution_month: int           # 1-12
     artist_code:      str           # 3-4 letter abbreviation
+    chart_region:     str = "GLOBAL"          # GLOBAL | USA (kworb chart key)
     artist_name:      Optional[str] = None    # from yes_sub_title (canonical)
 
 
@@ -123,6 +130,7 @@ def parse_ticker(ticker: str, yes_sub_title: Optional[str] = None) -> Optional[M
         ticker=ticker, settle_date=settle_date,
         resolution_year=res_year, resolution_month=res_month,
         artist_code=m.group("artist_code"),
+        chart_region=m.group("region"),
         artist_name=(yes_sub_title or "").strip() or None,
     )
 
@@ -335,7 +343,7 @@ class MusicModel:
 # ── Brain ─────────────────────────────────────────────────────────────────
 class MusicBrain(DomainBrain):
     brain_id       = "music"
-    market_pattern = f"{MARKET_PREFIX}-*"
+    market_pattern = "KXRANKLISTSONGSPOT*-*"   # GLOBAL + USA
 
     def __init__(self, *, client: Optional[SpotifyChartsClient] = None,
                  model: Optional[MusicModel] = None) -> None:
@@ -343,7 +351,7 @@ class MusicBrain(DomainBrain):
         self.model  = model  or MusicModel.load()
 
     def can_evaluate(self, market_ticker: str) -> bool:
-        return market_ticker.startswith(MARKET_PREFIX + "-")
+        return any(market_ticker.startswith(p + "-") for p in MARKET_PREFIXES)
 
     def predict(self, market: dict) -> Optional[Prediction]:
         ticker = market.get("ticker", "")
@@ -351,10 +359,11 @@ class MusicBrain(DomainBrain):
         if not meta or not meta.artist_name:
             _log.debug(f"unparsable or no canonical artist: {ticker}")
             return None
+        chart_slug = CHART_REGIONS.get(meta.chart_region, "global")
         try:
-            chart = self.client.get_chart("global")
+            chart = self.client.get_chart(chart_slug)
         except Exception as e:
-            _log.warning(f"chart fetch failed: {e}")
+            _log.warning(f"chart fetch failed ({chart_slug}): {e}")
             return None
         if not chart:
             return None
@@ -381,6 +390,7 @@ class MusicBrain(DomainBrain):
                 **feats.audit_dict(),
                 "artist_name":     meta.artist_name,
                 "artist_code":     meta.artist_code,
+                "chart_region":    meta.chart_region,
                 "resolution_month": f"{meta.resolution_year}-{meta.resolution_month:02d}",
                 "settle_date":     meta.settle_date.isoformat(),
                 "model_n_train":   self.model.n_train,
