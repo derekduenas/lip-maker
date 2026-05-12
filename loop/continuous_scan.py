@@ -43,14 +43,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.settings import DB_PATH
 
 
-# Speaker → corpus event_type mapping. The corpus stores transcripts under
-# event_type strings; calculate_edge() looks up the frequency_matrix by
-# event_type+term. For Fed markets, the existing classify_market() returns
-# event_type='fed_speech' and speaker='powell'. We honour that — but also
-# expose a fallback to fomc_committee when powell-only is thin.
-DOMAIN_PREFIXES = {
-    "fed":   "KXFEDMENTION",
-    "trump": "KXTRUMPMENTION",
+# classify_market() returns event_type strings. We trust those — the live
+# Kalshi taxonomy is messier than the documented prefix scheme suggested
+# (e.g. KXTRUMPSAY, KXTRUMPSAYNICKNAME, KXTRUMPSAYMONTH all map to
+# trump_speech via title-keyword matching), so a static prefix list under-
+# counts. Filter on the classifier's output instead of substring.
+DOMAIN_EVENT_TYPES = {
+    "fed":   "fed_speech",
+    "trump": "trump_speech",
 }
 
 
@@ -58,10 +58,9 @@ def _get_conn():
     return sqlite3.connect(DB_PATH, timeout=10.0)
 
 
-def _domain_of(ticker: str) -> str | None:
-    tk = (ticker or "").upper()
-    for dom, pfx in DOMAIN_PREFIXES.items():
-        if pfx in tk:
+def _domain_of_event_type(event_type: str) -> str | None:
+    for dom, et in DOMAIN_EVENT_TYPES.items():
+        if event_type == et:
             return dom
     return None
 
@@ -98,11 +97,9 @@ def run_continuous_scan(*, dry_run: bool = False) -> dict:
     all_markets = client.get_mention_markets()
     by_domain: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
     for m in all_markets:
-        dom = _domain_of(m.get("ticker", ""))
-        if dom not in DOMAIN_PREFIXES:
-            continue
         classified = classify_market(m)
-        if classified.get("event_type") not in ("fed_speech", "trump_speech"):
+        dom = _domain_of_event_type(classified.get("event_type", ""))
+        if dom is None:
             continue
         if not classified.get("term") or not classified.get("speaker"):
             continue
@@ -110,9 +107,11 @@ def run_continuous_scan(*, dry_run: bool = False) -> dict:
 
     if not any(by_domain.values()):
         return {
+            "ts": datetime.now(timezone.utc).isoformat(),
             "scanned": len(all_markets), "fed_markets": 0, "trump_markets": 0,
             "qualifying": 0, "executed": 0, "skipped_open_position": 0,
             "skipped_no_edge": 0, "errors": 0, "dry_run": dry_run,
+            "per_domain": {},
         }
 
     # Generic always-applicable headlines so context_scorer has *something* to
