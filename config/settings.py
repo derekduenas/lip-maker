@@ -211,7 +211,29 @@ SERIES_BLOCKLIST = {
     "KXLOWMIA",       # no-T variant
     "KXMETGALA",      # net -$65 in 6h 2026-05-05 (Met Gala — entertainment prop, sharp insider edge)
     "KXEOWEEK",       # net -$48 in 6h 2026-05-05 (executive orders weekly — political insider edge)
+    # 2026-05-12 EVENT-BINARY BANS (bleed_monitor flagged 99% losses):
+    # Long-dated one-shot binaries where two-sided LIP fills create
+    # unbounded directional decay. Diagnosed 2026-05-12 from $135.89
+    # single-batch ban event. Days-to-settle gate (EVENT_BINARY_MAX_DAYS)
+    # backstops these; explicit blacklist prevents repeat enrolment if
+    # series re-spawn with shorter resolution windows.
+    "KXBLUEWAVECOMBO",       # 2026 midterms compound (House+Senate Dem) — 265d
+    "KXGROK",                # xAI Grok release timing — 49d, decayed to 0.7%
+    "KXJIMMYKIMMELFIRED",    # late-night host firing — 234d, decayed to 1%
+    "KXJUDGECOUNT",          # federal judge confirmations — multi-tick monthly
+    "KXKANYE",               # Kanye-* event family (releases, news)
+    "KXKANYEISRAEL",         # Kanye-Israel statement timing
+    "KXBALLONDOR",           # Ballon d'Or winner — once/year long-dated
+    "KXFEDEND",              # "End of Fed" hypothetical — 4yr+ horizon
+    # KXFEDDECISION already in list above (kept; flagship)
 }
+
+# 2026-05-12: event-binary days-to-settle cap. Markets where settle is
+# more than this many days out AND the series is not on the recurring
+# whitelist (engine/lip_discovery.is_repeating_series) get rejected at
+# discovery time. Backstops the SERIES_BLOCKLIST against newly-spawned
+# event binaries we haven't manually banned.
+EVENT_BINARY_MAX_DAYS = 60
 
 # ── Quote pricing ─────────────────────────────────────────────────────────
 # Where to place our quote relative to best bid/ask:

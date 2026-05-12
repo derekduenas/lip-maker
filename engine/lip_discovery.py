@@ -72,6 +72,57 @@ def _parse_program(raw: dict) -> dict:
     }
 
 
+import re as _re
+
+# 2026-05-12 (event-binary gate): patterns that identify RECURRING series —
+# weekly/daily/monthly cycles where today's market settles in days, next
+# week's is similar. These are SAFE for LIP rebate harvesting because
+# directional decay is bounded by the short cycle.
+#
+# Anything NOT matching is treated as an EVENT BINARY (one-shot, long-dated,
+# unbounded directional risk). Conservative default = block when days_to_settle
+# is large (see EVENT_BINARY_MAX_DAYS).
+# 2026-05-12: standalone W and D removed — too many false positives on
+# event-binary series ending in those letters (e.g. KXJIMMYKIMMELFIRE_D_).
+# Commodity weeklies/dailies (KXCORNW, KXBRENTD) are covered by the PREFIX
+# regex already (CORN, BRENT in the commodity list). Multi-char suffixes
+# only.
+_RECURRING_SUFFIX_RX = _re.compile(
+    r"(?:MON|WEEK|DAILY|WEEKLY|MONTHLY|MAXMON|MINMON|MAXWK|MINWK"
+    r"|YOY|YEAR|MTH|HOUR|MIN15|15M|HOURLY)$"
+)
+_RECURRING_PREFIX_RX = _re.compile(
+    r"^KX("
+    r"CPI|CHCPI|NFP|GDP|PPI|UNEMPLOY|JOBLESS|"
+    r"HIGHT|LOWT|HIGH|LOW|RAIN|SNOW|TEMP|"
+    r"BTC|ETH|XRP|SOL|DOGE|"
+    r"BRENT|WTI|GOLD|SILVER|COPPER|CORN|SOYBEAN|WHEAT|COCOA|COFFEE|HOIL|SUGAR|"
+    r"NATGAS|HEAT|GAS|"
+    r"AAA|EIA|"
+    r"FED|TREAS|UST|"
+    r"VIX|SPX|NDX|RUT"
+    r")"
+)
+
+
+def is_repeating_series(series_prefix: str) -> bool:
+    """True if series is a serial commodity / weather / macro / crypto cycle.
+
+    These are SAFE for LIP rebate harvesting — short cycle bounds the
+    directional decay, next week's market repeats the structure.
+
+    Conservative default: anything not matching is an EVENT BINARY
+    (long-dated, one-shot, unbounded directional risk → block via days_to_settle).
+    """
+    if not series_prefix:
+        return False
+    if _RECURRING_PREFIX_RX.match(series_prefix):
+        return True
+    if _RECURRING_SUFFIX_RX.search(series_prefix):
+        return True
+    return False
+
+
 def is_active_clause(alias: str = "") -> str:
     """SQL fragment: row represents a CURRENTLY active enrolled market.
 
@@ -113,6 +164,22 @@ def _decide_enrol(p: dict, now_iso: str | None = None) -> tuple[int, str]:
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
     if p["end_date"] and p["end_date"] <= now_iso:
         return 0, "expired"
+    # 2026-05-12: event-binary gate. Long-dated NON-recurring series have
+    # unbounded directional decay over the holding period — LIP rebate
+    # cannot cover the loss when our two-sided fill's losing side dies.
+    # Diagnostic from 4 banned series (KXBLUEWAVECOMBO 265d, KXJIMMYKIMMELFIRED
+    # 234d, KXJUDGECOUNT 20d, KXGROK 49d) all became 99% losses while bleed_monitor
+    # caught $135.89 in a single batch. Recurring series (commodity/weather/macro
+    # weeklies + monthlies) are EXEMPT — short cycle bounds the decay.
+    if not is_repeating_series(series):
+        try:
+            ed = datetime.fromisoformat(p["end_date"].replace("Z", "+00:00"))
+            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+            days_to_settle = (ed - now).total_seconds() / 86400.0
+            if days_to_settle > settings.EVENT_BINARY_MAX_DAYS:
+                return 0, f"event_binary_too_long:{days_to_settle:.0f}d"
+        except (ValueError, AttributeError):
+            pass
     return 1, "ok"
 
 
