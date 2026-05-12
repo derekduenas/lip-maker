@@ -82,11 +82,36 @@ def _local_state(db_path: str = settings.DB_PATH) -> dict:
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        # 2026-05-12: NAV-truth MTD reconciliation. settlement_log overstates
+        # by ignoring unrealized losses on still-open positions; NAV delta
+        # captures both. Pull oldest + newest NAV this month from balance_log.
+        nav_mtd = {"start": None, "end": None, "delta": None}
+        try:
+            month_start_iso = datetime.now(timezone.utc).replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            r_start = conn.execute(
+                """SELECT COALESCE(total_nav_usd, balance_usd) FROM balance_log
+                   WHERE recorded_at >= ?
+                   ORDER BY recorded_at ASC LIMIT 1""", (month_start_iso,)).fetchone()
+            r_end = conn.execute(
+                """SELECT COALESCE(total_nav_usd, balance_usd) FROM balance_log
+                   ORDER BY recorded_at DESC LIMIT 1""").fetchone()
+            if r_start and r_end:
+                nav_mtd = {
+                    "start": round(r_start[0], 2),
+                    "end":   round(r_end[0], 2),
+                    "delta": round(r_end[0] - r_start[0], 2),
+                }
+        except sqlite3.OperationalError:
+            pass
 
-        # PnL trajectory last 7 days
+        # PnL trajectory last 7 days. 2026-05-12: pull NAV (cash + portfolio)
+        # alongside cash. Columns may be NULL on legacy rows; coalesce to cash.
         pnl_rows = conn.execute(
             """SELECT day, realized_pnl_usd, daily_realized_delta,
-                      open_positions, balance_usd
+                      open_positions, balance_usd,
+                      COALESCE(total_nav_usd, balance_usd) AS nav_usd,
+                      portfolio_value_usd
                FROM daily_pnl_log
                WHERE day >= date('now', '-7 days')
                ORDER BY day"""
@@ -129,6 +154,7 @@ def _local_state(db_path: str = settings.DB_PATH) -> dict:
         "settlements_7d": settle_rows,
         "vip_7d":         round(float(vip_total or 0), 2),
         "active_blacklist": bl_count,
+        "nav_mtd":        nav_mtd,
     }
 
 
@@ -169,17 +195,30 @@ def render(k: dict, l: dict) -> None:
         print(f"  {s:<28s}  {d['orders']:>3} orders / {len(d['tickers']):>2} markets")
 
     # ── 7-day PnL ──
+    # 2026-05-12: NAV (cash + portfolio) is the honest wealth view; cash
+    # alone fluctuates as engine deploys and isn't a P&L signal. Show NAV
+    # primary, cash as a secondary column.
     print(f"\n💰 PnL LAST 7 DAYS")
     pnl = l["pnl_trajectory"]
     if pnl:
-        print(f"  {'day':<10s}  {'cum_realized':>12s}  {'daily_Δ':>10s}  {'positions':>9s}  {'balance':>8s}")
-        for day, realized, delta, n_pos, bal in pnl:
-            # AUDIT FIX: realized may be None if daily_pnl_log row was
-            # incomplete; default to 0 for display.
-            print(f"  {day:<10s}  ${realized or 0:>+11.2f}  ${delta or 0:>+9.2f}  {n_pos or 0:>9d}  ${bal or 0:>7.2f}")
-        weekly_delta = sum(d[2] or 0 for d in pnl[-7:])
-        print(f"  {'─'*60}")
-        print(f"  Weekly Δ realized: ${weekly_delta:+.2f}")
+        print(f"  {'day':<10s}  {'cum_real':>10s}  {'daily_Δ':>9s}  "
+              f"{'pos':>4s}  {'NAV':>8s}  {'cash':>8s}  {'pv':>8s}")
+        for day, realized, delta, n_pos, bal, nav, pv in pnl:
+            print(f"  {day:<10s}  ${realized or 0:>+9.2f}  ${delta or 0:>+8.2f}  "
+                  f"{n_pos or 0:>4d}  ${nav or 0:>7.2f}  ${bal or 0:>7.2f}  "
+                  f"${pv or 0:>7.2f}")
+        # NAV-based weekly delta = today's NAV − 7d-ago NAV
+        if len(pnl) >= 2:
+            nav_first = pnl[0][5] or pnl[0][4] or 0
+            nav_last  = pnl[-1][5] or pnl[-1][4] or 0
+            weekly_nav_delta = nav_last - nav_first
+        else:
+            weekly_nav_delta = 0
+        weekly_realized_delta = sum(d[2] or 0 for d in pnl[-7:])
+        print(f"  {'─'*70}")
+        print(f"  Weekly Δ NAV:     ${weekly_nav_delta:+.2f}   ← honest wealth change")
+        print(f"  Weekly Δ realized: ${weekly_realized_delta:+.2f}   "
+              f"(settlement_log only — open positions invisible)")
     else:
         print("  (no daily_pnl_log entries yet)")
 
@@ -201,6 +240,15 @@ def render(k: dict, l: dict) -> None:
         total_realized = sum(d[2] or 0 for d in all_settles)
         print(f"  {'─'*60}")
         print(f"  Total 7d:  realized=${total_realized:+.2f}  rebate=${total_rebate:+.2f}  NET=${total_net:+.2f}")
+        # NAV-truth reconciliation against settlement_log (the 2x gap)
+        nav = l.get("nav_mtd") or {}
+        if nav.get("delta") is not None:
+            mtd_settle_net = total_net   # 7d settle, but useful comparison
+            print(f"  ─")
+            print(f"  MTD NAV change:    ${nav['delta']:+.2f}   "
+                  f"(start ${nav['start']} → now ${nav['end']})")
+            print(f"  ↑ NAV is the honest number. Gap vs settlement_log = "
+                  f"unrealized open-position MTM.")
     else:
         print("  (no settlements in last 7 days)")
 
@@ -303,7 +351,9 @@ def main() -> int:
             "local": {
                 "pnl_trajectory": [
                     {"day": r[0], "realized": r[1], "delta": r[2],
-                     "positions": r[3], "balance": r[4]} for r in l["pnl_trajectory"]
+                     "positions": r[3], "balance": r[4],
+                     "nav": r[5], "portfolio_value": r[6]}
+                    for r in l["pnl_trajectory"]
                 ],
                 "vip_7d_usd": l["vip_7d"],
                 "active_blacklist_count": l["active_blacklist"],
