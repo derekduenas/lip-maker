@@ -226,6 +226,10 @@ SERIES_BLOCKLIST = {
     "KXBALLONDOR",           # Ballon d'Or winner — once/year long-dated
     "KXFEDEND",              # "End of Fed" hypothetical — 4yr+ horizon
     # KXFEDDECISION already in list above (kept; flagship)
+    # 2026-05-12 v2: geopolitical/event "weeklies" that previously slipped
+    # through the suffix-only is_repeating_series fallback.
+    "KXHORMUZ",              # Strait of Hormuz events — was -$15 on T20+T200
+    "KXMAKARYOUT",           # FDA Commissioner firing — was -$7
 }
 
 # 2026-05-12: event-binary days-to-settle cap. Markets where settle is

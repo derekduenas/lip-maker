@@ -74,23 +74,20 @@ def _parse_program(raw: dict) -> dict:
 
 import re as _re
 
-# 2026-05-12 (event-binary gate): patterns that identify RECURRING series —
-# weekly/daily/monthly cycles where today's market settles in days, next
-# week's is similar. These are SAFE for LIP rebate harvesting because
-# directional decay is bounded by the short cycle.
+# 2026-05-12 (event-binary gate): RECURRING series — weekly/daily/monthly
+# cycles where today's market settles in days, next week's is similar. SAFE
+# for LIP rebate harvesting because directional decay is bounded by the
+# short cycle. Anything NOT matching is treated as an EVENT BINARY (one-shot,
+# long-dated, unbounded directional risk → blocked when days_to_settle is
+# large, see EVENT_BINARY_MAX_DAYS).
 #
-# Anything NOT matching is treated as an EVENT BINARY (one-shot, long-dated,
-# unbounded directional risk). Conservative default = block when days_to_settle
-# is large (see EVENT_BINARY_MAX_DAYS).
-# 2026-05-12: standalone W and D removed — too many false positives on
-# event-binary series ending in those letters (e.g. KXJIMMYKIMMELFIRE_D_).
-# Commodity weeklies/dailies (KXCORNW, KXBRENTD) are covered by the PREFIX
-# regex already (CORN, BRENT in the commodity list). Multi-char suffixes
-# only.
-_RECURRING_SUFFIX_RX = _re.compile(
-    r"(?:MON|WEEK|DAILY|WEEKLY|MONTHLY|MAXMON|MINMON|MAXWK|MINWK"
-    r"|YOY|YEAR|MTH|HOUR|MIN15|15M|HOURLY)$"
-)
+# 2026-05-12 v2: dropped suffix-only fallback. Original code also accepted
+# any prefix ending in WEEKLY/MON/MONTHLY/DAILY/etc.; that let in
+# geopolitical "weeklies" with the same directional-decay shape as event
+# binaries — KXHORMUZWEEKLY bled -$15 across 2 strikes, KXEOWEEK -$48 in 6h.
+# All legitimate recurring suffixes (KXBTCMAXMON, KXBTC15M, KXCORNW) are
+# already caught by the PREFIX whitelist below, so the suffix path was
+# dead code masking false positives. Now: prefix-match OR block.
 _RECURRING_PREFIX_RX = _re.compile(
     r"^KX("
     r"CPI|CHCPI|NFP|GDP|PPI|UNEMPLOY|JOBLESS|"
@@ -99,28 +96,24 @@ _RECURRING_PREFIX_RX = _re.compile(
     r"BRENT|WTI|GOLD|SILVER|COPPER|CORN|SOYBEAN|WHEAT|COCOA|COFFEE|HOIL|SUGAR|"
     r"NATGAS|HEAT|GAS|"
     r"AAA|EIA|"
-    r"FED|TREAS|UST|"
+    r"FED|TREAS|UST|DXY|"
     r"VIX|SPX|NDX|RUT"
     r")"
 )
 
 
 def is_repeating_series(series_prefix: str) -> bool:
-    """True if series is a serial commodity / weather / macro / crypto cycle.
+    """True if series prefix is in the known-recurring whitelist.
 
-    These are SAFE for LIP rebate harvesting — short cycle bounds the
-    directional decay, next week's market repeats the structure.
-
-    Conservative default: anything not matching is an EVENT BINARY
-    (long-dated, one-shot, unbounded directional risk → block via days_to_settle).
+    Whitelist covers commodity / weather / macro / crypto / index cycles.
+    Conservative default: anything else is treated as an event binary and
+    subjected to the days-to-settle gate. Geopolitical/event "weeklies"
+    (KXHORMUZWEEKLY, KXEOWEEK) are intentionally rejected even though they
+    recur — directional decay dominates the rebate.
     """
     if not series_prefix:
         return False
-    if _RECURRING_PREFIX_RX.match(series_prefix):
-        return True
-    if _RECURRING_SUFFIX_RX.search(series_prefix):
-        return True
-    return False
+    return bool(_RECURRING_PREFIX_RX.match(series_prefix))
 
 
 def is_active_clause(alias: str = "") -> str:
