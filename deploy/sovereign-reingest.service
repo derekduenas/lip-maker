@@ -1,0 +1,12 @@
+[Unit]
+Description=Sovereign auto-reingest — fold resolved earnings transcripts back into the corpus
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/sovereign
+Environment="PYTHONPATH=/root/sovereign"
+ExecStart=/usr/bin/python3 -m loop.auto_reingest --lookback 48
+StandardOutput=append:/root/sovereign/logs/auto_reingest.log
+StandardError=append:/root/sovereign/logs/auto_reingest.log

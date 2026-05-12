@@ -1,0 +1,14 @@
+[Unit]
+Description=Run Sovereign auto-reingest every 6h (offset 03/09/15/21 UTC)
+
+[Timer]
+# Offset from sovereign-continuous (00/06/12/18). The 3h offset spreads
+# load + maximizes chance the Motley Fool transcript has published by
+# the time the reingest fires.
+OnCalendar=03,09,15,21:00
+AccuracySec=2min
+Persistent=true
+Unit=sovereign-reingest.service
+
+[Install]
+WantedBy=timers.target
