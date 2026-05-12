@@ -7,6 +7,12 @@ Type=oneshot
 User=root
 WorkingDirectory=/root/lip-maker
 Environment="PYTHONPATH=/root/lip-maker"
+# 2026-05-12: paper-only bankroll bumped to $5k. With 50% deployed cap
+# and ~$14 avg position size the working set fits ~140 positions instead
+# of ~36 → 3x faster track-record accumulation. ARGUS_PAPER_BANKROLL is
+# isolated from any future ARGUS_BANKROLL (live) so this does NOT touch
+# real-money sizing.
+Environment="ARGUS_PAPER_BANKROLL=5000"
 ExecStart=/root/lip-maker/venv/bin/python -m tools.argus_scan
 StandardOutput=append:/root/lip-maker/logs/argus_scan.log
 StandardError=append:/root/lip-maker/logs/argus_scan.log

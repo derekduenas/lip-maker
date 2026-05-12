@@ -94,25 +94,35 @@ CREATE INDEX IF NOT EXISTS idx_argus_cand_ticker  ON argus_candidates(ticker);
 CREATE INDEX IF NOT EXISTS idx_argus_cand_actionable ON argus_candidates(actionable);
 
 CREATE TABLE IF NOT EXISTS argus_paper_positions (
-    position_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker         TEXT NOT NULL,
-    side           TEXT NOT NULL,            -- 'yes' | 'no'
-    entry_price    REAL NOT NULL,            -- market mid at entry, $0..1
-    size_usd       REAL NOT NULL,            -- quarter-Kelly recommended
-    entry_ts       TEXT NOT NULL,            -- ISO UTC
-    model_p        REAL NOT NULL,            -- our_p at entry
-    market_p       REAL NOT NULL,            -- mid at entry
-    edge_pp        REAL NOT NULL,            -- signed edge at entry
-    confidence     REAL NOT NULL,
-    brain_id       TEXT NOT NULL,
-    model_version  TEXT NOT NULL,
-    chart_region   TEXT,                     -- GLOBAL | USA | WEATHER
-    market_type    TEXT,                     -- 'threshold' | 'range' (2026-05-12)
-    status         TEXT NOT NULL,            -- 'open' | 'resolved' | 'aborted'
-    settled_at     TEXT,                     -- ISO UTC of settle (resolved only)
-    outcome        TEXT,                     -- 'yes' | 'no' | NULL
-    paper_pnl      REAL,                     -- realized $ if resolved
-    notes          TEXT
+    position_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker             TEXT NOT NULL,
+    side               TEXT NOT NULL,            -- 'yes' | 'no'
+    entry_price        REAL NOT NULL,            -- market mid at entry, $0..1
+    size_usd           REAL NOT NULL,            -- quarter-Kelly recommended
+    entry_ts           TEXT NOT NULL,            -- ISO UTC
+    model_p            REAL NOT NULL,            -- our_p at entry (immutable)
+    market_p           REAL NOT NULL,            -- mid at entry (immutable)
+    edge_pp            REAL NOT NULL,            -- signed edge at entry (immutable)
+    confidence         REAL NOT NULL,            -- self-confidence at entry (immutable)
+    brain_id           TEXT NOT NULL,
+    model_version      TEXT NOT NULL,
+    chart_region       TEXT,                     -- GLOBAL | USA | WEATHER
+    market_type        TEXT,                     -- 'threshold' | 'range' (2026-05-12)
+    status             TEXT NOT NULL,            -- 'open' | 'resolved' | 'aborted'
+    settled_at         TEXT,                     -- ISO UTC of settle (resolved only)
+    outcome            TEXT,                     -- 'yes' | 'no' | NULL
+    paper_pnl          REAL,                     -- realized $ if resolved
+    notes              TEXT,
+    -- Phase 2 (2026-05-12) — intra-month forecast trajectory:
+    latest_model_p     REAL,                     -- updated each scan that sees this ticker
+    latest_market_p    REAL,
+    latest_edge_pp     REAL,
+    latest_confidence  REAL,
+    last_updated_ts    TEXT,                     -- ISO UTC of last update
+    update_count       INTEGER DEFAULT 0,        -- # of scans since entry
+    trajectory_json    TEXT,                     -- JSON [{ts, p, mkt, edge_pp, conf}, ...]
+    entry_brier        REAL,                     -- filled at settle: (model_p - o)^2
+    final_brier        REAL                      -- filled at settle: (latest_model_p - o)^2
 );
 CREATE INDEX IF NOT EXISTS idx_argus_paper_status ON argus_paper_positions(status);
 CREATE INDEX IF NOT EXISTS idx_argus_paper_ticker ON argus_paper_positions(ticker);
@@ -129,8 +139,20 @@ def _get_db() -> sqlite3.Connection:
         if "chart_region" not in cols:
             conn.execute("ALTER TABLE argus_candidates ADD COLUMN chart_region TEXT")
         pcols = [r[1] for r in conn.execute("PRAGMA table_info(argus_paper_positions)")]
-        if "market_type" not in pcols:
-            conn.execute("ALTER TABLE argus_paper_positions ADD COLUMN market_type TEXT")
+        for col, ddl in [
+            ("market_type",        "ALTER TABLE argus_paper_positions ADD COLUMN market_type TEXT"),
+            ("latest_model_p",     "ALTER TABLE argus_paper_positions ADD COLUMN latest_model_p REAL"),
+            ("latest_market_p",    "ALTER TABLE argus_paper_positions ADD COLUMN latest_market_p REAL"),
+            ("latest_edge_pp",     "ALTER TABLE argus_paper_positions ADD COLUMN latest_edge_pp REAL"),
+            ("latest_confidence",  "ALTER TABLE argus_paper_positions ADD COLUMN latest_confidence REAL"),
+            ("last_updated_ts",    "ALTER TABLE argus_paper_positions ADD COLUMN last_updated_ts TEXT"),
+            ("update_count",       "ALTER TABLE argus_paper_positions ADD COLUMN update_count INTEGER DEFAULT 0"),
+            ("trajectory_json",    "ALTER TABLE argus_paper_positions ADD COLUMN trajectory_json TEXT"),
+            ("entry_brier",        "ALTER TABLE argus_paper_positions ADD COLUMN entry_brier REAL"),
+            ("final_brier",        "ALTER TABLE argus_paper_positions ADD COLUMN final_brier REAL"),
+        ]:
+            if col not in pcols:
+                conn.execute(ddl)
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -320,9 +342,12 @@ def _score_paper_pnl(*, side: str, size_usd: float, entry_price: float,
 
 
 def reconcile_open_positions(conn: sqlite3.Connection) -> dict:
-    """Close resolved paper positions. Returns summary dict."""
+    """Close resolved paper positions. Records BOTH entry_brier and
+    final_brier so we can audit whether intra-month forecast updates
+    actually improved calibration."""
     rows = conn.execute(
-        """SELECT position_id, ticker, side, entry_price, size_usd
+        """SELECT position_id, ticker, side, entry_price, size_usd,
+                  model_p, latest_model_p
            FROM argus_paper_positions WHERE status='open'"""
     ).fetchall()
     if not rows:
@@ -332,7 +357,7 @@ def reconcile_open_positions(conn: sqlite3.Connection) -> dict:
     client = KalshiClient()
     n_resolved = n_open = n_err = 0
     pnl_total = 0.0
-    for pid, ticker, side, entry_price, size_usd in rows:
+    for pid, ticker, side, entry_price, size_usd, entry_p, latest_p in rows:
         info = _market_outcome(client, ticker)
         if info is None:
             n_err += 1
@@ -340,20 +365,29 @@ def reconcile_open_positions(conn: sqlite3.Connection) -> dict:
         result = info["result"]
         status = info["status"]
         if result not in ("yes", "no"):
-            # Not yet settled — leave open
             n_open += 1
             continue
         pnl = _score_paper_pnl(
             side=side, size_usd=float(size_usd),
             entry_price=float(entry_price), outcome=result,
         )
+        # Brier: (predicted_p_yes - outcome_int)^2. latest_model_p is the
+        # forecast made on the LAST scan before settlement — that's the
+        # one that "mattered" if the operator could have re-entered.
+        # entry_brier vs final_brier comparison answers: does updating help?
+        outcome_int = 1.0 if result == "yes" else 0.0
+        entry_brier = (float(entry_p) - outcome_int) ** 2
+        eff_latest = latest_p if latest_p is not None else entry_p
+        final_brier = (float(eff_latest) - outcome_int) ** 2
         conn.execute(
             """UPDATE argus_paper_positions
                SET status='resolved', outcome=?, paper_pnl=?, settled_at=?,
+                   entry_brier=?, final_brier=?,
                    notes=COALESCE(notes,'') || ?
                WHERE position_id=?""",
             (result, pnl,
              dt.datetime.now(dt.timezone.utc).isoformat(),
+             entry_brier, final_brier,
              f" reconciled status={status}", pid),
         )
         n_resolved += 1
@@ -368,13 +402,61 @@ def reconcile_open_positions(conn: sqlite3.Connection) -> dict:
     }
 
 
-# ── Paper-position writer ───────────────────────────────────────────────────
+# ── Paper-position writer + updater ─────────────────────────────────────────
 def _has_open_position(conn: sqlite3.Connection, ticker: str) -> bool:
     r = conn.execute(
         "SELECT 1 FROM argus_paper_positions WHERE ticker=? AND status='open' LIMIT 1",
         (ticker,),
     ).fetchone()
     return r is not None
+
+
+def _update_open_position(
+    conn: sqlite3.Connection, *, ticker: str, pred, mid: float, edge_pp: float,
+) -> bool:
+    """Append today's forecast to the trajectory of an existing open position.
+
+    Entry fields (model_p, market_p, edge_pp, confidence, entry_price,
+    entry_ts, size_usd) are IMMUTABLE — they represent what we knew at
+    entry. We don't re-size mid-stream.
+
+    Updates the 'latest_*' columns + appends to trajectory_json so the
+    reconciler can compute both entry-Brier and final-Brier at settle.
+    Returns True if a row was updated, False if no open position exists.
+    """
+    row = conn.execute(
+        """SELECT position_id, trajectory_json
+           FROM argus_paper_positions
+           WHERE ticker=? AND status='open' LIMIT 1""",
+        (ticker,),
+    ).fetchone()
+    if row is None:
+        return False
+    pos_id, traj_json = row
+    try:
+        traj = json.loads(traj_json) if traj_json else []
+    except (ValueError, TypeError):
+        traj = []
+    ts = dt.datetime.now(dt.timezone.utc).isoformat()
+    traj.append({
+        "ts":    ts,
+        "p":     round(pred.p_yes, 4),
+        "mkt":   round(mid, 4) if mid else None,
+        "edge":  round(edge_pp, 4) if edge_pp is not None else None,
+        "conf":  round(pred.confidence, 4),
+    })
+    conn.execute(
+        """UPDATE argus_paper_positions
+           SET latest_model_p=?, latest_market_p=?, latest_edge_pp=?,
+               latest_confidence=?, last_updated_ts=?,
+               update_count=COALESCE(update_count,0)+1,
+               trajectory_json=?
+           WHERE position_id=?""",
+        (pred.p_yes, mid, edge_pp, pred.confidence, ts,
+         json.dumps(traj, default=str), pos_id),
+    )
+    conn.commit()
+    return True
 
 
 def _emit_paper_position(
@@ -441,7 +523,7 @@ def _scan_one_brain(
     rows: list[tuple] = []
     candidates: list[dict] = []
     paper_emitted: list[dict] = []
-    n_no_pred = n_no_mid = 0
+    n_no_pred = n_no_mid = n_trajectory_updates = 0
 
     for m in markets:
         tk = m.get("ticker", "")
@@ -485,6 +567,14 @@ def _scan_one_brain(
             json.dumps(feat, default=str),
         ))
 
+        # Phase 2: update trajectory on EVERY open position we see (even
+        # if no longer actionable today — the forecast trajectory should
+        # reflect today's view).
+        if mid is not None and _has_open_position(conn, tk):
+            if _update_open_position(conn, ticker=tk, pred=pred,
+                                     mid=mid, edge_pp=edge_pp):
+                n_trajectory_updates += 1
+
         if actionable:
             candidates.append({
                 "ticker":          tk,
@@ -511,12 +601,13 @@ def _scan_one_brain(
                     deployed_now += emitted["size_usd"]
 
     return {
-        "rows":          rows,
-        "candidates":    candidates,
-        "paper_emitted": paper_emitted,
-        "n_no_pred":     n_no_pred,
-        "n_no_mid":      n_no_mid,
-        "deployed_now":  deployed_now,
+        "rows":             rows,
+        "candidates":       candidates,
+        "paper_emitted":    paper_emitted,
+        "n_no_pred":        n_no_pred,
+        "n_no_mid":         n_no_mid,
+        "n_traj_updates":   n_trajectory_updates,
+        "deployed_now":     deployed_now,
     }
 
 
@@ -726,7 +817,8 @@ def main() -> int:
         print(f"  [{label.upper():<7}] markets={n_markets:>3}  "
               f"preds={len(res['rows']):>3}  no_pred={res['n_no_pred']:>3}  "
               f"no_mid={res['n_no_mid']:>3}  actionable={len(res['candidates']):>3}  "
-              f"new_paper={len(res['paper_emitted']):>2}")
+              f"new_paper={len(res['paper_emitted']):>2}  "
+              f"traj_updates={res.get('n_traj_updates',0):>3}")
         for e in res["paper_emitted"][:5]:
             print(f"    + {e['ticker'][:48]:<48} {e['side']:<3} "
                   f"${e['size_usd']:>6.2f} @ {e['entry_price']:.3f}")
