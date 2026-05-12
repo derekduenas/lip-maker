@@ -55,7 +55,7 @@ def record_balance_snapshot(db_path: str = settings.DB_PATH) -> float:
         _log.warning(f"balance fetch failed: {e}")
         return 0.0
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         # Create table if not present (lightweight, idempotent)
         conn.execute("""
@@ -85,7 +85,7 @@ def record_balance_snapshot(db_path: str = settings.DB_PATH) -> float:
 
 def get_period_boundaries(db_path: str = settings.DB_PATH) -> list[tuple[str, str]]:
     """Return unique (start, end) tuples from lip_programs we've seen."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         rows = conn.execute(
             "SELECT DISTINCT start_date, end_date FROM lip_programs ORDER BY end_date"
@@ -97,7 +97,7 @@ def get_period_boundaries(db_path: str = settings.DB_PATH) -> list[tuple[str, st
 
 def balance_at(ts_iso: str, db_path: str = settings.DB_PATH) -> float | None:
     """Return the closest-after balance record to a given ISO timestamp."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         row = conn.execute(
             "SELECT balance_usd FROM balance_log WHERE recorded_at >= ? ORDER BY recorded_at LIMIT 1",
@@ -115,7 +115,7 @@ def simulated_period_reward(period_start: str, period_end: str,
     Rough heuristic: our per-snapshot score was logged into lip_snapshots
     during paper mode. Multiply by fraction-of-period covered × reward.
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         # Sum per-market: our_score_sum × reward_per_period / total_snapshots_in_period
         rows = conn.execute(
@@ -207,7 +207,7 @@ def reconcile_period(period_start: str, period_end: str,
     }
 
     # Persist
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         conn.execute(
             """INSERT INTO period_reconciliation
@@ -226,7 +226,7 @@ def reconcile_period(period_start: str, period_end: str,
 
 def report(db_path: str = settings.DB_PATH) -> None:
     """Print reconciliation summary across all observed periods."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         rows = conn.execute(
             """SELECT period_start, period_end, our_simulated_usd, kalshi_actual_usd, recorded_at
