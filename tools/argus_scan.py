@@ -253,7 +253,8 @@ def reconcile_open_positions(conn: sqlite3.Connection) -> dict:
            FROM argus_paper_positions WHERE status='open'"""
     ).fetchall()
     if not rows:
-        return {"checked": 0, "resolved": 0, "still_open": 0, "errors": 0}
+        return {"checked": 0, "resolved": 0, "still_open": 0, "errors": 0,
+                "pnl_resolved_usd": 0.0}
 
     client = KalshiClient()
     n_resolved = n_open = n_err = 0
