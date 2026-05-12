@@ -85,13 +85,38 @@ def auto_ingest(ticker: str, event_date: date = None) -> dict:
             for w in result.warnings:
                 logger.warning(f"{ticker} {quarter_str}: {w}")
 
-        # Ingest
+        # Ingest with content-hash dedup. 2026-05-12: even if the
+        # (ticker, quarter) heuristic missed a duplicate (e.g. transcript
+        # text identical across two source URLs), hashing the raw_text
+        # blocks the second insert.
         try:
+            import hashlib
+            ch = hashlib.sha256(
+                " ".join((text or "").split()).encode("utf-8")
+            ).hexdigest()
             conn = sqlite3.connect(DB_PATH)
+            # Ensure column exists (idempotent for legacy DBs).
+            tcols = [r[1] for r in conn.execute("PRAGMA table_info(transcripts)")]
+            if "content_hash" not in tcols:
+                conn.execute("ALTER TABLE transcripts ADD COLUMN content_hash TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_transcripts_content_hash "
+                    "ON transcripts(content_hash)"
+                )
+            dup = conn.execute(
+                "SELECT id FROM transcripts WHERE content_hash=? LIMIT 1", (ch,)
+            ).fetchone()
+            if dup is not None:
+                conn.close()
+                logger.info(f"{ticker} {quarter_str}: SKIP — content hash already in corpus (id={dup[0]})")
+                rejected += 1
+                continue
             conn.execute(
-                """INSERT INTO transcripts (source, speaker, event_type, event_date, raw_text, word_count)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                ("earnings", speaker, event_type, q["approx_date"], text, result.word_count)
+                """INSERT INTO transcripts (source, speaker, event_type, event_date,
+                                            raw_text, word_count, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("earnings", speaker, event_type, q["approx_date"], text,
+                 result.word_count, ch)
             )
             conn.commit()
             conn.close()
