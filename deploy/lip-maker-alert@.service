@@ -1,0 +1,24 @@
+[Unit]
+Description=Append a one-line alert when %i fails / restarts
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+# %i is the failing unit's name (passed by OnFailure=lip-maker-alert@%n).
+# We append a timestamped CRITICAL line to alerts.log so the operator
+# can grep it. The optional webhook hook fires only if LIP_ALERT_WEBHOOK
+# is set in /etc/default/lip-maker (not committed to git).
+ExecStart=/bin/bash -c '\
+  TS=$(date -u +"%%Y-%%m-%%dT%%H:%%M:%%SZ"); \
+  STATE=$(systemctl is-active "%i" 2>&1); \
+  LINE="$TS  CRITICAL  unit=%i  state=$STATE  systemd auto-restart triggered"; \
+  echo "$LINE" >> /root/lip-maker/logs/alerts.log; \
+  if [ -f /etc/default/lip-maker ] && grep -q LIP_ALERT_WEBHOOK /etc/default/lip-maker; then \
+    . /etc/default/lip-maker; \
+    if [ -n "$LIP_ALERT_WEBHOOK" ]; then \
+      curl -s -m 5 -X POST -H "Content-Type: application/json" \
+        -d "{\"text\":\"$LINE\"}" "$LIP_ALERT_WEBHOOK" || true; \
+    fi; \
+  fi'
