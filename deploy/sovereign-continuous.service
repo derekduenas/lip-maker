@@ -1,0 +1,12 @@
+[Unit]
+Description=Sovereign continuous Fed+Trump mention scanner — calendar-independent
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/sovereign
+Environment="PYTHONPATH=/root/sovereign"
+ExecStart=/usr/bin/python3 -m loop.continuous_scan
+StandardOutput=append:/root/sovereign/logs/continuous_scan.log
+StandardError=append:/root/sovereign/logs/continuous_scan.log

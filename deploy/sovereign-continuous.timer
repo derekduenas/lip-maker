@@ -1,0 +1,14 @@
+[Unit]
+Description=Run Sovereign continuous Fed+Trump scan every 6 hours
+Requires=sovereign-continuous.service
+
+[Timer]
+# Every 6 hours, aligned to 00/06/12/18 UTC. Picks up open KXFEDMENTION-* /
+# KXTRUMPMENTION-* markets and runs edge pipeline regardless of whether a
+# scheduled event is on the prep calendar.
+OnCalendar=00,06,12,18:00
+AccuracySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
