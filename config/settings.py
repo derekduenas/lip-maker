@@ -230,6 +230,15 @@ SERIES_BLOCKLIST = {
     # through the suffix-only is_repeating_series fallback.
     "KXHORMUZ",              # Strait of Hormuz events — was -$15 on T20+T200
     "KXMAKARYOUT",           # FDA Commissioner firing — was -$7
+    # 2026-05-13: profitability audit caught KXTRUEV as the BIGGEST ongoing
+    # leak — 14d net -$229 across 155 fills (rebate +$30 vs realized -$258),
+    # textbook adverse-selection-disguised-as-maker. Same pattern that ate
+    # KXHORMUZ before the prefix-gate. series_auto_prune SHOULD have caught
+    # this (7d net < -$5, n>=3) but its per-ticker bans expire 7d while new
+    # KXTRUEV-* strikes respawn daily — bans never aggregate to the series.
+    # FOLLOW-UP: investigate why auto_prune doesn't escalate to
+    # SERIES_BLOCKLIST after N consecutive cycles flag the same prefix.
+    "KXTRUEV",
 }
 
 # 2026-05-12: event-binary days-to-settle cap. Markets where settle is
