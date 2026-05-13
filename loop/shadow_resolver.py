@@ -63,10 +63,27 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+# Tickers like KXTRUMPMENTION-26MAY12-BIDE (date-then-3+letter-term) are
+# multi-week event-binaries pegged to a specific Trump appearance — verified
+# 2026-05-13: KXTRUMPMENTION-26MAY12-BIDE listed 5/12, expires 5/28. The
+# YYMMDD in the ticker is the LISTING date, NOT the settle date. These do
+# NOT match the per-call cadence the trump_mention bucket was calibrated
+# on (Brier 0.181 from project_sovereign_calibration_validated.md), so
+# they get their own domain bucket to avoid contaminating that number.
+import re as _re
+_RX_TRUMPMENTION_EVENT_BINARY = _re.compile(
+    r"KXTRUMPMENTION-\d{2}[A-Z]{3}\d{2}-[A-Z]{3,}"
+)
+
+
 # ── Domain inference (from ticker) ──────────────────────────────────────────
 def _infer_domain(ticker: str) -> str:
     """Map ticker prefix → domain bucket so per-domain Brier stays clean."""
     t = (ticker or "").upper()
+    # 2026-05-13: split event-binary KXTRUMPMENTION-YYMMDD-TERM from the
+    # calibrated trump_mention bucket. See _RX_TRUMPMENTION_EVENT_BINARY.
+    if _RX_TRUMPMENTION_EVENT_BINARY.search(t):
+        return "trump_mention_event"
     if "TRUMPMENTION" in t or "TRUMPSAY" in t or "TRUMPFIRE" in t:
         return "trump_mention"
     if "FEDMENTION" in t or "POWELL" in t:
@@ -259,15 +276,33 @@ def main() -> int:
     print(f"  resolved:         {res['resolved']}  "
           f"still_open: {res['still_open']}  errors: {res['errors']}")
     print(f"  pnl_resolved:     ${res.get('pnl_resolved_usd',0):+.2f}")
-    pd = res.get("per_domain", {})
-    if pd:
-        print(f"\n  Per-domain breakdown:")
-        for dom, d in sorted(pd.items()):
-            wr = (d['wins'] / d['n'] * 100.0) if d['n'] else 0.0
-            mb = d.get('mean_brier')
-            mb_str = f"  mean_brier={mb}" if mb is not None else "  (no model_p)"
-            print(f"    {dom:<18}  n={d['n']:>3}  WR={wr:>5.1f}%  "
-                  f"pnl=${d['pnl']:+.2f}{mb_str}")
+
+    # 2026-05-13: always show per-domain bucket distribution including
+    # buckets that have OPEN positions but no resolutions yet. Otherwise
+    # newly-split buckets like trump_mention_event are invisible until
+    # they accumulate resolutions. Reads shadow_trades directly so it
+    # works even on a no-op resolver cycle.
+    try:
+        _c = _get_conn()
+        bk = _c.execute(
+            """SELECT COALESCE(domain,'(null)'),
+                      COUNT(*) AS n_total,
+                      SUM(CASE WHEN outcome='OPEN' THEN 1 ELSE 0 END) AS n_open,
+                      SUM(CASE WHEN outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END) AS n_resolved,
+                      ROUND(SUM(pnl), 2) AS pnl,
+                      ROUND(AVG(CASE WHEN outcome IN ('WIN','LOSS') THEN brier END), 4) AS mean_brier
+               FROM shadow_trades GROUP BY domain ORDER BY domain"""
+        ).fetchall()
+        _c.close()
+        if bk:
+            print(f"\n  Per-domain bucket (all):")
+            print(f"    {'domain':<22} {'open':>5} {'resolved':>9} {'pnl':>10} {'brier':>8}")
+            for dom, n_total, n_open, n_resolved, pnl, mb in bk:
+                pnl_s = f"${pnl:+.2f}" if pnl is not None else "—"
+                mb_s  = f"{mb:.4f}" if mb is not None else "—"
+                print(f"    {dom:<22} {n_open:>5} {n_resolved:>9} {pnl_s:>10} {mb_s:>8}")
+    except Exception as e:
+        _log.warning(f"bucket summary failed: {e}")
     print()
     return 0
 
