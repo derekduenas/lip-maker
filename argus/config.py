@@ -6,7 +6,7 @@ Modes mirror dislocation/config.py pattern:
     LIVE_MODE   — execute trades (requires per-brain validation gate passed)
 
 Brains opt in via the BRAIN_REGISTRY map. Brains whose
-backtest test-Brier > BRIER_LIVE_GATE remain paper-only regardless of
+backtest BSS < BSS_LIVE_GATE remain paper-only regardless of
 LIVE_MODE flag.
 """
 from __future__ import annotations
@@ -69,4 +69,4 @@ if __name__ == "__main__":
     print(f"REVIEW_MODE = {REVIEW_MODE}")
     print(f"LIVE_MODE   = {LIVE_MODE}")
     print(f"BANKROLL    = ${BANKROLL_USD}")
-    print(f"BRIER gate  = {BRIER_LIVE_GATE} (n>={MIN_BACKTEST_N})")
+    print(f"BSS gate    = {BSS_LIVE_GATE} (n>={MIN_BACKTEST_N})")
