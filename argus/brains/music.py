@@ -234,8 +234,16 @@ def extract_features(
     resolution_month:  int,
     chart:             list[ChartEntry],
     today:             dt.date,
+    client:            Optional[SpotifyChartsClient] = None,
 ) -> MusicFeatures:
-    """Compute features for one (artist, month) pair. Raw + normalized."""
+    """Compute features for one (artist, month) pair. Raw + normalized.
+
+    `client` (optional) enables historical_no1_rate_12mo lookup. Pass the
+    same SpotifyChartsClient the brain uses so the kworb cache is shared
+    between chart fetches and per-track history fetches inside the helper.
+    Without a client (e.g. unit tests with synthetic chart) the feature
+    falls back to 0.0 — the prior bug, but explicit and test-only.
+    """
     rows = chart_rows_crediting(artist_name, chart)
     if rows:
         top = min(rows, key=lambda e: e.rank)
@@ -254,6 +262,25 @@ def extract_features(
 
     days_left = days_remaining(resolution_year, resolution_month, today)
 
+    # 2026-05-13: wire historical_no1_rate_12mo via the same authoritative
+    # function that built the training set (argus/backtest/historical_no1).
+    # No-leakage anchor = first day of resolution month (lookback = 365 days
+    # ending the day BEFORE that). Per-(artist, anchor) JSON-cached so this
+    # is one HTTP burst on first use, free thereafter. Fallback 0.0 only
+    # when client is None (unit-test path) or lookup fails.
+    hist_rate_12mo = 0.0
+    if client is not None and artist_name:
+        try:
+            from argus.backtest.historical_no1 import compute_historical_no1_rate
+            anchor = dt.date(resolution_year, resolution_month, 1)
+            hist = compute_historical_no1_rate(artist_name, anchor, client)
+            hist_rate_12mo = float(hist.rate)
+        except Exception as e:
+            _log.warning(
+                f"historical_no1 lookup failed for {artist_name!r} "
+                f"@ {resolution_year}-{resolution_month:02d}: {e}"
+            )
+
     return MusicFeatures(
         # raw
         current_top_track_rank=cur_rank,
@@ -266,7 +293,7 @@ def extract_features(
         top_rank_lift=max(0.0, 11.0 - cur_rank) if cur_rank <= 200 else 0.0,
         streams_velocity_norm_today=d_today / 1_000_000.0,
         days_factor=days_left / 31.0,
-        historical_no1_rate_12mo=0.0,    # Phase 4 backfills from cached chart history
+        historical_no1_rate_12mo=hist_rate_12mo,
         streams_7d_velocity_sign=(1 if d_7d > 0 else (-1 if d_7d < 0 else 0)),
         peer_gap_norm=peer_gap / 1_000_000.0,
     )
@@ -372,7 +399,7 @@ class MusicBrain(DomainBrain):
             artist_name=meta.artist_name,
             resolution_year=meta.resolution_year,
             resolution_month=meta.resolution_month,
-            chart=chart, today=today,
+            chart=chart, today=today, client=self.client,
         )
         # If month is over and artist never hit #1, p_yes ≈ 0.
         # If month is over and artist DID hit #1, market would have resolved
