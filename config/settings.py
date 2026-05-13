@@ -239,6 +239,13 @@ SERIES_BLOCKLIST = {
     # FOLLOW-UP: investigate why auto_prune doesn't escalate to
     # SERIES_BLOCKLIST after N consecutive cycles flag the same prefix.
     "KXTRUEV",
+    # 2026-05-13: caught by the new series escalator on first run
+    # (banned_tickers=3, net=-$50.73 over 14d, 26 settles, rebate $7
+    # vs realized loss $58). Same daily-respawn shape as KXTRUEV early —
+    # SNL host mention markets (Chris/Jason/Jimmy as hosts). Pre-emptive
+    # block per asymmetric-EV reasoning: $0-30/wk foregone rebate vs
+    # ~$150+ over 4wks if it keeps bleeding.
+    "KXSNLMENTION",
 }
 
 # 2026-05-13: series-level auto-escalator (tools/series_auto_prune.py).
