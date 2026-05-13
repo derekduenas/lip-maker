@@ -241,6 +241,15 @@ SERIES_BLOCKLIST = {
     "KXTRUEV",
 }
 
+# 2026-05-13: series-level auto-escalator (tools/series_auto_prune.py).
+# When False (default): escalator detects + logs candidates to
+# series_blocklist_candidates table + alerts.log, but does NOT add to
+# the runtime overlay. Operator reviews accuracy before enabling.
+# When True: candidates auto-insert into series_blocklist_overlay,
+# which engine/lip_discovery.py reads alongside SERIES_BLOCKLIST.
+# Per the operator's "log-first, action-second" pattern.
+SERIES_AUTO_BLOCKLIST_ENABLED = False
+
 # 2026-05-12: event-binary days-to-settle cap. Markets where settle is
 # more than this many days out AND the series is not on the recurring
 # whitelist (engine/lip_discovery.is_repeating_series) get rejected at

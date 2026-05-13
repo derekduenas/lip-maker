@@ -32,6 +32,25 @@ from execution.kalshi_auth import KalshiClient
 _log = logging.getLogger(__name__)
 
 
+def _load_overlay_blocklist() -> set[str]:
+    """Read the runtime series_blocklist_overlay table populated by
+    tools/series_auto_prune escalator. Empty until SERIES_AUTO_BLOCKLIST_ENABLED
+    is flipped to True. Returns set of series prefixes; checked alongside
+    the static settings.SERIES_BLOCKLIST in _decide_enrol."""
+    try:
+        conn = sqlite3.connect(settings.DB_PATH, timeout=2.0)
+        try:
+            rows = conn.execute(
+                "SELECT series FROM series_blocklist_overlay"
+            ).fetchall()
+            return {r[0] for r in rows if r[0]}
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        # Table not yet created (escalator hasn't run on this DB) → empty.
+        return set()
+
+
 def _series_from_market_ticker(ticker: str) -> str:
     """Extract series prefix. E.g., 'KXHIGHCHI-26APR19-B50.5' → 'KXHIGHCHI'."""
     if not ticker:
@@ -142,6 +161,13 @@ def _decide_enrol(p: dict, now_iso: str | None = None) -> tuple[int, str]:
     # subseries exist; doesn't accidentally match KXFEDERALCHARGE).
     if any(series.startswith(b) for b in settings.SERIES_BLOCKLIST):
         return 0, f"blocklist:series({series})"
+    # 2026-05-13: runtime overlay table populated by tools/series_auto_prune
+    # when SERIES_AUTO_BLOCKLIST_ENABLED=True. Empty when flag is False, so
+    # this is a no-op until the operator turns it on. Cached at module load
+    # via _load_overlay_blocklist (refreshed on each call — table is tiny).
+    overlay = _load_overlay_blocklist()
+    if any(series.startswith(b) for b in overlay):
+        return 0, f"blocklist:overlay({series})"
     if p["reward_per_day_usd"] < settings.MIN_REWARD_PER_DAY_USD:
         return 0, f"reward_too_small:{p['reward_per_day_usd']:.2f}"
     if p["target_size"] > settings.MAX_TARGET_SIZE_CONTRACTS:
