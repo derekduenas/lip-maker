@@ -95,6 +95,22 @@ class Executor:
         if SHADOW_MODE:
             mode = "SHADOW"
             trade["order_id"] = f"SHADOW-{ticker}-{int(datetime.now(timezone.utc).timestamp())}"
+            # 2026-05-13: persist model_p / edge / confidence so the
+            # shadow_resolver can compute Brier without joining opportunities.
+            # Caller passes the raw opportunity dict via opportunity_id;
+            # we look up its richer fields if available.
+            opp_estimated_prob = opp_edge = opp_confidence = opp_corpus_n = None
+            if opportunity_id:
+                try:
+                    rec = _get_conn().execute(
+                        """SELECT estimated_prob, edge, kelly_fraction
+                           FROM opportunities WHERE id=?""",
+                        (opportunity_id,)
+                    ).fetchone()
+                    if rec:
+                        opp_estimated_prob, opp_edge, opp_confidence = rec
+                except Exception:
+                    pass
             conn = _get_conn()
             conn.execute(
                 """INSERT INTO shadow_trades
@@ -102,7 +118,8 @@ class Executor:
                     confidence_weight, strategy, estimated_prob, market_price)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (ticker, term, side.upper(), price_dollars, contracts, total_cost,
-                 None, None, None, None, price_dollars)
+                 opp_edge, opp_confidence, "continuous_or_event",
+                 opp_estimated_prob, price_dollars)
             )
             conn.commit()
             conn.close()

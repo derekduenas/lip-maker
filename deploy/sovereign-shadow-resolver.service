@@ -1,0 +1,12 @@
+[Unit]
+Description=Sovereign shadow_trades resolver — closes paper-trade outcomes
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/sovereign
+Environment="PYTHONPATH=/root/sovereign"
+ExecStart=/usr/bin/python3 -m loop.shadow_resolver
+StandardOutput=append:/root/sovereign/logs/shadow_resolver.log
+StandardError=append:/root/sovereign/logs/shadow_resolver.log

@@ -1,0 +1,14 @@
+[Unit]
+Description=Run sovereign shadow-trades resolver every 30 min
+
+[Timer]
+# Mention markets settle at varied times (Trump-says markets often close
+# 23:00 UTC same-day; Fed-mention varies). 30-min cadence catches the
+# settle within an hour, which is fine for paper-mode track-record.
+OnCalendar=*:0/30
+AccuracySec=2min
+Persistent=true
+Unit=sovereign-shadow-resolver.service
+
+[Install]
+WantedBy=timers.target
