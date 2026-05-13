@@ -959,37 +959,56 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     # 2026-05-01 PREDATOR: pass saturated tickers so ranker skips markets
     # where existing positions already exhaust per-market cap. Without this
     # the ranker keeps surfacing the same stuck markets at top-N.
-    saturated = _compute_saturated_tickers()
     use_capital_alloc = os.getenv("LIP_USE_CAPITAL_ALLOC", "true").lower() == "true"
-    if use_capital_alloc:
-        markets = select_optimal_portfolio(
-            budget_usd=settings.MAX_TOTAL_GROSS_USD,
-            exclude_tickers=saturated,
-        )
-        _log.info(f"capital-aware ranker: {len(markets)} markets, "
-                  f"E[net]=${sum(m.get('expected_net_per_day',0) for m in markets):.2f}/d")
-        # Sprint 4 #2: pre-deploy depth gate (reject <5% projected share)
-        if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
-            try:
-                from execution.kalshi_auth import KalshiClient as _KC_dg
-                _dg_client = _KC_dg()
-                pre_n = len(markets)
-                markets = filter_by_depth(
-                    markets, _dg_client,
-                    min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
-                    exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
-                    min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
-                    min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
-                )
-                _log.info(f"depth_gate: {pre_n} -> {len(markets)} markets "
-                          f"({100*(pre_n-len(markets))/max(1,pre_n):.0f}% rejected)")
-            except Exception as e:
-                _log.warning(f"depth_gate skipped due to error: {e}")
-    else:
-        markets = top_n_to_quote(top_n, exclude_tickers=saturated)
-    if not markets:
-        _log.warning("no enrolled markets")
-        return
+    def _select_markets() -> list[dict]:
+        saturated = _compute_saturated_tickers()
+        if use_capital_alloc:
+            sel = select_optimal_portfolio(
+                budget_usd=settings.MAX_TOTAL_GROSS_USD,
+                exclude_tickers=saturated,
+            )
+            _log.info(f"capital-aware ranker: {len(sel)} markets, "
+                      f"E[net]=${sum(m.get('expected_net_per_day',0) for m in sel):.2f}/d")
+            # Sprint 4 #2: pre-deploy depth gate (reject <5% projected share)
+            if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
+                try:
+                    from execution.kalshi_auth import KalshiClient as _KC_dg
+                    _dg_client = _KC_dg()
+                    pre_n = len(sel)
+                    sel = filter_by_depth(
+                        sel, _dg_client,
+                        min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
+                        exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
+                        min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
+                        min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
+                    )
+                    _log.info(f"depth_gate: {pre_n} -> {len(sel)} markets "
+                              f"({100*(pre_n-len(sel))/max(1,pre_n):.0f}% rejected)")
+                except Exception as e:
+                    _log.warning(f"depth_gate skipped due to error: {e}")
+            return sel
+        return top_n_to_quote(top_n, exclude_tickers=saturated)
+    markets = _select_markets()
+    # 2026-05-13: clean-exit storm fix. Empty universe used to `return` →
+    # exit 0 → systemd Restart loop with no OnFailure visibility (~36 cycles
+    # in 48 min on 01:04-01:52 UTC). Idle and retry instead; escalate to
+    # exit 2 after MAX_WAIT so the supervisor's flap detector + OnFailure
+    # both fire loudly. See settings.EMPTY_UNIVERSE_*.
+    consecutive_empty = 0
+    while not markets:
+        _log.warning(f"empty quotable universe (cycle {consecutive_empty}); "
+                     f"idling {settings.EMPTY_UNIVERSE_SLEEP_SEC}s")
+        await asyncio.sleep(settings.EMPTY_UNIVERSE_SLEEP_SEC)
+        consecutive_empty += 1
+        if consecutive_empty * settings.EMPTY_UNIVERSE_SLEEP_SEC >= settings.EMPTY_UNIVERSE_MAX_WAIT_SEC:
+            _log.error(f"empty universe for >={settings.EMPTY_UNIVERSE_MAX_WAIT_SEC}s — "
+                       "exiting non-zero so supervisor visibility kicks in")
+            sys.exit(2)
+        try:
+            discover(save=True)
+        except Exception as e:
+            _log.warning(f"discover refresh during empty-universe idle failed: {e}")
+        markets = _select_markets()
     _log.info(f"quoting top-{len(markets)} markets, total pool ${sum(m['reward_per_day_usd'] for m in markets):.2f}/day")
 
     runner = PaperRunner(markets)

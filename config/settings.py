@@ -419,3 +419,15 @@ MAX_GROSS_PER_MARKET_BY_SERIES = {
 # prong has its own bankroll envelope so a Kalshi LIP draw-down doesn't
 # implicitly pause convergence trades).
 DISLOCATION_PRONG_ENABLED = os.getenv("DISLOCATION_ENABLED", "false").lower() == "true"
+
+# ── 2026-05-13 EMPTY-UNIVERSE IDLE / FLAP-DETECTOR (clean-exit storm fix) ──
+# Prong 1 (run_paper.py): if select_optimal_portfolio + filter_by_depth
+# return zero markets (cold-start race vs periodic_discover), sleep and
+# retry instead of `return`-ing. Clean exit-0 was bypassing systemd's
+# OnFailure/StartLimitBurst → silent restart loop (~36 cycles in 48 min on
+# 2026-05-13 01:04-01:52 UTC). MAX_WAIT aligns with periodic_discover (1800s).
+# After MAX_WAIT we exit 2 (NOT 0) so the supervisor sees a real failure
+# and alerts.log fires. Prong 2 = tools/restart_flap_watcher.py is exit-code
+# agnostic and catches any rapid-restart pattern via journalctl.
+EMPTY_UNIVERSE_SLEEP_SEC    = int(os.getenv("LIP_EMPTY_UNIVERSE_SLEEP_SEC",    "60"))
+EMPTY_UNIVERSE_MAX_WAIT_SEC = int(os.getenv("LIP_EMPTY_UNIVERSE_MAX_WAIT_SEC", "1800"))
