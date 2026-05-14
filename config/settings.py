@@ -371,3 +371,15 @@ GRADUATED_THROTTLE = os.getenv("GRADUATED_THROTTLE", "false").lower() == "true"
 # A.5 — Per-market online calibration EWMA replaces the global 0.25 / 0.10
 # constants in cross_venue.yield_equation. Falls back to global on cold start.
 PER_MARKET_CALIB_ENABLED = os.getenv("PER_MARKET_CALIB_ENABLED", "false").lower() == "true"
+
+# B.2 — Cross-venue hedger master switch. When False: log-only (records what
+# hedge WOULD have fired; no orders placed). When True: hedger calls broker
+# adapters and places real orders. KEEP FALSE until B.5 hedge_effectiveness
+# shows GOOD verdict on the eligible series over 14+ days.
+AUTO_HEDGE_ENABLED = os.getenv("AUTO_HEDGE_ENABLED", "false").lower() == "true"
+
+# B.3 — Per-venue execution flags. Stay False even when AUTO_HEDGE_ENABLED
+# flips on, until the venue-specific adapter has been validated against TWS
+# / Kraken with small test orders.
+AUTO_HEDGE_CME = os.getenv("AUTO_HEDGE_CME", "false").lower() == "true"
+AUTO_HEDGE_KRAKEN = os.getenv("AUTO_HEDGE_KRAKEN", "false").lower() == "true"
