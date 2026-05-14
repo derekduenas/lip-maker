@@ -51,6 +51,9 @@ from engine.lip_scorer import (
 )
 from engine.adaptive_sizer import AdaptiveSizer
 from engine.microprice import microprice_yes  # A.1: imbalance-weighted fair value
+from engine.reservation_price import (        # A.2: inventory-aware fair value
+    reservation_price, realized_sigma_cents, suggest_quote_skew,
+)
 from execution.kalshi_ws import KalshiWS, BookState, BookLevel
 from execution.quote_manager import QuoteManager, QuoteTarget
 
@@ -493,10 +496,51 @@ class PaperRunner:
                 yes_size_override = size + skew_amount
                 no_size_override  = max(min_size, size - skew_amount)
 
+        # A.2 (2026-05-14): Avellaneda-Stoikov reservation price layer.
+        # Computes r = mp - q×γ×σ²×(T-t) and proposes a per-side tick
+        # offset. Only takes effect when AS_RESERVATION_ENABLED=True AND
+        # market's DiscountFactor ≥ 0.70 (otherwise size-skew alone).
+        # Always logged for diagnostic purposes so paper-mode A/B can show
+        # whether the price skew would have changed fill toxicity.
+        yes_bid_c = best_yes.price_cents
+        no_bid_c  = best_no.price_cents
+        as_reason = "off"
+        if settings.AS_RESERVATION_ENABLED:
+            mp_tuple = self._last_microprice.get(book.market_ticker)
+            mp = mp_tuple[0] if mp_tuple is not None else None
+            net_q = inv.net_yes_contracts if (inv and inv.net_yes_contracts) else 0
+            hist = self._best_history.get(book.market_ticker)
+            samples = [h[1] for h in hist] if hist else []
+            sigma_c = realized_sigma_cents(samples)
+            hours_settle = mins_until / 60.0 if (mins_until is not None) else 24.0
+            if mp is not None and sigma_c > 0 and net_q != 0:
+                r = reservation_price(
+                    mp_cents=mp, net_inventory=net_q,
+                    gamma=settings.AS_GAMMA, sigma_cents=sigma_c,
+                    hours_to_settle=hours_settle,
+                )
+                skew = suggest_quote_skew(
+                    mp_cents=mp, r_cents=r,
+                    discount_factor=float(p.discount_factor),
+                    max_tick_offset=1,
+                )
+                as_reason = skew.reason
+                # Apply the offsets (negative = quote 1c worse than best)
+                # Clamp to [1, 99] just in case
+                if skew.yes_tick_offset:
+                    yes_bid_c = max(1, min(99, yes_bid_c + skew.yes_tick_offset))
+                if skew.no_tick_offset:
+                    no_bid_c  = max(1, min(99, no_bid_c  + skew.no_tick_offset))
+                if skew.yes_tick_offset or skew.no_tick_offset:
+                    _log.info(f"AS_skew[{book.market_ticker}] mp={mp:.2f} r={r:.2f} "
+                              f"q={net_q} σ={sigma_c:.2f}c T={hours_settle:.1f}h "
+                              f"yes_off={skew.yes_tick_offset} no_off={skew.no_tick_offset} "
+                              f"reason={skew.reason}")
+
         return QuoteTarget(
             market_ticker=book.market_ticker,
-            yes_bid_cents=best_yes.price_cents,
-            no_bid_cents=best_no.price_cents,
+            yes_bid_cents=yes_bid_c,
+            no_bid_cents=no_bid_c,
             size_contracts=size,
             yes_size_override=yes_size_override,
             no_size_override=no_size_override,
