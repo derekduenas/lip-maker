@@ -1,0 +1,10 @@
+[Unit]
+Description=Mark-to-microprice all open Kalshi positions; alert on 1h bleed
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/usr/bin/python3 monitor/unrealized_pnl.py --quiet
+StandardOutput=journal
+StandardError=journal
