@@ -214,6 +214,32 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
                      now.isoformat()),
                 )
                 action = "blacklisted"
+
+                # A.3 graduated companion: write a market_throttle row at the
+                # same time. When GRADUATED_THROTTLE is on, quote_manager
+                # applies the (size_scale, tick_offset) instead of dropping
+                # the whole quote. Tiers reflect imbalance severity:
+                #   imbal 0.85–0.90 → size_scale 0.40, tick 1
+                #   imbal 0.90–0.95 → size_scale 0.20, tick 2
+                #   imbal 0.95+    → size_scale 0.05, tick 2  (near-full block)
+                try:
+                    from monitor.market_throttle import upsert as _mt_upsert
+                    if imbal >= 0.95:
+                        ss, toff = 0.05, 2
+                    elif imbal >= 0.90:
+                        ss, toff = 0.20, 2
+                    else:
+                        ss, toff = 0.40, 1
+                    _mt_upsert(
+                        tkr, size_scale=ss, tick_offset=toff,
+                        source="toxicity",
+                        ttl_sec=BLACKLIST_HOURS * 3600,
+                        detail=f"imbal={int(imbal*100)}% dominant={dominant} "
+                               f"y={ync} n={nnc}",
+                        db_path=db_path,
+                    )
+                except Exception as _e:
+                    _log.debug(f"toxicity_filter graduated upsert failed for {tkr}: {_e}")
             else:
                 action = f"skipped:{skip_reason}"
 

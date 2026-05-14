@@ -145,6 +145,31 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
                          f"({n_contracts} contracts) in last {WINDOW_SEC}s "
                          f"→ blacklisted {BLACKLIST_HOURS}h")
 
+            # A.3 graduated companion: same-side sequential fills are the
+            # cleanest one-sided-toxicity signal we have. Apply a per-side
+            # bias by tilting size_scale + tick_offset asymmetrically. For
+            # consistency with vpin/toxicity we still write a single
+            # market_throttle row; the per-side tilt is left to caller
+            # (quote_manager applies tick_offset to BOTH sides for now,
+            # B.6 will refine to per-side asymmetric pull).
+            try:
+                from monitor.market_throttle import upsert as _mt_upsert
+                # 3-fills 60s baseline → mid-tier throttle; >5 fills → near-full
+                if total_n >= 5:
+                    ss, toff = 0.10, 2
+                else:
+                    ss, toff = 0.30, 1
+                _mt_upsert(
+                    ticker, size_scale=ss, tick_offset=toff,
+                    source="order_flow",
+                    ttl_sec=BLACKLIST_HOURS * 3600,
+                    detail=f"{side}_side n={total_n} c={n_contracts} "
+                           f"window={WINDOW_SEC}s",
+                    db_path=db_path,
+                )
+            except Exception as _e:
+                _log.debug(f"order_flow graduated upsert failed for {ticker}: {_e}")
+
         conn.execute(
             """INSERT OR IGNORE INTO order_flow_log
                (ticker, detected_at, side, n_fills, n_contracts, window_sec, action)
