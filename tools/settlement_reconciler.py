@@ -381,6 +381,27 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
                 correct += 1
         total_net_outcome += net
 
+        # A.5 hook (2026-05-14): update per-series calibration EWMA with the
+        # observed "capture rate" = rebate_earned / pool_per_day. The series
+        # prefix gets a learned calibration that replaces the global 0.25
+        # prior once n_samples ≥ 5 (set in calibration_ewma.calib_for).
+        try:
+            pool_row = conn.execute(
+                "SELECT reward_per_day_usd FROM lip_programs WHERE market_ticker = ?",
+                (tkr,),
+            ).fetchone()
+            pool_per_day = float(pool_row[0]) if pool_row and pool_row[0] else 0.0
+            if pool_per_day >= 0.50 and rebate >= 0:
+                from engine.calibration_ewma import update as _cal_update
+                _cal_update(
+                    key=s["prefix"],
+                    predicted_usd=pool_per_day,   # pool we competed for
+                    actual_usd=rebate,             # what we actually earned
+                    db_path=db_path,
+                )
+        except Exception as _e:
+            _log.debug(f"calibration_ewma hook failed for {tkr}: {_e}")
+
     conn.commit()
 
     # Aggregate per-series summary. COALESCE to handle markets with NULL
