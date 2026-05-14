@@ -277,12 +277,71 @@ def persist(decision: HedgeDecision, db_path: str = settings.DB_PATH) -> bool:
         return False
 
 
+def _execute_if_enabled(d: HedgeDecision, db_path: str) -> HedgeDecision:
+    """When AUTO_HEDGE_ENABLED, call the venue adapter. The adapter itself
+    is dry-run unless AUTO_HEDGE_<VENUE> is also True, so the call still
+    produces broker_dry_run_log rows but no real orders.
+
+    Updates the HedgeDecision's status:
+      'would_have_fired' → 'placed' (or 'failed') when adapter touched
+    """
+    if not getattr(settings, "AUTO_HEDGE_ENABLED", False):
+        return d
+    if d.status != "would_have_fired" or d.hedge_spec is None:
+        return d
+    qty = d.hedge_qty_int or 0
+    if qty == 0:
+        # Hedge ratio rounded to zero contracts — log and skip.
+        d.status_detail = (d.status_detail or "") + " | qty_rounded_to_0"
+        return d
+    side = "sell" if qty < 0 else "buy"
+    abs_qty = abs(qty)
+
+    venue = d.hedge_spec.hedge_venue
+    try:
+        if venue == "CME":
+            from execution.ibkr_adapter import IBKRAdapter
+            adapter = IBKRAdapter(db_path=db_path)
+            result = adapter.place_market(
+                instrument=d.hedge_spec.instrument,
+                qty=abs_qty, side=side,
+                notes=f"kalshi={d.kalshi_ticker} q={d.kalshi_contracts}",
+            )
+        elif venue == "Kraken":
+            # B.4 will land kraken_adapter; until then, stay log-only.
+            d.status_detail = (d.status_detail or "") + " | kraken_adapter_pending"
+            return d
+        elif venue == "ICE":
+            # ICE has no public retail API; manual hedge or skip.
+            d.status_detail = (d.status_detail or "") + " | ICE_manual_only"
+            return d
+        else:
+            d.status_detail = (d.status_detail or "") + f" | unknown_venue:{venue}"
+            return d
+    except Exception as e:
+        d.status = "failed"
+        d.status_detail = f"adapter_exception: {e}"
+        return d
+
+    if result.status in ("dry_run", "filled", "partial"):
+        d.status = "placed"
+        d.status_detail = (
+            f"adapter_status={result.status} fill_id={result.fill_id} "
+            f"avg_price={result.avg_price}"
+        )
+    else:
+        d.status = "failed"
+        d.status_detail = f"adapter_status={result.status} detail={result.detail}"
+    return d
+
+
 def process_fill(fill_id: str, ticker: str, side: str,
                  fill_price_c: Optional[int], fill_size: int, fill_ts: float,
                  db_path: str = settings.DB_PATH) -> HedgeDecision:
-    """Decide + persist for one fill. Returns the decision either way."""
+    """Decide + (optionally execute) + persist for one fill."""
     d = decide(fill_id, ticker, side, fill_price_c, fill_size, fill_ts,
                db_path=db_path)
+    d = _execute_if_enabled(d, db_path=db_path)
     persist(d, db_path=db_path)
     return d
 
