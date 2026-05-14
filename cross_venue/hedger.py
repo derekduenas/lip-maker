@@ -308,9 +308,13 @@ def _execute_if_enabled(d: HedgeDecision, db_path: str) -> HedgeDecision:
                 notes=f"kalshi={d.kalshi_ticker} q={d.kalshi_contracts}",
             )
         elif venue == "Kraken":
-            # B.4 will land kraken_adapter; until then, stay log-only.
-            d.status_detail = (d.status_detail or "") + " | kraken_adapter_pending"
-            return d
+            from execution.kraken_adapter import KrakenAdapter
+            adapter = KrakenAdapter(db_path=db_path)
+            result = adapter.place_market(
+                instrument=d.hedge_spec.instrument,
+                qty=abs_qty, side=side,
+                notes=f"kalshi={d.kalshi_ticker} q={d.kalshi_contracts}",
+            )
         elif venue == "ICE":
             # ICE has no public retail API; manual hedge or skip.
             d.status_detail = (d.status_detail or "") + " | ICE_manual_only"
