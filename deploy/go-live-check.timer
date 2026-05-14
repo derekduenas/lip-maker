@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily readiness check — emits pass/fail across 5 quantitative gates
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+Unit=go-live-check.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Score the hedge book vs Kalshi outcomes; write hedge_residual_log
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/usr/bin/python3 tools/hedge_effectiveness.py --days 7 --persist
+StandardOutput=journal
+StandardError=journal

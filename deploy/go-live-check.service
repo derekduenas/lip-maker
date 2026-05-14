@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily go-live readiness gate run (logs to journal; exit code 0/1/2)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/usr/bin/python3 tools/go_live_check.py --days 14
+StandardOutput=journal
+StandardError=journal
+# SuccessExitStatus=0 1 2  — uncomment to suppress non-zero alerts;
+# default treats 1/2 as failure so journal flags it.

@@ -1,0 +1,10 @@
+[Unit]
+Description=Backfill fill_markouts for fills whose book history is now mature
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/usr/bin/python3 -c "from monitor.markout_logger import backfill_pending; print(backfill_pending(lookback_sec=3600))"
+StandardOutput=journal
+StandardError=journal
