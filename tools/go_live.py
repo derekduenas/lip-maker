@@ -192,14 +192,24 @@ def apply_live(bankroll: float):
 def _gate0_quant_check(days: int = 14) -> tuple[bool, str]:
     """Phase 3 quantitative gate — wraps tools/go_live_check.py.
 
-    Returns (passed, detail). passed=False covers both "gate failed" and
-    "insufficient data" — neither is safe to flip live.
+    Returns (passed, detail). passed=False covers all of:
+      - run_check import failure
+      - run_check exception during evaluation  (P1-5 fix 2026-05-14)
+      - insufficient data
+      - any gate failure
+    All paths return False — fail-closed semantics. The script can no longer
+    crash with a SystemExit on a DB lock or schema-drift exception during
+    gate evaluation; instead the gate reports a failure and the caller can
+    refuse to apply.
     """
     try:
         from tools.go_live_check import run_check
     except Exception as e:
         return False, f"go_live_check import failed: {e}"
-    rep = run_check(days=days)
+    try:
+        rep = run_check(days=days)
+    except Exception as e:
+        return False, f"run_check exception: {type(e).__name__}: {e}"
     if rep.insufficient:
         n_partial = sum(1 for g in rep.gates if g.insufficient_data)
         return False, (f"insufficient data: {n_partial}/{len(rep.gates)} gates "

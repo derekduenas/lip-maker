@@ -290,13 +290,19 @@ class IBKRAdapter:
 
     def get_position(self, instrument: str) -> int:
         if self.dry_run:
-            # Sum signed dry-run qty across all logged orders
+            # Sum signed dry-run qty across orders WITHIN THE LAST 24 HOURS.
+            # P1-2 fix (2026-05-14): previously unbounded — paper runs from
+            # days/weeks ago contaminated today's position view, causing the
+            # hedger to think a position was 2x its real size (potential
+            # double-hedge). Live get_position via TWS is naturally bounded;
+            # dry_run sum needs the same boundedness.
             try:
                 conn = sqlite3.connect(self.db_path, timeout=2.0)
                 try:
                     rows = conn.execute(
                         """SELECT side, SUM(qty) FROM broker_dry_run_log
                            WHERE venue=? AND instrument=?
+                             AND datetime(intended_at) >= datetime('now', '-1 day')
                            GROUP BY side""",
                         (self.venue_name, instrument),
                     ).fetchall()

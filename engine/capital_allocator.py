@@ -351,13 +351,28 @@ def select_optimal_portfolio(
             # market_calibration. Falls back to 0.25 prior on cold start.
             base_calib = kalshi_calib_for(ticker)
 
-            # Offense O.2: hedge-eligible AND auto-hedge on → reduced adverse
-            # cost. When AUTO_HEDGE_ENABLED is off we don't claim the hedge
-            # exists yet (so we don't over-size).
-            is_hedged_now = (
-                getattr(settings, "AUTO_HEDGE_ENABLED", False)
-                and _is_hedge_eligible(ticker)
-            )
+            # Offense O.2 (P1-1 fix 2026-05-14): hedge-eligible AND the
+            # specific venue adapter is LIVE (not just dry_run). The earlier
+            # version checked only AUTO_HEDGE_ENABLED; that caused capital_
+            # allocator to size positions UP expecting an 80% adverse-cost
+            # reduction during the 1-2 day window where AUTO_HEDGE_ENABLED
+            # was on but AUTO_HEDGE_CME / AUTO_HEDGE_KRAKEN were still off
+            # (adapters in dry_run). Result: unhedged basis at scaled-up size.
+            # Tightened: require the actual venue adapter to be live.
+            is_hedged_now = False
+            if getattr(settings, "AUTO_HEDGE_ENABLED", False):
+                try:
+                    from cross_venue.market_match import hedge_for_ticker
+                    _spec = hedge_for_ticker(ticker)
+                except Exception:
+                    _spec = None
+                if _spec is not None:
+                    venue = _spec.hedge_venue
+                    venue_live = (
+                        (venue == "CME"    and getattr(settings, "AUTO_HEDGE_CME",    False))
+                        or (venue == "Kraken" and getattr(settings, "AUTO_HEDGE_KRAKEN", False))
+                    )
+                    is_hedged_now = venue_live
 
             y = MarketYield(
                 market_id=ticker,

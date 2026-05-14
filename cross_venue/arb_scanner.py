@@ -210,7 +210,17 @@ def fetch_kalshi_book(ticker: str) -> dict:
 
 
 def fetch_pm_book(slug: str) -> dict:
-    """Best YES/NO bid + size from Polymarket gamma-api (public, no auth)."""
+    """Best YES/NO bid + size from Polymarket gamma-api (public, no auth).
+
+    P1-4 fix (2026-05-14): gamma-api `outcomePrices` are MID, not BID.
+    Real PM bid is typically 1-3c below mid; treating mid as bid
+    overstates cross-venue arb edge and produces phantom opportunities
+    (~10-20% of logged arbs disappear at execution). Until we switch
+    to the PM CLOB /book endpoint, subtract `MID_TO_BID_CONSERVATISM_C`
+    cents from both sides so the scanner reports edge that is more
+    likely to clear at real execution.
+    """
+    MID_TO_BID_CONSERVATISM_C = 1
     try:
         import urllib.request, json
         url = f"https://gamma-api.polymarket.com/markets/{slug}"
@@ -219,19 +229,15 @@ def fetch_pm_book(slug: str) -> dict:
         # PM returns prices in [0, 1]; convert to cents
         outcomes = data.get("outcomes") or []
         prices = data.get("outcomePrices") or data.get("outcome_prices") or []
-        # PM is two-outcome (YES / NO); we pull bid info from the
-        # CLOB book endpoint when needed. For first-pass scanner we
-        # use mid-price as proxy for bid (conservative — actual bid
-        # is at-or-below this).
         if not prices or len(prices) < 2:
             return {}
         yes_mid = int(round(float(prices[0]) * 100))
         no_mid  = int(round(float(prices[1]) * 100))
-        # Treat mid as approximation; size unknown without book endpoint
+        # Conservative bid proxy: mid - 1c. Size unknown without CLOB book.
         return {
-            "yes_bid_c": max(1, min(99, yes_mid)),
+            "yes_bid_c": max(1, min(99, yes_mid - MID_TO_BID_CONSERVATISM_C)),
             "yes_size":  None,
-            "no_bid_c":  max(1, min(99, no_mid)),
+            "no_bid_c":  max(1, min(99, no_mid  - MID_TO_BID_CONSERVATISM_C)),
             "no_size":   None,
         }
     except Exception as e:

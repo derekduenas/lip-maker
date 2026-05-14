@@ -207,7 +207,9 @@ class KrakenAdapter:
             return False
 
     def get_position(self, instrument: str) -> int:
-        # Dry-run: same logic as IBKR — sum signed dry_run_log entries.
+        # Dry-run: same logic as IBKR — sum signed dry_run_log entries
+        # WITHIN THE LAST 24 HOURS (P1-2 fix 2026-05-14: bounded to avoid
+        # contamination from historical paper runs).
         if self.dry_run:
             try:
                 conn = sqlite3.connect(self.db_path, timeout=2.0)
@@ -215,6 +217,7 @@ class KrakenAdapter:
                     rows = conn.execute(
                         """SELECT side, SUM(qty) FROM broker_dry_run_log
                            WHERE venue=? AND instrument=?
+                             AND datetime(intended_at) >= datetime('now', '-1 day')
                            GROUP BY side""",
                         (self.venue_name, instrument),
                     ).fetchall()

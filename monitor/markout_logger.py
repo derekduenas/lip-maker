@@ -229,6 +229,14 @@ def compute_markouts_for_fill(
             # Need at minimum the t+60s point to be useful
             if mp_60s is None:
                 return False
+            # P1-3 fix (2026-05-14): also need a fair-value reference AT
+            # fill time. Without mp_fill, downstream markout_report cannot
+            # distinguish "we had no reference" from "fill was benign" —
+            # the Phase 3 readiness gate would be biased toward false-positive
+            # "go-live" verdicts. Fail closed; backfill_pending will retry
+            # on the next sweep when book history is denser.
+            if mp_fill is None:
+                return False
 
             mo_1s  = _signed_markout(side, fill_price_c, mp_1s)  if mp_1s  is not None else None
             mo_10s = _signed_markout(side, fill_price_c, mp_10s) if mp_10s is not None else None
