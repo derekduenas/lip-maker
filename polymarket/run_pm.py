@@ -218,6 +218,27 @@ class Runner:
             return None, "no book"
         if yes_bid <= 0 or yes_ask >= 1 or yes_bid >= yes_ask:
             return None, f"degenerate book bid={yes_bid} ask={yes_ask}"
+
+        # A.1 + A.4 port (2026-05-14): persist PM US microprice to
+        # book_microprice_history so the arb scanner + future markout
+        # logger can compute against it. PM prices in [0, 1] → convert
+        # to cents [1, 99] matching Kalshi schema.
+        try:
+            bid_sz = float(book.get("top_bid_size") or 0)
+            ask_sz = float(book.get("top_ask_size") or 0)
+            if bid_sz + ask_sz > 0:
+                mp = (float(yes_ask) * bid_sz + float(yes_bid) * ask_sz) / (bid_sz + ask_sz)
+                mp_c = max(1.0, min(99.0, mp * 100.0))
+                from monitor.markout_logger import record_book_snapshot
+                record_book_snapshot(
+                    ticker=f"PM:{slug}",          # namespaced key
+                    microprice_c=mp_c,
+                    best_bid_c=int(round(yes_bid * 100)),
+                    best_ask_c=int(round(yes_ask * 100)),
+                    bid_size=int(bid_sz), ask_size=int(ask_sz),
+                )
+        except Exception as _e:
+            _log.debug(f"PM microprice snapshot failed for {slug}: {_e}")
         # AUDIT FIX #2: spread sanity. Wide spreads = adverse-selection trap.
         spread = yes_ask - yes_bid
         if spread > settings.MAX_SPREAD_FRACTION:

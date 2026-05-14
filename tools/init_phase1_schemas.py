@@ -24,8 +24,11 @@ def main() -> int:
     modules = [
         ("monitor.markout_logger",        "fill_markouts + book_microprice_history"),
         ("monitor.market_throttle",       "market_throttle (graduated A.3 ladder)"),
+        ("monitor.unrealized_pnl",        "unrealized_pnl_snapshot (live MTM)"),
         ("engine.calibration_ewma",       "market_calibration (per-market EWMA)"),
         ("cross_venue.hedger",            "hedge_log (cross-venue intentions/fills)"),
+        ("cross_venue.kalshi_pm_map",     "kalshi_pm_manual_map (operator overrides)"),
+        ("cross_venue.arb_scanner",       "cross_venue_arb_log (arbitrage opportunities)"),
         ("execution.ibkr_adapter",        "broker_health + broker_dry_run_log"),
     ]
     for mod_name, label in modules:

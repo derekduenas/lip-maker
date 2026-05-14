@@ -1,0 +1,10 @@
+[Unit]
+Description=Scan Kalshi ↔ PM US for crossed bids; log to cross_venue_arb_log
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/lip-maker
+ExecStart=/usr/bin/python3 tools/arb_scan.py --quiet
+StandardOutput=journal
+StandardError=journal
