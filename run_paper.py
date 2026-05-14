@@ -725,6 +725,32 @@ class PaperRunner:
                     best_no = book.best_no_bid()
                     if best_yes is None or best_no is None:
                         continue
+                    # A.4 (2026-05-14): persist microprice + book to history
+                    # so markout_logger can compute t+1/10/60s markouts on
+                    # fills retrospectively. Lightweight — one row per ticker
+                    # per heartbeat (≈30s); skipped when microprice undefined.
+                    if settings.USE_MICROPRICE:
+                        mp = microprice_yes(book)
+                        if mp is not None:
+                            try:
+                                from monitor.markout_logger import record_book_snapshot
+                                # Derive yes_ask from explicit or no_bid mirror
+                                yes_ask_lvl = book.best_yes_ask()
+                                if yes_ask_lvl is not None:
+                                    ask_c = yes_ask_lvl.price_cents
+                                    ask_sz = yes_ask_lvl.size
+                                else:
+                                    ask_c = 100 - best_no.price_cents
+                                    ask_sz = best_no.size
+                                record_book_snapshot(
+                                    tkr, mp,
+                                    best_bid_c=best_yes.price_cents,
+                                    best_ask_c=ask_c,
+                                    bid_size=best_yes.size,
+                                    ask_size=ask_sz,
+                                )
+                            except Exception as e:
+                                _log.debug(f"markout_logger snapshot failed for {tkr}: {e}")
                     # #104 (2026-04-28): pre-settlement cancel — kill quotes
                     # in last X min before close to avoid adverse-fill bleed
                     # on Friday W-series settlements.

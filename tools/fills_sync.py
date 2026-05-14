@@ -111,6 +111,28 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
             )
             new_ledger += 1
 
+            # A.4 (2026-05-14): trigger markout computation for this fill.
+            # Best-effort — if book history is too thin, backfill_pending
+            # will pick it up on the next sweep. Wrapped in try so a markout
+            # failure never blocks fill ledger persistence.
+            try:
+                from monitor.markout_logger import (
+                    ensure_schema as _ml_ensure, compute_markouts_for_fill,
+                )
+                _ml_ensure(db_path)
+                _fp = yp_c if (side or "").lower() == "yes" else np_c
+                if _fp is not None:
+                    _ts = datetime.fromisoformat(
+                        f.get("created_time", now_iso).replace("Z", "+00:00")
+                    ).timestamp()
+                    compute_markouts_for_fill(
+                        fill_id=trade_id, ticker=ticker, side=side or "",
+                        fill_price_c=int(_fp), fill_size=int(cnt_real or cnt),
+                        fill_ts=_ts, db_path=db_path,
+                    )
+            except Exception as _e:
+                _log.debug(f"markout hook failed for {trade_id}: {_e}")
+
             # Update matching quote row (fill_price_cents = side's execution price)
             fill_price = yp_c if side == "yes" else np_c
             rc = conn.execute(
