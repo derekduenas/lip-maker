@@ -55,24 +55,6 @@ from execution.quote_manager import QuoteManager, QuoteTarget
 
 
 
-def _hydra_skew_for(ticker: str) -> tuple:
-    """HYDRA-SKEW (2026-05-06): proactive directional bias from LLM swarm.
-    Reads market_skew_hint table populated by tools/hydra_skew_predictor.py.
-    Returns (skew_yes_float, confidence_float) or (None, None) if no fresh hint."""
-    try:
-        conn = sqlite3.connect(settings.DB_PATH, timeout=5)
-        now = datetime.now(timezone.utc).isoformat()
-        row = conn.execute(
-            "SELECT skew_yes, confidence FROM market_skew_hint "
-            "WHERE ticker=? AND expires_at > ?",
-            (ticker, now),
-        ).fetchone()
-        conn.close()
-        if not row: return (None, None)
-        return (float(row[0]), float(row[1]))
-    except Exception:
-        return (None, None)
-
 _log = logging.getLogger("lip_maker")
 
 
@@ -480,9 +462,6 @@ class PaperRunner:
         # bias quote sizes to absorb the offsetting side and let the long
         # side bleed off naturally. Reduces time-to-flat from minutes
         # (passive) to seconds (active recirculation).
-        # NOTE 2026-05-06: HYDRA-skew layer reverted — was costing /mo API
-        # without proven value. Pure inventory-skew restored. Helper function
-        # _hydra_skew_for() retained for future use but no longer called.
         yes_size_override = None
         no_size_override = None
         self.qm._refresh_inventory(book.market_ticker)
