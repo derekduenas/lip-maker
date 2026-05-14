@@ -115,12 +115,12 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
             # Best-effort — if book history is too thin, backfill_pending
             # will pick it up on the next sweep. Wrapped in try so a markout
             # failure never blocks fill ledger persistence.
+            _fp = yp_c if (side or "").lower() == "yes" else np_c
             try:
                 from monitor.markout_logger import (
                     ensure_schema as _ml_ensure, compute_markouts_for_fill,
                 )
                 _ml_ensure(db_path)
-                _fp = yp_c if (side or "").lower() == "yes" else np_c
                 if _fp is not None:
                     _ts = datetime.fromisoformat(
                         f.get("created_time", now_iso).replace("Z", "+00:00")
@@ -132,6 +132,27 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
                     )
             except Exception as _e:
                 _log.debug(f"markout hook failed for {trade_id}: {_e}")
+
+            # B.2 (2026-05-14): hedger — log-only. Records what hedge
+            # WOULD have fired against this fill. AUTO_HEDGE_ENABLED stays
+            # False until B.3/B.4 adapters land and effectiveness tracker
+            # confirms basis residual is bounded.
+            try:
+                from cross_venue.hedger import (
+                    ensure_schema as _hg_ensure, process_fill as _hg_process,
+                )
+                _hg_ensure(db_path)
+                if _fp is not None:
+                    _hts = datetime.fromisoformat(
+                        f.get("created_time", now_iso).replace("Z", "+00:00")
+                    ).timestamp()
+                    _hg_process(
+                        fill_id=trade_id, ticker=ticker, side=side or "",
+                        fill_price_c=int(_fp), fill_size=int(cnt_real or cnt),
+                        fill_ts=_hts, db_path=db_path,
+                    )
+            except Exception as _e:
+                _log.debug(f"hedger hook failed for {trade_id}: {_e}")
 
             # Update matching quote row (fill_price_cents = side's execution price)
             fill_price = yp_c if side == "yes" else np_c
