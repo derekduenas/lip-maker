@@ -101,6 +101,41 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
             out["flagged"] += 1
             _log.info(f"VPIN BAN {ticker}  vpin={vpin:.3f}  (y={yes_buys}/n={no_buys})  "
                       f"→ blacklist {VPIN_BAN_MINUTES}min")
+
+        # A.3 (2026-05-14): graduated throttle ladder.
+        # In addition to the binary blacklist (legacy, fires only at
+        # VPIN ≥ 0.65 + ≥ MIN_FILLS_FOR_VPIN), also write market_throttle
+        # rows for VPIN ≥ 0.50 so quote_manager can apply graduated
+        # size_scale + tick_offset. Active only when GRADUATED_THROTTLE
+        # feature flag is on (else dormant data).
+        try:
+            from monitor.market_throttle import vpin_tier, upsert as _mt_upsert
+        except Exception:
+            vpin_tier = None
+        if vpin_tier is not None:
+            # Re-iterate the same rows but with the lower (0.50) cutoff
+            graduated_n = 0
+            for ticker, yes_buys, no_buys, n_fills in rows:
+                yes_buys = yes_buys or 0
+                no_buys = no_buys or 0
+                total = yes_buys + no_buys
+                if total == 0 or n_fills < MIN_FILLS_FOR_VPIN:
+                    continue
+                vpin = abs(yes_buys - no_buys) / total
+                if SKIP_BROAD_MARKETS and _is_broad_market(ticker):
+                    continue
+                tier = vpin_tier(vpin)
+                if tier is None:
+                    continue
+                ss, off, detail = tier
+                _mt_upsert(
+                    ticker, size_scale=ss, tick_offset=off,
+                    source="vpin", ttl_sec=VPIN_BAN_MINUTES * 60,
+                    detail=f"{detail} y={yes_buys} n={no_buys} f={n_fills}",
+                    db_path=db_path,
+                )
+                graduated_n += 1
+            out["graduated_throttled"] = graduated_n
         conn.commit()
     finally:
         conn.close()
