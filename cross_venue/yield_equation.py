@@ -82,6 +82,11 @@ class MarketYield:
     calibration:      float       # REQUIRED
     series_priority:  float = 1.0
     observed_share:   float | None = None
+    # 2026-05-14 Offense (O.2): when True, this market has a continuous-
+    # hedge counterpart on CME/Kraken/ICE AND auto-hedging is enabled.
+    # Adverse-selection cost is multiplied by `hedged_adverse_factor`
+    # because the hedge neutralizes inventory drift before settlement.
+    is_hedged:                float = False  # bool but kept numeric for dataclass quirks
 
     @property
     def our_share(self) -> float:
@@ -107,12 +112,21 @@ class MarketYield:
         days = max(0.04, self.hours_to_settle / 24)
         return math.exp(-days / 90.0)
 
+    # Reduction factor applied to adverse_cost when a continuous hedge is
+    # actively neutralizing inventory drift. 0.20 = 80% reduction — the
+    # remaining 20% covers basis residual + slippage on the hedge leg.
+    # Conservative; B.5 hedge_effectiveness can refine per series.
+    HEDGED_ADVERSE_FACTOR = 0.20
+
     @property
     def adverse_cost_per_day(self) -> float:
         days = max(0.04, self.hours_to_settle / 24)
         worst_leg_price = max(self.midpoint, 1.0 - self.midpoint)
         position_usd = self.our_size * worst_leg_price
-        return 0.005 * math.sqrt(days) * position_usd
+        raw = 0.005 * math.sqrt(days) * position_usd
+        if self.is_hedged:
+            return raw * self.HEDGED_ADVERSE_FACTOR
+        return raw
 
     @property
     def expected_daily_rebate(self) -> float:

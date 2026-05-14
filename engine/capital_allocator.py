@@ -37,9 +37,20 @@ from typing import Optional
 
 from config import settings
 try:
-    from cross_venue.yield_equation import MarketYield, KALSHI_CALIB
+    from cross_venue.yield_equation import MarketYield, KALSHI_CALIB, kalshi_calib_for
 except ImportError:
-    from engine.yield_equation import MarketYield, KALSHI_CALIB
+    from engine.yield_equation import MarketYield, KALSHI_CALIB, kalshi_calib_for
+
+# Offense O.2 (2026-05-14): import hedge-eligibility lookup. When a market
+# has a continuous-hedge counterpart AND AUTO_HEDGE_ENABLED, MarketYield's
+# adverse_cost is reduced (cf. cross_venue/yield_equation.py:HEDGED_ADVERSE_FACTOR).
+# This makes hedge-eligible markets rank higher in the allocator + earn
+# bigger size since the inventory risk is neutralized by the hedge.
+try:
+    from cross_venue.market_match import is_hedge_eligible as _is_hedge_eligible
+except ImportError:
+    def _is_hedge_eligible(_t: str) -> bool:
+        return False
 
 _log = logging.getLogger(__name__)
 
@@ -335,6 +346,19 @@ def select_optimal_portfolio(
             capital = optimal_size * midpoint_default * 2  # recompute
 
         try:
+            # Offense O.1: per-market EWMA calibration overrides global
+            # KALSHI_CALIB when PER_MARKET_CALIB_ENABLED + ≥5 samples in
+            # market_calibration. Falls back to 0.25 prior on cold start.
+            base_calib = kalshi_calib_for(ticker)
+
+            # Offense O.2: hedge-eligible AND auto-hedge on → reduced adverse
+            # cost. When AUTO_HEDGE_ENABLED is off we don't claim the hedge
+            # exists yet (so we don't over-size).
+            is_hedged_now = (
+                getattr(settings, "AUTO_HEDGE_ENABLED", False)
+                and _is_hedge_eligible(ticker)
+            )
+
             y = MarketYield(
                 market_id=ticker,
                 pool_per_day=pool_d,
@@ -344,9 +368,10 @@ def select_optimal_portfolio(
                 discount_factor=df,
                 hours_to_settle=_hours_to_settle(end_date),
                 midpoint=midpoint_default,
-                calibration=KALSHI_CALIB * series_cal,
+                calibration=base_calib * series_cal,
                 series_priority=priority * setup_mult,
                 observed_share=obs_share,
+                is_hedged=is_hedged_now,
             )
             e_net_d = y.expected_daily_rebate
             yield_pct = y.yield_pct_daily
