@@ -27,9 +27,41 @@ import math
 from dataclasses import dataclass
 
 
-# Convenience constants for callers — venue-specific calibration
+# Convenience constants for callers — venue-specific calibration.
+# These are PRIORS; per-market EWMA-learned values are served by
+# `kalshi_calib_for(key)` / `pm_calib_for(key)` below, which fall back
+# to these constants on cold start or when PER_MARKET_CALIB_ENABLED is off.
 KALSHI_CALIB = 0.25
 PM_CALIB     = 0.10
+
+
+def kalshi_calib_for(ticker_or_series: str) -> float:
+    """Per-market (well, per-series) Kalshi calibration.
+
+    Reads `market_calibration` via engine.calibration_ewma; falls back
+    to KALSHI_CALIB when:
+      - settings.PER_MARKET_CALIB_ENABLED is False (the default)
+      - no row exists for the series prefix yet
+      - n_samples < 5 (cold start)
+
+    Safe to call from hot path; one indexed sqlite lookup.
+    """
+    try:
+        from engine.calibration_ewma import calib_for
+        return calib_for(ticker_or_series, fallback=KALSHI_CALIB)
+    except Exception:
+        return KALSHI_CALIB
+
+
+def pm_calib_for(slug_or_series: str) -> float:
+    """Per-market Polymarket US calibration. Same semantics as
+    `kalshi_calib_for` but fallback is PM_CALIB (0.10).
+    """
+    try:
+        from engine.calibration_ewma import calib_for
+        return calib_for(slug_or_series, fallback=PM_CALIB)
+    except Exception:
+        return PM_CALIB
 
 
 @dataclass
