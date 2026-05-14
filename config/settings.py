@@ -345,3 +345,29 @@ MAX_GROSS_PER_MARKET_BY_SERIES = {
     "KXHYPEMAXMON": 90.0, "KXHYPEMINMON": 90.0,
     "KXZECMAXMON":  90.0, "KXZECMINMON":  90.0,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 feature flags (2026-05-14 rebuild)
+# Each defaults conservatively. Toggle via env var of the same name.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A.1 — Compute and cache microprice on every book update.
+# Microprice = (ask×bid_size + bid×ask_size) / (bid_size + ask_size). Used by
+# A.2 reservation price + A.4 markout logger as the fair-value reference.
+# Default ON because it is read-only and additive; nothing downstream consumes
+# it until A.2 / A.4 land.
+USE_MICROPRICE = os.getenv("USE_MICROPRICE", "true").lower() == "true"
+
+# A.2 — Avellaneda-Stoikov reservation price for inventory-aware quote skew.
+# r = microprice - net_inventory × AS_GAMMA × σ² × (T-t)
+# Default OFF until A.2 ships; flip after measuring fill-quality on paper.
+AS_RESERVATION_ENABLED = os.getenv("AS_RESERVATION_ENABLED", "false").lower() == "true"
+AS_GAMMA = float(os.getenv("AS_GAMMA", "0.1"))
+
+# A.3 — Graduated VPIN/toxicity ladder (replaces binary blacklist with
+# (size_scale, tick_offset) tuples in the market_throttle table).
+GRADUATED_THROTTLE = os.getenv("GRADUATED_THROTTLE", "false").lower() == "true"
+
+# A.5 — Per-market online calibration EWMA replaces the global 0.25 / 0.10
+# constants in cross_venue.yield_equation. Falls back to global on cold start.
+PER_MARKET_CALIB_ENABLED = os.getenv("PER_MARKET_CALIB_ENABLED", "false").lower() == "true"

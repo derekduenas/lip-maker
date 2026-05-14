@@ -50,6 +50,7 @@ from engine.lip_scorer import (
     OurQuotes, ProgramParams, score_snapshot,
 )
 from engine.adaptive_sizer import AdaptiveSizer
+from engine.microprice import microprice_yes  # A.1: imbalance-weighted fair value
 from execution.kalshi_ws import KalshiWS, BookState, BookLevel
 from execution.quote_manager import QuoteManager, QuoteTarget
 
@@ -112,6 +113,10 @@ class PaperRunner:
         from collections import deque
         self._best_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
         self._blacklist_last_action: dict[str, float] = {}   # ticker → last-cancel ts
+        # A.1 (2026-05-14): microprice cache. Updated on every book in
+        # _quote_target_for. Consumed by A.2 (reservation price) and A.4
+        # (markout logger). Tuple of (microprice_yes_cents, ts).
+        self._last_microprice: dict[str, tuple[float, float]] = {}
 
     BLACKLIST_CACHE_SEC = 10  # refresh cache every 10s
 
@@ -397,6 +402,14 @@ class PaperRunner:
         best_no  = book.best_no_bid()
         if best_yes is None or best_no is None:
             return None
+
+        # A.1 (2026-05-14): cache microprice for downstream consumers
+        # (A.2 reservation price, A.4 markout). Best-effort — None when
+        # book is crossed/empty; downstream falls back to arithmetic mid.
+        if settings.USE_MICROPRICE:
+            mp = microprice_yes(book)
+            if mp is not None:
+                self._last_microprice[book.market_ticker] = (mp, time.time())
 
         # #104 (2026-04-28) Pre-settlement skip: don't re-quote in last
         # X min before close. Heartbeat already cancelled; this prevents
