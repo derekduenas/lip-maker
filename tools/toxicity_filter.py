@@ -204,16 +204,23 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
                     skip_reason = "already_blacklisted"
 
             if not skip_reason:
-                conn.execute(
-                    """INSERT INTO market_blacklist
-                       (ticker, expires_at, reason, added_at)
-                       VALUES (?, ?, ?, ?)""",
-                    (tkr,
-                     (now + timedelta(hours=BLACKLIST_HOURS)).isoformat(),
-                     f"toxicity:{dominant}_side_imbal_{int(imbal*100)}pct",
-                     now.isoformat()),
-                )
-                action = "blacklisted"
+                # When GRADUATED_THROTTLE is on, skip the binary blacklist
+                # write — graduated companion below handles all severity
+                # tiers (0.95+ imbalance writes size_scale=0.05, effectively
+                # a near-full block). When off, retain legacy binary behavior.
+                if not getattr(settings, "GRADUATED_THROTTLE", False):
+                    conn.execute(
+                        """INSERT INTO market_blacklist
+                           (ticker, expires_at, reason, added_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (tkr,
+                         (now + timedelta(hours=BLACKLIST_HOURS)).isoformat(),
+                         f"toxicity:{dominant}_side_imbal_{int(imbal*100)}pct",
+                         now.isoformat()),
+                    )
+                    action = "blacklisted"
+                else:
+                    action = "graduated_throttle"
 
                 # A.3 graduated companion: write a market_throttle row at the
                 # same time. When GRADUATED_THROTTLE is on, quote_manager

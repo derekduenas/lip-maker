@@ -84,23 +84,27 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
             if SKIP_BROAD_MARKETS and _is_broad_market(ticker):
                 out["skipped_broad"] += 1
                 continue
-            # Already blocked?
-            existing = conn.execute(
-                "SELECT 1 FROM market_blacklist WHERE ticker=? AND datetime(expires_at) > datetime('now')",
-                (ticker,),
-            ).fetchone()
-            if existing:
-                out["already_blocked"] += 1
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO market_blacklist(ticker, reason, expires_at, added_at) "
-                "VALUES(?, ?, ?, ?)",
-                (ticker, f"vpin={vpin:.2f} (yes_to_us={yes_buys}, no_to_us={no_buys}, n={n_fills})",
-                 expires, datetime.now(timezone.utc).isoformat()),
-            )
-            out["flagged"] += 1
-            _log.info(f"VPIN BAN {ticker}  vpin={vpin:.3f}  (y={yes_buys}/n={no_buys})  "
-                      f"→ blacklist {VPIN_BAN_MINUTES}min")
+            # When GRADUATED_THROTTLE is on, the graduated layer below
+            # handles all VPIN tiers (including the highest as size_scale=0).
+            # Skip the legacy binary blacklist write to avoid double-blocking.
+            if not getattr(settings, "GRADUATED_THROTTLE", False):
+                # Already blocked?
+                existing = conn.execute(
+                    "SELECT 1 FROM market_blacklist WHERE ticker=? AND datetime(expires_at) > datetime('now')",
+                    (ticker,),
+                ).fetchone()
+                if existing:
+                    out["already_blocked"] += 1
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO market_blacklist(ticker, reason, expires_at, added_at) "
+                    "VALUES(?, ?, ?, ?)",
+                    (ticker, f"vpin={vpin:.2f} (yes_to_us={yes_buys}, no_to_us={no_buys}, n={n_fills})",
+                     expires, datetime.now(timezone.utc).isoformat()),
+                )
+                out["flagged"] += 1
+                _log.info(f"VPIN BAN {ticker}  vpin={vpin:.3f}  (y={yes_buys}/n={no_buys})  "
+                          f"→ blacklist {VPIN_BAN_MINUTES}min")
 
         # A.3 (2026-05-14): graduated throttle ladder.
         # In addition to the binary blacklist (legacy, fires only at
