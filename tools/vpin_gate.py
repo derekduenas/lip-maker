@@ -113,12 +113,22 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
         # size_scale + tick_offset. Active only when GRADUATED_THROTTLE
         # feature flag is on (else dormant data).
         try:
-            from monitor.market_throttle import vpin_tier, upsert as _mt_upsert
+            from monitor.market_throttle import (
+                vpin_tier, upsert as _mt_upsert, classify_market,
+            )
         except Exception:
             vpin_tier = None
+            classify_market = None
         if vpin_tier is not None:
-            # Re-iterate the same rows but with the lower (0.50) cutoff
+            # Phase B (2026-05-15): per-market-type VPIN cuts.
+            #   single_name  → cuts -0.10 (earlier throttle)
+            #   mid          → base cuts (0.50 .. 0.80)
+            #   broad_index  → cuts +0.10 (later throttle)
+            # SKIP_BROAD_MARKETS no longer short-circuits here; broad
+            # markets now get throttled at the higher tier instead of
+            # being exempt entirely.
             graduated_n = 0
+            type_counts = {"single_name": 0, "mid": 0, "broad_index": 0}
             for ticker, yes_buys, no_buys, n_fills in rows:
                 yes_buys = yes_buys or 0
                 no_buys = no_buys or 0
@@ -126,9 +136,8 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
                 if total == 0 or n_fills < MIN_FILLS_FOR_VPIN:
                     continue
                 vpin = abs(yes_buys - no_buys) / total
-                if SKIP_BROAD_MARKETS and _is_broad_market(ticker):
-                    continue
-                tier = vpin_tier(vpin)
+                mtype = classify_market(ticker) if classify_market else "mid"
+                tier = vpin_tier(vpin, mtype)
                 if tier is None:
                     continue
                 ss, off, detail = tier
@@ -139,7 +148,9 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
                     db_path=db_path,
                 )
                 graduated_n += 1
+                type_counts[mtype] = type_counts.get(mtype, 0) + 1
             out["graduated_throttled"] = graduated_n
+            out["by_type"] = type_counts
         conn.commit()
     finally:
         conn.close()

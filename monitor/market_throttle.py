@@ -69,23 +69,75 @@ def ensure_schema(db_path: str = settings.DB_PATH) -> None:
         conn.close()
 
 
+# ── Market type classifier (Phase B, 2026-05-15) ────────────────────────────
+# Bartlett & O'Hara (2026, Stanford/Cornell): toxicity-via-VPIN is high on
+# single-name event markets, dilutes on broad indices. So the VPIN cuts that
+# trigger throttling should differ by market type.
+
+_BROAD_INDEX_PREFIXES = (
+    "KXMIDTERMMOV", "KXMIDTERM", "KXSENPARL", "KXFETTERMAN",
+    "KXCONGRESS", "KXHOUSERACE", "KXTRUMPACT", "KXMETGALA",
+    "KXSPYWEEK", "KXSPY", "KXSP500", "KXNASDAQ",
+)
+_SINGLE_NAME_PREFIXES = (
+    # Commodities (single underlying, externally priced — informed flow common)
+    "KXBRENTD", "KXBRENT", "KXCRUDE", "KXWTI",
+    "KXGAS", "KXNG", "KXHEATOIL",
+    "KXGOLD", "KXSILVER", "KXCOPPER", "KXPLATINUM",
+    "KXWHEAT", "KXCORN", "KXSOYBEAN", "KXCOTTON",
+    "KXCOCOA", "KXCOFFEE", "KXSUGAR", "KXOJ",
+    # Crypto (24/7, externally priced)
+    "KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP", "KXADA",
+    # Single equity / single FX
+    "KXAAPL", "KXTSLA", "KXNVDA", "KXMSFT", "KXGOOG",
+    "KXEURUSD", "KXUSDJPY", "KXGBPUSD",
+)
+
+
+def classify_market(ticker: str) -> str:
+    """Return one of 'broad_index', 'single_name', or 'mid'.
+
+    Used by vpin_tier to shift the VPIN cuts so single-name markets get
+    throttled earlier (informed flow common) and broad indices get
+    throttled later (idiosyncratic dilution lowers actual toxicity).
+    """
+    if not ticker:
+        return "mid"
+    if ticker.startswith(_BROAD_INDEX_PREFIXES):
+        return "broad_index"
+    if ticker.startswith(_SINGLE_NAME_PREFIXES):
+        return "single_name"
+    return "mid"
+
+
 # ── Standard VPIN tier mapper ───────────────────────────────────────────────
 # Used by vpin_gate; toxicity_filter / order_flow_tracker can define their own.
 
-def vpin_tier(vpin: float) -> Optional[tuple[float, int, str]]:
+# Base ladder cuts for mid markets. Single-name shifts -0.10 (earlier
+# throttle); broad-index shifts +0.10 (later throttle).
+_BASE_CUTS = (0.50, 0.60, 0.70, 0.80)
+_MARKET_TYPE_SHIFT = {"single_name": -0.10, "mid": 0.0, "broad_index": +0.10}
+
+
+def vpin_tier(vpin: float, market_type: str = "mid") -> Optional[tuple[float, int, str]]:
     """Map a VPIN value to (size_scale, tick_offset, detail).
 
-    Returns None if VPIN < 0.50 (no throttle row needed).
+    Cuts shift by market type (single_name lower, broad_index higher).
+    Returns None when VPIN is below the tier-1 cut.
     """
-    if vpin is None or vpin < 0.50:
+    if vpin is None:
         return None
-    if vpin < 0.60:
-        return (0.70, 0, f"vpin={vpin:.3f} tier-1")
-    if vpin < 0.70:
-        return (0.40, 1, f"vpin={vpin:.3f} tier-2")
-    if vpin < 0.80:
-        return (0.15, 2, f"vpin={vpin:.3f} tier-3")
-    return (0.0, 0, f"vpin={vpin:.3f} tier-4 (full block)")
+    shift = _MARKET_TYPE_SHIFT.get(market_type, 0.0)
+    c1, c2, c3, c4 = (c + shift for c in _BASE_CUTS)
+    if vpin < c1:
+        return None
+    if vpin < c2:
+        return (0.70, 0, f"vpin={vpin:.3f} tier-1 [{market_type}]")
+    if vpin < c3:
+        return (0.40, 1, f"vpin={vpin:.3f} tier-2 [{market_type}]")
+    if vpin < c4:
+        return (0.15, 2, f"vpin={vpin:.3f} tier-3 [{market_type}]")
+    return (0.0, 0, f"vpin={vpin:.3f} tier-4 (full block) [{market_type}]")
 
 
 def upsert(
