@@ -185,8 +185,10 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
         ).fetchall()
 
         for tkr, net_yes, yes_cnt, yes_cost, no_cnt, no_cost in per_market:
-            avg_yes = (yes_cost / yes_cnt / 100.0) if yes_cnt else None
-            avg_no  = (no_cost  / no_cnt  / 100.0) if no_cnt  else None
+            # Guard against NULL prices in fill_ledger (known schema quirk —
+            # price columns nullable; SUM(count*NULL)=NULL even when count>0).
+            avg_yes = (yes_cost / yes_cnt / 100.0) if (yes_cnt and yes_cost is not None) else None
+            avg_no  = (no_cost  / no_cnt  / 100.0) if (no_cnt  and no_cost  is not None) else None
             # Open exposure: |net| × relevant avg price.
             # If net_yes > 0 → net long YES → exposure = net_yes × avg_yes_entry
             # If net_yes < 0 → net long NO  → exposure = |net_yes| × avg_no_entry
