@@ -19,6 +19,9 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.csv
+data/historical/*.csv
+!data/historical/*.example
+!data/*.example
 logs/*.log
 logs/*.json
 

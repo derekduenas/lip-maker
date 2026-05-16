@@ -32,6 +32,25 @@ from execution.kalshi_auth import KalshiClient
 _log = logging.getLogger(__name__)
 
 
+def _load_overlay_blocklist() -> set[str]:
+    """Read the runtime series_blocklist_overlay table populated by
+    tools/series_auto_prune escalator. Empty until SERIES_AUTO_BLOCKLIST_ENABLED
+    is flipped to True. Returns set of series prefixes; checked alongside
+    the static settings.SERIES_BLOCKLIST in _decide_enrol."""
+    try:
+        conn = sqlite3.connect(settings.DB_PATH, timeout=2.0)
+        try:
+            rows = conn.execute(
+                "SELECT series FROM series_blocklist_overlay"
+            ).fetchall()
+            return {r[0] for r in rows if r[0]}
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        # Table not yet created (escalator hasn't run on this DB) → empty.
+        return set()
+
+
 def _series_from_market_ticker(ticker: str) -> str:
     """Extract series prefix. E.g., 'KXHIGHCHI-26APR19-B50.5' → 'KXHIGHCHI'."""
     if not ticker:
@@ -72,7 +91,67 @@ def _parse_program(raw: dict) -> dict:
     }
 
 
-def _decide_enrol(p: dict) -> tuple[int, str]:
+import re as _re
+
+# 2026-05-12 (event-binary gate): RECURRING series — weekly/daily/monthly
+# cycles where today's market settles in days, next week's is similar. SAFE
+# for LIP rebate harvesting because directional decay is bounded by the
+# short cycle. Anything NOT matching is treated as an EVENT BINARY (one-shot,
+# long-dated, unbounded directional risk → blocked when days_to_settle is
+# large, see EVENT_BINARY_MAX_DAYS).
+#
+# 2026-05-12 v2: dropped suffix-only fallback. Original code also accepted
+# any prefix ending in WEEKLY/MON/MONTHLY/DAILY/etc.; that let in
+# geopolitical "weeklies" with the same directional-decay shape as event
+# binaries — KXHORMUZWEEKLY bled -$15 across 2 strikes, KXEOWEEK -$48 in 6h.
+# All legitimate recurring suffixes (KXBTCMAXMON, KXBTC15M, KXCORNW) are
+# already caught by the PREFIX whitelist below, so the suffix path was
+# dead code masking false positives. Now: prefix-match OR block.
+_RECURRING_PREFIX_RX = _re.compile(
+    r"^KX("
+    r"CPI|CHCPI|NFP|GDP|PPI|UNEMPLOY|JOBLESS|"
+    r"HIGHT|LOWT|HIGH|LOW|RAIN|SNOW|TEMP|"
+    r"BTC|ETH|XRP|SOL|DOGE|"
+    r"BRENT|WTI|GOLD|SILVER|COPPER|CORN|SOYBEAN|WHEAT|COCOA|COFFEE|HOIL|SUGAR|"
+    r"NATGAS|HEAT|GAS|"
+    r"AAA|EIA|"
+    r"FED|TREAS|UST|DXY|"
+    r"VIX|SPX|NDX|RUT"
+    r")"
+)
+
+
+def is_repeating_series(series_prefix: str) -> bool:
+    """True if series prefix is in the known-recurring whitelist.
+
+    Whitelist covers commodity / weather / macro / crypto / index cycles.
+    Conservative default: anything else is treated as an event binary and
+    subjected to the days-to-settle gate. Geopolitical/event "weeklies"
+    (KXHORMUZWEEKLY, KXEOWEEK) are intentionally rejected even though they
+    recur — directional decay dominates the rebate.
+    """
+    if not series_prefix:
+        return False
+    return bool(_RECURRING_PREFIX_RX.match(series_prefix))
+
+
+def is_active_clause(alias: str = "") -> str:
+    """SQL fragment: row represents a CURRENTLY active enrolled market.
+
+    Single source of truth for quotability gating. Use as:
+        f"SELECT ... FROM lip_programs WHERE {is_active_clause()}"
+    Or with a table alias:
+        f"SELECT ... FROM lip_programs p WHERE {is_active_clause('p')}"
+
+    Three gates: enrolled (our decision), paid_out (Kalshi's done flag),
+    end_date (program window). All three must hold for "currently quotable".
+    """
+    pre = f"{alias}." if alias else ""
+    return (f"{pre}enrolled = 1 AND {pre}paid_out = 0 "
+            f"AND datetime({pre}end_date) > datetime('now')")
+
+
+def _decide_enrol(p: dict, now_iso: str | None = None) -> tuple[int, str]:
     """Our quoting decision for a program. Returns (enrol 0/1, reason)."""
     series = p["series_ticker"] or ""
     # 2026-04-22: prefix-match (startswith) instead of exact. Kalshi spawns
@@ -82,6 +161,13 @@ def _decide_enrol(p: dict) -> tuple[int, str]:
     # subseries exist; doesn't accidentally match KXFEDERALCHARGE).
     if any(series.startswith(b) for b in settings.SERIES_BLOCKLIST):
         return 0, f"blocklist:series({series})"
+    # 2026-05-13: runtime overlay table populated by tools/series_auto_prune
+    # when SERIES_AUTO_BLOCKLIST_ENABLED=True. Empty when flag is False, so
+    # this is a no-op until the operator turns it on. Cached at module load
+    # via _load_overlay_blocklist (refreshed on each call — table is tiny).
+    overlay = _load_overlay_blocklist()
+    if any(series.startswith(b) for b in overlay):
+        return 0, f"blocklist:overlay({series})"
     if p["reward_per_day_usd"] < settings.MIN_REWARD_PER_DAY_USD:
         return 0, f"reward_too_small:{p['reward_per_day_usd']:.2f}"
     if p["target_size"] > settings.MAX_TARGET_SIZE_CONTRACTS:
@@ -90,6 +176,29 @@ def _decide_enrol(p: dict) -> tuple[int, str]:
         return 0, f"discount_too_low:{p['discount_factor']:.2f}"
     if p["paid_out"]:
         return 0, "already_paid_out"
+    # 2026-05-10 Phase 3: end_date gate at write-time. Kalshi's API returns
+    # programs past end_date until they flip paid_out=1 (lag of hours/days).
+    # Without this check, callers see ~10% stale enrolled rows that aren't
+    # actually quotable. Belt-and-suspenders with daily lip_state_hygiene cron.
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    if p["end_date"] and p["end_date"] <= now_iso:
+        return 0, "expired"
+    # 2026-05-12: event-binary gate. Long-dated NON-recurring series have
+    # unbounded directional decay over the holding period — LIP rebate
+    # cannot cover the loss when our two-sided fill's losing side dies.
+    # Diagnostic from 4 banned series (KXBLUEWAVECOMBO 265d, KXJIMMYKIMMELFIRED
+    # 234d, KXJUDGECOUNT 20d, KXGROK 49d) all became 99% losses while bleed_monitor
+    # caught $135.89 in a single batch. Recurring series (commodity/weather/macro
+    # weeklies + monthlies) are EXEMPT — short cycle bounds the decay.
+    if not is_repeating_series(series):
+        try:
+            ed = datetime.fromisoformat(p["end_date"].replace("Z", "+00:00"))
+            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+            days_to_settle = (ed - now).total_seconds() / 86400.0
+            if days_to_settle > settings.EVENT_BINARY_MAX_DAYS:
+                return 0, f"event_binary_too_long:{days_to_settle:.0f}d"
+        except (ValueError, AttributeError):
+            pass
     return 1, "ok"
 
 
@@ -155,7 +264,7 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
         try:
             for p in programs:
                 n_total += 1
-                enrol, reason = _decide_enrol(p)
+                enrol, reason = _decide_enrol(p, now_iso=now_iso)
                 if enrol:
                     n_enrolled += 1
                 else:

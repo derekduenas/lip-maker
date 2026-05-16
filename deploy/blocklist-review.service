@@ -1,0 +1,12 @@
+[Unit]
+Description=INNAIT blocklist review — flag stale SERIES_BLOCKLIST entries for unban
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+Environment="PYTHONPATH=/root/lip-maker"
+ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/tools/blocklist_review.py
+StandardOutput=append:/root/lip-maker/logs/blocklist_review.log
+StandardError=append:/root/lip-maker/logs/blocklist_review.log

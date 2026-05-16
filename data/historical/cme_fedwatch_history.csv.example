@@ -1,0 +1,20 @@
+snapshot_date,fomc_date,target_lower,cme_prob
+# CME FedWatch published probabilities. Operator populates from:
+#   - Manual screenshot of cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html
+#   - Wayback Machine snapshots (https://web.archive.org/web/*/cmegroup.com/fedwatch)
+#   - Bloomberg / Refinitiv historical (paid)
+#   - Investing.com FedWatch mirror (current snapshot only — record daily for new data)
+#
+# target_lower: lower bound of post-meeting target range, decimal (0.0500 = 5.00%)
+# cme_prob: probability CME's tool shows for that bucket [0, 1]
+#
+# Example: on 2024-09-17 (T-1 to Sep FOMC), CME FedWatch showed:
+#   ~37% chance of 50bp cut to 4.75-5.00%
+#   ~63% chance of 25bp cut to 5.00-5.25%
+2024-09-17,2024-09-18,0.0475,0.37
+2024-09-17,2024-09-18,0.0500,0.63
+2024-09-11,2024-09-18,0.0475,0.59
+2024-09-11,2024-09-18,0.0500,0.41
+2024-08-19,2024-09-18,0.0475,0.30
+2024-08-19,2024-09-18,0.0500,0.65
+2024-08-19,2024-09-18,0.0525,0.05

@@ -308,8 +308,10 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
         ).fetchall()
         # Guard against NULL prices in fill_ledger (known schema quirk —
         # price columns nullable; SUM(count*NULL)=NULL blew up reconciler).
-        yes_cost = sum(v / 100.0 for side, v in cost_rows if side == "yes" and v is not None) if cost_rows else 0
-        no_cost  = sum(v / 100.0 for side, v in cost_rows if side == "no"  and v is not None) if cost_rows else 0
+        # Both branches independently caught this. The (v or 0) form from
+        # lip-fixes-saturday is equivalent and slightly shorter.
+        yes_cost = sum((v or 0) / 100.0 for side, v in cost_rows if side == "yes") if cost_rows else 0
+        no_cost  = sum((v or 0) / 100.0 for side, v in cost_rows if side == "no")  if cost_rows else 0
 
         settle_val = s["settle_value"]
         kalshi_result = s["result"]  # "yes" or "no"

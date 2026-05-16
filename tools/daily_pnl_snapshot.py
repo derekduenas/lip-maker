@@ -32,15 +32,28 @@ CREATE TABLE IF NOT EXISTS daily_pnl_log (
     open_exposure_usd    REAL,
     open_positions       INTEGER,
     total_fills_to_date  INTEGER,
-    balance_usd          REAL,
+    balance_usd          REAL,                    -- cash only (legacy)
+    portfolio_value_usd  REAL,                    -- 2026-05-12: open-position MTM
+    total_nav_usd        REAL,                    -- 2026-05-12: cash + portfolio = honest wealth
     snapshot_at          TEXT NOT NULL
 );
 """
+
+# Idempotent ALTER for existing DBs
+ALTER_STMTS = [
+    "ALTER TABLE daily_pnl_log ADD COLUMN portfolio_value_usd REAL",
+    "ALTER TABLE daily_pnl_log ADD COLUMN total_nav_usd REAL",
+]
 
 
 def snapshot(db_path: str = settings.DB_PATH) -> dict:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    for stmt in ALTER_STMTS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass    # column already exists
     conn.commit()
 
     try:
@@ -88,9 +101,15 @@ def snapshot(db_path: str = settings.DB_PATH) -> dict:
         # Fill count from ledger (authoritative)
         fills_n = conn.execute("SELECT COUNT(*) FROM fill_ledger").fetchone()[0]
 
-        # Balance — also protect against API failure
+        # Balance + portfolio_value (NAV-truth: cash + open-position MTM).
+        # 2026-05-12: balance_usd alone misled the dashboard — cash drops as
+        # engine deploys into positions are NOT losses; wealth shifts into
+        # portfolio. Always pull both and compute total_nav.
         try:
-            balance = k.get_balance()
+            br = k.get("/portfolio/balance")
+            balance         = float(br.get("balance", 0)) / 100.0
+            portfolio_value = float(br.get("portfolio_value", 0)) / 100.0
+            total_nav       = balance + portfolio_value
         except Exception as e:
             _log.error(f"Kalshi balance fetch failed: {e}. SKIPPING daily snapshot.")
             return {"skipped": True, "reason": f"balance_fetch_failed: {e}"}
@@ -115,8 +134,9 @@ def snapshot(db_path: str = settings.DB_PATH) -> dict:
         conn.execute(
             """INSERT INTO daily_pnl_log
                (day, realized_pnl_usd, daily_realized_delta, open_exposure_usd,
-                open_positions, total_fills_to_date, balance_usd, snapshot_at)
-               VALUES (?,?,?,?,?,?,?,?)
+                open_positions, total_fills_to_date, balance_usd,
+                portfolio_value_usd, total_nav_usd, snapshot_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(day) DO UPDATE SET
                  realized_pnl_usd     = excluded.realized_pnl_usd,
                  daily_realized_delta = excluded.daily_realized_delta,
@@ -124,20 +144,25 @@ def snapshot(db_path: str = settings.DB_PATH) -> dict:
                  open_positions       = excluded.open_positions,
                  total_fills_to_date  = excluded.total_fills_to_date,
                  balance_usd          = excluded.balance_usd,
+                 portfolio_value_usd  = excluded.portfolio_value_usd,
+                 total_nav_usd        = excluded.total_nav_usd,
                  snapshot_at          = excluded.snapshot_at""",
-            (day, realized, daily_delta, exposure, open_n, fills_n, balance, now.isoformat()),
+            (day, realized, daily_delta, exposure, open_n, fills_n,
+             balance, portfolio_value, total_nav, now.isoformat()),
         )
         conn.commit()
         return {
-            "day":           day,
-            "realized":      round(realized, 2),
-            "open_realized": round(open_realized, 2),
-            "settled_cum":   round(settled_cum, 2),
-            "delta":         round(daily_delta, 2),
-            "exposure":      round(exposure, 2),
-            "positions":     open_n,
-            "fills":         fills_n,
-            "balance":       round(balance, 2),
+            "day":             day,
+            "realized":        round(realized, 2),
+            "open_realized":   round(open_realized, 2),
+            "settled_cum":     round(settled_cum, 2),
+            "delta":           round(daily_delta, 2),
+            "exposure":        round(exposure, 2),
+            "positions":       open_n,
+            "fills":           fills_n,
+            "balance":         round(balance, 2),
+            "portfolio_value": round(portfolio_value, 2),
+            "total_nav":       round(total_nav, 2),
         }
     finally:
         conn.close()
