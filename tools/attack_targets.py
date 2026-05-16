@@ -175,6 +175,27 @@ def compute_attack_targets(
                 qual = qual or 1.0
                 net_per_day = reward_per_day * share * qual
 
+            # 2026-05-16: per-series calibration scale. Historical settlement
+            # data shows weather series (KXHIGH*, KXLOW*) earn ~0% of pool
+            # despite heavy quoting volume — they should not be picked. Pull
+            # the EWMA from market_calibration and scale the projection. Series
+            # with < 5 settlements fall back to the global 0.25 prior.
+            try:
+                from engine.calibration_ewma import calib_for
+                series_pref = t.split("-", 1)[0] if "-" in t else t
+                calib_scale = calib_for(series_pref, fallback=0.25)
+                # Normalize: existing net_per_day already assumes ~25% capture in
+                # its priors (share × qual ≈ 0.20). Multiply by (calib / 0.25)
+                # to retune to learned rate. Result: 0.0001 calib → ~near-zero
+                # net_per_day → automatically drops to LOW priority.
+                calib_factor = max(calib_scale / 0.25, 0.0)
+                net_per_day_raw = net_per_day
+                net_per_day = net_per_day * calib_factor
+            except Exception:
+                calib_scale = None
+                calib_factor = 1.0
+                net_per_day_raw = net_per_day
+
             # Effective competitors estimate (1 = us only, higher = more)
             if share and share > 0:
                 eff_comp = max(0.0, 1.0 / share - 1.0)
@@ -219,6 +240,8 @@ def compute_attack_targets(
                 "discount_factor_bps":   df_bps,
                 "adverse_per_day":       round(adverse, 3) if adverse else 0.0,
                 "expected_net_per_day":  round(net_per_day, 3),
+                "expected_net_pre_calib": round(net_per_day_raw, 3),
+                "calibration":           round(calib_scale, 4) if calib_scale is not None else None,
                 "attack_score":          round(score, 3),
                 "attack_priority":       priority,
                 "why":                   ",".join(why) if why else "",
