@@ -383,3 +383,16 @@ AUTO_HEDGE_ENABLED = os.getenv("AUTO_HEDGE_ENABLED", "false").lower() == "true"
 # / Kraken with small test orders.
 AUTO_HEDGE_CME = os.getenv("AUTO_HEDGE_CME", "false").lower() == "true"
 AUTO_HEDGE_KRAKEN = os.getenv("AUTO_HEDGE_KRAKEN", "false").lower() == "true"
+
+# === Droplet hotfix ported 2026-05-14 ===
+SERIES_BLOCKLIST = set(SERIES_BLOCKLIST) | {
+    "KXBLUEWAVECOMBO",
+    "KXGROK",
+    "KXJIMMYKIMMELFIRED",
+    "KXJUDGECOUNT",
+
+  "KXKANYE",
+    "KXKANYEISRAEL",
+    "KXBALLONDOR",
+    "KXFEDEND",
+}
