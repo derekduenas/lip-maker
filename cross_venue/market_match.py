@@ -290,6 +290,78 @@ HEDGE_MAP: dict[str, HedgeSpec] = {
         contract_size_units=1.0, contract_unit="ETH",
         sigma_annual_default=0.75,
     ),
+
+    # Phase E (2026-05-16): expand to cover currently-active crypto LIP
+    # series. Each pair below maps to a Kraken Pro spot/perp pair when
+    # available; HYPE has no Kraken listing, so hedge_venue is tagged
+    # 'Hyperliquid' for now (execution path is dry-run-only until we
+    # build a Hyperliquid adapter; the hedger still computes intent so
+    # we measure basis residual against CoinGecko spot).
+    "KXXRPMINMON": HedgeSpec(
+        instrument="XRPUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="XRP",
+        sigma_annual_default=0.85,
+    ),
+    "KXXRPMAXMON": HedgeSpec(
+        instrument="XRPUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="XRP",
+        sigma_annual_default=0.85,
+    ),
+    "KXSOLMINMON": HedgeSpec(
+        instrument="SOLUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="SOL",
+        sigma_annual_default=0.95,
+    ),
+    "KXSOLMAXMON": HedgeSpec(
+        instrument="SOLUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="SOL",
+        sigma_annual_default=0.95,
+    ),
+    "KXDOGEMINMON": HedgeSpec(
+        instrument="XDGUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="DOGE",
+        sigma_annual_default=1.20,
+        notes="Kraken DOGE uses 'XDGUSD' symbol",
+    ),
+    "KXDOGEMAXMON": HedgeSpec(
+        instrument="XDGUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="DOGE",
+        sigma_annual_default=1.20,
+    ),
+    "KXADAMINMON": HedgeSpec(
+        instrument="ADAUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="ADA",
+        sigma_annual_default=0.85,
+    ),
+    "KXADAMAXMON": HedgeSpec(
+        instrument="ADAUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="ADA",
+        sigma_annual_default=0.85,
+    ),
+    "KXZECMINMON": HedgeSpec(
+        instrument="ZECUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="ZEC",
+        sigma_annual_default=1.10,
+    ),
+    "KXZECMAXMON": HedgeSpec(
+        instrument="ZECUSD", hedge_venue="Kraken",
+        contract_size_units=1.0, contract_unit="ZEC",
+        sigma_annual_default=1.10,
+    ),
+    # Hyperliquid token — not on Kraken. Mark venue Hyperliquid; execution
+    # path is dry-run until a HL adapter exists. Spot still fetched (HL has
+    # a public API) so basis residual is measurable.
+    "KXHYPEMINMON": HedgeSpec(
+        instrument="HYPE-USD", hedge_venue="Hyperliquid",
+        contract_size_units=1.0, contract_unit="HYPE",
+        sigma_annual_default=1.30,
+        notes="Hyperliquid native token; execution requires HL adapter.",
+    ),
+    "KXHYPEMAXMON": HedgeSpec(
+        instrument="HYPE-USD", hedge_venue="Hyperliquid",
+        contract_size_units=1.0, contract_unit="HYPE",
+        sigma_annual_default=1.30,
+    ),
 }
 
 

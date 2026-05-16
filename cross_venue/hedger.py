@@ -95,12 +95,18 @@ def ensure_schema(db_path: str = settings.DB_PATH) -> None:
 #   KXNATGASD-26MAY-T3.5
 #   KXBTCMINMON-26MAY-T100000
 #   KXCPIYOY-2604-T2.5
-# We capture the numeric trailer.
-_STRIKE_RE = re.compile(r"-T([+-]?\d+(?:\.\d+)?)\s*$")
+# We capture the numeric trailer. Phase E (2026-05-16): newer crypto LIP
+# tickers use a bare "-<strike>" suffix without the "T" prefix
+# (e.g. KXXRPMAXMON-XRP-26MAY31-210). Make T optional to cover both.
+_STRIKE_RE = re.compile(r"-T?([+-]?\d+(?:\.\d+)?)\s*$")
 
 
 def parse_strike(ticker: str) -> Optional[float]:
     """Extract the strike from a Kalshi ticker. Returns None if not parseable.
+
+    Handles two formats:
+      - Legacy: ...-T<strike>   (KXBRENTD-26JUN0117-T100)
+      - Newer:  ...-<strike>    (KXXRPMAXMON-XRP-26MAY31-210)
 
     Some tickers (sports, politics) don't encode a numeric strike — those
     series should be tagged in NO_HEDGE_SERIES rather than reaching here.
