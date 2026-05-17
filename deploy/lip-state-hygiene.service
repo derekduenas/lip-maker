@@ -1,0 +1,12 @@
+[Unit]
+Description=INNAIT LIP state hygiene — demote expired enrolled rows + mark stale
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/lip-maker
+Environment="PYTHONPATH=/root/lip-maker"
+ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/tools/lip_state_hygiene.py
+StandardOutput=append:/root/lip-maker/logs/lip_state_hygiene.log
+StandardError=append:/root/lip-maker/logs/lip_state_hygiene.log

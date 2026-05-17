@@ -189,6 +189,37 @@ def apply_live(bankroll: float):
     alert("CRITICAL", "go_live", f"LIP flipped to LIVE — bankroll=${bankroll:.0f} phase=1")
 
 
+def _gate0_quant_check(days: int = 14) -> tuple[bool, str]:
+    """Phase 3 quantitative gate — wraps tools/go_live_check.py.
+
+    Returns (passed, detail). passed=False covers all of:
+      - run_check import failure
+      - run_check exception during evaluation  (P1-5 fix 2026-05-14)
+      - insufficient data
+      - any gate failure
+    All paths return False — fail-closed semantics. The script can no longer
+    crash with a SystemExit on a DB lock or schema-drift exception during
+    gate evaluation; instead the gate reports a failure and the caller can
+    refuse to apply.
+    """
+    try:
+        from tools.go_live_check import run_check
+    except Exception as e:
+        return False, f"go_live_check import failed: {e}"
+    try:
+        rep = run_check(days=days)
+    except Exception as e:
+        return False, f"run_check exception: {type(e).__name__}: {e}"
+    if rep.insufficient:
+        n_partial = sum(1 for g in rep.gates if g.insufficient_data)
+        return False, (f"insufficient data: {n_partial}/{len(rep.gates)} gates "
+                       f"need more samples (markout, sharpe, fills, basis)")
+    if not rep.overall_pass:
+        n_fail = sum(1 for g in rep.gates if not g.passed and not g.insufficient_data)
+        return False, f"{n_fail}/{len(rep.gates)} quant gates failed"
+    return True, f"all 5 quant gates pass over {days}d window"
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     p = argparse.ArgumentParser()
@@ -197,21 +228,38 @@ def main():
                    help="execute flip with given bankroll USD")
     p.add_argument("--force", action="store_true",
                    help="apply even if gates fail (DANGEROUS)")
+    p.add_argument("--quant-days", type=int, default=14,
+                   help="lookback for the Phase 3 quant gate (default 14)")
     a = p.parse_args()
+
+    # Gate 0 (quant): the 5-gate Phase 3 check — markout, Sharpe, drawdown,
+    # fill_rate, basis_residual. This is the math protection added in the
+    # 2026-05-14 rebuild. Without it, the operational gates below cannot
+    # tell whether the system is statistically profitable, only that it is
+    # operationally healthy. BOTH must pass.
+    quant_pass, quant_detail = _gate0_quant_check(days=a.quant_days)
 
     all_pass, results = run_gates()
     print("\n═══════════════════════════════════════════════════")
     print("  GO-LIVE PRE-FLIGHT CHECKS")
     print("═══════════════════════════════════════════════════")
+    mark = "✅" if quant_pass else "❌"
+    print(f"  {mark} quant_gates       {quant_detail}")
     for name, passed, detail in results:
         mark = "✅" if passed else "❌"
         print(f"  {mark} {name:<18s}  {detail}")
     print()
+
+    all_pass = all_pass and quant_pass
+
     if all_pass:
         print("  ALL GATES PASSED — system ready for live flip")
     else:
         n_fail = sum(1 for _, p, _ in results if not p)
+        if not quant_pass:
+            n_fail += 1
         print(f"  {n_fail} gate(s) failed — cannot flip live safely")
+        print(f"  Run `python tools/go_live_check.py --days {a.quant_days}` for quant detail")
 
     if a.apply is not None:
         if not all_pass and not a.force:

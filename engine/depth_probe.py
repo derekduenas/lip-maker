@@ -63,12 +63,69 @@ def probe(client, ticker: str) -> dict:
                 "yes_price": 0, "yes_size": 0, "no_price": 0, "no_size": 0}
 
 
+def has_exit_liquidity(
+    yes_price_cents: float, yes_size: float,
+    no_price_cents:  float, no_size:  float,
+    *,
+    min_exit_contracts:   int = 50,
+    min_exit_price_cents: int = 5,
+) -> dict:
+    """Can we EXIT positions on this market if filled?
+
+    LIP makers post BOTH yes and no bids. Whichever side fills, we hold a
+    directional position. Exit path = buy the OPPOSITE side to neutralize
+    (1 YES + 1 NO = $1 settled regardless of outcome).
+
+    Diagnosed 2026-05-12: 38 stranded positions sitting at "no_bid_to_sell_into"
+    — depth_probe approved entry on projected_share but the opposite-side
+    bid vanished after we filled. Engine had no exit path → held to settle.
+
+    Conservative gate: BOTH opposite-side bids must have ≥ min_exit_contracts
+    at ≥ min_exit_price_cents (since either side could fill). Returns dict
+    with verdict + diagnostic fields.
+    """
+    # If we fill on YES, exit by buying NO at no_price_cents (no_size available)
+    yes_exit_ok = (no_size >= min_exit_contracts and
+                   no_price_cents >= min_exit_price_cents)
+    # If we fill on NO, exit by buying YES at yes_price_cents
+    no_exit_ok  = (yes_size >= min_exit_contracts and
+                   yes_price_cents >= min_exit_price_cents)
+    can_exit = yes_exit_ok and no_exit_ok
+    if can_exit:
+        reason = "ok"
+    elif not yes_exit_ok and not no_exit_ok:
+        reason = (f"both_sides_thin: no={no_size:.0f}@{no_price_cents:.0f}c "
+                  f"yes={yes_size:.0f}@{yes_price_cents:.0f}c")
+    elif not yes_exit_ok:
+        reason = (f"no_side_thin (can't exit a YES fill): "
+                  f"no={no_size:.0f}@{no_price_cents:.0f}c "
+                  f"min={min_exit_contracts}@{min_exit_price_cents}c")
+    else:
+        reason = (f"yes_side_thin (can't exit a NO fill): "
+                  f"yes={yes_size:.0f}@{yes_price_cents:.0f}c "
+                  f"min={min_exit_contracts}@{min_exit_price_cents}c")
+    return {
+        "can_exit":               can_exit,
+        "yes_exit_ok":            yes_exit_ok,
+        "no_exit_ok":             no_exit_ok,
+        "opp_no_size":            no_size,
+        "opp_no_price_cents":     no_price_cents,
+        "opp_yes_size":           yes_size,
+        "opp_yes_price_cents":    yes_price_cents,
+        "reason":                 reason,
+    }
+
+
 def filter_by_depth(
     candidates: list[dict],
     client,
     min_share: float = 0.05,
     max_probes: int = 60,
     sleep_between: float = 0.05,
+    *,
+    exit_gate_enabled:    bool = True,
+    min_exit_contracts:   int  = 50,
+    min_exit_price_cents: int  = 5,
 ) -> list[dict]:
     """Reject candidates whose projected share < min_share on EITHER side.
 
@@ -102,31 +159,63 @@ def filter_by_depth(
         share_yes = projected_share(our_size, d["yes_size"])
         share_no = projected_share(our_size, d["no_size"])
 
-        # Pass if EITHER side meets min_share (we can quote one side only)
-        # Empty book → share_X = 1.0 (we're alone), passes trivially
-        passes = (share_yes >= min_share) or (share_no >= min_share)
+        # Share gate: pass if EITHER side meets min_share
+        share_passes = (share_yes >= min_share) or (share_no >= min_share)
+
+        # Exit-liquidity gate: BOTH opposite sides must have decent depth so
+        # we can unwind whichever side fills. 2026-05-12 fix — previously
+        # blind to thin-exit traps that stranded 38 positions.
+        if exit_gate_enabled:
+            ex = has_exit_liquidity(
+                d["yes_price"], d["yes_size"],
+                d["no_price"],  d["no_size"],
+                min_exit_contracts=min_exit_contracts,
+                min_exit_price_cents=min_exit_price_cents,
+            )
+            exit_passes = ex["can_exit"]
+            exit_reason = ex["reason"]
+        else:
+            exit_passes = True
+            exit_reason = "gate_disabled"
+
+        passes = share_passes and exit_passes
+        if not share_passes:
+            verdict = "fail_share"
+        elif not exit_passes:
+            verdict = "fail_exit"
+        else:
+            verdict = "pass"
 
         c2 = {
             **c,
-            "depth_share_yes": round(share_yes, 4),
-            "depth_share_no": round(share_no, 4),
-            "depth_yes_top": d["yes_size"],
-            "depth_no_top": d["no_size"],
-            "depth_gate": "pass" if passes else "fail",
+            "depth_share_yes":  round(share_yes, 4),
+            "depth_share_no":   round(share_no, 4),
+            "depth_yes_top":    d["yes_size"],
+            "depth_no_top":     d["no_size"],
+            "depth_yes_price":  d["yes_price"],
+            "depth_no_price":   d["no_price"],
+            "depth_gate":       verdict,
+            "exit_reason":      exit_reason,
         }
         if passes:
             out.append(c2)
         else:
             rejected.append(c2)
 
+    n_share_fail = sum(1 for r in rejected if r.get("depth_gate") == "fail_share")
+    n_exit_fail  = sum(1 for r in rejected if r.get("depth_gate") == "fail_exit")
     if rejected:
-        _log.info(f"depth_probe rejected {len(rejected)} markets (probed {n_probed})")
+        _log.info(
+            f"depth_probe rejected {len(rejected)} markets "
+            f"(probed {n_probed}, share_fail={n_share_fail}, exit_fail={n_exit_fail})"
+        )
         for r in rejected[:5]:
             _log.info(
-                f"  REJECT {r['market_ticker'][:35]} "
+                f"  REJECT[{r['depth_gate']}] {r['market_ticker'][:35]} "
                 f"size={r['optimal_size_per_side']} "
-                f"yes_top={r['depth_yes_top']:.0f} ({r['depth_share_yes']*100:.1f}%) "
-                f"no_top={r['depth_no_top']:.0f} ({r['depth_share_no']*100:.1f}%)"
+                f"yes_top={r['depth_yes_top']:.0f}@{r['depth_yes_price']:.0f}c "
+                f"no_top={r['depth_no_top']:.0f}@{r['depth_no_price']:.0f}c "
+                f"reason={r.get('exit_reason','-')[:60]}"
             )
 
     return out

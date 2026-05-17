@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily hedge effectiveness scan; persists per-series basis residual
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+Unit=hedge-effectiveness.service
+
+[Install]
+WantedBy=timers.target

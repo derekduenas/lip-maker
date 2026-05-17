@@ -84,23 +84,73 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
             if SKIP_BROAD_MARKETS and _is_broad_market(ticker):
                 out["skipped_broad"] += 1
                 continue
-            # Already blocked?
-            existing = conn.execute(
-                "SELECT 1 FROM market_blacklist WHERE ticker=? AND datetime(expires_at) > datetime('now')",
-                (ticker,),
-            ).fetchone()
-            if existing:
-                out["already_blocked"] += 1
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO market_blacklist(ticker, reason, expires_at, added_at) "
-                "VALUES(?, ?, ?, ?)",
-                (ticker, f"vpin={vpin:.2f} (yes_to_us={yes_buys}, no_to_us={no_buys}, n={n_fills})",
-                 expires, datetime.now(timezone.utc).isoformat()),
+            # When GRADUATED_THROTTLE is on, the graduated layer below
+            # handles all VPIN tiers (including the highest as size_scale=0).
+            # Skip the legacy binary blacklist write to avoid double-blocking.
+            if not getattr(settings, "GRADUATED_THROTTLE", False):
+                # Already blocked?
+                existing = conn.execute(
+                    "SELECT 1 FROM market_blacklist WHERE ticker=? AND datetime(expires_at) > datetime('now')",
+                    (ticker,),
+                ).fetchone()
+                if existing:
+                    out["already_blocked"] += 1
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO market_blacklist(ticker, reason, expires_at, added_at) "
+                    "VALUES(?, ?, ?, ?)",
+                    (ticker, f"vpin={vpin:.2f} (yes_to_us={yes_buys}, no_to_us={no_buys}, n={n_fills})",
+                     expires, datetime.now(timezone.utc).isoformat()),
+                )
+                out["flagged"] += 1
+                _log.info(f"VPIN BAN {ticker}  vpin={vpin:.3f}  (y={yes_buys}/n={no_buys})  "
+                          f"→ blacklist {VPIN_BAN_MINUTES}min")
+
+        # A.3 (2026-05-14): graduated throttle ladder.
+        # In addition to the binary blacklist (legacy, fires only at
+        # VPIN ≥ 0.65 + ≥ MIN_FILLS_FOR_VPIN), also write market_throttle
+        # rows for VPIN ≥ 0.50 so quote_manager can apply graduated
+        # size_scale + tick_offset. Active only when GRADUATED_THROTTLE
+        # feature flag is on (else dormant data).
+        try:
+            from monitor.market_throttle import (
+                vpin_tier, upsert as _mt_upsert, classify_market,
             )
-            out["flagged"] += 1
-            _log.info(f"VPIN BAN {ticker}  vpin={vpin:.3f}  (y={yes_buys}/n={no_buys})  "
-                      f"→ blacklist {VPIN_BAN_MINUTES}min")
+        except Exception:
+            vpin_tier = None
+            classify_market = None
+        if vpin_tier is not None:
+            # Phase B (2026-05-15): per-market-type VPIN cuts.
+            #   single_name  → cuts -0.10 (earlier throttle)
+            #   mid          → base cuts (0.50 .. 0.80)
+            #   broad_index  → cuts +0.10 (later throttle)
+            # SKIP_BROAD_MARKETS no longer short-circuits here; broad
+            # markets now get throttled at the higher tier instead of
+            # being exempt entirely.
+            graduated_n = 0
+            type_counts = {"single_name": 0, "mid": 0, "broad_index": 0}
+            for ticker, yes_buys, no_buys, n_fills in rows:
+                yes_buys = yes_buys or 0
+                no_buys = no_buys or 0
+                total = yes_buys + no_buys
+                if total == 0 or n_fills < MIN_FILLS_FOR_VPIN:
+                    continue
+                vpin = abs(yes_buys - no_buys) / total
+                mtype = classify_market(ticker) if classify_market else "mid"
+                tier = vpin_tier(vpin, mtype)
+                if tier is None:
+                    continue
+                ss, off, detail = tier
+                _mt_upsert(
+                    ticker, size_scale=ss, tick_offset=off,
+                    source="vpin", ttl_sec=VPIN_BAN_MINUTES * 60,
+                    detail=f"{detail} y={yes_buys} n={no_buys} f={n_fills}",
+                    db_path=db_path,
+                )
+                graduated_n += 1
+                type_counts[mtype] = type_counts.get(mtype, 0) + 1
+            out["graduated_throttled"] = graduated_n
+            out["by_type"] = type_counts
         conn.commit()
     finally:
         conn.close()

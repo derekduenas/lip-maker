@@ -36,10 +36,22 @@ import sqlite3
 from typing import Optional
 
 from config import settings
+from engine.lip_discovery import is_active_clause
 try:
-    from cross_venue.yield_equation import MarketYield, KALSHI_CALIB
+    from cross_venue.yield_equation import MarketYield, KALSHI_CALIB, kalshi_calib_for
 except ImportError:
-    from engine.yield_equation import MarketYield, KALSHI_CALIB
+    from engine.yield_equation import MarketYield, KALSHI_CALIB, kalshi_calib_for
+
+# Offense O.2 (2026-05-14): import hedge-eligibility lookup. When a market
+# has a continuous-hedge counterpart AND AUTO_HEDGE_ENABLED, MarketYield's
+# adverse_cost is reduced (cf. cross_venue/yield_equation.py:HEDGED_ADVERSE_FACTOR).
+# This makes hedge-eligible markets rank higher in the allocator + earn
+# bigger size since the inventory risk is neutralized by the hedge.
+try:
+    from cross_venue.market_match import is_hedge_eligible as _is_hedge_eligible
+except ImportError:
+    def _is_hedge_eligible(_t: str) -> bool:
+        return False
 
 _log = logging.getLogger(__name__)
 
@@ -125,16 +137,15 @@ def _enrolled_universe(db_path: str, max_target_size: int) -> list[tuple]:
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
         return conn.execute(
-            """SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
-                      p.target_size, p.discount_factor, p.end_date
-               FROM lip_programs p
-               LEFT JOIN market_blacklist b
-                 ON p.market_ticker = b.ticker
-                 AND datetime(b.expires_at) > datetime('now')
-               WHERE p.enrolled = 1 AND p.paid_out = 0
-                 AND p.target_size <= ?
-                 AND datetime(p.end_date) > datetime('now')
-                 AND b.ticker IS NULL""",
+            f"""SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
+                       p.target_size, p.discount_factor, p.end_date
+                FROM lip_programs p
+                LEFT JOIN market_blacklist b
+                  ON p.market_ticker = b.ticker
+                  AND datetime(b.expires_at) > datetime('now')
+                WHERE {is_active_clause('p')}
+                  AND p.target_size <= ?
+                  AND b.ticker IS NULL""",
             (max_target_size,),
         ).fetchall()
     finally:
@@ -335,6 +346,34 @@ def select_optimal_portfolio(
             capital = optimal_size * midpoint_default * 2  # recompute
 
         try:
+            # Offense O.1: per-market EWMA calibration overrides global
+            # KALSHI_CALIB when PER_MARKET_CALIB_ENABLED + ≥5 samples in
+            # market_calibration. Falls back to 0.25 prior on cold start.
+            base_calib = kalshi_calib_for(ticker)
+
+            # Offense O.2 (P1-1 fix 2026-05-14): hedge-eligible AND the
+            # specific venue adapter is LIVE (not just dry_run). The earlier
+            # version checked only AUTO_HEDGE_ENABLED; that caused capital_
+            # allocator to size positions UP expecting an 80% adverse-cost
+            # reduction during the 1-2 day window where AUTO_HEDGE_ENABLED
+            # was on but AUTO_HEDGE_CME / AUTO_HEDGE_KRAKEN were still off
+            # (adapters in dry_run). Result: unhedged basis at scaled-up size.
+            # Tightened: require the actual venue adapter to be live.
+            is_hedged_now = False
+            if getattr(settings, "AUTO_HEDGE_ENABLED", False):
+                try:
+                    from cross_venue.market_match import hedge_for_ticker
+                    _spec = hedge_for_ticker(ticker)
+                except Exception:
+                    _spec = None
+                if _spec is not None:
+                    venue = _spec.hedge_venue
+                    venue_live = (
+                        (venue == "CME"    and getattr(settings, "AUTO_HEDGE_CME",    False))
+                        or (venue == "Kraken" and getattr(settings, "AUTO_HEDGE_KRAKEN", False))
+                    )
+                    is_hedged_now = venue_live
+
             y = MarketYield(
                 market_id=ticker,
                 pool_per_day=pool_d,
@@ -344,9 +383,10 @@ def select_optimal_portfolio(
                 discount_factor=df,
                 hours_to_settle=_hours_to_settle(end_date),
                 midpoint=midpoint_default,
-                calibration=KALSHI_CALIB * series_cal,
+                calibration=base_calib * series_cal,
                 series_priority=priority * setup_mult,
                 observed_share=obs_share,
+                is_hedged=is_hedged_now,
             )
             e_net_d = y.expected_daily_rebate
             yield_pct = y.yield_pct_daily

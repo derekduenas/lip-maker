@@ -1,0 +1,11 @@
+[Unit]
+Description=Cross-venue Kalshi ↔ PM US arbitrage scanner (60s cadence)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=arb-scan.service
+
+[Install]
+WantedBy=timers.target

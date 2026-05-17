@@ -211,7 +211,74 @@ SERIES_BLOCKLIST = {
     "KXLOWMIA",       # no-T variant
     "KXMETGALA",      # net -$65 in 6h 2026-05-05 (Met Gala — entertainment prop, sharp insider edge)
     "KXEOWEEK",       # net -$48 in 6h 2026-05-05 (executive orders weekly — political insider edge)
+    # 2026-05-12 EVENT-BINARY BANS (bleed_monitor flagged 99% losses):
+    # Long-dated one-shot binaries where two-sided LIP fills create
+    # unbounded directional decay. Diagnosed 2026-05-12 from $135.89
+    # single-batch ban event. Days-to-settle gate (EVENT_BINARY_MAX_DAYS)
+    # backstops these; explicit blacklist prevents repeat enrolment if
+    # series re-spawn with shorter resolution windows.
+    "KXBLUEWAVECOMBO",       # 2026 midterms compound (House+Senate Dem) — 265d
+    "KXGROK",                # xAI Grok release timing — 49d, decayed to 0.7%
+    "KXJIMMYKIMMELFIRED",    # late-night host firing — 234d, decayed to 1%
+    "KXJUDGECOUNT",          # federal judge confirmations — multi-tick monthly
+    "KXKANYE",               # Kanye-* event family (releases, news)
+    "KXKANYEISRAEL",         # Kanye-Israel statement timing
+    "KXBALLONDOR",           # Ballon d'Or winner — once/year long-dated
+    "KXFEDEND",              # "End of Fed" hypothetical — 4yr+ horizon
+    # KXFEDDECISION already in list above (kept; flagship)
+    # 2026-05-12 v2: geopolitical/event "weeklies" that previously slipped
+    # through the suffix-only is_repeating_series fallback.
+    "KXHORMUZ",              # Strait of Hormuz events — was -$15 on T20+T200
+    "KXMAKARYOUT",           # FDA Commissioner firing — was -$7
+    # 2026-05-13: profitability audit caught KXTRUEV as the BIGGEST ongoing
+    # leak — 14d net -$229 across 155 fills (rebate +$30 vs realized -$258),
+    # textbook adverse-selection-disguised-as-maker. Same pattern that ate
+    # KXHORMUZ before the prefix-gate. series_auto_prune SHOULD have caught
+    # this (7d net < -$5, n>=3) but its per-ticker bans expire 7d while new
+    # KXTRUEV-* strikes respawn daily — bans never aggregate to the series.
+    # FOLLOW-UP: investigate why auto_prune doesn't escalate to
+    # SERIES_BLOCKLIST after N consecutive cycles flag the same prefix.
+    "KXTRUEV",
+    # 2026-05-13: caught by the new series escalator on first run
+    # (banned_tickers=3, net=-$50.73 over 14d, 26 settles, rebate $7
+    # vs realized loss $58). Same daily-respawn shape as KXTRUEV early —
+    # SNL host mention markets (Chris/Jason/Jimmy as hosts). Pre-emptive
+    # block per asymmetric-EV reasoning: $0-30/wk foregone rebate vs
+    # ~$150+ over 4wks if it keeps bleeding.
+    "KXSNLMENTION",
 }
+
+# 2026-05-13: series-level auto-escalator (tools/series_auto_prune.py).
+# When False (default): escalator detects + logs candidates to
+# series_blocklist_candidates table + alerts.log, but does NOT add to
+# the runtime overlay. Operator reviews accuracy before enabling.
+# When True: candidates auto-insert into series_blocklist_overlay,
+# which engine/lip_discovery.py reads alongside SERIES_BLOCKLIST.
+# Per the operator's "log-first, action-second" pattern.
+SERIES_AUTO_BLOCKLIST_ENABLED = False
+
+# 2026-05-12: event-binary days-to-settle cap. Markets where settle is
+# more than this many days out AND the series is not on the recurring
+# whitelist (engine/lip_discovery.is_repeating_series) get rejected at
+# discovery time. Backstops the SERIES_BLOCKLIST against newly-spawned
+# event binaries we haven't manually banned.
+EVENT_BINARY_MAX_DAYS = 60
+
+# 2026-05-12 EXIT-LIQUIDITY GATE: depth_probe previously checked only
+# projected SHARE at entry, missing markets where the opposite-side bid
+# vanished after we filled. Diagnosed: 38 stranded positions sitting at
+# "no_bid_to_sell_into" — engine had no exit path so they held to settle,
+# costing $570-1140 of expected loss over 2-3 weeks.
+#
+# Gate: BOTH opposite-side bids must satisfy
+#   bid_size  >= MIN_EXIT_CONTRACTS  AND
+#   bid_price >= MIN_EXIT_PRICE_CENTS
+# (LIP makers post both YES and NO; either side could fill, so both must
+#  have an exit path.) Override per env: EXIT_GATE_ENABLED, MIN_EXIT_CONTRACTS,
+# MIN_EXIT_PRICE_CENTS — read in run_paper.py at filter_by_depth call sites.
+EXIT_GATE_ENABLED       = True
+MIN_EXIT_CONTRACTS      = 50
+MIN_EXIT_PRICE_CENTS    = 5
 
 # ── Quote pricing ─────────────────────────────────────────────────────────
 # Where to place our quote relative to best bid/ask:
@@ -345,3 +412,75 @@ MAX_GROSS_PER_MARKET_BY_SERIES = {
     "KXHYPEMAXMON": 90.0, "KXHYPEMINMON": 90.0,
     "KXZECMAXMON":  90.0, "KXZECMINMON":  90.0,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 feature flags (2026-05-14 rebuild)
+# Each defaults conservatively. Toggle via env var of the same name.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A.1 — Compute and cache microprice on every book update.
+# Microprice = (ask×bid_size + bid×ask_size) / (bid_size + ask_size). Used by
+# A.2 reservation price + A.4 markout logger as the fair-value reference.
+# Default ON because it is read-only and additive; nothing downstream consumes
+# it until A.2 / A.4 land.
+USE_MICROPRICE = os.getenv("USE_MICROPRICE", "true").lower() == "true"
+
+# A.2 — Avellaneda-Stoikov reservation price for inventory-aware quote skew.
+# r = microprice - net_inventory × AS_GAMMA × σ² × (T-t)
+# Default OFF until A.2 ships; flip after measuring fill-quality on paper.
+AS_RESERVATION_ENABLED = os.getenv("AS_RESERVATION_ENABLED", "false").lower() == "true"
+AS_GAMMA = float(os.getenv("AS_GAMMA", "0.1"))
+
+# A.3 — Graduated VPIN/toxicity ladder (replaces binary blacklist with
+# (size_scale, tick_offset) tuples in the market_throttle table).
+GRADUATED_THROTTLE = os.getenv("GRADUATED_THROTTLE", "false").lower() == "true"
+
+# A.5 — Per-market online calibration EWMA replaces the global 0.25 / 0.10
+# constants in cross_venue.yield_equation. Falls back to global on cold start.
+PER_MARKET_CALIB_ENABLED = os.getenv("PER_MARKET_CALIB_ENABLED", "false").lower() == "true"
+
+# B.2 — Cross-venue hedger master switch. When False: log-only (records what
+# hedge WOULD have fired; no orders placed). When True: hedger calls broker
+# adapters and places real orders. KEEP FALSE until B.5 hedge_effectiveness
+# shows GOOD verdict on the eligible series over 14+ days.
+AUTO_HEDGE_ENABLED = os.getenv("AUTO_HEDGE_ENABLED", "false").lower() == "true"
+
+# B.3 — Per-venue execution flags. Stay False even when AUTO_HEDGE_ENABLED
+# flips on, until the venue-specific adapter has been validated against TWS
+# / Kraken with small test orders.
+AUTO_HEDGE_CME = os.getenv("AUTO_HEDGE_CME", "false").lower() == "true"
+AUTO_HEDGE_KRAKEN = os.getenv("AUTO_HEDGE_KRAKEN", "false").lower() == "true"
+
+# === Droplet hotfix ported 2026-05-14 ===
+# 8 series banned 2026-05-12 after $135 single-batch loss event on
+# long-dated event binaries. Unions cleanly with the KXTRUEV/KXSNLMENTION
+# entries added in lip-fixes-saturday earlier in the same set literal.
+SERIES_BLOCKLIST = set(SERIES_BLOCKLIST) | {
+    "KXBLUEWAVECOMBO",
+    "KXGROK",
+    "KXJIMMYKIMMELFIRED",
+    "KXJUDGECOUNT",
+    "KXKANYE",
+    "KXKANYEISRAEL",
+    "KXBALLONDOR",
+    "KXFEDEND",
+}
+
+# ── Prong 3: Cross-Venue Dislocation Harvester ───────────────────────────
+# All scanner config lives in dislocation/config.py to keep prongs decoupled.
+# Read it via `from dislocation.config import ...` (do NOT alias here — the
+# prong has its own bankroll envelope so a Kalshi LIP draw-down doesn't
+# implicitly pause convergence trades).
+DISLOCATION_PRONG_ENABLED = os.getenv("DISLOCATION_ENABLED", "false").lower() == "true"
+
+# ── 2026-05-13 EMPTY-UNIVERSE IDLE / FLAP-DETECTOR (clean-exit storm fix) ──
+# Prong 1 (run_paper.py): if select_optimal_portfolio + filter_by_depth
+# return zero markets (cold-start race vs periodic_discover), sleep and
+# retry instead of `return`-ing. Clean exit-0 was bypassing systemd's
+# OnFailure/StartLimitBurst → silent restart loop (~36 cycles in 48 min on
+# 2026-05-13 01:04-01:52 UTC). MAX_WAIT aligns with periodic_discover (1800s).
+# After MAX_WAIT we exit 2 (NOT 0) so the supervisor sees a real failure
+# and alerts.log fires. Prong 2 = tools/restart_flap_watcher.py is exit-code
+# agnostic and catches any rapid-restart pattern via journalctl.
+EMPTY_UNIVERSE_SLEEP_SEC    = int(os.getenv("LIP_EMPTY_UNIVERSE_SLEEP_SEC",    "60"))
+EMPTY_UNIVERSE_MAX_WAIT_SEC = int(os.getenv("LIP_EMPTY_UNIVERSE_MAX_WAIT_SEC", "1800"))

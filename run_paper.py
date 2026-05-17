@@ -50,28 +50,14 @@ from engine.lip_scorer import (
     OurQuotes, ProgramParams, score_snapshot,
 )
 from engine.adaptive_sizer import AdaptiveSizer
+from engine.microprice import microprice_yes  # A.1: imbalance-weighted fair value
+from engine.reservation_price import (        # A.2: inventory-aware fair value
+    reservation_price, realized_sigma_cents, suggest_quote_skew,
+)
 from execution.kalshi_ws import KalshiWS, BookState, BookLevel
 from execution.quote_manager import QuoteManager, QuoteTarget
 
 
-
-def _hydra_skew_for(ticker: str) -> tuple:
-    """HYDRA-SKEW (2026-05-06): proactive directional bias from LLM swarm.
-    Reads market_skew_hint table populated by tools/hydra_skew_predictor.py.
-    Returns (skew_yes_float, confidence_float) or (None, None) if no fresh hint."""
-    try:
-        conn = sqlite3.connect(settings.DB_PATH, timeout=5)
-        now = datetime.now(timezone.utc).isoformat()
-        row = conn.execute(
-            "SELECT skew_yes, confidence FROM market_skew_hint "
-            "WHERE ticker=? AND expires_at > ?",
-            (ticker, now),
-        ).fetchone()
-        conn.close()
-        if not row: return (None, None)
-        return (float(row[0]), float(row[1]))
-    except Exception:
-        return (None, None)
 
 _log = logging.getLogger("lip_maker")
 
@@ -130,6 +116,10 @@ class PaperRunner:
         from collections import deque
         self._best_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
         self._blacklist_last_action: dict[str, float] = {}   # ticker → last-cancel ts
+        # A.1 (2026-05-14): microprice cache. Updated on every book in
+        # _quote_target_for. Consumed by A.2 (reservation price) and A.4
+        # (markout logger). Tuple of (microprice_yes_cents, ts).
+        self._last_microprice: dict[str, tuple[float, float]] = {}
 
     BLACKLIST_CACHE_SEC = 10  # refresh cache every 10s
 
@@ -416,6 +406,14 @@ class PaperRunner:
         if best_yes is None or best_no is None:
             return None
 
+        # A.1 (2026-05-14): cache microprice for downstream consumers
+        # (A.2 reservation price, A.4 markout). Best-effort — None when
+        # book is crossed/empty; downstream falls back to arithmetic mid.
+        if settings.USE_MICROPRICE:
+            mp = microprice_yes(book)
+            if mp is not None:
+                self._last_microprice[book.market_ticker] = (mp, time.time())
+
         # #104 (2026-04-28) Pre-settlement skip: don't re-quote in last
         # X min before close. Heartbeat already cancelled; this prevents
         # a book update from immediately triggering a fresh placement.
@@ -480,9 +478,6 @@ class PaperRunner:
         # bias quote sizes to absorb the offsetting side and let the long
         # side bleed off naturally. Reduces time-to-flat from minutes
         # (passive) to seconds (active recirculation).
-        # NOTE 2026-05-06: HYDRA-skew layer reverted — was costing /mo API
-        # without proven value. Pure inventory-skew restored. Helper function
-        # _hydra_skew_for() retained for future use but no longer called.
         yes_size_override = None
         no_size_override = None
         self.qm._refresh_inventory(book.market_ticker)
@@ -501,10 +496,51 @@ class PaperRunner:
                 yes_size_override = size + skew_amount
                 no_size_override  = max(min_size, size - skew_amount)
 
+        # A.2 (2026-05-14): Avellaneda-Stoikov reservation price layer.
+        # Computes r = mp - q×γ×σ²×(T-t) and proposes a per-side tick
+        # offset. Only takes effect when AS_RESERVATION_ENABLED=True AND
+        # market's DiscountFactor ≥ 0.70 (otherwise size-skew alone).
+        # Always logged for diagnostic purposes so paper-mode A/B can show
+        # whether the price skew would have changed fill toxicity.
+        yes_bid_c = best_yes.price_cents
+        no_bid_c  = best_no.price_cents
+        as_reason = "off"
+        if settings.AS_RESERVATION_ENABLED:
+            mp_tuple = self._last_microprice.get(book.market_ticker)
+            mp = mp_tuple[0] if mp_tuple is not None else None
+            net_q = inv.net_yes_contracts if (inv and inv.net_yes_contracts) else 0
+            hist = self._best_history.get(book.market_ticker)
+            samples = [h[1] for h in hist] if hist else []
+            sigma_c = realized_sigma_cents(samples)
+            hours_settle = mins_until / 60.0 if (mins_until is not None) else 24.0
+            if mp is not None and sigma_c > 0 and net_q != 0:
+                r = reservation_price(
+                    mp_cents=mp, net_inventory=net_q,
+                    gamma=settings.AS_GAMMA, sigma_cents=sigma_c,
+                    hours_to_settle=hours_settle,
+                )
+                skew = suggest_quote_skew(
+                    mp_cents=mp, r_cents=r,
+                    discount_factor=float(p.discount_factor),
+                    max_tick_offset=1,
+                )
+                as_reason = skew.reason
+                # Apply the offsets (negative = quote 1c worse than best)
+                # Clamp to [1, 99] just in case
+                if skew.yes_tick_offset:
+                    yes_bid_c = max(1, min(99, yes_bid_c + skew.yes_tick_offset))
+                if skew.no_tick_offset:
+                    no_bid_c  = max(1, min(99, no_bid_c  + skew.no_tick_offset))
+                if skew.yes_tick_offset or skew.no_tick_offset:
+                    _log.info(f"AS_skew[{book.market_ticker}] mp={mp:.2f} r={r:.2f} "
+                              f"q={net_q} σ={sigma_c:.2f}c T={hours_settle:.1f}h "
+                              f"yes_off={skew.yes_tick_offset} no_off={skew.no_tick_offset} "
+                              f"reason={skew.reason}")
+
         return QuoteTarget(
             market_ticker=book.market_ticker,
-            yes_bid_cents=best_yes.price_cents,
-            no_bid_cents=best_no.price_cents,
+            yes_bid_cents=yes_bid_c,
+            no_bid_cents=no_bid_c,
             size_contracts=size,
             yes_size_override=yes_size_override,
             no_size_override=no_size_override,
@@ -733,6 +769,32 @@ class PaperRunner:
                     best_no = book.best_no_bid()
                     if best_yes is None or best_no is None:
                         continue
+                    # A.4 (2026-05-14): persist microprice + book to history
+                    # so markout_logger can compute t+1/10/60s markouts on
+                    # fills retrospectively. Lightweight — one row per ticker
+                    # per heartbeat (≈30s); skipped when microprice undefined.
+                    if settings.USE_MICROPRICE:
+                        mp = microprice_yes(book)
+                        if mp is not None:
+                            try:
+                                from monitor.markout_logger import record_book_snapshot
+                                # Derive yes_ask from explicit or no_bid mirror
+                                yes_ask_lvl = book.best_yes_ask()
+                                if yes_ask_lvl is not None:
+                                    ask_c = yes_ask_lvl.price_cents
+                                    ask_sz = yes_ask_lvl.size
+                                else:
+                                    ask_c = 100 - best_no.price_cents
+                                    ask_sz = best_no.size
+                                record_book_snapshot(
+                                    tkr, mp,
+                                    best_bid_c=best_yes.price_cents,
+                                    best_ask_c=ask_c,
+                                    bid_size=best_yes.size,
+                                    ask_size=ask_sz,
+                                )
+                            except Exception as e:
+                                _log.debug(f"markout_logger snapshot failed for {tkr}: {e}")
                     # #104 (2026-04-28): pre-settlement cancel — kill quotes
                     # in last X min before close to avoid adverse-fill bleed
                     # on Friday W-series settlements.
@@ -959,32 +1021,56 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     # 2026-05-01 PREDATOR: pass saturated tickers so ranker skips markets
     # where existing positions already exhaust per-market cap. Without this
     # the ranker keeps surfacing the same stuck markets at top-N.
-    saturated = _compute_saturated_tickers()
     use_capital_alloc = os.getenv("LIP_USE_CAPITAL_ALLOC", "true").lower() == "true"
-    if use_capital_alloc:
-        markets = select_optimal_portfolio(
-            budget_usd=settings.MAX_TOTAL_GROSS_USD,
-            exclude_tickers=saturated,
-        )
-        _log.info(f"capital-aware ranker: {len(markets)} markets, "
-                  f"E[net]=${sum(m.get('expected_net_per_day',0) for m in markets):.2f}/d")
-        # Sprint 4 #2: pre-deploy depth gate (reject <5% projected share)
-        if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
-            try:
-                from execution.kalshi_auth import KalshiClient as _KC_dg
-                _dg_client = _KC_dg()
-                pre_n = len(markets)
-                markets = filter_by_depth(markets, _dg_client,
-                                          min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")))
-                _log.info(f"depth_gate: {pre_n} -> {len(markets)} markets "
-                          f"({100*(pre_n-len(markets))/max(1,pre_n):.0f}% rejected)")
-            except Exception as e:
-                _log.warning(f"depth_gate skipped due to error: {e}")
-    else:
-        markets = top_n_to_quote(top_n, exclude_tickers=saturated)
-    if not markets:
-        _log.warning("no enrolled markets")
-        return
+    def _select_markets() -> list[dict]:
+        saturated = _compute_saturated_tickers()
+        if use_capital_alloc:
+            sel = select_optimal_portfolio(
+                budget_usd=settings.MAX_TOTAL_GROSS_USD,
+                exclude_tickers=saturated,
+            )
+            _log.info(f"capital-aware ranker: {len(sel)} markets, "
+                      f"E[net]=${sum(m.get('expected_net_per_day',0) for m in sel):.2f}/d")
+            # Sprint 4 #2: pre-deploy depth gate (reject <5% projected share)
+            if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
+                try:
+                    from execution.kalshi_auth import KalshiClient as _KC_dg
+                    _dg_client = _KC_dg()
+                    pre_n = len(sel)
+                    sel = filter_by_depth(
+                        sel, _dg_client,
+                        min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
+                        exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
+                        min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
+                        min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
+                    )
+                    _log.info(f"depth_gate: {pre_n} -> {len(sel)} markets "
+                              f"({100*(pre_n-len(sel))/max(1,pre_n):.0f}% rejected)")
+                except Exception as e:
+                    _log.warning(f"depth_gate skipped due to error: {e}")
+            return sel
+        return top_n_to_quote(top_n, exclude_tickers=saturated)
+    markets = _select_markets()
+    # 2026-05-13: clean-exit storm fix. Empty universe used to `return` →
+    # exit 0 → systemd Restart loop with no OnFailure visibility (~36 cycles
+    # in 48 min on 01:04-01:52 UTC). Idle and retry instead; escalate to
+    # exit 2 after MAX_WAIT so the supervisor's flap detector + OnFailure
+    # both fire loudly. See settings.EMPTY_UNIVERSE_*.
+    consecutive_empty = 0
+    while not markets:
+        _log.warning(f"empty quotable universe (cycle {consecutive_empty}); "
+                     f"idling {settings.EMPTY_UNIVERSE_SLEEP_SEC}s")
+        await asyncio.sleep(settings.EMPTY_UNIVERSE_SLEEP_SEC)
+        consecutive_empty += 1
+        if consecutive_empty * settings.EMPTY_UNIVERSE_SLEEP_SEC >= settings.EMPTY_UNIVERSE_MAX_WAIT_SEC:
+            _log.error(f"empty universe for >={settings.EMPTY_UNIVERSE_MAX_WAIT_SEC}s — "
+                       "exiting non-zero so supervisor visibility kicks in")
+            sys.exit(2)
+        try:
+            discover(save=True)
+        except Exception as e:
+            _log.warning(f"discover refresh during empty-universe idle failed: {e}")
+        markets = _select_markets()
     _log.info(f"quoting top-{len(markets)} markets, total pool ${sum(m['reward_per_day_usd'] for m in markets):.2f}/day")
 
     runner = PaperRunner(markets)
@@ -1041,8 +1127,13 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                             from execution.kalshi_auth import KalshiClient as _KC_dg2
                             _dg_client2 = _KC_dg2()
                             pre_n = len(fresh)
-                            fresh = filter_by_depth(fresh, _dg_client2,
-                                                    min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")))
+                            fresh = filter_by_depth(
+                                fresh, _dg_client2,
+                                min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
+                                exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
+                                min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
+                                min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
+                            )
                             _log.info(f"depth_gate refresh: {pre_n} -> {len(fresh)}")
                         except Exception as e:
                             _log.warning(f"depth_gate refresh skipped: {e}")

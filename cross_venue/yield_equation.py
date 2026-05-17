@@ -27,9 +27,41 @@ import math
 from dataclasses import dataclass
 
 
-# Convenience constants for callers — venue-specific calibration
+# Convenience constants for callers — venue-specific calibration.
+# These are PRIORS; per-market EWMA-learned values are served by
+# `kalshi_calib_for(key)` / `pm_calib_for(key)` below, which fall back
+# to these constants on cold start or when PER_MARKET_CALIB_ENABLED is off.
 KALSHI_CALIB = 0.25
 PM_CALIB     = 0.10
+
+
+def kalshi_calib_for(ticker_or_series: str) -> float:
+    """Per-market (well, per-series) Kalshi calibration.
+
+    Reads `market_calibration` via engine.calibration_ewma; falls back
+    to KALSHI_CALIB when:
+      - settings.PER_MARKET_CALIB_ENABLED is False (the default)
+      - no row exists for the series prefix yet
+      - n_samples < 5 (cold start)
+
+    Safe to call from hot path; one indexed sqlite lookup.
+    """
+    try:
+        from engine.calibration_ewma import calib_for
+        return calib_for(ticker_or_series, fallback=KALSHI_CALIB)
+    except Exception:
+        return KALSHI_CALIB
+
+
+def pm_calib_for(slug_or_series: str) -> float:
+    """Per-market Polymarket US calibration. Same semantics as
+    `kalshi_calib_for` but fallback is PM_CALIB (0.10).
+    """
+    try:
+        from engine.calibration_ewma import calib_for
+        return calib_for(slug_or_series, fallback=PM_CALIB)
+    except Exception:
+        return PM_CALIB
 
 
 @dataclass
@@ -50,6 +82,11 @@ class MarketYield:
     calibration:      float       # REQUIRED
     series_priority:  float = 1.0
     observed_share:   float | None = None
+    # 2026-05-14 Offense (O.2): when True, this market has a continuous-
+    # hedge counterpart on CME/Kraken/ICE AND auto-hedging is enabled.
+    # Adverse-selection cost is multiplied by `hedged_adverse_factor`
+    # because the hedge neutralizes inventory drift before settlement.
+    is_hedged:                float = False  # bool but kept numeric for dataclass quirks
 
     @property
     def our_share(self) -> float:
@@ -75,12 +112,21 @@ class MarketYield:
         days = max(0.04, self.hours_to_settle / 24)
         return math.exp(-days / 90.0)
 
+    # Reduction factor applied to adverse_cost when a continuous hedge is
+    # actively neutralizing inventory drift. 0.20 = 80% reduction — the
+    # remaining 20% covers basis residual + slippage on the hedge leg.
+    # Conservative; B.5 hedge_effectiveness can refine per series.
+    HEDGED_ADVERSE_FACTOR = 0.20
+
     @property
     def adverse_cost_per_day(self) -> float:
         days = max(0.04, self.hours_to_settle / 24)
         worst_leg_price = max(self.midpoint, 1.0 - self.midpoint)
         position_usd = self.our_size * worst_leg_price
-        return 0.005 * math.sqrt(days) * position_usd
+        raw = 0.005 * math.sqrt(days) * position_usd
+        if self.is_hedged:
+            return raw * self.HEDGED_ADVERSE_FACTOR
+        return raw
 
     @property
     def expected_daily_rebate(self) -> float:

@@ -306,8 +306,12 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
                FROM fill_ledger WHERE ticker=? GROUP BY side""",
             (tkr,),
         ).fetchall()
-        yes_cost = sum(v / 100.0 for side, v in cost_rows if side == "yes") if cost_rows else 0
-        no_cost  = sum(v / 100.0 for side, v in cost_rows if side == "no")  if cost_rows else 0
+        # Guard against NULL prices in fill_ledger (known schema quirk —
+        # price columns nullable; SUM(count*NULL)=NULL blew up reconciler).
+        # Both branches independently caught this. The (v or 0) form from
+        # lip-fixes-saturday is equivalent and slightly shorter.
+        yes_cost = sum((v or 0) / 100.0 for side, v in cost_rows if side == "yes") if cost_rows else 0
+        no_cost  = sum((v or 0) / 100.0 for side, v in cost_rows if side == "no")  if cost_rows else 0
 
         settle_val = s["settle_value"]
         kalshi_result = s["result"]  # "yes" or "no"
@@ -380,6 +384,43 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
             if prediction_correct == 1:
                 correct += 1
         total_net_outcome += net
+
+        # A.5 hook (2026-05-14): update per-series calibration EWMA with the
+        # observed "capture rate" = rebate_earned / pool_per_day. The series
+        # prefix gets a learned calibration that replaces the global 0.25
+        # prior once n_samples ≥ 5 (set in calibration_ewma.calib_for).
+        try:
+            pool_row = conn.execute(
+                "SELECT reward_per_day_usd FROM lip_programs WHERE market_ticker = ?",
+                (tkr,),
+            ).fetchone()
+            pool_per_day = float(pool_row[0]) if pool_row and pool_row[0] else 0.0
+            if pool_per_day >= 0.50 and rebate >= 0:
+                from engine.calibration_ewma import update as _cal_update
+                _cal_update(
+                    key=s["prefix"],
+                    predicted_usd=pool_per_day,   # pool we competed for
+                    actual_usd=rebate,             # what we actually earned
+                    db_path=db_path,
+                )
+        except Exception as _e:
+            _log.debug(f"calibration_ewma hook failed for {tkr}: {_e}")
+
+        # B.6 (2026-05-16): unwind any open hedge legs for this settled
+        # ticker. Adapter respects AUTO_HEDGE_<venue> flags — paper/dry-run
+        # stays paper, live stays live. Idempotent: re-runs only touch
+        # hedges whose unwound_at IS NULL. Failures degrade gracefully
+        # (logged but don't block settlement_reconciler).
+        try:
+            from cross_venue.hedge_unwind import unwind_for_ticker as _hu
+            _res = _hu(tkr, db_path=db_path)
+            if _res["n_unwound"] > 0 or _res["n_skipped"] > 0:
+                _log.info(
+                    f"[B.6] {tkr}: unwound={_res['n_unwound']} "
+                    f"skipped={_res['n_skipped']}"
+                )
+        except Exception as _e:
+            _log.debug(f"hedge_unwind hook failed for {tkr}: {_e}")
 
     conn.commit()
 

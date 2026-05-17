@@ -342,6 +342,41 @@ class QuoteManager:
         ev_ok, ev_reason = check_series_ev(series_prefix, self.db_path)
         if not ev_ok:
             return False, ev_reason
+
+        # A.3 (2026-05-14): graduated throttle. Apply size_scale and
+        # tick_offset from market_throttle table (VPIN / toxicity /
+        # order_flow sources, combined MIN size_scale + MAX tick_offset).
+        # When size_scale == 0 → reject like a binary blacklist; when
+        # 0 < size_scale < 1 → shrink and widen instead of killing the
+        # quote. Default (no rows / flag off) is (1.0, 0) = no change.
+        try:
+            from monitor.market_throttle import active_for as _mt_active
+            ss, toff = _mt_active(target.market_ticker, self.db_path)
+            if ss <= 0.0:
+                return False, f"THROTTLE: size_scale=0 (full block)"
+            if ss < 1.0:
+                target.size_contracts = max(
+                    settings.MIN_QUOTE_SIZE_CONTRACTS,
+                    int(target.size_contracts * ss),
+                )
+                if target.yes_size_override is not None:
+                    target.yes_size_override = max(
+                        settings.MIN_QUOTE_SIZE_CONTRACTS,
+                        int(target.yes_size_override * ss),
+                    )
+                if target.no_size_override is not None:
+                    target.no_size_override = max(
+                        settings.MIN_QUOTE_SIZE_CONTRACTS,
+                        int(target.no_size_override * ss),
+                    )
+            if toff > 0:
+                # Back off both sides by toff cents (quote 1-2c worse than best)
+                if target.yes_bid_cents is not None:
+                    target.yes_bid_cents = max(1, target.yes_bid_cents - toff)
+                if target.no_bid_cents is not None:
+                    target.no_bid_cents = max(1, target.no_bid_cents - toff)
+        except Exception as _e:
+            _log.debug(f"throttle reader failed for {target.market_ticker}: {_e}")
         # Circuit breaker: halt all quoting if daily loss exceeds cap (live only)
         if not self.paper:
             daily_pnl = self._daily_realized_pnl()

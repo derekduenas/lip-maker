@@ -1,7 +1,9 @@
 [Unit]
-Description=INNAIT LIP Market-Maker — paper-mode validation
+Description=INNAIT LIP Market-Maker — production supervisor
 After=network.target
 Wants=network-online.target
+# Fire the alert unit on ANY failure mode (oneshot writes to alerts.log).
+OnFailure=lip-maker-alert@%n.service
 
 [Service]
 Type=simple
@@ -9,13 +11,27 @@ User=root
 WorkingDirectory=/root/lip-maker
 Environment=PYTHONPATH=/root/lip-maker
 Environment=PYTHONUNBUFFERED=1
-Environment=LIP_PAPER=true
+# LIVE-mode env — matches the nohup config that's been running since the
+# Sunday exit-gate ship. 2026-05-12: was LIP_PAPER=true here, but the
+# operator overrode via nohup with LIP_PAPER=false. Unit now reflects
+# reality so systemd takes ownership.
+Environment=LIP_PAPER=false
 Environment=LIP_SHADOW=true
-ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/run_paper.py --duration 2592000 --top-n 100
-Restart=on-failure
-RestartSec=30
-StandardOutput=append:/root/lip-maker/logs/lip-maker.log
-StandardError=append:/root/lip-maker/logs/lip-maker.log
+Environment=LIP_BANKROLL=2000
+Environment=LIP_RAMP_PHASE=1
+# --duration 31536000 = 1 year (script default is 300s = 5min, so an
+# explicit large value is required). Restart=always brings it back in
+# 10s on ANY exit (clean OR crash) before the year elapses.
+ExecStart=/root/lip-maker/venv/bin/python /root/lip-maker/run_paper.py --duration 31536000 --top-n 15
+Restart=always
+RestartSec=10
+# Burst protection: if the engine flaps (>5 restarts in 5min) systemd
+# stops the unit and the OnFailure alert fires — operator must
+# investigate before re-enabling.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=append:/root/lip-maker/logs/lip_maker.log
+StandardError=append:/root/lip-maker/logs/lip_maker.log
 
 [Install]
 WantedBy=multi-user.target

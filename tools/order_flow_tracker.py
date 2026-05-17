@@ -130,20 +130,53 @@ def scan(db_path: str = settings.DB_PATH) -> dict:
         if existing_bl:
             action = f"skipped:already_blacklisted ({existing_bl[0][:30]})"
         else:
-            # Add to blacklist
-            expires = (now + timedelta(hours=BLACKLIST_HOURS)).isoformat()
-            conn.execute(
-                """INSERT INTO market_blacklist
-                   (ticker, expires_at, reason, added_at)
-                   VALUES (?, ?, ?, ?)""",
-                (ticker, expires,
-                 f"orderflow:{side}_side_{total_n}fills_{n_contracts}c_in_{WINDOW_SEC}s",
-                 now.isoformat()),
-            )
-            action = "blacklisted"
-            _log.warning(f"orderflow {ticker}: {total_n}x {side.upper()} fills "
-                         f"({n_contracts} contracts) in last {WINDOW_SEC}s "
-                         f"→ blacklisted {BLACKLIST_HOURS}h")
+            # When GRADUATED_THROTTLE is on, skip the binary blacklist
+            # write — graduated companion below handles severity tiers
+            # (≥5 fills → size_scale=0.10, near-full block). When off,
+            # retain legacy binary behavior.
+            if not getattr(settings, "GRADUATED_THROTTLE", False):
+                expires = (now + timedelta(hours=BLACKLIST_HOURS)).isoformat()
+                conn.execute(
+                    """INSERT INTO market_blacklist
+                       (ticker, expires_at, reason, added_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (ticker, expires,
+                     f"orderflow:{side}_side_{total_n}fills_{n_contracts}c_in_{WINDOW_SEC}s",
+                     now.isoformat()),
+                )
+                action = "blacklisted"
+                _log.warning(f"orderflow {ticker}: {total_n}x {side.upper()} fills "
+                             f"({n_contracts} contracts) in last {WINDOW_SEC}s "
+                             f"→ blacklisted {BLACKLIST_HOURS}h")
+            else:
+                action = "graduated_throttle"
+                _log.info(f"orderflow {ticker}: {total_n}x {side.upper()} fills "
+                          f"({n_contracts}c/{WINDOW_SEC}s) → graduated throttle")
+
+            # A.3 graduated companion: same-side sequential fills are the
+            # cleanest one-sided-toxicity signal we have. Apply a per-side
+            # bias by tilting size_scale + tick_offset asymmetrically. For
+            # consistency with vpin/toxicity we still write a single
+            # market_throttle row; the per-side tilt is left to caller
+            # (quote_manager applies tick_offset to BOTH sides for now,
+            # B.6 will refine to per-side asymmetric pull).
+            try:
+                from monitor.market_throttle import upsert as _mt_upsert
+                # 3-fills 60s baseline → mid-tier throttle; >5 fills → near-full
+                if total_n >= 5:
+                    ss, toff = 0.10, 2
+                else:
+                    ss, toff = 0.30, 1
+                _mt_upsert(
+                    ticker, size_scale=ss, tick_offset=toff,
+                    source="order_flow",
+                    ttl_sec=BLACKLIST_HOURS * 3600,
+                    detail=f"{side}_side n={total_n} c={n_contracts} "
+                           f"window={WINDOW_SEC}s",
+                    db_path=db_path,
+                )
+            except Exception as _e:
+                _log.debug(f"order_flow graduated upsert failed for {ticker}: {_e}")
 
         conn.execute(
             """INSERT OR IGNORE INTO order_flow_log

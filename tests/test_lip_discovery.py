@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engine.lip_discovery import _decide_enrol, top_n_to_quote
+from engine.lip_discovery import _decide_enrol, top_n_to_quote, is_repeating_series
 
 
 def _program(**kw) -> dict:
@@ -132,6 +132,46 @@ class TestGateOrdering(unittest.TestCase):
         ))
         self.assertEqual(enrol, 0)
         self.assertIn("blocklist", reason)
+
+
+class TestIsRepeatingSeries(unittest.TestCase):
+    """Pin the prefix-only whitelist for recurring series (2026-05-12 v2).
+
+    Why: suffix-only fallback (any *WEEKLY / *MON) used to exempt
+    geopolitical and event "weeklies" from the days-to-settle gate. After
+    KXHORMUZWEEKLY bled -$15 the rule tightened to prefix-only.
+    """
+
+    def test_commodity_prefix_recurs(self):
+        self.assertTrue(is_repeating_series("KXCORNW"))
+        self.assertTrue(is_repeating_series("KXBRENTD"))
+        self.assertTrue(is_repeating_series("KXWHEATMON"))
+
+    def test_weather_prefix_recurs(self):
+        self.assertTrue(is_repeating_series("KXHIGHTNY"))
+        self.assertTrue(is_repeating_series("KXLOWTMIA"))
+        self.assertTrue(is_repeating_series("KXRAINLAX"))
+
+    def test_crypto_prefix_recurs(self):
+        self.assertTrue(is_repeating_series("KXBTC15M"))
+        self.assertTrue(is_repeating_series("KXETHMAXMON"))
+
+    def test_geopolitical_weekly_blocked(self):
+        # Was the BUG — suffix WEEKLY exempted it. Now must be rejected.
+        self.assertFalse(is_repeating_series("KXHORMUZWEEKLY"))
+
+    def test_event_weekly_blocked(self):
+        # KXEOWEEK = executive orders weekly — bled $48 in 6h before ban.
+        self.assertFalse(is_repeating_series("KXEOWEEK"))
+
+    def test_event_binary_blocked(self):
+        # No suffix, no whitelisted prefix — definitely event binary.
+        self.assertFalse(is_repeating_series("KXJIMMYKIMMELFIRED"))
+        self.assertFalse(is_repeating_series("KXMAKARYOUT"))
+
+    def test_empty_input_blocked(self):
+        self.assertFalse(is_repeating_series(""))
+        self.assertFalse(is_repeating_series(None))
 
 
 class TestTopNPriorityWeighting(unittest.TestCase):
