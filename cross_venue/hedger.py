@@ -210,6 +210,25 @@ def decide(fill_id: str, ticker: str, side: str, fill_price_c: Optional[int],
             kalshi_fill_price_c=fill_price_c,
         )
 
+    # Polymarket / same-event hedges bypass strike + spot lookup. The
+    # hedge is 1:1 contract count regardless of underlying price.
+    if getattr(spec, "hedge_strategy", "delta_binary") == "same_event_unit":
+        qty_float = spec.hedge_qty(
+            kalshi_contracts=signed, strike_price=0.0,
+            spot=0.0, hours_to_settle=0.0,
+        )
+        qty_int = int(round(qty_float))
+        residual = qty_float - qty_int
+        return HedgeDecision(
+            fill_id=fill_id, kalshi_ticker=ticker, kalshi_side=s,
+            kalshi_contracts=signed, status="would_have_fired",
+            hedge_spec=spec, spot=None, hours_to_settle=None,
+            hedge_qty_float=qty_float, hedge_qty_int=qty_int,
+            hedge_qty_residual=residual, kalshi_strike=None,
+            kalshi_fill_price_c=fill_price_c,
+            sigma_annual=spec.sigma_annual_default,
+        )
+
     strike = parse_strike(ticker)
     if strike is None:
         return HedgeDecision(
@@ -320,6 +339,27 @@ def _execute_if_enabled(d: HedgeDecision, db_path: str) -> HedgeDecision:
                 instrument=d.hedge_spec.instrument,
                 qty=abs_qty, side=side,
                 notes=f"kalshi={d.kalshi_ticker} q={d.kalshi_contracts}",
+            )
+        elif venue == "Polymarket":
+            # Same-event 1:1 hedge. Adapter accepts 'yes'/'no' semantics.
+            # qty>0 means we're long YES on Kalshi → buy NO on PM.
+            # qty<0 (sell) means we're long NO on Kalshi → buy YES on PM.
+            # qty here is the SIGNED hedge_qty_int (already negated vs Kalshi).
+            from execution.polymarket_adapter import PolymarketAdapter
+            pm_side = "no" if d.kalshi_side == "yes" else "yes"
+            adapter = PolymarketAdapter(db_path=db_path)
+            # Resolve PM slug from kalshi_pm_map if available; otherwise
+            # use the spec.instrument as placeholder. Real-time mapping:
+            try:
+                from cross_venue.kalshi_pm_map import find_pm_counterpart
+                pair = find_pm_counterpart(d.kalshi_ticker)
+                pm_slug = pair[1] if pair else d.hedge_spec.instrument
+            except Exception:
+                pm_slug = d.hedge_spec.instrument
+            result = adapter.place_market(
+                instrument=pm_slug,
+                qty=abs_qty, side=pm_side,
+                notes=f"kalshi={d.kalshi_ticker} side={d.kalshi_side} q={d.kalshi_contracts}",
             )
         elif venue == "ICE":
             # ICE has no public retail API; manual hedge or skip.

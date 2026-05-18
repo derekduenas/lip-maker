@@ -90,13 +90,18 @@ class HedgeSpec:
     """How to hedge a Kalshi position with an external instrument.
 
     Attributes:
-        instrument: external symbol (e.g. CME "MCL", Kraken "XBTUSD")
-        hedge_venue: "CME" | "Kraken" | "ICE" | "manual"
+        instrument: external symbol (e.g. CME "MCL", Kraken "XBTUSD", PM slug)
+        hedge_venue: "CME" | "Kraken" | "ICE" | "Polymarket" | "Hyperliquid" | "manual"
         contract_size_units: how much underlying one external contract covers
-            (e.g. 100 bbl for MCL, 1 BTC for Kraken perp)
-        contract_unit: human label ("bbl", "MMBtu", "BTC", "$/oz", ...)
+            (e.g. 100 bbl for MCL, 1 BTC for Kraken perp, 1 contract for PM)
+        contract_unit: human label ("bbl", "MMBtu", "BTC", "$/oz", "contracts")
         sigma_annual_default: annualized vol prior for delta approximation
         kalshi_payoff_usd: dollar payoff per Kalshi contract (Kalshi binary = $1)
+        hedge_strategy: how to compute hedge qty
+            "delta_binary": classic delta hedge against continuous underlying
+                            (Kraken/CME/ICE). Requires strike + spot + sigma.
+            "same_event_unit": 1:1 cross-venue same-event hedge (Polymarket).
+                               Bypass delta math; qty = -kalshi_contracts.
         notes: per-mapping caveats (e.g. confidence, contract-month, basis)
     """
     instrument: str
@@ -105,36 +110,35 @@ class HedgeSpec:
     contract_unit: str
     sigma_annual_default: float = 0.30
     kalshi_payoff_usd: float = 1.0
+    hedge_strategy: str = "delta_binary"
     notes: str = ""
 
     def hedge_qty(self, kalshi_contracts: int, strike_price: float,
                   spot: float, hours_to_settle: float,
                   sigma_annual: Optional[float] = None) -> float:
-        """Return signed external contract qty needed to delta-hedge a Kalshi position.
+        """Return signed external contract qty needed to hedge a Kalshi position.
 
-        Sign convention: a positive `kalshi_contracts` means long YES on
-        Kalshi (binary call). The hedge to delta-flatten is SHORT the
-        underlying (negative qty returned).
+        Routing depends on hedge_strategy:
+          delta_binary (default): full delta-hedge math (Kraken/CME/ICE)
+          same_event_unit: 1:1 opposite-side on the SAME event (Polymarket).
+                           Returns -kalshi_contracts directly.
 
-        Args:
-            kalshi_contracts: signed; +=long YES, -=long NO (or short YES).
-            strike_price: Kalshi market strike (same units as spot).
-            spot: current underlying price.
-            hours_to_settle: hours until Kalshi market settles.
-            sigma_annual: optional override of self.sigma_annual_default.
-
-        Returns:
-            Float external-contract qty (signed). Caller rounds to whole
-            contracts and accumulates fractional residual.
+        Sign convention: positive kalshi_contracts = long YES on Kalshi.
+        delta_binary returns negative qty (short underlying to flatten).
+        same_event_unit returns -kalshi_contracts (buy NO of same event,
+        since YES_kalshi + NO_pm = $1 guaranteed payoff).
         """
         if kalshi_contracts == 0 or self.contract_size_units <= 0:
             return 0.0
+        if self.hedge_strategy == "same_event_unit":
+            # 1:1 cross-venue hedge. PM contract = 1 contract face value.
+            # Long YES on Kalshi → BUY NO on PM (same magnitude, opposite outcome).
+            # The hedger downstream maps the negative sign to side='no'/'sell'.
+            return -float(kalshi_contracts)
+        # Default: delta-binary continuous-underlying hedge
         sig = float(sigma_annual) if sigma_annual is not None else self.sigma_annual_default
         years = max(1.0 / (365.0 * 24.0), float(hours_to_settle) / (365.0 * 24.0))
         delta_binary = binary_delta(spot, strike_price, sig, years)
-        # Position $-delta = N_kalshi × payoff × delta_binary
-        # One external contract $-delta per $1 spot move = contract_size_units
-        # So qty to OFFSET = -(N × payoff × delta_binary) / contract_size_units
         return -(kalshi_contracts * self.kalshi_payoff_usd * delta_binary
                  / self.contract_size_units)
 
@@ -361,6 +365,54 @@ HEDGE_MAP: dict[str, HedgeSpec] = {
         instrument="HYPE-USD", hedge_venue="Hyperliquid",
         contract_size_units=1.0, contract_unit="HYPE",
         sigma_annual_default=1.30,
+    ),
+
+    # ── Polymarket US — same-event hedge (1:1 contract count) ────────────
+    # Phase F (2026-05-18): use PM as the hedge venue for series with no
+    # continuous-underlying counterpart. Each entry's `instrument` is the
+    # PM slug (must match polymarket.com/event/<slug>). hedge_strategy =
+    # same_event_unit bypasses delta math: hedge_qty = -kalshi_contracts.
+    #
+    # When Kalshi YES fills: PM adapter places NO of same event (1:1).
+    # When Kalshi NO fills:  PM adapter places YES of same event (1:1).
+    # Combined position pays $1 guaranteed regardless of outcome.
+    #
+    # SLUG MAPPING: lookup uses cross_venue.kalshi_pm_map.find_pm_counterpart
+    # at decide-time. The `instrument` field here is a PLACEHOLDER label;
+    # the actual PM slug is resolved per-fill from kalshi_pm_map.
+    # NOTE: only enable series where the Kalshi <-> PM event has clear
+    # 1:1 outcome semantics. Multi-outcome / asymmetric events stay
+    # out — would settle on Kalshi but not PM and vice versa.
+    "KXBTC75VS100": HedgeSpec(
+        instrument="will-btc-reach-100k-before-75k",  # PM slug template; resolved per-ticker
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="BTC level race; check kalshi_pm_map for exact slug per market.",
+    ),
+    "KXTRUMPENDORSE": HedgeSpec(
+        instrument="will-trump-endorse-x",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Trump endorsement events; resolve slug per ticker.",
+    ),
+    "KXVOTEHUBTRUMPUPDOWN": HedgeSpec(
+        instrument="trump-approval-week",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Trump approval; resolves to weekly PM slug.",
+    ),
+    "KXCPIYOY_PM": HedgeSpec(
+        # CPI also has CME ZQ hedge; this is the PM fallback when CME
+        # access isn't live yet. Key suffixed _PM so it doesn't clobber the
+        # primary CME entry. Hedger picks the live-venue one.
+        instrument="cpi-yoy-month",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="CPI YoY; PM fallback before IBKR/CME wired live.",
     ),
 }
 
