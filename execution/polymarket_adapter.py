@@ -24,13 +24,16 @@ must use spec.hedge_strategy="same_event_unit" to route this correctly.
 
 ENVIRONMENT (when going live)
 -----------------------------
-- PM_API_KEY                (CLOB v2 API key from polymarket.com/markets)
-- PM_SECRET                 (HMAC secret for signing orders)
-- PM_USDC_WALLET_ADDRESS    (the deposit address Polymarket US assigned)
+- PM_API_KEY    (CLOB v2 API key from polymarket.com/markets)
+- PM_SECRET     (HMAC secret for signing orders)
+
+Note: PM US uses a custodial USDC model; no wallet address env var is
+required for trading. Deposits/withdrawals happen via PM's UI, separate
+from this adapter's order-placement path.
 
 Live trading also requires:
 - KYC complete on polymarket.com
-- USDC deposited via Polymarket US wallet (separate from offshore PM)
+- USDC deposited via Polymarket US's deposit flow
 - CLOB v2 endpoint enabled (Feb 2026 launch onward)
 
 INSTRUMENT NOTES
@@ -86,7 +89,7 @@ class PolymarketAdapter:
         )
         self.api_key = os.getenv("PM_API_KEY", "")
         self.secret = os.getenv("PM_SECRET", "")
-        self.wallet = os.getenv("PM_USDC_WALLET_ADDRESS", "")
+        # PM US is custodial; no wallet env var required for trading.
         self.db_path = db_path or settings.DB_PATH
         self._client = None    # lazy init
         _ensure_health_schema(self.db_path)

@@ -45,7 +45,7 @@ echo "value unchanged if it was set previously)."
 echo ""
 
 # ── Read existing values to allow partial updates ─────────────────────────
-existing_pm_key=""; existing_pm_secret=""; existing_pm_wallet=""
+existing_pm_key=""; existing_pm_secret=""
 existing_kraken_key=""; existing_kraken_secret=""
 if [ -f "$CREDS_FILE" ]; then
     echo "Existing credentials file found. Empty input KEEPS the old value."
@@ -53,7 +53,6 @@ if [ -f "$CREDS_FILE" ]; then
     # Source-style parse without exposing values
     existing_pm_key=$(grep -oP 'PM_API_KEY=\K[^"]+' "$CREDS_FILE" 2>/dev/null | head -1 | tr -d '"' || true)
     existing_pm_secret=$(grep -oP 'PM_SECRET=\K[^"]+' "$CREDS_FILE" 2>/dev/null | head -1 | tr -d '"' || true)
-    existing_pm_wallet=$(grep -oP 'PM_USDC_WALLET_ADDRESS=\K[^"]+' "$CREDS_FILE" 2>/dev/null | head -1 | tr -d '"' || true)
     existing_kraken_key=$(grep -oP 'KRAKEN_API_KEY=\K[^"]+' "$CREDS_FILE" 2>/dev/null | head -1 | tr -d '"' || true)
     existing_kraken_secret=$(grep -oP 'KRAKEN_API_SECRET=\K[^"]+' "$CREDS_FILE" 2>/dev/null | head -1 | tr -d '"' || true)
 fi
@@ -107,9 +106,10 @@ validate_creds() {
 }
 
 echo "── Polymarket US ──"
+echo "  (PM US uses a custodial USDC model; wallet address is NOT required"
+echo "   for trading — only API key + secret. Deposits flow via PM's UI.)"
 pm_key=$(prompt_secret "PM_API_KEY" "$existing_pm_key" "(from polymarket.com → API)")
 pm_secret=$(prompt_secret "PM_SECRET" "$existing_pm_secret" "(HMAC secret)")
-pm_wallet=$(prompt_secret "PM_USDC_WALLET_ADDRESS" "$existing_pm_wallet" "(your deposit address)")
 
 echo ""
 echo "── Kraken Pro ──"
@@ -119,7 +119,6 @@ kraken_secret=$(prompt_secret "KRAKEN_API_SECRET" "$existing_kraken_secret" "(ba
 # ── Validate every value before writing — fail fast on malformed paste ─────
 validate_creds "PM_API_KEY" "$pm_key" || exit 1
 validate_creds "PM_SECRET" "$pm_secret" || exit 1
-validate_creds "PM_USDC_WALLET_ADDRESS" "$pm_wallet" || exit 1
 validate_creds "KRAKEN_API_KEY" "$kraken_key" || exit 1
 validate_creds "KRAKEN_API_SECRET" "$kraken_secret" || exit 1
 
@@ -165,7 +164,6 @@ write_env_line() {
 
 write_env_line "PM_API_KEY" "$pm_key"
 write_env_line "PM_SECRET" "$pm_secret"
-write_env_line "PM_USDC_WALLET_ADDRESS" "$pm_wallet"
 write_env_line "KRAKEN_API_KEY" "$kraken_key"
 write_env_line "KRAKEN_API_SECRET" "$kraken_secret"
 
@@ -207,7 +205,7 @@ fi
 echo ""
 echo "── credentials present in running process (values masked) ──"
 pid=$(systemctl show -p MainPID --value lip-maker.service)
-for var in PM_API_KEY PM_SECRET PM_USDC_WALLET_ADDRESS KRAKEN_API_KEY KRAKEN_API_SECRET; do
+for var in PM_API_KEY PM_SECRET KRAKEN_API_KEY KRAKEN_API_SECRET; do
     if cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | grep -q "^${var}="; then
         echo "  ✓ $var  set"
     else
