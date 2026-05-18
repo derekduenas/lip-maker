@@ -426,6 +426,38 @@ HEDGE_MAP: dict[str, HedgeSpec] = {
         hedge_strategy="same_event_unit",
         notes="CPI YoY range; PM US lists these natively (DCM-approved).",
     ),
+    # ── Phase F.2 (2026-05-18): added after Sunday-night rotation scan ─────
+    # The Trump activity cluster ($4K/d aggregate active LIP pool on the
+    # weekend rotation) all has 1:1 counterparts on PM US — these are
+    # PM's bread and butter category. Slugs resolved per-ticker via
+    # kalshi_pm_map.find_pm_counterpart at decide-time.
+    "KXAPRPOTUS": HedgeSpec(
+        instrument="trump-approval-friday-poll",  # placeholder; resolved per ticker
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Trump approval rating snapshot; PM has weekly poll-based markets.",
+    ),
+    "KXTRUTHSOCIAL": HedgeSpec(
+        instrument="trump-truth-social-posts-week",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Trump weekly Truth Social post counts; PM lists same.",
+    ),
+    "KXTRUMPACT": HedgeSpec(
+        # Trump weekly executive-order count. PM has equivalent.
+        # NOTE: KXTRUMPACT was previously in NO_HEDGE_SERIES. Adding here
+        # OVERRIDES that (hedge_for_ticker checks HEDGE_MAP first via
+        # series prefix). Reasoning: with PM US live-auth verified, this
+        # is now hedgeable; the NO_HEDGE classification was for the era
+        # before PM US existed as a viable counterparty.
+        instrument="trump-eo-count-week",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Trump weekly executive action count; PM has parallel listings.",
+    ),
     # NOTE: KXBTC* / KXETH* etc. NOT routed to Polymarket because PM US
     # doesn't list the same daily/monthly strike ladder Kalshi has. Crypto
     # stays on Kraken (already wired with full delta-hedge math).
