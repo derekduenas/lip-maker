@@ -369,51 +369,66 @@ HEDGE_MAP: dict[str, HedgeSpec] = {
 
     # ── Polymarket US — same-event hedge (1:1 contract count) ────────────
     # Phase F (2026-05-18): use PM as the hedge venue for series with no
-    # continuous-underlying counterpart. Each entry's `instrument` is the
-    # PM slug (must match polymarket.com/event/<slug>). hedge_strategy =
-    # same_event_unit bypasses delta math: hedge_qty = -kalshi_contracts.
+    # continuous-underlying counterpart. PM US (CFTC DCM, Feb 2026 launch)
+    # focuses on political + macro + major news; sports/entertainment/
+    # rich-crypto-ladder are NOT covered — those still rely on Kraken/CME
+    # or stay unhedged. Each entry's `instrument` is a PLACEHOLDER PM
+    # slug; the live slug resolves per-fill via
+    # cross_venue.kalshi_pm_map.find_pm_counterpart(ticker).
     #
     # When Kalshi YES fills: PM adapter places NO of same event (1:1).
     # When Kalshi NO fills:  PM adapter places YES of same event (1:1).
     # Combined position pays $1 guaranteed regardless of outcome.
     #
-    # SLUG MAPPING: lookup uses cross_venue.kalshi_pm_map.find_pm_counterpart
-    # at decide-time. The `instrument` field here is a PLACEHOLDER label;
-    # the actual PM slug is resolved per-fill from kalshi_pm_map.
-    # NOTE: only enable series where the Kalshi <-> PM event has clear
-    # 1:1 outcome semantics. Multi-outcome / asymmetric events stay
-    # out — would settle on Kalshi but not PM and vice versa.
-    "KXBTC75VS100": HedgeSpec(
-        instrument="will-btc-reach-100k-before-75k",  # PM slug template; resolved per-ticker
-        hedge_venue="Polymarket",
-        contract_size_units=1.0, contract_unit="contracts",
-        hedge_strategy="same_event_unit",
-        notes="BTC level race; check kalshi_pm_map for exact slug per market.",
-    ),
-    "KXTRUMPENDORSE": HedgeSpec(
-        instrument="will-trump-endorse-x",
-        hedge_venue="Polymarket",
-        contract_size_units=1.0, contract_unit="contracts",
-        hedge_strategy="same_event_unit",
-        notes="Trump endorsement events; resolve slug per ticker.",
-    ),
+    # hedge_strategy=same_event_unit bypasses delta math: qty = -kalshi_contracts.
+    #
+    # ONLY enable series where:
+    #   1. Kalshi and PM list materially the SAME event (not just adjacent)
+    #   2. Outcome semantics are 1:1 (Kalshi YES ↔ PM YES of same event)
+    #   3. Both venues have liquid books at our quote size
     "KXVOTEHUBTRUMPUPDOWN": HedgeSpec(
-        instrument="trump-approval-week",
+        instrument="trump-approval-week",   # placeholder; resolved per-ticker
         hedge_venue="Polymarket",
         contract_size_units=1.0, contract_unit="contracts",
         hedge_strategy="same_event_unit",
-        notes="Trump approval; resolves to weekly PM slug.",
+        notes="Trump approval rating; PM has weekly equivalents.",
+    ),
+    "KXMAMDANIEO": HedgeSpec(
+        instrument="mamdani-executive-order",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="NYC mayoral EO; PM lists Mamdani actions.",
+    ),
+    "KXTRUMPENDORSEMENTS": HedgeSpec(
+        instrument="trump-endorses-candidate-week",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Trump weekly endorsement count; PM has parallel markets.",
+    ),
+    "KXLAKECONF": HedgeSpec(
+        instrument="kari-lake-confirmation",
+        hedge_venue="Polymarket",
+        contract_size_units=1.0, contract_unit="contracts",
+        hedge_strategy="same_event_unit",
+        notes="Kari Lake ambassador confirmation date; PM equivalent.",
     ),
     "KXCPIYOY_PM": HedgeSpec(
-        # CPI also has CME ZQ hedge; this is the PM fallback when CME
-        # access isn't live yet. Key suffixed _PM so it doesn't clobber the
-        # primary CME entry. Hedger picks the live-venue one.
+        # CPI is the rare case where BOTH PM US and CME (via IBKR ZQ) are
+        # viable hedges. PM US lists CPI YoY ranges natively. CME ZQ gives
+        # Fed-rate-implied CPI sensitivity. Use PM until IBKR live, then
+        # add basis comparison. Key suffixed _PM so the CME entry remains
+        # primary in the lookup once that adapter is funded.
         instrument="cpi-yoy-month",
         hedge_venue="Polymarket",
         contract_size_units=1.0, contract_unit="contracts",
         hedge_strategy="same_event_unit",
-        notes="CPI YoY; PM fallback before IBKR/CME wired live.",
+        notes="CPI YoY range; PM US lists these natively (DCM-approved).",
     ),
+    # NOTE: KXBTC* / KXETH* etc. NOT routed to Polymarket because PM US
+    # doesn't list the same daily/monthly strike ladder Kalshi has. Crypto
+    # stays on Kraken (already wired with full delta-hedge math).
 }
 
 
