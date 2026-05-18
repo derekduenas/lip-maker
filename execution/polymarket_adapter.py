@@ -95,36 +95,73 @@ class PolymarketAdapter:
         _ensure_health_schema(self.db_path)
 
     def _connect_if_live(self) -> bool:
+        """Validate Ed25519 signing key + readiness for live calls.
+
+        PM US uses Ed25519-signed requests (no SDK middleman):
+          X-PM-Access-Key:  keyId (UUID)
+          X-PM-Timestamp:   unix milliseconds
+          X-PM-Signature:   base64(Ed25519.sign(f"{ts}{method}{path}{body}"))
+
+        The 88-char base64 secret decodes to 64 bytes (libsodium signing key);
+        first 32 bytes are the Ed25519 seed. We construct the signing key
+        once at connect time and reuse it for each request.
+        """
         if self.dry_run:
             return False
         if self._client is not None:
             return True
-        # Attempt to import the SDK installed at /root/polymarket-maker/venv
-        try:
-            # Try the upstream SDK if available
-            from polymarket_us.client import PolymarketUSClient  # type: ignore
-        except ImportError:
-            _log.warning(
-                "polymarket_us SDK not installed in lip-maker venv; "
-                "staying dry-run. Install via: "
-                "/root/lip-maker/venv/bin/pip install polymarket-us"
-            )
-            self.dry_run = True
-            return False
         if not (self.api_key and self.secret):
             _log.warning("PM_API_KEY/SECRET not set; staying dry-run.")
             self.dry_run = True
             return False
         try:
-            self._client = PolymarketUSClient(
-                api_url=self.api_url,
-                api_key=self.api_key,
-                secret=self.secret,
+            import base64
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PrivateKey,
             )
+            secret_bytes = base64.b64decode(self.secret)
+            if len(secret_bytes) == 64:
+                seed = secret_bytes[:32]   # libsodium format
+            elif len(secret_bytes) == 32:
+                seed = secret_bytes
+            else:
+                _log.warning(
+                    f"PM_SECRET decoded to {len(secret_bytes)} bytes; "
+                    f"expected 32 or 64. Staying dry-run."
+                )
+                self.dry_run = True
+                return False
+            # Store the signing key directly (no SDK middleman; PM US doesnt
+            # ship an official Python SDK as of 2026-05).
+            self._client = Ed25519PrivateKey.from_private_bytes(seed)
+            # Override api_url to the verified host
+            self.api_url = "https://api.polymarket.us"
             return True
         except Exception as e:
-            _log.warning(f"Polymarket init failed: {e} — staying dry-run")
+            _log.warning(f"Polymarket signing key init failed: "
+                         f"{type(e).__name__} — staying dry-run")
+            self.dry_run = True
             return False
+
+    def _signed_headers(self, method: str, path: str, body: str = "") -> dict:
+        """Build Ed25519-signed headers per docs.polymarket.us.
+
+        Payload = timestamp_ms + method + path + body
+        Headers:
+          X-PM-Access-Key, X-PM-Timestamp, X-PM-Signature (base64)
+        """
+        import base64
+        import time
+        timestamp = str(int(time.time() * 1000))
+        payload = f"{timestamp}{method}{path}{body}"
+        sig = self._client.sign(payload.encode("utf-8"))
+        return {
+            "X-PM-Access-Key": self.api_key,
+            "X-PM-Timestamp": timestamp,
+            "X-PM-Signature": base64.b64encode(sig).decode(),
+            "Content-Type": "application/json",
+            "User-Agent": "innait-lip-maker/1.0",
+        }
 
     def heartbeat(self) -> bool:
         if self.dry_run:
