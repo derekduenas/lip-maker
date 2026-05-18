@@ -914,24 +914,36 @@ class PaperRunner:
 
                 # NEXUS V4 D-misc port (2026-04-30): Money-Print line for Kalshi.
                 # Theoretical max: sum(reward_per_day_usd) of markets we currently quote.
-                # Calibration factor: empirical haircut (Kalshi calibrated_predictor
-                # showed actual ≈ 0.20-0.30x of theoretical).
+                # 2026-05-18: per-market net-capture calibration now used in place of
+                # the flat 0.25 prior. Each market's pool is multiplied by its own
+                # kalshi_calib_for() value (rebate-minus-adverse-cost EWMA from
+                # market_calibration). Fallback to 0.25 only when n_samples < 5.
                 try:
-                    KALSHI_CALIB = 0.25
+                    from cross_venue.yield_equation import kalshi_calib_for
                     qm_summary = self.qm.summary() if hasattr(self.qm, "summary") else {}
-                    # Kalshi summary key is total_gross_usd (not gross_usd)
                     cap_deployed = (qm_summary.get("total_gross_usd")
                                     or qm_summary.get("gross_usd") or 0)
                     quoted_tickers = set(self.qm.resting.keys()) if hasattr(self.qm, "resting") else set()
-                    proj_max = sum(
-                        m["reward_per_day_usd"] for m in self.markets
-                        if m["market_ticker"] in quoted_tickers
-                    )
-                    proj_real = proj_max * KALSHI_CALIB
+                    proj_max = 0.0
+                    proj_real = 0.0
+                    pool_learned = 0.0
+                    for m in self.markets:
+                        if m["market_ticker"] not in quoted_tickers:
+                            continue
+                        pool = float(m["reward_per_day_usd"])
+                        c = kalshi_calib_for(m["market_ticker"])
+                        proj_max += pool
+                        proj_real += pool * c
+                        if abs(c - 0.25) > 1e-6:
+                            pool_learned += pool
+                    avg_calib = (proj_real / proj_max) if proj_max > 0 else 0.0
+                    learned_pct = (pool_learned / proj_max * 100) if proj_max > 0 else 0.0
                     yield_pct = (proj_real / cap_deployed * 100) if cap_deployed > 0 else 0.0
                     _log.info(
                         f"💰 MONEY_PRINT: cap=${cap_deployed:.2f} "
-                        f"proj_daily=${proj_real:.2f} (theo_max=${proj_max:.0f}, calib={KALSHI_CALIB:.2f}) "
+                        f"proj_daily=${proj_real:.2f} "
+                        f"(theo_max=${proj_max:.0f}, avg_calib={avg_calib:.3f}, "
+                        f"learned_pool={learned_pct:.0f}% of {len(quoted_tickers)} mkts) "
                         f"proj_monthly=${proj_real*30:.0f} "
                         f"yield={yield_pct:.2f}%/d"
                     )
