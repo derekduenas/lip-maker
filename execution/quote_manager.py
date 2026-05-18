@@ -330,7 +330,24 @@ class QuoteManager:
 
     # ── Pre-trade safety ──────────────────────────────────────────────
     def _passes_safety(self, target: QuoteTarget) -> tuple[bool, str]:
-        """Run all gates. Returns (passes, reason)."""
+        """Run all gates. Returns (passes, reason).
+
+        SENTINEL is the FIRST check — unconditional Python-coded risk
+        veto from risk/sentinel.py. Cannot be bypassed at runtime; any
+        limit change requires editing config/constitution.py + commit.
+        See the strategic plan Section A (constitutional layer).
+        """
+        # SENTINEL — first check, fail-closed on any internal error
+        try:
+            from risk.sentinel import Sentinel
+            ok, sentinel_reason = Sentinel(self.db_path).approve(target)
+            if not ok:
+                return False, f"SENTINEL: {sentinel_reason}"
+        except Exception as _e:
+            # If Sentinel itself fails to load/run, fail closed.
+            # Better to miss quotes than skip the gate.
+            return False, f"SENTINEL_LOAD_ERROR: {type(_e).__name__}"
+
         # Market blacklist — auto-blocks after repeated losses
         from execution.market_blacklist import is_blocked
         blocked, reason = is_blocked(target.market_ticker, self.db_path)
