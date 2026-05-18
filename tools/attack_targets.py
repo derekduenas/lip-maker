@@ -221,6 +221,42 @@ def compute_attack_targets(
                 score *= URGENT_BOOST
                 why.append(f"urgent({hours_remaining:.1f}h)")
 
+            # Phase H (2026-05-18): hedge-aware boost. Markets with a verified
+            # external hedge counterpart (HEDGE_MAP entry + kalshi_pm_manual_map
+            # confirmation for PM-routed series) get a 1.3x score multiplier
+            # because their adverse-selection cost is bounded by the basis
+            # residual rather than realized P&L. Reasoning: with hedging the
+            # rebate becomes near-pure income — we should prefer those markets.
+            try:
+                from cross_venue.market_match import hedge_for_ticker
+                hedge_spec = hedge_for_ticker(t)
+                if hedge_spec is not None:
+                    # For PM venues, additionally require a manual_map entry
+                    # (confirms PM actually has a counterpart for THIS ticker).
+                    if hedge_spec.hedge_venue == "Polymarket":
+                        try:
+                            _c = sqlite3.connect(
+                                f"file:{settings.DB_PATH}?mode=ro",
+                                uri=True, timeout=1.0,
+                            )
+                            row = _c.execute(
+                                "SELECT 1 FROM kalshi_pm_manual_map "
+                                "WHERE kalshi_ticker = ? AND status='active'",
+                                (t,),
+                            ).fetchone()
+                            _c.close()
+                            if row:
+                                score *= 1.30
+                                why.append("hedged(PM-verified)")
+                        except sqlite3.OperationalError:
+                            pass   # manual map not populated yet
+                    else:
+                        # Kraken / CME / etc — series-level mapping is enough
+                        score *= 1.30
+                        why.append(f"hedged({hedge_spec.hedge_venue})")
+            except Exception:
+                pass
+
             priority = _attack_priority(net_per_day, hours_remaining, is_new_event, eff_comp)
             if not include_low and priority == "LOW":
                 continue
