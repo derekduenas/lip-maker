@@ -294,18 +294,24 @@ def discover(quiet: bool = False) -> dict:
             pm_slug = pm_markets[0]["slug"]
             # The full prefix is what we actually want stored — the hedger
             # can scan the family for the strike-specific slug at fill time.
+            # Schema is shared with pre-existing kalshi_pm_manual_map
+            # which has added_at NOT NULL + last_verified_at. New columns
+            # (status, source, discovered_at, expires_at) added via ALTER.
             conn.execute("""
                 INSERT INTO kalshi_pm_manual_map
-                    (kalshi_ticker, pm_slug, side_invariant, status,
-                     source, discovered_at, expires_at)
-                VALUES (?, ?, 'same', 'active', 'weather_discover', ?, ?)
+                    (kalshi_ticker, pm_slug, side_invariant,
+                     added_at, last_verified_at,
+                     status, source, discovered_at, expires_at)
+                VALUES (?, ?, 'same', ?, ?, 'active', 'weather_discover', ?, ?)
                 ON CONFLICT(kalshi_ticker) DO UPDATE SET
                     pm_slug = excluded.pm_slug,
+                    last_verified_at = excluded.last_verified_at,
                     status = 'active',
                     source = excluded.source,
                     discovered_at = excluded.discovered_at,
                     expires_at = excluded.expires_at
-            """, (k["ticker"], prefix, now_iso, k["end_date"]))
+            """, (k["ticker"], prefix, now_iso, now_iso,
+                  now_iso, k["end_date"]))
             n_promoted += 1
             matched_tickers.append(k["ticker"])
             break
