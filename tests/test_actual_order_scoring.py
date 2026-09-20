@@ -56,7 +56,8 @@ def db(tmp_path, monkeypatch):
 
 def _market(**kw):
     m = dict(market_ticker=TKR, target_size=50, discount_factor=0.5,
-             reward_per_day_usd=100.0, period_reward_usd=700.0, period_seconds=7 * 86400.0)
+             reward_per_day_usd=100.0, period_reward_usd=700.0, period_seconds=7 * 86400.0,
+             start_date="2026-01-01T00:00:00Z", end_date="2028-01-01T00:00:00Z")
     m.update(kw)
     return m
 
@@ -70,6 +71,7 @@ def runner(db):
     r._refresh_blacklist = MagicMock()
     r._is_blacklisted = MagicMock(return_value=False)
     r.qm.reconcile = MagicMock(return_value={"action": "ok"})
+    r.last_complete_scan_ts = time.time()      # freshness gate satisfied
     return r
 
 

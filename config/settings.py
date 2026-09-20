@@ -156,6 +156,12 @@ ZOMBIE_GAP_CENTS          = 3
 # Cancel on stale data: if WS hasn't updated for this many seconds, pull quotes.
 STALE_DATA_PULL_SECONDS   = 10
 
+# Discovery freshness (2026-09-20 review). Programs are only trusted while a
+# COMPLETE scan (every status page succeeded) is younger than this. Older
+# than this — or none yet — and every exposure gate pulls our orders: we
+# cannot verify the programs we would be quoting. 3 × the 30-min refresh.
+DISCOVERY_MAX_AGE_SEC = 3 * 1800
+
 # Reward accrual caps (2026-09-20 review). The per-program cumulative cap is
 # the pool itself times this share. Kalshi's program terms may limit what a
 # single account can earn from one pool; that value must be taken from the

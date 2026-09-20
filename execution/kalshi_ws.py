@@ -145,8 +145,10 @@ class FillEvent:
     count: float                    # contracts filled in this event (fractional ok)
     price_cents_exact: Optional[float]
     is_taker: bool
-    trade_id: str
-    ts: float
+    trade_id: str                   # execution identity — idempotency key
+    ts: float                       # local receive time
+    exchange_ts: Optional[float] = None   # venue timestamp (epoch), preserved as sent
+    subaccount: str = ""            # subaccount identity, preserved as sent
 
 
 BookCallback = Callable[[BookState], Awaitable[None]]
@@ -620,6 +622,20 @@ class KalshiWS:
         else:
             p_raw = None
         price_exact = cls._price_to_cents_exact(p_raw) if p_raw is not None else None
+        # Exchange timestamp: epoch seconds/millis (int/float/str) or ISO.
+        exchange_ts: Optional[float] = None
+        raw_ts = m.get("ts", m.get("created_time"))
+        if raw_ts is not None:
+            try:
+                v = float(raw_ts)
+                exchange_ts = v / 1000.0 if v > 1e11 else v
+            except (TypeError, ValueError):
+                try:
+                    exchange_ts = datetime.fromisoformat(
+                        str(raw_ts).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    exchange_ts = None
+        sub = m.get("subaccount_id", m.get("subaccount", ""))
         return FillEvent(
             order_id=order_id,
             market_ticker=ticker,
@@ -629,6 +645,8 @@ class KalshiWS:
             is_taker=bool(m.get("is_taker", False)),
             trade_id=str(m.get("trade_id", "") or ""),
             ts=time.time(),
+            exchange_ts=exchange_ts,
+            subaccount=str(sub) if sub is not None else "",
         )
 
     # ── Sequence tracking (per subscription) ─────────────────────────

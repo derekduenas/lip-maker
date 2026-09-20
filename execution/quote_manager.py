@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,6 +134,19 @@ class QuoteManager:
         self.inventory: dict[str, InventoryState] = {}     # ticker -> state
         self._last_balance_check = 0.0
         self._cached_balance = 0.0
+        # 2026-09-20 review (state consistency). Fills arrive on the WS
+        # thread/loop, REST resyncs and reconciles run in executor threads:
+        # every mutation of `resting` goes through this lock. Fills are
+        # idempotent by execution identity (trade_id) — remembered here and
+        # in fill_ledger so a replay after restart is also rejected.
+        # Orders we removed (filled/cancelled) are tombstoned for a while
+        # so an older REST snapshot cannot re-adopt them.
+        self._state_lock = threading.RLock()
+        self._seen_fills: "OrderedDict[str, float]" = OrderedDict()
+        self._tombstones: dict[str, float] = {}
+        self.fill_stats: dict[str, int] = {"applied": 0, "duplicate": 0,
+                                           "untracked": 0, "unknown_order": 0}
+        self.last_fill_status: str = ""
         # 2026-04-25 COLD-BOOT RECONCILIATION: rehydrate self.resting from
         # Kalshi's actual order book on init. Without this, a service
         # restart leaves us blind to live orders → next reconcile() places
@@ -148,8 +163,9 @@ class QuoteManager:
             return
         try:
             live = self._fetch_live_orders()
-            for o in live.values():
-                self.resting.setdefault(o.market_ticker, []).append(o)
+            with self._state_lock:
+                for o in live.values():
+                    self.resting.setdefault(o.market_ticker, []).append(o)
             _log.warning(f"cold-boot: rehydrated {len(live)} resting orders "
                          f"across {len(self.resting)} tickers from Kalshi")
         except Exception as e:
@@ -250,7 +266,42 @@ class QuoteManager:
             return {"skipped": "paper_mode"}
         try:
             live = self._fetch_live_orders()
-            phantoms = updated = added = 0
+        except Exception as e:
+            _log.warning(f"periodic_resync failed: {e}")
+            return {"error": str(e)}
+        return self._merge_live_orders(live)
+
+    TOMBSTONE_TTL_SEC = 600.0
+
+    def _tombstone(self, order_id: str) -> None:
+        now = time.time()
+        self._tombstones[order_id] = now
+        if len(self._tombstones) > 5000:
+            for k, ts in list(self._tombstones.items()):
+                if now - ts > self.TOMBSTONE_TTL_SEC:
+                    self._tombstones.pop(k, None)
+
+    def _is_tombstoned(self, order_id: str) -> bool:
+        ts = self._tombstones.get(order_id)
+        if ts is None:
+            return False
+        if time.time() - ts > self.TOMBSTONE_TTL_SEC:
+            self._tombstones.pop(order_id, None)
+            return False
+        return True
+
+    def _merge_live_orders(self, live: dict[str, RestingOrder]) -> dict:
+        """Merge a REST snapshot into local state under the state lock.
+
+        Ordering rule (2026-09-20 review): a resting order's remaining
+        quantity only ever DECREASES, so the smaller of (local, venue) is
+        always the fresher value. A snapshot fetched before a fill we have
+        already applied therefore cannot resurrect quantity, and a snapshot
+        that saw fills we missed still corrects us downward. Orders we
+        removed (filled / cancelled) are tombstoned, so an older snapshot
+        that still lists them cannot re-adopt them."""
+        with self._state_lock:
+            phantoms = updated = added = kept_local = 0
             seen: set[str] = set()
             for ticker, orders in list(self.resting.items()):
                 kept = []
@@ -258,20 +309,25 @@ class QuoteManager:
                     lo = live.get(o.order_id)
                     if lo is None:
                         phantoms += 1
+                        self._tombstone(o.order_id)
                         self._update_quote_status(o.order_id, "cancelled", notes="resync_gone")
                         continue
                     seen.add(o.order_id)
-                    if (abs(lo.size_contracts - o.size_contracts) > _QTY_EPS
-                            or lo.price_cents != o.price_cents
-                            or lo.price_off_grid != o.price_off_grid):
-                        _log.info(f"periodic_resync: {ticker} {o.side} oid={o.order_id[:12]} "
-                                  f"size {o.size_contracts:g}→{lo.size_contracts:g} "
-                                  f"price {o.price_cents}→{lo.price_cents}"
-                                  f"{' OFF-GRID' if lo.price_off_grid else ''}")
-                        o.size_contracts = lo.size_contracts
+                    changed = False
+                    if lo.size_contracts < o.size_contracts - _QTY_EPS:
+                        o.size_contracts = lo.size_contracts     # venue saw fills we missed
+                        changed = True
+                    elif lo.size_contracts > o.size_contracts + _QTY_EPS:
+                        kept_local += 1                           # snapshot predates our fills
+                    if lo.price_cents != o.price_cents or lo.price_off_grid != o.price_off_grid:
                         o.price_cents = lo.price_cents
                         o.price_off_grid = lo.price_off_grid
+                        changed = True
+                    if changed:
                         updated += 1
+                        _log.info(f"periodic_resync: {ticker} {o.side} oid={o.order_id[:12]} "
+                                  f"→ size {o.size_contracts:g} price {o.price_cents}"
+                                  f"{' OFF-GRID' if o.price_off_grid else ''}")
                     if lo.client_order_id and not o.client_order_id:
                         o.client_order_id = lo.client_order_id
                     kept.append(o)
@@ -280,50 +336,165 @@ class QuoteManager:
                 else:
                     self.resting.pop(ticker, None)
             for oid, lo in live.items():
-                if oid in seen:
+                if oid in seen or self._is_tombstoned(oid):
                     continue
                 self.resting.setdefault(lo.market_ticker, []).append(lo)
                 added += 1
                 _log.warning(f"periodic_resync: adopted live order {lo.market_ticker} "
                              f"{lo.side}@{lo.price_cents}c x{lo.size_contracts:g} "
                              f"oid={oid[:12]} ours={lo.is_ours}")
-            if phantoms or updated or added:
+            if phantoms or updated or added or kept_local:
                 _log.info(f"periodic_resync: phantoms={phantoms} updated={updated} "
-                          f"added={added} live={len(live)}")
-            return {"phantoms_purged": phantoms, "updated": updated,
-                    "added": added, "live_count": len(live)}
-        except Exception as e:
-            _log.warning(f"periodic_resync failed: {e}")
-            return {"error": str(e)}
+                          f"added={added} kept_local={kept_local} live={len(live)}")
+            return {"phantoms_purged": phantoms, "updated": updated, "added": added,
+                    "kept_local": kept_local, "live_count": len(live)}
 
-    def apply_fill(self, order_id: str, market_ticker: str, count: float) -> Optional[RestingOrder]:
-        """Decrement a resting order's remaining size by a fill (WS `fill`
-        channel). Removes the order when nothing remains. Returns the order
-        touched, or None when it is not one we track."""
+    # ── Fills ─────────────────────────────────────────────────────────
+    _FILL_LEDGER_DDL = """
+        CREATE TABLE IF NOT EXISTS fill_ledger (
+            trade_id          TEXT PRIMARY KEY,
+            order_id          TEXT NOT NULL,
+            ticker            TEXT NOT NULL,
+            side              TEXT NOT NULL,
+            count             INTEGER NOT NULL,
+            yes_price_cents   INTEGER,
+            no_price_cents    INTEGER,
+            is_taker          INTEGER,
+            created_at        TEXT NOT NULL,
+            synced_at         TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_fill_ledger_ticker ON fill_ledger(ticker);
+        CREATE INDEX IF NOT EXISTS idx_fill_ledger_order  ON fill_ledger(order_id);
+    """
+
+    def _fill_known(self, trade_id: str) -> bool:
+        """Seen in memory or already in fill_ledger (survives restarts)."""
+        if trade_id in self._seen_fills:
+            return True
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            try:
+                row = conn.execute("SELECT 1 FROM fill_ledger WHERE trade_id = ?",
+                                   (trade_id,)).fetchone()
+            finally:
+                conn.close()
+            return row is not None
+        except Exception:
+            return False
+
+    def _remember_fill(self, trade_id: str) -> None:
+        self._seen_fills[trade_id] = time.time()
+        while len(self._seen_fills) > 20000:
+            self._seen_fills.popitem(last=False)
+
+    def _ledger_fill(self, *, trade_id: str, order_id: str, ticker: str, side: str,
+                     count: float, price_cents: Optional[int], is_taker: bool,
+                     exchange_ts: Optional[float], subaccount: str) -> bool:
+        """INSERT OR IGNORE the fill into fill_ledger with the same identity
+        tools/fills_sync.py uses, so the two paths never double-record and
+        _refresh_inventory sees the fill immediately."""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            try:
+                conn.executescript(self._FILL_LEDGER_DDL)
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(fill_ledger)").fetchall()}
+                for col, ddl in (("count_real", "REAL"), ("exchange_ts", "REAL"),
+                                 ("subaccount", "TEXT")):
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE fill_ledger ADD COLUMN {col} {ddl}")
+                yp = npc = None
+                if price_cents is not None:
+                    yp = price_cents if side == "yes" else 100 - price_cents
+                    npc = price_cents if side == "no" else 100 - price_cents
+                created = (datetime.fromtimestamp(exchange_ts, tz=timezone.utc).isoformat()
+                           if exchange_ts else datetime.now(timezone.utc).isoformat())
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO fill_ledger
+                       (trade_id, order_id, ticker, side, count, count_real,
+                        yes_price_cents, no_price_cents, is_taker, created_at, synced_at,
+                        exchange_ts, subaccount)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (trade_id, order_id, ticker, side, int(count), float(count), yp, npc,
+                     1 if is_taker else 0, created, datetime.now(timezone.utc).isoformat(),
+                     exchange_ts, subaccount or None))
+                conn.commit()
+                return bool(cur.rowcount)
+            finally:
+                conn.close()
+        except Exception as e:
+            _log.warning(f"fill ledger write failed for {trade_id}: {e}")
+            return False
+
+    def apply_fill(self, order_id: str, market_ticker: str, count: float, *,
+                   trade_id: str = "", side: str = "", price_cents: Optional[int] = None,
+                   is_taker: bool = False, exchange_ts: Optional[float] = None,
+                   subaccount: str = "") -> Optional[RestingOrder]:
+        """Apply one execution (WS `fill` channel).
+
+        Idempotent by execution identity: a trade_id already seen (memory
+        or fill_ledger) is a duplicate and changes nothing. Serialized with
+        REST resync under the state lock. Updates inventory immediately
+        (in memory AND fill_ledger, so the next ledger refresh agrees), then
+        decrements the order's remaining size, tombstoning it when nothing
+        remains. Sets self.last_fill_status ∈ {applied, duplicate,
+        unknown_order, invalid} and returns the order touched (None for
+        duplicates / unknown orders)."""
         try:
             count = float(count)
         except (TypeError, ValueError):
+            self.last_fill_status = "invalid"
             return None
-        if count <= 0:
+        if count <= 0 or count != count:
+            self.last_fill_status = "invalid"
             return None
-        lst = self.resting.get(market_ticker, [])
-        for o in lst:
-            if o.order_id != order_id:
-                continue
-            o.size_contracts = max(0.0, o.size_contracts - count)
-            if o.size_contracts <= _QTY_EPS:
-                lst.remove(o)
-                if not lst:
-                    self.resting.pop(market_ticker, None)
-                self._update_quote_status(order_id, "filled", notes="ws_fill_complete")
-                _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c fully filled oid={order_id[:12]}")
+        with self._state_lock:
+            if trade_id:
+                if self._fill_known(trade_id):
+                    self.fill_stats["duplicate"] += 1
+                    self.last_fill_status = "duplicate"
+                    _log.info(f"fill: duplicate trade_id={trade_id[:16]} ignored")
+                    return None
+                self._remember_fill(trade_id)
+                self._ledger_fill(trade_id=trade_id, order_id=order_id, ticker=market_ticker,
+                                  side=side, count=count, price_cents=price_cents,
+                                  is_taker=is_taker, exchange_ts=exchange_ts,
+                                  subaccount=subaccount)
             else:
-                _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c -{count:g} "
-                          f"→ {o.size_contracts:g} remaining oid={order_id[:12]}")
-            # Inventory changed; force the next _refresh_inventory to re-read.
-            self.inventory.pop(market_ticker, None)
-            return o
-        return None
+                # No execution identity: cannot dedupe. Apply, but say so.
+                self.fill_stats["untracked"] += 1
+                _log.warning(f"fill without trade_id for {market_ticker} oid={order_id[:12]} "
+                             f"— applied without idempotency")
+            # Inventory: immediate in-memory update (the ledger row above
+            # makes the next _refresh_inventory agree).
+            inv = self.inventory.get(market_ticker)
+            if inv is not None and side in ("yes", "no"):
+                inv.net_yes_contracts += count if side == "yes" else -count
+                inv.total_filled_vol += count
+                if price_cents is not None:
+                    inv.gross_usd += count * price_cents / 100.0
+                inv.last_updated = time.time()
+            lst = self.resting.get(market_ticker, [])
+            for o in lst:
+                if o.order_id != order_id:
+                    continue
+                o.size_contracts = max(0.0, o.size_contracts - count)
+                if o.size_contracts <= _QTY_EPS:
+                    lst.remove(o)
+                    if not lst:
+                        self.resting.pop(market_ticker, None)
+                    self._tombstone(order_id)
+                    self._update_quote_status(order_id, "filled", notes="ws_fill_complete")
+                    _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c fully filled "
+                              f"oid={order_id[:12]}")
+                else:
+                    _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c -{count:g} "
+                              f"→ {o.size_contracts:g} remaining oid={order_id[:12]}")
+                self.fill_stats["applied"] += 1
+                self.last_fill_status = "applied"
+                return o
+            self.fill_stats["unknown_order"] += 1
+            self.last_fill_status = "unknown_order"
+            return None
 
     # ── Inventory tracking ────────────────────────────────────────────
     def _refresh_inventory(self, market_ticker: str) -> None:
@@ -736,11 +907,13 @@ class QuoteManager:
                     return False
 
         # Remove from in-memory resting (runs on all paths except non-404 error)
-        lst = self.resting.get(order.market_ticker, [])
-        try:
-            lst.remove(order)
-        except ValueError:
-            pass
+        with self._state_lock:
+            lst = self.resting.get(order.market_ticker, [])
+            try:
+                lst.remove(order)
+            except ValueError:
+                pass
+            self._tombstone(order.order_id)   # an older REST snapshot must not re-adopt it
         # UPDATE existing row (don't INSERT a new cancelled one) — otherwise the
         # quotes table grows unbounded and confuses per-market counting.
         self._update_quote_status(order.order_id, "cancelled", notes="manager_cancel")

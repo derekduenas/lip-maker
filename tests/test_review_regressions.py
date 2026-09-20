@@ -71,10 +71,11 @@ def db(tmp_path, monkeypatch):
 
 
 def _market(**kw):
-    # 7-day window covering T0 (2027-01-15T08:00:00Z): 2027-01-14 → 2027-01-21
+    # Window spans BOTH the wall clock (gates use real now) and T0, the
+    # synthetic timestamp the accrual tests drive _persist_snapshot with.
     m = dict(market_ticker=TKR, target_size=50, discount_factor=0.5,
              reward_per_day_usd=100.0, period_reward_usd=700.0, period_seconds=7 * 86400.0,
-             start_date="2027-01-14T00:00:00Z", end_date="2027-01-21T00:00:00Z")
+             start_date="2026-01-01T00:00:00Z", end_date="2028-01-01T00:00:00Z")
     m.update(kw)
     return m
 
@@ -88,6 +89,7 @@ def runner(db):
     r._refresh_blacklist = MagicMock()
     r._is_blacklisted = MagicMock(return_value=False)
     r.qm.reconcile = MagicMock(return_value={"action": "ok"})
+    r.last_complete_scan_ts = time.time()      # freshness gate satisfied
     return r
 
 
@@ -569,8 +571,8 @@ class TestForwardIntervalAccounting:
 
     def test_program_params_carry_window(self):
         p = _program_params_from_market(_market())
-        assert p.start_ts == pytest.approx(T0 - 32 * 3600)     # 2027-01-14T00:00:00Z
-        assert p.end_ts == pytest.approx(p.start_ts + 7 * 86400)
+        assert p.start_ts == pytest.approx(1767225600.0)       # 2026-01-01T00:00:00Z
+        assert p.end_ts == pytest.approx(1830297600.0)         # 2028-01-01T00:00:00Z
         assert p.start_ts <= T0 < p.end_ts
 
     def test_post_reconcile_share_applied_forward(self, runner, db):

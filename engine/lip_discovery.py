@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -291,8 +292,63 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 INCENTIVE_STATUSES = ("active", "upcoming", "closed", "paid_out")
 
 
+@dataclass
+class DiscoveryResult:
+    """Outcome of one /incentive_programs scan (2026-09-20 review).
+
+    `complete` is True only when EVERY status page of a full-universe scan
+    succeeded. A partial scan still upserts what it saw, but it must not
+    be treated as fresh: rows it did not reach may describe programs that
+    changed or ended, and nothing is demoted on its evidence."""
+    programs: list[dict]
+    complete: bool
+    started_ts: float
+    finished_ts: float
+    errors: list[str] = field(default_factory=list)
+    n_rejected: int = 0
+    n_demoted: int = 0
+
+
 def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
-    """Fetch + persist LIP programs. Returns parsed list.
+    """Fetch + persist LIP programs. Returns the parsed list (see
+    discover_result for the completeness verdict)."""
+    return discover_result(status=status, save=save).programs
+
+
+def _ensure_runs_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_runs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
+               complete INTEGER NOT NULL, n_programs INTEGER, n_rejected INTEGER,
+               n_demoted INTEGER, errors TEXT)""")
+
+
+def last_complete_scan_ts(db_path: str | None = None) -> float | None:
+    """Epoch of the most recent COMPLETE discovery scan, or None.
+
+    NOTE: db_path defaults to settings.DB_PATH read AT CALL TIME — a
+    default argument would bind the value at import and silently read the
+    wrong database whenever the path is reconfigured."""
+    db_path = db_path or settings.DB_PATH
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            _ensure_runs_table(conn)
+            row = conn.execute("SELECT finished_at FROM discovery_runs WHERE complete = 1 "
+                               "ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    d = _parse_ts(row[0])
+    return d.timestamp() if d else None
+
+
+def discover_result(*, status: str | None = None, save: bool = True) -> DiscoveryResult:
+    """Fetch + persist LIP programs.
 
     2026-04-30: pull ALL status flavors so settlement_log → lip_programs
     JOIN works for already-settled markets. Previously pulled only active →
@@ -302,12 +358,22 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
     2026-09-20 audit #2: statuses are INCENTIVE_STATUSES (active, upcoming,
     closed, paid_out) — the API's actual vocabulary. Malformed programs are
     skipped individually (see _parse_program), never abort the run.
+
+    2026-09-20 review (freshness): a scan is COMPLETE only if every status
+    succeeded. On a complete scan, enrolled rows the API no longer returns
+    are demoted (enrolled=0, blocked_reason='not_in_scan') so a failed
+    earlier scan cannot leave dead programs eligible. Partial scans demote
+    nothing and do not advance freshness. Every saved run is recorded in
+    discovery_runs for the runner's freshness gate.
     """
     c = KalshiClient()
     programs: list[dict] = []
     statuses = INCENTIVE_STATUSES if status is None else (status,)
     n_rejected = 0
     rejected_samples: list[str] = []
+    errors: list[str] = []
+    started = datetime.now(timezone.utc)
+    started_ts = started.timestamp()
 
     for s in statuses:
         cursor = None
@@ -323,6 +389,7 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
                 resp = c.get_unauth("/incentive_programs", params=params)
             except Exception as e:
                 _log.warning(f"/incentive_programs status={s} failed: {e}")
+                errors.append(f"{s}: {type(e).__name__}: {e}")
                 break
             batch = resp.get("incentive_programs", [])
             page_n += 1
@@ -367,6 +434,8 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
     }
     n_enrolled = 0
     n_total = 0
+    n_demoted = 0
+    complete = (status is None) and not errors
     if save and programs:
         conn = sqlite3.connect(settings.DB_PATH)
         try:
@@ -397,9 +466,33 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
                         p["reward_per_day_usd"], now_iso,
                     ),
                 )
+            if complete:
+                # Complete universe: anything still enrolled that this scan
+                # did not touch is not a program the venue lists any more.
+                cur = conn.execute(
+                    "UPDATE lip_programs SET enrolled = 0, blocked_reason = 'not_in_scan' "
+                    "WHERE enrolled = 1 AND (last_seen IS NULL OR datetime(last_seen) < datetime(?))",
+                    (started.isoformat(),))
+                n_demoted = cur.rowcount if cur.rowcount is not None else 0
             conn.commit()
         finally:
             conn.close()
+    if save:
+        try:
+            conn = sqlite3.connect(settings.DB_PATH)
+            try:
+                _ensure_runs_table(conn)
+                conn.execute(
+                    "INSERT INTO discovery_runs (started_at, finished_at, complete, n_programs, "
+                    "n_rejected, n_demoted, errors) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (started.isoformat(), datetime.now(timezone.utc).isoformat(),
+                     1 if complete else 0, len(programs), n_rejected, n_demoted,
+                     json.dumps(errors) if errors else None))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            _log.warning(f"discovery_runs record failed: {e}")
 
     # CHECKPOINT-2: filter drop summary
     for bucket, victims in drop_buckets.items():
@@ -413,7 +506,18 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
         f"dropped={n_total-n_enrolled}  saved_to_db={n_total}"
     )
 
-    return programs
+    if not complete:
+        _log.warning(f"DISCOVERY INCOMPLETE: {len(errors)} status scan(s) failed "
+                     f"({errors[:3]}); rows not refreshed, nothing demoted, "
+                     f"freshness NOT advanced")
+    elif n_demoted:
+        _log.info(f"discovery: demoted {n_demoted} enrolled rows absent from this scan")
+
+    return DiscoveryResult(
+        programs=programs, complete=complete, started_ts=started_ts,
+        finished_ts=datetime.now(timezone.utc).timestamp(), errors=errors,
+        n_rejected=n_rejected, n_demoted=n_demoted,
+    )
 
 
 def _build_series_capture_ratios(db_path: str) -> dict:

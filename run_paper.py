@@ -41,7 +41,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import settings
-from engine.lip_discovery import discover, top_n_to_quote, is_active_clause, _parse_ts
+from engine.lip_discovery import (
+    discover, discover_result, top_n_to_quote, is_active_clause, _parse_ts,
+    last_complete_scan_ts,
+)
 # from engine.sniper_select import top_n_by_ev  # archived 2026-04-29 (audit: unused)
 # 2026-05-03 GOLDEN-FUNNEL: capital-aware ranker. Replaces fixed top-N with
 # greedy yield-per-dollar fill. N becomes OUTPUT not INPUT — adapts to
@@ -162,9 +165,13 @@ class PaperRunner:
         # orders must be pulled. Counts per reason for the summary line.
         self._skip_reason: dict[str, str] = {}
         self.skip_counts: dict[str, int] = defaultdict(int)
+        self.fill_counts: dict[str, int] = defaultdict(int)
         self._skip_cancel_ts: dict[str, float] = {}
         # 2026-09-20 review: per-market forward accrual chains.
         self._accrual: dict[str, AccrualState] = {}
+        # Freshness of the last COMPLETE discovery scan (epoch). Seeded from
+        # the DB so a restart does not start out trusting unverified rows.
+        self.last_complete_scan_ts: float | None = last_complete_scan_ts()
         self._ensure_snapshot_schema()
         # 2026-05-03 GOLDEN-FUNNEL: per-market size FLOOR from capital_allocator.
         # Ensures we always quote enough to cross the qualify cliff. Sizer can
@@ -636,6 +643,115 @@ class PaperRunner:
             self.retire_market(t, "program_inactive")
         return retired
 
+    @staticmethod
+    def _program_window_reason(params: ProgramParams, now: float) -> str | None:
+        """Blocking reason when `now` is outside the program window.
+
+        Independent of discovery: the window came with the program, so
+        expiry is known the moment it happens (2026-09-20 review)."""
+        if params.end_ts is not None and now >= params.end_ts:
+            return "program_expired"
+        if params.start_ts is not None and now < params.start_ts:
+            return "program_not_started"
+        return None
+
+    def _discovery_staleness_reason(self, now: float) -> str | None:
+        """Blocking reason when no COMPLETE scan is recent enough.
+
+        A failed or partial scan does not advance freshness, so repeated
+        failures eventually pull all exposure rather than leaving us
+        quoting programs we can no longer verify."""
+        max_age = float(getattr(settings, "DISCOVERY_MAX_AGE_SEC", 0) or 0)
+        if max_age <= 0:
+            return None
+        ts = self.last_complete_scan_ts
+        if ts is None:
+            return "discovery_never_completed"
+        if now - ts > max_age:
+            return "discovery_stale"
+        return None
+
+    def note_discovery(self, result) -> None:
+        """Record a discovery scan's completeness for the freshness gate."""
+        if getattr(result, "complete", False):
+            self.last_complete_scan_ts = getattr(result, "finished_ts", time.time())
+        else:
+            _log.warning("discovery scan incomplete — freshness not advanced "
+                         f"(errors={getattr(result, 'errors', [])[:3]})")
+
+    def refresh_params(self, markets: list[dict]) -> dict:
+        """Refresh ProgramParams for markets we ALREADY quote, not just new
+        ones (2026-09-20 review).
+
+        A ticker can be re-listed with a different pool, target size,
+        discount factor or window. The old update path only handled
+        `fresh - current`, so an existing ticker kept its stale parameters
+        indefinitely. When the program WINDOW changes the accrual chain is
+        reset (a new window means a new pool and a new cumulative cap)."""
+        changed = reprogrammed = 0
+        for m in markets:
+            tkr = m.get("market_ticker")
+            old = self.params_by_ticker.get(tkr) if tkr else None
+            if old is None:
+                continue
+            new = _program_params_from_market(m)
+            if new == old:
+                continue
+            new_window = (new.start_ts != old.start_ts or new.end_ts != old.end_ts)
+            self.params_by_ticker[tkr] = new
+            for i, existing in enumerate(self.markets):
+                if existing.get("market_ticker") == tkr:
+                    self.markets[i] = m
+                    break
+            self.optimal_size_floors[tkr] = int(m.get("optimal_size_per_side", 0) or 0)
+            changed += 1
+            if new_window:
+                # Different program on the same ticker: the previous
+                # window's accrual and cap must not carry over.
+                self._accrual.pop(tkr, None)
+                reprogrammed += 1
+                _log.warning(f"refresh_params[{tkr}]: NEW PROGRAM WINDOW "
+                             f"pool ${old.period_reward_usd:.2f}→${new.period_reward_usd:.2f} "
+                             f"target {old.target_size:g}→{new.target_size:g} — accrual reset")
+            else:
+                _log.info(f"refresh_params[{tkr}]: pool ${old.period_reward_usd:.2f}→"
+                          f"${new.period_reward_usd:.2f} target {old.target_size:g}→"
+                          f"{new.target_size:g} df {old.discount_factor:g}→{new.discount_factor:g}")
+        return {"changed": changed, "reprogrammed": reprogrammed}
+
+    def on_fill(self, ev: FillEvent) -> str:
+        """Apply an execution and immediately reconcile dependent state
+        (2026-09-20 review).
+
+        A fill changes the depth we have resting, so the accrual share
+        recorded at the last snapshot is no longer what the venue is
+        paying us. Rather than letting a fully-filled order keep earning
+        its old rate until the next scoring event, the chain is BROKEN
+        here: nothing is credited for the interval spanning an unobserved
+        state change, and the next snapshot starts a fresh chain from a
+        re-measured share. Inventory is invalidated so the next sizing
+        decision re-reads it."""
+        status_order = self.qm.apply_fill(
+            ev.order_id, ev.market_ticker, ev.count,
+            trade_id=ev.trade_id, side=ev.side,
+            price_cents=(int(round(ev.price_cents_exact))
+                         if ev.price_cents_exact is not None else None),
+            is_taker=ev.is_taker, exchange_ts=ev.exchange_ts,
+            subaccount=ev.subaccount,
+        )
+        status = self.qm.last_fill_status
+        self.fill_counts[status] += 1
+        if status != "applied":
+            return status        # duplicates change nothing, including accrual
+        self._break_accrual(ev.market_ticker, "fill")
+        self.qm.inventory.pop(ev.market_ticker, None)
+        if status_order is None or status_order.size_contracts <= 0:
+            # Nothing of ours left on this side: two-sided presence is gone,
+            # so the share is a KNOWN zero from this instant.
+            if not self._actually_resting(ev.market_ticker):
+                self._note_flat(ev.market_ticker)
+        return status
+
     # ── Accrual chain bookkeeping ─────────────────────────────────────
     def _accrual_for(self, ticker: str, params: ProgramParams) -> AccrualState:
         st = self._accrual.get(ticker)
@@ -1055,11 +1171,26 @@ class PaperRunner:
         if self._is_blacklisted(tkr):
             self._handle_blacklisted(tkr)
             return "blacklist"
-        if tkr not in self.params_by_ticker:
+        params = self.params_by_ticker.get(tkr)
+        if params is None:
             # Market dropped from our set (program ended / de-allocated):
             # anything still resting there is unmonitored exposure.
             self._handle_skip(tkr, "no_params", force=True)
             return "no_params"
+        # 2026-09-20 review: program boundaries and discovery freshness are
+        # enforced HERE, on every event, not only when a discovery cycle
+        # happens to run. A program that ended 15 minutes ago must not wait
+        # up to 30 minutes for the next scan to have its exposure pulled.
+        window = self._program_window_reason(params, time.time())
+        if window is not None:
+            self._handle_skip(tkr, window, force=True)
+            self._break_accrual(tkr, window)
+            return window
+        stale_scan = self._discovery_staleness_reason(time.time())
+        if stale_scan is not None:
+            self._handle_skip(tkr, stale_scan, force=True)
+            self._break_accrual(tkr, stale_scan)
+            return stale_scan
         if getattr(book, "unsupported_grid", False):
             self._handle_skip(tkr, "unsupported_grid", force=True)
             self._break_accrual(tkr, "unsupported_grid")
@@ -1211,6 +1342,7 @@ class PaperRunner:
                     if tkr not in self.params_by_ticker:
                         self._handle_skip(tkr, "no_params", force=True)
                 ws_up = bool(getattr(ws, "connected", True))
+                stale_scan = self._discovery_staleness_reason(now)
                 for tkr, params in list(self.params_by_ticker.items()):
                     if self._is_blacklisted(tkr):
                         self._handle_blacklisted(tkr)
@@ -1218,6 +1350,18 @@ class PaperRunner:
                     if not ws_up:
                         self._handle_skip(tkr, "ws_disconnect", force=True)
                         self._break_accrual(tkr, "ws_disconnect")
+                        continue
+                    # Expiry is independent of both scoring and discovery:
+                    # a program that ended is cancelled here even if its
+                    # book has gone quiet and no scan has run since.
+                    window = self._program_window_reason(params, now)
+                    if window is not None:
+                        self._handle_skip(tkr, window, force=True)
+                        self._break_accrual(tkr, window)
+                        continue
+                    if stale_scan is not None:
+                        self._handle_skip(tkr, stale_scan, force=True)
+                        self._break_accrual(tkr, stale_scan)
                         continue
                     book = ws.books.get(tkr)
                     if book is None:
@@ -1362,6 +1506,11 @@ class PaperRunner:
         if self.skip_counts:
             top = sorted(self.skip_counts.items(), key=lambda kv: -kv[1])[:6]
             print("  Quote skips: " + ", ".join(f"{k}={v}" for k, v in top))
+        if self.fill_counts:
+            print("  Fills: " + ", ".join(f"{k}={v}" for k, v in sorted(self.fill_counts.items())))
+        scan_age = ("never" if self.last_complete_scan_ts is None
+                    else f"{time.time() - self.last_complete_scan_ts:.0f}s ago")
+        print(f"  Last complete discovery scan: {scan_age}")
         print(f"  Quote manager: {self.qm.summary()}")
 
 
@@ -1506,9 +1655,10 @@ async def main(duration_sec: int = 300, top_n: int = 50):
             _log.warning(f"WS reconnect: resynced resting state from venue: {res}")
     ws.on_reconnect(_on_ws_reconnect)
 
-    # Private fill channel keeps resting sizes honest between resyncs.
+    # Private fill channel keeps resting sizes honest between resyncs and
+    # invalidates accrual/inventory immediately (2026-09-20 review).
     async def _on_fill(ev: FillEvent) -> None:
-        runner.qm.apply_fill(ev.order_id, ev.market_ticker, ev.count)
+        await asyncio.get_running_loop().run_in_executor(None, runner.on_fill, ev)
     ws.on_fill(_on_fill)
 
     await ws.subscribe_orderbook([m["market_ticker"] for m in markets])
@@ -1533,45 +1683,65 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     # rotates tickers at 21:00 UTC for daily commodities) auto-enroll mid-run.
     # Prior behavior: discover() only at startup → 8+ hrs of unquoted new
     # markets per day. Fix = ~30-min refresh.
+    def _discover_and_select() -> tuple[object, list[dict]]:
+        """ALL blocking work for one discovery cycle: the /incentive_programs
+        scan, the saturation probe, ranking and the depth gate. Runs in an
+        executor thread — 2026-09-20 review: doing this inline stalled the WS
+        feed (and therefore every cancellation) for the duration."""
+        res = discover_result(save=True)
+        saturated = _compute_saturated_tickers()
+        if use_capital_alloc:
+            fresh = select_optimal_portfolio(
+                budget_usd=settings.MAX_TOTAL_GROSS_USD,
+                exclude_tickers=saturated,
+            )
+            # Sprint 4 #2: depth gate on refresh
+            if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
+                try:
+                    from execution.kalshi_auth import KalshiClient as _KC_dg2
+                    _dg_client2 = _KC_dg2()
+                    pre_n = len(fresh)
+                    fresh = filter_by_depth(
+                        fresh, _dg_client2,
+                        min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
+                        exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
+                        min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
+                        min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
+                    )
+                    _log.info(f"depth_gate refresh: {pre_n} -> {len(fresh)}")
+                except Exception as e:
+                    _log.warning(f"depth_gate refresh skipped: {e}")
+        else:
+            fresh = top_n_to_quote(top_n, exclude_tickers=saturated)
+        return res, fresh
+
     async def _periodic_discover(interval_sec: int = 1800):
         """Refresh LIP programs + subscribe newly enrolled markets."""
         await asyncio.sleep(interval_sec)  # initial wait; startup already did it
         while not stop.is_set():
             try:
-                discover(save=True)
+                loop_ = asyncio.get_running_loop()
+                res, fresh = await loop_.run_in_executor(None, _discover_and_select)
+                # Freshness: only a COMPLETE scan advances the clock. A
+                # partial/failed scan leaves the gate to expire on its own.
+                runner.note_discovery(res)
+                if not getattr(res, "complete", False):
+                    _log.warning("periodic_discover: incomplete scan — not retiring or "
+                                 "re-ranking on its evidence")
+                    await asyncio.sleep(interval_sec)
+                    continue
                 # 2026-09-20 review (discovery freshness): programs that
                 # ended / paid out / got de-enrolled since the last refresh
                 # are retired now, not at the next restart.
-                retired = runner.retire_inactive_markets()
+                retired = await loop_.run_in_executor(None, runner.retire_inactive_markets)
                 if retired:
                     _log.warning(f"periodic_discover: retired {len(retired)} inactive "
                                  f"markets: {retired[:5]}")
-                # PREDATOR: refresh saturated set per cycle so newly-saturated
-                # markets get filtered + freshly-drained ones get re-included.
-                saturated = _compute_saturated_tickers()
-                if use_capital_alloc:
-                    fresh = select_optimal_portfolio(
-                        budget_usd=settings.MAX_TOTAL_GROSS_USD,
-                        exclude_tickers=saturated,
-                    )
-                    # Sprint 4 #2: depth gate on refresh
-                    if os.getenv("DEPTH_GATE_ENABLED", "true").lower() == "true":
-                        try:
-                            from execution.kalshi_auth import KalshiClient as _KC_dg2
-                            _dg_client2 = _KC_dg2()
-                            pre_n = len(fresh)
-                            fresh = filter_by_depth(
-                                fresh, _dg_client2,
-                                min_share=float(os.getenv("DEPTH_GATE_MIN_SHARE", "0.05")),
-                                exit_gate_enabled=os.getenv("EXIT_GATE_ENABLED", "true").lower() == "true",
-                                min_exit_contracts=int(os.getenv("MIN_EXIT_CONTRACTS", "50")),
-                                min_exit_price_cents=int(os.getenv("MIN_EXIT_PRICE_CENTS", "5")),
-                            )
-                            _log.info(f"depth_gate refresh: {pre_n} -> {len(fresh)}")
-                        except Exception as e:
-                            _log.warning(f"depth_gate refresh skipped: {e}")
-                else:
-                    fresh = top_n_to_quote(top_n, exclude_tickers=saturated)
+                # Existing tickers get REFRESHED parameters, not just new ones.
+                upd = runner.refresh_params(fresh)
+                if upd["changed"]:
+                    _log.info(f"periodic_discover: refreshed params for {upd['changed']} "
+                              f"existing markets ({upd['reprogrammed']} new program windows)")
                 current_tickers = set(runner.params_by_ticker.keys())
                 fresh_tickers = {m["market_ticker"] for m in fresh}
                 new_tickers = fresh_tickers - current_tickers
