@@ -1,0 +1,14 @@
+[
+  {
+    "maker_fee_per_contract_usd": ".01",
+    "exit_fee_per_contract_usd": ".02",
+    "latency_ms": 250,
+    "queue_multiplier": "1"
+  },
+  {
+    "maker_fee_per_contract_usd": ".01",
+    "exit_fee_per_contract_usd": ".02",
+    "latency_ms": 500,
+    "queue_multiplier": "2"
+  }
+]

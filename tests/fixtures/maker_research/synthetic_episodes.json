@@ -1,0 +1,116 @@
+[
+  {
+    "episode_id": "synthetic-dev",
+    "underlying_event_id": "SYNTHETIC_GAME_1",
+    "events": [
+      {
+        "event_id": "b0",
+        "kind": "book",
+        "market": "M",
+        "ts_ms": 0,
+        "yes_bids": [
+          [
+            ".4",
+            "2"
+          ]
+        ],
+        "no_bids": [
+          [
+            ".5",
+            "2"
+          ]
+        ],
+        "valid": true,
+        "episode_id": "synthetic-dev"
+      },
+      {
+        "event_id": "t300",
+        "kind": "trade",
+        "market": "M",
+        "ts_ms": 300,
+        "side": "yes",
+        "aggressor": "sell",
+        "price_usd": ".4",
+        "quantity": "3",
+        "episode_id": "synthetic-dev"
+      },
+      {
+        "event_id": "b400",
+        "kind": "book",
+        "market": "M",
+        "ts_ms": 400,
+        "yes_bids": [
+          [
+            ".4",
+            "2"
+          ]
+        ],
+        "no_bids": [
+          [
+            ".5",
+            "2"
+          ]
+        ],
+        "valid": true,
+        "episode_id": "synthetic-dev"
+      }
+    ]
+  },
+  {
+    "episode_id": "synthetic-heldout",
+    "underlying_event_id": "SYNTHETIC_GAME_2",
+    "events": [
+      {
+        "event_id": "b2000",
+        "kind": "book",
+        "market": "M",
+        "ts_ms": 2000,
+        "yes_bids": [
+          [
+            ".4",
+            "2"
+          ]
+        ],
+        "no_bids": [
+          [
+            ".5",
+            "2"
+          ]
+        ],
+        "valid": true,
+        "episode_id": "synthetic-heldout"
+      },
+      {
+        "event_id": "t2300",
+        "kind": "trade",
+        "market": "M",
+        "ts_ms": 2300,
+        "side": "yes",
+        "aggressor": "sell",
+        "price_usd": ".4",
+        "quantity": "3",
+        "episode_id": "synthetic-heldout"
+      },
+      {
+        "event_id": "b2400",
+        "kind": "book",
+        "market": "M",
+        "ts_ms": 2400,
+        "yes_bids": [
+          [
+            ".4",
+            "2"
+          ]
+        ],
+        "no_bids": [
+          [
+            ".5",
+            "2"
+          ]
+        ],
+        "valid": true,
+        "episode_id": "synthetic-heldout"
+      }
+    ]
+  }
+]

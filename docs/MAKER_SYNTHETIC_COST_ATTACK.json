@@ -1,0 +1,60 @@
+{
+  "status": "RESEARCH_ONLY",
+  "fingerprint": "70495d923a7cce528e2947910c7328d7e08ba136c94acee61a6a3319e110fd8c",
+  "selected_from_development": null,
+  "development": {
+    "do_nothing": {
+      "episodes": 1,
+      "valued_episodes": 1,
+      "mean_worst_scenario_net_usd": "0",
+      "mean_break_even_reward_usd": "0"
+    },
+    "join_best": {
+      "episodes": 1,
+      "valued_episodes": 1,
+      "mean_worst_scenario_net_usd": "-0.03",
+      "mean_break_even_reward_usd": "0.03"
+    },
+    "spread_guard": {
+      "episodes": 1,
+      "valued_episodes": 1,
+      "mean_worst_scenario_net_usd": "-0.03",
+      "mean_break_even_reward_usd": "0.03"
+    }
+  },
+  "held_out": {
+    "do_nothing": {
+      "episodes": 1,
+      "valued_episodes": 1,
+      "mean_worst_scenario_net_usd": "0",
+      "mean_break_even_reward_usd": "0"
+    },
+    "join_best": {
+      "episodes": 1,
+      "valued_episodes": 1,
+      "mean_worst_scenario_net_usd": "-0.03",
+      "mean_break_even_reward_usd": "0.03"
+    },
+    "spread_guard": {
+      "episodes": 1,
+      "valued_episodes": 1,
+      "mean_worst_scenario_net_usd": "-0.03",
+      "mean_break_even_reward_usd": "0.03"
+    }
+  },
+  "blockers": [
+    "no_positive_development_edge_before_rewards"
+  ],
+  "unique_underlying_events": {
+    "development": 1,
+    "held_out": 1
+  },
+  "live_eligible": false,
+  "profitability_verified": false,
+  "limitations": [
+    "Episode means are not portfolio returns or evidence of independent observations.",
+    "Each episode starts flat. No capital compounding or cross-episode inventory modeled.",
+    "Actual reward credits cannot be awarded to counterfactual baseline policies.",
+    "A positive modeled result still requires source coverage and statistical validation."
+  ]
+}

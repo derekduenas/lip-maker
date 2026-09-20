@@ -97,7 +97,7 @@ class KalshiClient:
         sig = self._private_key.sign(
             msg,
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-                        salt_length=padding.PSS.MAX_LENGTH),
+                        salt_length=hashes.SHA256().digest_size),
             hashes.SHA256(),
         )
         return {

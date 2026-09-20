@@ -1,11 +1,8 @@
 """Tests for run_paper.PaperRunner._fair_value_skip — the futures gate.
 
-Why critical: Apr 24 2026 lost -$66.75 on Coffee because confidence='unreliable'
-made the gate skip. These tests pin both the working ("exact"/"close" with
-sufficient delta = SKIP) and broken ("unreliable" = no skip) behaviors.
-
-Task #102 will add unreliable-feed handling — when that ships, ADD tests
-for the new behavior, don't replace existing ones.
+These tests cover the existing exact/close-confidence delta gate and the
+unreliable-feed price cap shipped in task #102. The historical no-gate
+expectations were obsolete once that protection was implemented.
 
 Run: python -m unittest tests.test_fair_value_gate
 """
@@ -65,23 +62,32 @@ class TestFairValueSkipExact(unittest.TestCase):
 
 
 class TestFairValueSkipUnreliableConfidence(unittest.TestCase):
-    """Pin the CURRENT behavior: unreliable feeds get skipped (no gate fires).
-    This is the Apr 24 Coffee bug. Task #102 will add stricter behavior for
-    unreliable feeds — when shipped, those tests get added separately."""
+    """Unreliable feeds cannot justify extreme-price bids on either side."""
 
-    def test_unreliable_coffee_does_not_fire_gate(self):
-        # Coffee marked 'unreliable' in FUTURES_MAP. Even with massive delta,
-        # the gate currently skips entirely. Apr 24 lost -$66 because of this.
+    def test_unreliable_coffee_fires_gate(self):
         r = _runner_with_futures("KXCOFFEEW", 350.0)
-        # Strike 290 — futures 60 above strike (huge directional signal)
-        result = r._fair_value_skip("KXCOFFEEW-26APR2417-T290", yes_bid=80, no_bid=80)
-        # Currently returns None (skip) — task #102 should make it return a skip
-        self.assertIsNone(result)
+        with patch("run_paper.settings.UNRELIABLE_FUTURES_MAX_BID", 65):
+            result = r._fair_value_skip("KXCOFFEEW-26APR2417-T290", yes_bid=80, no_bid=80)
+        self.assertIn("unreliable_futures_skip[KXCOFFEEW]", result)
 
-    def test_unreliable_sugar_does_not_fire_gate(self):
+    def test_unreliable_sugar_fires_gate(self):
         r = _runner_with_futures("KXSUGARW", 14.10)
-        result = r._fair_value_skip("KXSUGARW-26APR2417-T13.74", yes_bid=80, no_bid=80)
-        self.assertIsNone(result)
+        with patch("run_paper.settings.UNRELIABLE_FUTURES_MAX_BID", 65):
+            result = r._fair_value_skip("KXSUGARW-26APR2417-T13.74", yes_bid=80, no_bid=80)
+        self.assertIn("unreliable_futures_skip[KXSUGARW]", result)
+
+    def test_unreliable_cap_includes_boundary_on_both_sides(self):
+        r = _runner_with_futures("KXCOFFEEW", 350.0)
+        with patch("run_paper.settings.UNRELIABLE_FUTURES_MAX_BID", 65):
+            for yes_bid,no_bid,side in [(65,40,"yes_bid"),(40,65,"no_bid")]:
+                with self.subTest(side=side):
+                    result=r._fair_value_skip("KXCOFFEEW-26APR2417-T290",yes_bid=yes_bid,no_bid=no_bid)
+                    self.assertIn(side+"=65c",result)
+
+    def test_unreliable_prices_below_cap_do_not_fire_this_gate(self):
+        r = _runner_with_futures("KXCOFFEEW", 350.0)
+        with patch("run_paper.settings.UNRELIABLE_FUTURES_MAX_BID", 65):
+            self.assertIsNone(r._fair_value_skip("KXCOFFEEW-26APR2417-T290",yes_bid=64,no_bid=64))
 
 
 class TestFairValueSkipEdgeCases(unittest.TestCase):

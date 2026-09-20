@@ -63,6 +63,7 @@ def replay(events, config=ReplayConfig()):
     spent = fees = number(0)
     fills, decisions = [], []
     had_gap = False
+    exit_book_observed = True
 
     def fresh(now):
         return book is not None and book.get('valid', True) and 0 <= now-book['ts_ms'] <= config.stale_ms
@@ -90,7 +91,7 @@ def replay(events, config=ReplayConfig()):
             if spent + fees + reserved + size*(price+maker_fee) > budget:
                 continue
             ahead = sum(number(q) for p,q in book.get(side+'_bids', []) if number(p)>=price)
-            orders[side] = dict(price=price, remaining=size, ahead=ahead*queue_mult)
+            orders[side] = dict(price=price, remaining=size, ahead=ahead*queue_mult, activated_ms=now)
 
     for e in timeline:
         now = e['ts_ms']
@@ -101,10 +102,13 @@ def replay(events, config=ReplayConfig()):
             pending = {s:(now+config.latency_ms,None) for s in orders}
             continue
         if e['kind'] == 'book':
+            if type(e.get('valid', True)) is not bool:
+                raise ValueError('book validity must be boolean')
             # Validate all levels, including crossed/empty detection below.
             for side in positions:
                 exit_value(e, side, size)
             book = e
+            exit_book_observed = True
             if not e.get('valid',True):
                 had_gap = True
             y,n = bid('yes'), bid('no')
@@ -125,6 +129,9 @@ def replay(events, config=ReplayConfig()):
                                           price_usd=str(desired) if desired is not None else None))
             advance(now)
         elif e['kind'] == 'trade':
+            # A trade may have consumed the displayed exit depth. Require a
+            # subsequent book observation before marking open inventory.
+            exit_book_observed = False
             # Explicit aggressor side is required; never guess from price alone.
             if e.get('aggressor') not in ('buy','sell') or e.get('side') not in positions:
                 raise ValueError('trade needs token side and aggressor')
@@ -132,7 +139,7 @@ def replay(events, config=ReplayConfig()):
             if q <= 0 or not 0 <= p <= 1:
                 raise ValueError('invalid trade')
             o = orders.get(e['side'])
-            if not o or e['aggressor'] != 'sell' or p > o['price']:
+            if not o or e['aggressor'] != 'sell' or p > o['price'] or e.get('exchange_ts_ms', now) < o['activated_ms']:
                 continue
             consumed = min(q, o['ahead'])
             o['ahead'] -= consumed
@@ -153,7 +160,7 @@ def replay(events, config=ReplayConfig()):
     for side, q in positions.items():
         if not q:
             continue
-        value = exit_value(book, side, q) if fresh(end) else None
+        value = exit_value(book, side, q) if fresh(end) and exit_book_observed else None
         if value is None:
             complete = False
         else:

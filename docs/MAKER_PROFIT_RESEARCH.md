@@ -1,6 +1,6 @@
 # Maker profitability research
 
-This is an **offline research layer**, not a profitable strategy or a live execution upgrade. It does not alter runner gates, reward scoring, routing, or deployment. No account data has been evaluated by this change. Live eligibility is always false.
+This is an **offline research layer**, not a profitable strategy or a live execution upgrade. It does not alter runner gates, reward scoring, routing, or deployment. Shared authentication now uses the documented SHA256 digest-length RSA-PSS salt; the existing runner explicitly requests legacy leg book prices, while the standalone recorder requests unified YES prices. No account data has been evaluated by this change. Live eligibility is always false.
 
 ## Run
 
@@ -14,7 +14,7 @@ python -m tools.maker_research markouts --fills fills.json --books books.json
 python -m tools.maker_research evaluate --candidates candidates.json --budget-usd 100 --event-cap-usd 20
 ```
 
-Output is JSON on stdout; redirect to retain reports. Inputs must be normalized explicitly. These commands neither fetch venue records nor automatically subscribe to the public trade feed. Do not infer trade aggressors from price alone. An adapter and capture completeness audit remain necessary before using venue data.
+Output is JSON on stdout; redirect to retain reports. Inputs must be normalized explicitly. The `capture` and `export-capture` commands below now record and normalize the public book/trade feed. Account reward ingestion uses an explicitly mapped CSV statement; no reward-payment API is assumed. Do not infer trade aggressors from price alone.
 
 ## Receipt ledger
 
@@ -52,7 +52,7 @@ These fees are **stress assumptions**, not Kalshi's fee schedule. Supply multipl
 
 Only sell-aggressor volume reaching our price consumes queue ahead and then fills our bid. Book touches never fill. Queue starts behind all displayed size at our price or better, multiplied by the stress factor. Missing cancellation evidence never improves queue position. Replacements and cancellations have latency, during which old orders can fill. Commands due at a timestamp activate using information available before the next record at that timestamp. This deterministic convention needs sensitivity analysis for coarse timestamps. Inventory and outstanding buys are capital bounded.
 
-The tape is counterfactual: our orders would change market activity. No hidden liquidity, endogenous reaction, exchange outages or impact model is established. The simulator does not award rewards; it reports the credited reward required to break even after modeled exit. An incomplete exit produces null profit. A capture gap disqualifies validation even if a later book permits a numerical mark.
+The tape is counterfactual: our orders would change market activity. No hidden liquidity, endogenous reaction, exchange outages or impact model is established. The simulator does not award rewards; it reports the credited reward required to break even after modeled exit. An incomplete exit produces null profit. Open inventory also requires a book observation after the latest trade; pre-trade depth is not reused for exit valuation. A capture gap disqualifies validation even if a later book permits a numerical mark.
 
 ## Adverse selection and allocation evaluation
 
@@ -67,3 +67,44 @@ Candidates with nonpositive conservative net are rejected. Remaining candidates 
 ## Remaining deployment prerequisites
 
 Capture and reconcile actual venue data; verify current program scoring/eligibility/account caps and fee schedules; construct separate training/validation periods grouped by underlying event; test multiple latency/queue/unwind scenarios; reconcile credited rewards; then review out-of-sample net profit and drawdown. No such empirical evidence is supplied by passing unit tests. The existing live interlock remains untouched.
+
+
+## Automatic capture and export
+
+```bash
+python -m tools.maker_research capture --market ACTUAL_MARKET_TICKER --seconds 300 --output /private/path/game.jsonl
+python -m tools.maker_research export-capture --capture /private/path/game.jsonl --episode-id GAME_SESSION > /private/path/episode.json
+```
+
+Run capture in the environment containing the existing Kalshi key configuration. It is a separate bounded process (up to one hour), connects with authentication and subscribes only to public orderbook/trade channels. It never submits, cancels or modifies orders. Do not supply a series ticker in place of a market ticker. Blocked captures return exit code 2. Files are exclusive-created; choose a new path for each session. Do not commit captures or account statements.
+
+Raw messages retain receipt wall time, monotonic time, sequence, and a chained content hash. A sidecar manifest is incomplete until the recording finishes. Disconnects/errors stop the session; there is no silent reconnect across a gap. Export checks the chain, record count, both subscription acknowledgements, per-subscription sequence continuity, snapshot-before-delta, prices, quantities, directions and timestamps. Checksums detect accidental alteration, not malicious replacement of both data and manifest. They do not prove the venue delivered every event. Local receipt latency and clock synchronization still require measurement.
+
+The capture requests `use_yes_price=true`; NO book levels are complemented into NO-token prices during export. Sub-cent research data is retained as Decimal. This does not enable sub-cent production quoting. Public long-NO aggressors consume YES bids; long-YES aggressors consume NO bids. Only canonical direction fields are accepted. Block trades, missing block classification, conflicting fields and future exchange timestamps fail export. Trades executed before a simulated order became active cannot fill that order merely because their notification arrived late.
+
+## Statement reward reconciliation
+
+```bash
+python -m tools.maker_research reconcile-rewards --db /private/path/profit.db --statement /private/path/rewards.csv --mapping /private/path/columns.json --account-id ACCOUNT --expected-total-usd 12.34
+```
+
+The mapping JSON maps each required canonical field to an actual CSV column name:
+`credit_id`, `market`, `program_id`, `ts_ms`, `amount_usd`, `account_id`, `status`, `kind`.
+This is our adapter contract, **not a claim about Kalshi's export column names**. Timestamps are integer epoch milliseconds and money is USD. Supply only rows whose status is `posted` and kind is `liquidity_reward`; mixed transaction exports need an explicit verified conversion. No conversion may substitute a market/program pool for an account receipt. If a statement has no program attribution, do not invent it: reconciliation remains blocked until a defensible mapping is available.
+
+Compare `expected-total-usd` to an independently checked statement total, not a total blindly recalculated from these same input rows. Import is atomic: a mismatch, conflicting existing credit, duplicate, wrong account or unsupported reversal writes no credits. Re-exported economic IDs do not double-credit even when CSV formatting changes. Source hashes and column mappings are retained in SQLite. Use a separate database per account. No paper reward credits are created from live statements.
+
+The output compares lifetime recorded credits and incremental estimates per market/program through the latest imported credit timestamp. It is a discrepancy report, not automatic proof of entitlement or complete account history. Authenticity, coverage, fee treatment and current incentive terms still need verification. Posted credits may differ from accrual estimates because of payment timing.
+
+## Chronological profitability attack
+
+```bash
+python -m tools.maker_research attack --episodes tests/fixtures/maker_research/synthetic_episodes.json --scenarios tests/fixtures/maker_research/stress_scenarios.json --cutoff-ms 1000
+```
+
+This example is synthetic. Its retained result is `docs/MAKER_SYNTHETIC_COST_ATTACK.json`.
+For actual research, the episodes file is an array of objects containing `episode_id`, `underlying_event_id`, and exported `events`. Every event must carry the same episode identity. Episodes are flat-start counterfactual experiments; they do not assert the actual account started flat. Group correlated markets and sessions using the same underlying-event ID. An episode may not straddle the cutoff and an underlying event may not occur in both splits.
+
+Declare the cutoff and the full array of scenario configurations before inspecting held-out outcomes. The workflow hashes the complete input, compares the three fixed policies, chooses only from development results, then reports held-out outcomes. Gaps, incomplete liquidation, a missing split or nonpositive development net prevent selection. Costs are scenario inputs, not a verified fee model. Episode means and worst-scenario means are descriptive, not compounded portfolio returns. There is no statistical promotion gate; live eligibility remains false even with positive modeled results. If the held-out result informs a code or parameter change, that data becomes development data for the next run.
+
+Actual credited rewards are not automatically assigned to alternate simulated policies. The attack reports break-even rewards separately. To establish a reward-dependent edge, collect real paper quote eligibility and actual account receipts under a fixed policy, verify program scoring and align economic windows. A simple positive modeled result is insufficient.

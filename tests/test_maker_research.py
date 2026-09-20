@@ -76,7 +76,7 @@ def test_touch_alone_never_fills():
 def test_latency_queue_and_fees():
     assert not replay([book(),trade(200)])['fills']
     assert not replay([book(),trade(quantity='2')])['fills']
-    r=replay([book(),trade()])
+    r=replay([book(),trade(),book(400)])
     assert len(r['fills']) == 1
     assert D(r['net_before_rewards_usd']) == D('-.03')
     assert D(r['break_even_credited_reward_usd']) == D('.03')
@@ -129,7 +129,7 @@ def candidate(**kw):
 
 
 def test_evaluation_evidence_and_event_caps():
-    r=evaluate_candidates([candidate(),candidate(market='N'),candidate(rules_verified=False)],'20','5')
+    r=evaluate_candidates([candidate(),candidate(market='N'),candidate(market='Z',rules_verified=False)],'20','5')
     assert len(r['selected']) == 1 and len(r['rejected']) == 2
     assert not r['live_eligible']
     assert not evaluate_candidates([candidate(trading_pnl_lower_bound_usd='-1')],'20','5')['selected']
@@ -163,7 +163,7 @@ def test_cli_round_trip_and_explicit_fee_requirement(tmp_path):
     result=run('report','--db',db,'--mode','paper','--asof-ms',0)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)['markets'][0]['net_if_liquidated_usd'] is None
-    events.write_text(json.dumps([book(),trade()]))
+    events.write_text(json.dumps([book(),trade(),book(400)]))
     cfg=tmp_path/'config.json'; cfg.write_text('{}')
     assert run('replay','--events',events,'--config',cfg).returncode != 0
     cfg.write_text(json.dumps(dict(maker_fee_per_contract_usd='.01',exit_fee_per_contract_usd='.02',latency_ms=250,queue_multiplier='1')))

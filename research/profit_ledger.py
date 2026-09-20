@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sqlite3
+from contextlib import nullcontext
 from decimal import Decimal
 
 ZERO = Decimal('0')
@@ -26,7 +27,7 @@ class ProfitLedger:
                 mode TEXT, event_id TEXT, ts_ms INTEGER, payload TEXT NOT NULL,
                 sha256 TEXT NOT NULL, PRIMARY KEY(mode,event_id))''')
 
-    def append(self, event):
+    def append(self, event, *, _connection=None):
         e = dict(event)
         for key in ('event_id', 'source', 'market', 'program_id'):
             if not isinstance(e.get(key), str) or not e[key]:
@@ -51,8 +52,9 @@ class ProfitLedger:
             raise ValueError('unknown event kind')
         body = canonical(e)
         digest = hashlib.sha256(body.encode()).hexdigest()
-        with sqlite3.connect(self.path) as db:
-            db.execute('BEGIN IMMEDIATE')
+        with (nullcontext(_connection) if _connection is not None else sqlite3.connect(self.path)) as db:
+            if _connection is None:
+                db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT sha256 FROM profit_events WHERE mode=? AND event_id=?',
                              (e['mode'], e['event_id'])).fetchone()
             if old:
@@ -128,7 +130,7 @@ class ProfitLedger:
             mark, complete, reasons = ZERO, True, []
             book = books.get(market)
             if open_qty:
-                if book is None or not 0 <= asof_ms - book['ts_ms'] <= max_book_age_ms:
+                if book is None or book.get('valid', True) is not True or not 0 <= asof_ms - book['ts_ms'] <= max_book_age_ms:
                     complete, reasons = False, ['missing_or_stale_exit_book']
                 else:
                     for side, (qty, _) in g['lots'].items():

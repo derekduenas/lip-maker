@@ -1,4 +1,4 @@
-"""Offline research CLI. Never imports or calls an order client."""
+"""Read-only capture and offline research CLI. Never submits orders."""
 import argparse
 import json
 from pathlib import Path
@@ -32,8 +32,38 @@ def main():
     alloc.add_argument('--candidates', required=True)
     alloc.add_argument('--budget-usd', required=True)
     alloc.add_argument('--event-cap-usd', required=True)
+    capture = sub.add_parser('capture')
+    capture.add_argument('--output', required=True)
+    capture.add_argument('--market', required=True)
+    capture.add_argument('--seconds', type=float, default=60)
+    export = sub.add_parser('export-capture')
+    export.add_argument('--capture', required=True)
+    export.add_argument('--episode-id', required=True)
+    rewards = sub.add_parser('reconcile-rewards')
+    rewards.add_argument('--db', required=True)
+    rewards.add_argument('--statement', required=True)
+    rewards.add_argument('--mapping', required=True)
+    rewards.add_argument('--account-id', required=True)
+    rewards.add_argument('--expected-total-usd', required=True)
+    attack = sub.add_parser('attack')
+    attack.add_argument('--episodes', required=True)
+    attack.add_argument('--scenarios', required=True)
+    attack.add_argument('--cutoff-ms', type=int, required=True)
     args = p.parse_args()
-    if args.command == 'ingest':
+    if args.command == 'capture':
+        import asyncio
+        from research.venue_capture import capture
+        result = asyncio.run(capture(args.output,args.market,args.seconds))
+    elif args.command == 'export-capture':
+        from research.venue_capture import export_capture
+        result = export_capture(args.capture,args.episode_id)
+    elif args.command == 'reconcile-rewards':
+        from research.reward_reconciliation import reconcile_rewards
+        result = reconcile_rewards(args.db,args.statement,read(args.mapping),args.account_id,args.expected_total_usd)
+    elif args.command == 'attack':
+        from research.profitability import attack_profitability
+        result = attack_profitability(read(args.episodes),read(args.scenarios),args.cutoff_ms)
+    elif args.command == 'ingest':
         ledger = ProfitLedger(args.db)
         events = read(args.events)
         inserted = sum(ledger.append(e) for e in events)
@@ -52,6 +82,8 @@ def main():
     else:
         result = evaluate_candidates(read(args.candidates), args.budget_usd, args.event_cap_usd)
     print(json.dumps(result, indent=2, allow_nan=False))
+    if isinstance(result, dict) and result.get("status") == "BLOCKED":
+        raise SystemExit(2)
 
 
 if __name__ == '__main__':

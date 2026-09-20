@@ -82,11 +82,16 @@ def evaluate_candidates(candidates, budget_usd, event_cap_usd):
     forecast or an in-sample result. Heuristics do not authorize live orders.
     """
     ranked, rejected = [], []
+    identities = set()
     for c in candidates:
+        identity = (c['market'], c['underlying_event_id'])
+        if identity in identities:
+            raise ValueError('duplicate candidate market/event')
+        identities.add(identity)
         reasons = []
-        if not c.get('rules_verified') or not c.get('reward_receipts_reconciled'):
+        if c.get('rules_verified') is not True or c.get('reward_receipts_reconciled') is not True:
             reasons.append('unverified_reward_economics')
-        if c.get('evaluation_split') != 'held_out' or c.get('independent_episodes', 0) < 30:
+        if c.get('evaluation_split') != 'held_out' or (type(c.get('independent_episodes')) is not int or c['independent_episodes'] < 30):
             reasons.append('insufficient_held_out_evidence')
         capital, hours = number(c['capital_usd']), number(c['horizon_hours'])
         if capital <= 0 or hours <= 0:
