@@ -1,13 +1,7 @@
-"""Fill sync — poll Kalshi /portfolio/fills and update local quotes table.
+"""Poll fills into a durable ledger, then drain independent replayable consumers.
 
-The WS fill handler was never wired, so the quotes table never sees status=filled.
-This poller closes the gap. Runs every 60s via systemd timer.
-
-Actions per fill:
-  1. Match by order_id → update quotes row (status=filled, fill_size, fill_price, filled_at)
-  2. Upsert into inventory table (net position per ticker+side)
-
-Idempotent: safe to re-run; UPSERT by order_id + trade_id.
+REST/WS ingestion shares identity; consumer completion is tracked separately.
+Only hedge diagnostics are processed here. This poller never submits hedges.
 """
 from __future__ import annotations
 
@@ -46,6 +40,9 @@ def ensure_fill_ledger(db_path: str = settings.DB_PATH):
         CREATE INDEX IF NOT EXISTS idx_fill_ledger_ticker ON fill_ledger(ticker);
         CREATE INDEX IF NOT EXISTS idx_fill_ledger_order  ON fill_ledger(order_id);
         """)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(fill_ledger)")}
+        if "count_real" not in cols:
+            conn.execute("ALTER TABLE fill_ledger ADD COLUMN count_real REAL")
         conn.commit()
     finally:
         conn.close()
@@ -82,13 +79,6 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
             if not trade_id or not order_id:
                 continue
 
-            # Skip if we already logged this fill
-            already = conn.execute(
-                "SELECT 1 FROM fill_ledger WHERE trade_id=?", (trade_id,)
-            ).fetchone()
-            if already:
-                continue
-
             # Price in dollars string → cents int
             yp = float(f.get("yes_price_dollars", "0") or 0)
             np_ = float(f.get("no_price_dollars", "0") or 0)
@@ -99,8 +89,8 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
             side = f.get("side", "?")
             ticker = f.get("ticker", f.get("market_ticker", "?"))
 
-            conn.execute(
-                """INSERT INTO fill_ledger
+            inserted = conn.execute(
+                """INSERT OR IGNORE INTO fill_ledger
                    (trade_id, order_id, ticker, side, count, count_real,
                     yes_price_cents, no_price_cents, is_taker,
                     created_at, synced_at)
@@ -109,65 +99,12 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
                  yp_c, np_c, 1 if f.get("is_taker") else 0,
                  f.get("created_time", now_iso), now_iso),
             )
-            new_ledger += 1
-
-            # A.4 (2026-05-14): trigger markout computation for this fill.
-            # Best-effort — if book history is too thin, backfill_pending
-            # will pick it up on the next sweep. Wrapped in try so a markout
-            # failure never blocks fill ledger persistence.
-            _fp = yp_c if (side or "").lower() == "yes" else np_c
-            try:
-                from monitor.markout_logger import (
-                    ensure_schema as _ml_ensure, compute_markouts_for_fill,
-                )
-                _ml_ensure(db_path)
-                if _fp is not None:
-                    _ts = datetime.fromisoformat(
-                        f.get("created_time", now_iso).replace("Z", "+00:00")
-                    ).timestamp()
-                    compute_markouts_for_fill(
-                        fill_id=trade_id, ticker=ticker, side=side or "",
-                        fill_price_c=int(_fp), fill_size=int(cnt_real or cnt),
-                        fill_ts=_ts, db_path=db_path,
-                    )
-            except Exception as _e:
-                _log.debug(f"markout hook failed for {trade_id}: {_e}")
-
-            # B.2 (2026-05-14): hedger — log-only. Records what hedge
-            # WOULD have fired against this fill. AUTO_HEDGE_ENABLED stays
-            # False until B.3/B.4 adapters land and effectiveness tracker
-            # confirms basis residual is bounded.
-            try:
-                from cross_venue.hedger import (
-                    ensure_schema as _hg_ensure, process_fill as _hg_process,
-                )
-                _hg_ensure(db_path)
-                if _fp is not None:
-                    _hts = datetime.fromisoformat(
-                        f.get("created_time", now_iso).replace("Z", "+00:00")
-                    ).timestamp()
-                    _hg_process(
-                        fill_id=trade_id, ticker=ticker, side=side or "",
-                        fill_price_c=int(_fp), fill_size=int(cnt_real or cnt),
-                        fill_ts=_hts, db_path=db_path,
-                    )
-            except Exception as _e:
-                _log.debug(f"hedger hook failed for {trade_id}: {_e}")
-
-            # Update matching quote row (fill_price_cents = side's execution price)
-            fill_price = yp_c if side == "yes" else np_c
-            rc = conn.execute(
-                """UPDATE quotes
-                      SET status='filled',
-                          fill_size = COALESCE(fill_size, 0) + ?,
-                          fill_price_cents = ?,
-                          filled_at = ?
-                    WHERE order_id = ? AND status IN ('resting', 'pending')""",
-                (cnt, fill_price, f.get("created_time", now_iso), order_id),
-            ).rowcount
-            quote_updates += rc
+            new_ledger += max(0, inserted.rowcount)
 
         conn.commit()
+
+        from tools.fill_consumers import drain_fill_consumers
+        quote_updates = drain_fill_consumers(db_path)
 
         # Recompute inventory — audit #9: gross_usd must be OPEN EXPOSURE
         # (|net_yes| × avg_price_per_contract), NOT cumulative traded notional.
@@ -175,11 +112,11 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
         # actual open position is zero.
         per_market = conn.execute(
             """SELECT ticker,
-                      SUM(CASE WHEN side='yes' THEN count ELSE -count END) AS net_yes,
-                      SUM(CASE WHEN side='yes' THEN count ELSE 0 END)   AS yes_cnt,
-                      SUM(CASE WHEN side='yes' THEN count*yes_price_cents ELSE 0 END) AS yes_cost,
-                      SUM(CASE WHEN side='no'  THEN count ELSE 0 END)   AS no_cnt,
-                      SUM(CASE WHEN side='no'  THEN count*no_price_cents  ELSE 0 END) AS no_cost
+                      SUM(CASE WHEN side='yes' THEN COALESCE(count_real,count) ELSE -COALESCE(count_real,count) END) AS net_yes,
+                      SUM(CASE WHEN side='yes' THEN COALESCE(count_real,count) ELSE 0 END)   AS yes_cnt,
+                      SUM(CASE WHEN side='yes' THEN COALESCE(count_real,count)*yes_price_cents ELSE 0 END) AS yes_cost,
+                      SUM(CASE WHEN side='no'  THEN COALESCE(count_real,count) ELSE 0 END)   AS no_cnt,
+                      SUM(CASE WHEN side='no'  THEN COALESCE(count_real,count)*no_price_cents  ELSE 0 END) AS no_cost
                FROM fill_ledger
                GROUP BY ticker"""
         ).fetchall()
@@ -192,7 +129,7 @@ def sync_fills(db_path: str = settings.DB_PATH, lookback_limit: int = 200,
             # Open exposure: |net| × relevant avg price.
             # If net_yes > 0 → net long YES → exposure = net_yes × avg_yes_entry
             # If net_yes < 0 → net long NO  → exposure = |net_yes| × avg_no_entry
-            net = int(net_yes or 0)
+            net = float(net_yes or 0)
             if net > 0 and avg_yes is not None:
                 gross_open = net * avg_yes
             elif net < 0 and avg_no is not None:

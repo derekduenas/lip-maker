@@ -622,6 +622,12 @@ class KalshiWS:
         else:
             p_raw = None
         price_exact = cls._price_to_cents_exact(p_raw) if p_raw is not None else None
+        # The documented fill payload may supply only YES price even for NO.
+        if price_exact is None and side == "no":
+            yes_raw = m.get("yes_price_dollars", m.get("yes_price_fp", m.get("yes_price")))
+            yes_price = cls._price_to_cents_exact(yes_raw) if yes_raw is not None else None
+            if yes_price is not None:
+                price_exact = 100.0 - yes_price
         # Exchange timestamp: epoch seconds/millis (int/float/str) or ISO.
         exchange_ts: Optional[float] = None
         raw_ts = m.get("ts", m.get("created_time"))

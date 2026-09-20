@@ -162,6 +162,9 @@ class TestFillIdempotency:
         live_qm.apply_fill(ev.order_id, ev.market_ticker, ev.count, trade_id=ev.trade_id,
                            side=ev.side, price_cents=50)
         assert live_qm.last_fill_status == "duplicate"
+        assert TKR in live_qm.uncertain_markets
+        live_qm.client = _FakeClient([_venue("o1", remaining="90.00")])
+        live_qm.periodic_resync()
         assert live_qm.resting[TKR][0].size_contracts == pytest.approx(90.0)
         assert live_qm.fill_stats == {"applied": 1, "duplicate": 1, "untracked": 0,
                                       "unknown_order": 0}
@@ -170,18 +173,21 @@ class TestFillIdempotency:
         live_qm.resting[TKR] = [_order("yes", 50, 100, oid="o1")]
         for tid in ("t1", "t2"):
             live_qm.apply_fill("o1", TKR, 10.0, trade_id=tid, side="yes", price_cents=50)
+        assert TKR in live_qm.uncertain_markets
+        live_qm.client = _FakeClient([_venue("o1", remaining="80.00")])
+        live_qm.periodic_resync()
         assert live_qm.resting[TKR][0].size_contracts == pytest.approx(80.0)
 
-    def test_duplicate_rejected_across_restart_via_ledger(self, live_qm, db):
-        """A trade_id already in fill_ledger is a duplicate even with an
-        empty in-memory cache (process restart, or fills_sync got there first)."""
+    def test_restart_replay_invalidates_local_state_without_double_ingestion(self, live_qm, db):
+        """Ledger identity must not suppress a new process's local reconciliation."""
         live_qm.resting[TKR] = [_order("yes", 50, 100, oid="o1")]
         live_qm.apply_fill("o1", TKR, 10.0, trade_id="t1", side="yes", price_cents=50)
         fresh = QuoteManager(paper=True, db_path=db)
         fresh.paper = False
         fresh.resting[TKR] = [_order("yes", 50, 90, oid="o1")]
         fresh.apply_fill("o1", TKR, 10.0, trade_id="t1", side="yes", price_cents=50)
-        assert fresh.last_fill_status == "duplicate"
+        assert fresh.last_fill_status == "applied"
+        assert TKR in fresh.uncertain_markets
         assert fresh.resting[TKR][0].size_contracts == pytest.approx(90.0)
 
     def test_fill_written_to_ledger_with_exchange_ts_and_subaccount(self, live_qm, db):
@@ -202,15 +208,19 @@ class TestFillIdempotency:
         assert ev.count == 10.0 and ev.price_cents_exact == 50.0
         assert ev.exchange_ts == 1758369600.0 and ev.subaccount == "sub-7"
 
-    def test_fill_without_trade_id_is_applied_but_counted(self, live_qm):
+    def test_fill_without_trade_id_is_uncertain_and_counted(self, live_qm):
         live_qm.resting[TKR] = [_order("yes", 50, 100, oid="o1")]
         live_qm.apply_fill("o1", TKR, 10.0, side="yes", price_cents=50)
         assert live_qm.fill_stats["untracked"] == 1
+        assert TKR in live_qm.uncertain_markets
+        live_qm.client = _FakeClient([_venue("o1", remaining="90.00")])
+        live_qm.periodic_resync()
         assert live_qm.resting[TKR][0].size_contracts == pytest.approx(90.0)
 
     def test_unknown_order_reported(self, live_qm):
         assert live_qm.apply_fill("nope", TKR, 1.0, trade_id="t9", side="yes") is None
-        assert live_qm.last_fill_status == "unknown_order"
+        assert live_qm.last_fill_status == "applied"
+        assert TKR in live_qm.uncertain_markets
 
     def test_concurrent_duplicate_replays_are_serialized(self, live_qm):
         live_qm.resting[TKR] = [_order("yes", 50, 100, oid="o1")]
@@ -224,6 +234,9 @@ class TestFillIdempotency:
             t.start()
         for t in threads:
             t.join()
+        assert TKR in live_qm.uncertain_markets
+        live_qm.client = _FakeClient([_venue("o1", remaining="90.00")])
+        live_qm.periodic_resync()
         assert live_qm.resting[TKR][0].size_contracts == pytest.approx(90.0)
         assert live_qm.fill_stats["applied"] == 1
 
@@ -232,13 +245,14 @@ class TestFillIdempotency:
 
 class TestRestFillOrdering:
     def test_stale_snapshot_cannot_undo_a_newer_fill(self, live_qm):
-        """Snapshot taken BEFORE the fill still says 100; local is 90."""
         live_qm.resting[TKR] = [_order("yes", 50, 100, oid="o1")]
-        live_qm.apply_fill("o1", TKR, 10.0, trade_id="t1", side="yes", price_cents=50)
-        live_qm.client = _FakeClient([_venue("o1", remaining="100.00")])   # pre-fill view
-        res = live_qm.periodic_resync()
-        assert live_qm.resting[TKR][0].size_contracts == pytest.approx(90.0)
-        assert res["kept_local"] == 1 and res["updated"] == 0
+        def fetch():
+            live_qm.apply_fill("o1", TKR, 10, trade_id="t1", side="yes")
+            return {"o1": _order("yes", 50, 100, oid="o1")}
+        live_qm.client = MagicMock()
+        live_qm._fetch_live_orders = fetch
+        assert live_qm.periodic_resync()["retry_required"]
+        assert TKR in live_qm.uncertain_markets
 
     def test_newer_snapshot_still_corrects_downward(self, live_qm):
         """Fills we never saw on the socket must still reduce us."""
@@ -256,12 +270,12 @@ class TestRestFillOrdering:
         assert live_qm.resting[TKR][0].size_contracts == pytest.approx(90.0)
 
     def test_full_fill_between_snapshots_is_not_readopted(self, live_qm):
-        """Order fully filled after the snapshot was taken: the stale
-        snapshot lists it as resting, but it must stay gone."""
         live_qm.resting[TKR] = [_order("yes", 50, 10, oid="o1")]
-        live_qm.apply_fill("o1", TKR, 10.0, trade_id="t1", side="yes", price_cents=50)
-        assert TKR not in live_qm.resting
-        live_qm.client = _FakeClient([_venue("o1", remaining="10.00")])    # pre-fill view
+        generation = live_qm._state_generation
+        live_qm.apply_fill("o1", TKR, 10, trade_id="t1", side="yes")
+        assert live_qm._merge_live_orders({"o1": _order("yes", 50, 10, oid="o1")},
+                                         expected_generation=generation)["retry_required"]
+        live_qm.client = _FakeClient([])
         live_qm.periodic_resync()
         assert TKR not in live_qm.resting
 
@@ -278,6 +292,7 @@ class TestRestFillOrdering:
     def test_tombstone_expires_so_genuine_reorder_is_adopted(self, live_qm):
         live_qm.resting[TKR] = [_order("yes", 50, 10, oid="o1")]
         live_qm.apply_fill("o1", TKR, 10.0, trade_id="t1", side="yes", price_cents=50)
+        live_qm._merge_live_orders({})
         live_qm._tombstones["o1"] -= QuoteManager.TOMBSTONE_TTL_SEC + 1
         live_qm.client = _FakeClient([_venue("o1", remaining="10.00")])
         live_qm.periodic_resync()
@@ -298,6 +313,8 @@ class TestRestFillOrdering:
                 live_qm.apply_fill("o1", TKR, 1.0, trade_id=f"t{i}", side="yes", price_cents=50)
         finally:
             done.set(); t.join()
+        live_qm.client = _FakeClient([_venue("o1", remaining="80.00")])
+        live_qm.periodic_resync()
         assert live_qm.resting[TKR][0].size_contracts == pytest.approx(80.0)
 
 

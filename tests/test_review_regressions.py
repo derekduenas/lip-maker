@@ -370,10 +370,11 @@ class TestResyncRemainingQuantity:
 
 class TestFillEvents:
     def test_apply_fill_partial_then_complete(self, live_qm):
+        live_qm.paper = True  # paper executions are locally simulated
         live_qm.resting[TKR] = [_order("yes", 50, 100, oid="o1", paper=False)]
-        o = live_qm.apply_fill("o1", TKR, 74.5)
+        o = live_qm.apply_fill("o1", TKR, 74.5, trade_id="partial", side="yes")
         assert o.size_contracts == pytest.approx(25.5)
-        assert live_qm.apply_fill("o1", TKR, 25.5) is not None
+        assert live_qm.apply_fill("o1", TKR, 25.5, trade_id="complete", side="yes") is not None
         assert TKR not in live_qm.resting
 
     def test_apply_fill_unknown_order_ignored(self, live_qm):

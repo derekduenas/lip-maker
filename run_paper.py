@@ -409,6 +409,8 @@ class PaperRunner:
         so this is purely the two-sided-presence gate. Parameter kept for
         call-site compatibility.
         """
+        if ticker in self.qm.uncertain_markets:
+            return False
         orders = self._live_resting(ticker)
         yes = next((o for o in orders if o.side == "yes"), None)
         no  = next((o for o in orders if o.side == "no"),  None)
@@ -741,10 +743,15 @@ class PaperRunner:
         )
         status = self.qm.last_fill_status
         self.fill_counts[status] += 1
-        if status != "applied":
+        if status not in ("applied", "persistence_failed", "untracked"):
             return status        # duplicates change nothing, including accrual
         self._break_accrual(ev.market_ticker, "fill")
         self.qm.inventory.pop(ev.market_ticker, None)
+        if not self.qm.paper and status == "applied":
+            self.qm.periodic_resync()
+        if ev.trade_id and status == "applied":
+            from tools.fill_consumers import drain_fill_consumers
+            drain_fill_consumers(self.qm.db_path, trade_id=ev.trade_id)
         if status_order is None or status_order.size_contracts <= 0:
             # Nothing of ours left on this side: two-sided presence is gone,
             # so the share is a KNOWN zero from this instant.
@@ -1167,6 +1174,10 @@ class PaperRunner:
         dropped and the orders stayed on the venue. Returns the blocking
         reason, or None when the event may proceed to scoring."""
         tkr = book.market_ticker
+        if self.qm.uncertain_markets:
+            self._handle_skip(tkr, "order_state_uncertain", force=True)
+            self._break_accrual(tkr, "order_state_uncertain")
+            return "order_state_uncertain"
         self._refresh_blacklist()
         if self._is_blacklisted(tkr):
             self._handle_blacklisted(tkr)
@@ -1346,6 +1357,10 @@ class PaperRunner:
                 for tkr, params in list(self.params_by_ticker.items()):
                     if self._is_blacklisted(tkr):
                         self._handle_blacklisted(tkr)
+                        continue
+                    if self.qm.uncertain_markets:
+                        self._handle_skip(tkr, "order_state_uncertain", force=True)
+                        self._break_accrual(tkr, "order_state_uncertain")
                         continue
                     if not ws_up:
                         self._handle_skip(tkr, "ws_disconnect", force=True)

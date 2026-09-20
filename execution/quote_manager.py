@@ -28,6 +28,7 @@ Kalshi order endpoint (POST /portfolio/orders) body:
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -72,9 +73,9 @@ class RestingOrder:
     """A currently-open order we've placed.
 
     2026-09-20 review: `size_contracts` is the REMAINING quantity on the
-    venue, as a float (Kalshi fills fractional contracts). It is decremented
-    by fill events and corrected from `remaining_count_fp` on every resync,
-    so the scorer sees what is actually still resting, not what we sent."""
+    venue, as a float (Kalshi fills fractional contracts). Live executions
+    invalidate its use until a fresh REST snapshot restores remaining size.
+    Paper executions decrement locally."""
     order_id:       str
     market_ticker:  str
     side:           str            # "yes" | "no"
@@ -136,12 +137,15 @@ class QuoteManager:
         self._cached_balance = 0.0
         # 2026-09-20 review (state consistency). Fills arrive on the WS
         # thread/loop, REST resyncs and reconciles run in executor threads:
-        # every mutation of `resting` goes through this lock. Fills are
-        # idempotent by execution identity (trade_id) — remembered here and
-        # in fill_ledger so a replay after restart is also rejected.
+        # Live fills invalidate quantities; complete REST reads restore them.
+        # Durable ingestion and in-process consumer identity are separate,
+        # so restart replays invalidate state without duplicating the ledger.
         # Orders we removed (filled/cancelled) are tombstoned for a while
         # so an older REST snapshot cannot re-adopt them.
         self._state_lock = threading.RLock()
+        self._state_generation = 0
+        self.uncertain_markets: set[str] = set()
+        self._fill_persistence_failed: dict[str, str] = {}
         self._seen_fills: "OrderedDict[str, float]" = OrderedDict()
         self._tombstones: dict[str, float] = {}
         self.fill_stats: dict[str, int] = {"applied": 0, "duplicate": 0,
@@ -169,6 +173,7 @@ class QuoteManager:
             _log.warning(f"cold-boot: rehydrated {len(live)} resting orders "
                          f"across {len(self.resting)} tickers from Kalshi")
         except Exception as e:
+            self.uncertain_markets.add("__startup__")
             _log.warning(f"cold-boot reconcile FAILED ({e}) — starting with empty resting state")
 
     @staticmethod
@@ -264,12 +269,14 @@ class QuoteManager:
         """
         if self.paper or self.client is None:
             return {"skipped": "paper_mode"}
+        with self._state_lock:
+            generation = self._state_generation
         try:
             live = self._fetch_live_orders()
         except Exception as e:
             _log.warning(f"periodic_resync failed: {e}")
             return {"error": str(e)}
-        return self._merge_live_orders(live)
+        return self._merge_live_orders(live, expected_generation=generation)
 
     TOMBSTONE_TTL_SEC = 600.0
 
@@ -290,17 +297,19 @@ class QuoteManager:
             return False
         return True
 
-    def _merge_live_orders(self, live: dict[str, RestingOrder]) -> dict:
-        """Merge a REST snapshot into local state under the state lock.
+    def _merge_live_orders(self, live: dict[str, RestingOrder], *,
+                           expected_generation: Optional[int] = None) -> dict:
+        """Accept a complete REST view only if no local mutation raced its fetch.
 
-        Ordering rule (2026-09-20 review): a resting order's remaining
-        quantity only ever DECREASES, so the smaller of (local, venue) is
-        always the fresher value. A snapshot fetched before a fill we have
-        already applied therefore cannot resurrect quantity, and a snapshot
-        that saw fills we missed still corrects us downward. Orders we
-        removed (filled / cancelled) are tombstoned, so an older snapshot
-        that still lists them cannot re-adopt them."""
+        We cannot infer which executions a REST quantity includes. Live fills
+        therefore invalidate local quantity rather than subtracting a delta.
+        A fresh, uncontended REST request re-establishes authoritative quantity.
+        """
         with self._state_lock:
+            if expected_generation is not None and expected_generation != self._state_generation:
+                self.uncertain_markets.update(self.resting)
+                self.uncertain_markets.update(o.market_ticker for o in live.values())
+                return {"error": "snapshot_raced_mutation", "retry_required": True}
             phantoms = updated = added = kept_local = 0
             seen: set[str] = set()
             for ticker, orders in list(self.resting.items()):
@@ -314,11 +323,9 @@ class QuoteManager:
                         continue
                     seen.add(o.order_id)
                     changed = False
-                    if lo.size_contracts < o.size_contracts - _QTY_EPS:
-                        o.size_contracts = lo.size_contracts     # venue saw fills we missed
+                    if abs(lo.size_contracts - o.size_contracts) > _QTY_EPS:
+                        o.size_contracts = lo.size_contracts
                         changed = True
-                    elif lo.size_contracts > o.size_contracts + _QTY_EPS:
-                        kept_local += 1                           # snapshot predates our fills
                     if lo.price_cents != o.price_cents or lo.price_off_grid != o.price_off_grid:
                         o.price_cents = lo.price_cents
                         o.price_off_grid = lo.price_off_grid
@@ -346,6 +353,9 @@ class QuoteManager:
             if phantoms or updated or added or kept_local:
                 _log.info(f"periodic_resync: phantoms={phantoms} updated={updated} "
                           f"added={added} kept_local={kept_local} live={len(live)}")
+            self.uncertain_markets = set(self._fill_persistence_failed.values())
+            self.inventory.clear()  # ledger-backed inventory must be re-read
+            self._state_generation += 1
             return {"phantoms_purged": phantoms, "updated": updated, "added": added,
                     "kept_local": kept_local, "live_count": len(live)}
 
@@ -366,21 +376,6 @@ class QuoteManager:
         CREATE INDEX IF NOT EXISTS idx_fill_ledger_ticker ON fill_ledger(ticker);
         CREATE INDEX IF NOT EXISTS idx_fill_ledger_order  ON fill_ledger(order_id);
     """
-
-    def _fill_known(self, trade_id: str) -> bool:
-        """Seen in memory or already in fill_ledger (survives restarts)."""
-        if trade_id in self._seen_fills:
-            return True
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
-            try:
-                row = conn.execute("SELECT 1 FROM fill_ledger WHERE trade_id = ?",
-                                   (trade_id,)).fetchone()
-            finally:
-                conn.close()
-            return row is not None
-        except Exception:
-            return False
 
     def _remember_fill(self, trade_id: str) -> None:
         self._seen_fills[trade_id] = time.time()
@@ -418,7 +413,7 @@ class QuoteManager:
                      1 if is_taker else 0, created, datetime.now(timezone.utc).isoformat(),
                      exchange_ts, subaccount or None))
                 conn.commit()
-                return bool(cur.rowcount)
+                return True  # INSERT OR IGNORE: durable ingestion, not consumer completion
             finally:
                 conn.close()
         except Exception as e:
@@ -431,48 +426,51 @@ class QuoteManager:
                    subaccount: str = "") -> Optional[RestingOrder]:
         """Apply one execution (WS `fill` channel).
 
-        Idempotent by execution identity: a trade_id already seen (memory
-        or fill_ledger) is a duplicate and changes nothing. Serialized with
-        REST resync under the state lock. Updates inventory immediately
-        (in memory AND fill_ledger, so the next ledger refresh agrees), then
-        decrements the order's remaining size, tombstoning it when nothing
-        remains. Sets self.last_fill_status ∈ {applied, duplicate,
-        unknown_order, invalid} and returns the order touched (None for
-        duplicates / unknown orders)."""
+        Ledger ingestion and local consumer completion are separate. In live
+        mode an execution makes quantities uncertain until a fenced REST read;
+        subtracting here could count a fill already included in a snapshot.
+        """
         try:
             count = float(count)
         except (TypeError, ValueError):
             self.last_fill_status = "invalid"
             return None
-        if count <= 0 or count != count:
+        if count <= 0 or not math.isfinite(count):
             self.last_fill_status = "invalid"
             return None
         with self._state_lock:
             if trade_id:
-                if self._fill_known(trade_id):
+                if trade_id in self._seen_fills:
                     self.fill_stats["duplicate"] += 1
                     self.last_fill_status = "duplicate"
                     _log.info(f"fill: duplicate trade_id={trade_id[:16]} ignored")
                     return None
+                if not self._ledger_fill(trade_id=trade_id, order_id=order_id, ticker=market_ticker,
+                                         side=side, count=count, price_cents=price_cents,
+                                         is_taker=is_taker, exchange_ts=exchange_ts,
+                                         subaccount=subaccount):
+                    self._fill_persistence_failed[trade_id] = market_ticker
+                    self.uncertain_markets.add(market_ticker)
+                    self._state_generation += 1
+                    self.last_fill_status = "persistence_failed"
+                    return None
+                self._fill_persistence_failed.pop(trade_id, None)
                 self._remember_fill(trade_id)
-                self._ledger_fill(trade_id=trade_id, order_id=order_id, ticker=market_ticker,
-                                  side=side, count=count, price_cents=price_cents,
-                                  is_taker=is_taker, exchange_ts=exchange_ts,
-                                  subaccount=subaccount)
             else:
-                # No execution identity: cannot dedupe. Apply, but say so.
                 self.fill_stats["untracked"] += 1
-                _log.warning(f"fill without trade_id for {market_ticker} oid={order_id[:12]} "
-                             f"— applied without idempotency")
-            # Inventory: immediate in-memory update (the ledger row above
-            # makes the next _refresh_inventory agree).
-            inv = self.inventory.get(market_ticker)
-            if inv is not None and side in ("yes", "no"):
-                inv.net_yes_contracts += count if side == "yes" else -count
-                inv.total_filled_vol += count
-                if price_cents is not None:
-                    inv.gross_usd += count * price_cents / 100.0
-                inv.last_updated = time.time()
+                self._fill_persistence_failed[f"unidentified:{order_id}"] = market_ticker
+                self.uncertain_markets.add(market_ticker)
+                self._state_generation += 1
+                self.last_fill_status = "untracked"
+                return None
+            self.inventory.pop(market_ticker, None)
+            self._state_generation += 1
+            if not self.paper:
+                self.uncertain_markets.add(market_ticker)
+                self.fill_stats["applied"] += 1
+                self.last_fill_status = "applied"
+                return next((o for o in self.resting.get(market_ticker, [])
+                             if o.order_id == order_id), None)
             lst = self.resting.get(market_ticker, [])
             for o in lst:
                 if o.order_id != order_id:
@@ -869,20 +867,26 @@ class QuoteManager:
         # _cancel_order silently failed (network error returns False but
         # leaves entry in self.resting). Closes the race that triggered
         # premature per_mkt_gross safety gate hits in paper mode.
-        existing_lst = self.resting.setdefault(market_ticker, [])
-        stale_same_side = [o for o in existing_lst if o.side == side]
-        for o in stale_same_side:
-            existing_lst.remove(o)
-            # Mark stale entry's DB row cancelled so it doesn't double-count
-            # in any future reporting query.
-            self._update_quote_status(o.order_id, "cancelled",
-                                      notes="upsert_replaced_by_127")
-        existing_lst.append(rest)
+        with self._state_lock:
+            self._state_generation += 1
+            existing_lst = self.resting.setdefault(market_ticker, [])
+            stale_same_side = [o for o in existing_lst if o.side == side]
+            for o in stale_same_side:
+                existing_lst.remove(o)
+                # Mark stale entry's DB row cancelled so it doesn't double-count
+                # in any future reporting query.
+                self._update_quote_status(o.order_id, "cancelled",
+                                          notes="upsert_replaced_by_127")
+            existing_lst.append(rest)
         self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                               order_id, "resting", notes=f"coid={coid}")
         return rest
 
     def _cancel_order(self, order: RestingOrder) -> bool:
+        with self._state_lock:
+            return self._cancel_order_locked(order)
+
+    def _cancel_order_locked(self, order: RestingOrder) -> bool:
         """Cancel a resting order.
 
         2026-04-22 FIX: On 404 (order already gone from Kalshi — filled, expired,
@@ -908,6 +912,7 @@ class QuoteManager:
 
         # Remove from in-memory resting (runs on all paths except non-404 error)
         with self._state_lock:
+            self._state_generation += 1
             lst = self.resting.get(order.market_ticker, [])
             try:
                 lst.remove(order)
@@ -958,6 +963,12 @@ class QuoteManager:
             _log.info(f"reset_for_market {market_ticker}: dropped {len(lst)} in-memory orders")
 
     def reconcile(self, target: QuoteTarget) -> dict:
+        with self._state_lock:
+            if self.uncertain_markets or self._fill_persistence_failed:
+                return {"action": "skip", "reason": "ORDER_STATE_UNCERTAIN"}
+            return self._reconcile_locked(target)
+
+    def _reconcile_locked(self, target: QuoteTarget) -> dict:
         """Bring resting orders in line with target for one market.
 
         Returns dict summarizing actions taken.
