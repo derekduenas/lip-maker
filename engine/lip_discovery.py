@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,23 +60,72 @@ def _series_from_market_ticker(ticker: str) -> str:
     return ticker.split("-", 1)[0]
 
 
-def _parse_program(raw: dict) -> dict:
-    """Normalize raw incentive program fields."""
-    period_reward_usd = float(raw.get("period_reward", 0)) / 10_000.0  # centi-cents → USD
-    discount_factor   = float(raw.get("discount_factor_bps", 10_000)) / 10_000.0  # bps → multiplier
-    target_size       = float(raw.get("target_size_fp", 0))
-    start_date        = raw.get("start_date", "")
-    end_date          = raw.get("end_date", "")
-
-    days_in_period = 1
+def _parse_ts(s) -> datetime | None:
+    """ISO-8601 → tz-aware UTC datetime. Naive timestamps are assumed UTC
+    (Kalshi always sends 'Z'). Returns None when unparseable."""
+    if not isinstance(s, str) or not s:
+        return None
     try:
-        s = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-        e = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-        days_in_period = max(1, (e - s).days or 1)
-    except Exception:
-        pass
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
 
-    reward_per_day = period_reward_usd / days_in_period
+
+def _finite_float(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+def _parse_program(raw: dict) -> dict | None:
+    """Normalize raw incentive program fields.
+
+    2026-09-20 audit #2. Returns None (caller skips the row, never aborts
+    the run) when the program cannot be scored honestly:
+      - period_reward / target_size non-finite or non-positive
+      - discount_factor outside (0, 1]
+      - start/end missing, unparseable, or end <= start
+
+    Period length is the EXACT half-open window [start, end) in seconds.
+    The old code used `(e - s).days` which floored a 36-hour program to
+    1 day (overstating reward/day by 1.5x) and a 20-hour program to 0 → 1
+    day. `period_reward_usd` stays the TOTAL pool for the window;
+    `reward_per_day_usd` is the normalized rate used only for ranking.
+    """
+    period_reward_usd = _finite_float(raw.get("period_reward"))
+    if period_reward_usd is None:
+        return None
+    period_reward_usd /= 10_000.0                       # centi-cents → USD
+    discount_factor = _finite_float(raw.get("discount_factor_bps"))
+    if discount_factor is None:
+        return None
+    discount_factor /= 10_000.0                         # bps → multiplier
+    target_size = _finite_float(raw.get("target_size_fp"))
+    if target_size is None:
+        return None
+    if period_reward_usd <= 0 or target_size <= 0:
+        return None
+    if not (0.0 < discount_factor <= 1.0):
+        return None
+
+    start_date = raw.get("start_date")
+    end_date   = raw.get("end_date")
+    s = _parse_ts(start_date)
+    e = _parse_ts(end_date)
+    if s is None or e is None:
+        return None
+    period_seconds = (e - s).total_seconds()
+    if period_seconds <= 0:
+        return None
+
+    reward_per_day = period_reward_usd / (period_seconds / 86400.0)
 
     return {
         "id":                 raw.get("id"),
@@ -83,11 +133,12 @@ def _parse_program(raw: dict) -> dict:
         "series_ticker":      _series_from_market_ticker(raw.get("market_ticker", "")),
         "start_date":         start_date,
         "end_date":           end_date,
-        "period_reward_usd":  period_reward_usd,
+        "period_reward_usd":  period_reward_usd,     # total pool for the window
+        "period_seconds":     period_seconds,        # exact window length
         "discount_factor":    discount_factor,
         "target_size":        target_size,
         "paid_out":           int(bool(raw.get("paid_out", False))),
-        "reward_per_day_usd": reward_per_day,
+        "reward_per_day_usd": reward_per_day,        # pool / (window in days)
     }
 
 
@@ -143,11 +194,19 @@ def is_active_clause(alias: str = "") -> str:
     Or with a table alias:
         f"SELECT ... FROM lip_programs p WHERE {is_active_clause('p')}"
 
-    Three gates: enrolled (our decision), paid_out (Kalshi's done flag),
-    end_date (program window). All three must hold for "currently quotable".
+    Four gates: enrolled (our decision), paid_out (Kalshi's done flag),
+    and the program window [start_date, end_date). All must hold for
+    "currently quotable".
+
+    2026-09-20 audit #2: the window check used to be end-only. Programs
+    with status=upcoming are persisted (so they become quotable the second
+    they start, without waiting for the next discovery run) but must not be
+    quoted before start_date — no snapshot is scored and no pool is paid
+    for that time, so quoting there is pure adverse-selection exposure.
     """
     pre = f"{alias}." if alias else ""
     return (f"{pre}enrolled = 1 AND {pre}paid_out = 0 "
+            f"AND datetime({pre}start_date) <= datetime('now') "
             f"AND datetime({pre}end_date) > datetime('now')")
 
 
@@ -180,9 +239,29 @@ def _decide_enrol(p: dict, now_iso: str | None = None) -> tuple[int, str]:
     # programs past end_date until they flip paid_out=1 (lag of hours/days).
     # Without this check, callers see ~10% stale enrolled rows that aren't
     # actually quotable. Belt-and-suspenders with daily lip_state_hygiene cron.
-    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
-    if p["end_date"] and p["end_date"] <= now_iso:
+    #
+    # 2026-09-20 audit #2: compare as parsed datetimes, not ISO strings —
+    # string compare breaks across 'Z' vs '+00:00' and differing precision.
+    # A malformed window is rejected here too (_parse_program already drops
+    # these from the API path; this covers rows fed in from elsewhere).
+    now = _parse_ts(now_iso) if now_iso else datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    sd = _parse_ts(p.get("start_date"))
+    ed = _parse_ts(p.get("end_date"))
+    if p.get("end_date") and ed is None:
+        return 0, "malformed_window"
+    if p.get("start_date") and sd is None:
+        return 0, "malformed_window"
+    if sd is not None and ed is not None and ed <= sd:
+        return 0, "malformed_window"
+    if ed is not None and ed <= now:
         return 0, "expired"
+    # NOTE: a program whose start_date is still in the future is ENROLLED
+    # (our decision is "yes, quote this when it opens"). Quotability at
+    # runtime is gated by is_active_clause()'s start_date check, so the
+    # market becomes live the second the window opens rather than waiting
+    # for the next discovery run.
     # 2026-05-12: event-binary gate. Long-dated NON-recurring series have
     # unbounded directional decay over the holding period — LIP rebate
     # cannot cover the loss when our two-sided fill's losing side dies.
@@ -190,29 +269,45 @@ def _decide_enrol(p: dict, now_iso: str | None = None) -> tuple[int, str]:
     # 234d, KXJUDGECOUNT 20d, KXGROK 49d) all became 99% losses while bleed_monitor
     # caught $135.89 in a single batch. Recurring series (commodity/weather/macro
     # weeklies + monthlies) are EXEMPT — short cycle bounds the decay.
-    if not is_repeating_series(series):
-        try:
-            ed = datetime.fromisoformat(p["end_date"].replace("Z", "+00:00"))
-            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
-            days_to_settle = (ed - now).total_seconds() / 86400.0
-            if days_to_settle > settings.EVENT_BINARY_MAX_DAYS:
-                return 0, f"event_binary_too_long:{days_to_settle:.0f}d"
-        except (ValueError, AttributeError):
-            pass
+    if not is_repeating_series(series) and ed is not None:
+        days_to_settle = (ed - now).total_seconds() / 86400.0
+        if days_to_settle > settings.EVENT_BINARY_MAX_DAYS:
+            return 0, f"event_binary_too_long:{days_to_settle:.0f}d"
     return 1, "ok"
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the original schema (idempotent)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(lip_programs)").fetchall()}
+    if cols and "period_seconds" not in cols:
+        conn.execute("ALTER TABLE lip_programs ADD COLUMN period_seconds REAL")
+        conn.commit()
+
+
+# Kalshi /incentive_programs `status` filter values. 2026-09-20 audit #2:
+# the previous tuple used "pending"/"paid", which the API does not define —
+# those two requests returned nothing, so upcoming programs were never
+# persisted and paid-out programs never had paid_out flipped locally.
+INCENTIVE_STATUSES = ("active", "upcoming", "closed", "paid_out")
 
 
 def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
     """Fetch + persist LIP programs. Returns parsed list.
 
-    2026-04-30: pull ALL status flavors (active, closed, pending, paid)
-    so settlement_log → lip_programs JOIN works for already-settled markets.
-    Previously pulled only active → closed programs got purged after settle
-    → _estimate_rebate returned $0 silently. Bug fixed.
+    2026-04-30: pull ALL status flavors so settlement_log → lip_programs
+    JOIN works for already-settled markets. Previously pulled only active →
+    closed programs got purged after settle → _estimate_rebate returned $0
+    silently. Bug fixed.
+
+    2026-09-20 audit #2: statuses are INCENTIVE_STATUSES (active, upcoming,
+    closed, paid_out) — the API's actual vocabulary. Malformed programs are
+    skipped individually (see _parse_program), never abort the run.
     """
     c = KalshiClient()
     programs: list[dict] = []
-    statuses = ("active", "closed", "pending", "paid") if status is None else (status,)
+    statuses = INCENTIVE_STATUSES if status is None else (status,)
+    n_rejected = 0
+    rejected_samples: list[str] = []
 
     for s in statuses:
         cursor = None
@@ -238,8 +333,20 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
                     first_5_tickers.append(tk[:30])
                 if raw.get("incentive_type") != "liquidity":
                     continue
+                parsed = _parse_program(raw)
+                if parsed is None:
+                    # Skip the row, never abort the run: one malformed
+                    # program must not blank out every other market.
+                    n_rejected += 1
+                    if len(rejected_samples) < 5:
+                        rejected_samples.append(
+                            f"{tk[:30]}|reward={raw.get('period_reward')}|"
+                            f"df_bps={raw.get('discount_factor_bps')}|"
+                            f"tgt={raw.get('target_size_fp')}|"
+                            f"{raw.get('start_date')}→{raw.get('end_date')}")
+                    continue
                 status_kept += 1
-                programs.append(_parse_program(raw))
+                programs.append(parsed)
             cursor = resp.get("next_cursor")
             if not cursor:
                 break
@@ -248,7 +355,8 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
             f"kept_as_liquidity={status_kept}  first_5={first_5_tickers}"
         )
 
-    _log.info(f"CHECKPOINT-1-TOTAL programs_after_status_loop={len(programs)}")
+    _log.info(f"CHECKPOINT-1-TOTAL programs_after_status_loop={len(programs)}  "
+              f"rejected_malformed={n_rejected}  samples={rejected_samples}")
 
     # Decide enrolment and persist
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -262,6 +370,7 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
     if save and programs:
         conn = sqlite3.connect(settings.DB_PATH)
         try:
+            _ensure_schema(conn)
             for p in programs:
                 n_total += 1
                 enrol, reason = _decide_enrol(p, now_iso=now_iso)
@@ -276,14 +385,15 @@ def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
                 conn.execute(
                     """INSERT OR REPLACE INTO lip_programs
                        (id, market_ticker, series_ticker, start_date, end_date,
-                        period_reward_usd, discount_factor, target_size, paid_out,
-                        enrolled, blocked_reason, reward_per_day_usd, last_seen)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        period_reward_usd, period_seconds, discount_factor,
+                        target_size, paid_out, enrolled, blocked_reason,
+                        reward_per_day_usd, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         p["id"], p["market_ticker"], p["series_ticker"],
                         p["start_date"], p["end_date"], p["period_reward_usd"],
-                        p["discount_factor"], p["target_size"], p["paid_out"],
-                        enrol, reason if not enrol else None,
+                        p["period_seconds"], p["discount_factor"], p["target_size"],
+                        p["paid_out"], enrol, reason if not enrol else None,
                         p["reward_per_day_usd"], now_iso,
                     ),
                 )
@@ -370,10 +480,13 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
       (end_date past, blacklist, target_size cap) still apply.
 
     Filters:
-      1. enrolled=1 AND paid_out=0
+      1. is_active_clause(): enrolled=1 AND paid_out=0 AND
+         start_date <= now < end_date (don't quote settled OR not-yet-open)
       2. target_size <= max_target_size
       3. NOT in active market_blacklist
-      4. end_date > today (don't quote settled markets)
+
+    Each row carries `period_reward_usd` (total pool) and `period_seconds`
+    so callers can build ProgramParams with the right units.
     """
 
     # 2026-05-08 TIER1E: ATTACK_TARGETS as primary source. Uses live Kalshi
@@ -388,6 +501,7 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
             ex = exclude_tickers or set()
             tconn = sqlite3.connect(db_path, timeout=5.0)
             try:
+                _ensure_schema(tconn)
                 out_rows = []
                 for t in targets:
                     tk = t.get("market_ticker") or ""
@@ -395,9 +509,9 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                         continue
                     row = tconn.execute(
                         "SELECT market_ticker, series_ticker, reward_per_day_usd, "
-                        "target_size, discount_factor, start_date, end_date "
-                        "FROM lip_programs WHERE market_ticker = ? AND enrolled = 1 "
-                        "AND paid_out = 0 AND datetime(end_date) > datetime('now') "
+                        "target_size, discount_factor, start_date, end_date, "
+                        "period_reward_usd, period_seconds "
+                        f"FROM lip_programs WHERE market_ticker = ? AND {is_active_clause()} "
                         "AND target_size <= ?",
                         (tk, max_target_size),
                     ).fetchone()
@@ -411,6 +525,8 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
                         "discount_factor":       row[4],
                         "start_date":            row[5],
                         "end_date":              row[6],
+                        "period_reward_usd":     row[7],
+                        "period_seconds":        row[8],
                         "series_priority":       1.0,
                         "competition_mult":      1.0,
                         "observed_share":        t.get("observed_share"),
@@ -489,16 +605,17 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
         try:
+            _ensure_schema(conn)
             rows = conn.execute(
-                """SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
-                          p.target_size, p.discount_factor, p.start_date, p.end_date
+                f"""SELECT p.market_ticker, p.series_ticker, p.reward_per_day_usd,
+                          p.target_size, p.discount_factor, p.start_date, p.end_date,
+                          p.period_reward_usd, p.period_seconds
                    FROM lip_programs p
                    LEFT JOIN market_blacklist b
                      ON p.market_ticker = b.ticker
                      AND datetime(b.expires_at) > datetime('now')
-                   WHERE p.enrolled = 1 AND p.paid_out = 0
+                   WHERE {is_active_clause('p')}
                      AND p.target_size <= ?
-                     AND datetime(p.end_date) > datetime('now')
                      AND b.ticker IS NULL
                    ORDER BY p.reward_per_day_usd DESC
                    LIMIT ?""",
@@ -655,6 +772,8 @@ def top_n_to_quote(n: int = 100, max_target_size: int = 2500,
             "discount_factor":       r[4],
             "start_date":            r[5],
             "end_date":              r[6],
+            "period_reward_usd":     r[7],
+            "period_seconds":        r[8],
             "series_priority":       priority,
             "competition_mult":      round(comp_mult, 3),
             "observed_share":        observed_share,

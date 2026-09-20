@@ -23,13 +23,14 @@ CREATE TABLE IF NOT EXISTS lip_programs (
     series_ticker            TEXT,
     start_date               TEXT NOT NULL,
     end_date                 TEXT NOT NULL,
-    period_reward_usd        REAL NOT NULL,               -- dollars (converted from centi-cents)
+    period_reward_usd        REAL NOT NULL,               -- TOTAL pool for the window, dollars (converted from centi-cents)
+    period_seconds           REAL,                        -- exact window length [start, end) in seconds
     discount_factor          REAL NOT NULL,               -- 0.0–1.0 (converted from bps)
     target_size              REAL NOT NULL,
     paid_out                 INTEGER NOT NULL DEFAULT 0,  -- 0/1
     enrolled                 INTEGER NOT NULL DEFAULT 0,  -- 0/1 our decision to quote
     blocked_reason           TEXT,                         -- e.g. "target_too_large"
-    reward_per_day_usd       REAL,                         -- period_reward / days_in_period
+    reward_per_day_usd       REAL,                         -- period_reward / (period_seconds/86400); ranking only
     last_seen                TEXT NOT NULL,
     UNIQUE(market_ticker, start_date)
 );

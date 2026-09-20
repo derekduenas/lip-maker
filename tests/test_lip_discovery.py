@@ -16,46 +16,71 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engine.lip_discovery import _decide_enrol, top_n_to_quote, is_repeating_series
+from config import settings
+from engine.lip_discovery import (
+    INCENTIVE_STATUSES, _decide_enrol, _parse_program, discover,
+    is_active_clause, is_repeating_series, top_n_to_quote,
+)
+
+
+def _iso(days: float) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _program(**kw) -> dict:
-    """Helper: program dict with sensible defaults."""
+    """Helper: program dict with sensible defaults (live 7-day window,
+    short enough to clear the event-binary days-to-settle gate)."""
     defaults = dict(
         series_ticker="KXTEST",
         reward_per_day_usd=50.0,
         target_size=500,
         discount_factor=0.5,
         paid_out=0,
+        start_date=_iso(-1),
+        end_date=_iso(+7),
     )
     defaults.update(kw)
     return defaults
 
 
 class TestBlocklistPrefixMatch(unittest.TestCase):
-    """Pin the prefix-match blocklist behavior (post 2026-04-22 fix)."""
+    """Pin the prefix-match blocklist behavior (post 2026-04-22 fix).
+
+    2026-05-05 SURGICAL: family bans (KXNFL/KXNBA/KXMLB) were replaced with
+    specific SIG-dominated subseries (KXNBAMVP, KXNFLSB, ...). Prefix
+    semantics still apply to those entries; the families themselves are
+    now allowed. These tests pin BOTH facts so a regression either way
+    (family ban creeping back, or prefix match silently becoming exact)
+    is caught.
+    """
 
     def test_exact_match_blocks(self):
-        # Prior to the fix this was the only thing that worked
-        enrol, reason = _decide_enrol(_program(series_ticker="KXNFL"))
+        enrol, reason = _decide_enrol(_program(series_ticker="KXNBAMVP"))
         self.assertEqual(enrol, 0)
         self.assertIn("blocklist:series", reason)
 
     def test_prefix_match_blocks_subseries(self):
-        # The KEY fix: KXNBAMENTION starts with KXNBA → must be blocked
-        enrol, reason = _decide_enrol(_program(series_ticker="KXNBAMENTION"))
+        # KXNBAMVP2026 starts with blocklisted KXNBAMVP → must be blocked
+        enrol, reason = _decide_enrol(_program(series_ticker="KXNBAMVP2026"))
         self.assertEqual(enrol, 0)
-        self.assertIn("KXNBAMENTION", reason)
+        self.assertIn("KXNBAMVP2026", reason)
 
     def test_prefix_match_blocks_nfl_subseries(self):
-        for sub in ["KXNFLDRAFT", "KXNFLDRAFTCAT", "KXNFLDRAFTOU", "KXNFLDRAFTTOP"]:
+        for sub in ["KXNFLSB", "KXNFLSBWINNER", "KXNFLMVP", "KXNFLMVPODDS"]:
             enrol, _ = _decide_enrol(_program(series_ticker=sub))
             self.assertEqual(enrol, 0, f"{sub} should be blocked")
 
     def test_prefix_match_blocks_mlb_subseries(self):
-        for sub in ["KXMLBSERIES", "KXMLBAWARDCOMBO", "KXMLBTRADE"]:
+        for sub in ["KXMLBWS", "KXMLBWSGAME", "KXMLBMVP", "KXMLBCYY"]:
             enrol, _ = _decide_enrol(_program(series_ticker=sub))
             self.assertEqual(enrol, 0, f"{sub} should be blocked")
+
+    def test_family_level_series_now_allowed(self):
+        # The 2026-05-05 policy: prop pools under the family are legitimate.
+        for fam in ["KXNBAMENTION", "KXNFLDRAFT", "KXMLBMANAGEROUT"]:
+            enrol, reason = _decide_enrol(_program(series_ticker=fam))
+            self.assertEqual(enrol, 1, f"{fam} unexpectedly blocked: {reason}")
 
     def test_non_blocked_series_passes(self):
         enrol, reason = _decide_enrol(_program(series_ticker="KXBRENTD"))
@@ -76,13 +101,14 @@ class TestBlocklistPrefixMatch(unittest.TestCase):
 
 class TestRewardFloor(unittest.TestCase):
     def test_reward_below_floor_blocks(self):
-        enrol, reason = _decide_enrol(_program(reward_per_day_usd=5.0))
+        floor = settings.MIN_REWARD_PER_DAY_USD
+        enrol, reason = _decide_enrol(_program(reward_per_day_usd=floor - 0.01))
         self.assertEqual(enrol, 0)
         self.assertIn("reward_too_small", reason)
 
     def test_reward_at_floor_passes(self):
-        # MIN_REWARD_PER_DAY_USD = 10.0 per settings
-        enrol, reason = _decide_enrol(_program(reward_per_day_usd=10.0))
+        floor = settings.MIN_REWARD_PER_DAY_USD
+        enrol, reason = _decide_enrol(_program(reward_per_day_usd=floor))
         self.assertEqual(enrol, 1)
 
 
@@ -93,19 +119,18 @@ class TestTargetSizeCap(unittest.TestCase):
         self.assertIn("target_too_large", reason)
 
     def test_target_at_cap_passes(self):
-        # MAX_TARGET_SIZE_CONTRACTS = 19999
-        enrol, _ = _decide_enrol(_program(target_size=19999))
+        enrol, _ = _decide_enrol(_program(target_size=settings.MAX_TARGET_SIZE_CONTRACTS))
         self.assertEqual(enrol, 1)
 
 
 class TestDiscountFactorFloor(unittest.TestCase):
     def test_discount_below_floor_blocks(self):
-        enrol, reason = _decide_enrol(_program(discount_factor=0.4))
+        enrol, reason = _decide_enrol(_program(discount_factor=settings.MIN_DISCOUNT_FACTOR - 0.01))
         self.assertEqual(enrol, 0)
         self.assertIn("discount_too_low", reason)
 
     def test_discount_at_floor_passes(self):
-        enrol, _ = _decide_enrol(_program(discount_factor=0.5))
+        enrol, _ = _decide_enrol(_program(discount_factor=settings.MIN_DISCOUNT_FACTOR))
         self.assertEqual(enrol, 1)
 
 
@@ -125,9 +150,9 @@ class TestGateOrdering(unittest.TestCase):
     waste subsequent checks on excluded series."""
 
     def test_blocklist_fires_before_reward_check(self):
-        # NBA market with high reward — blocklist should still block
+        # Blocklisted market with high reward — blocklist should still block
         enrol, reason = _decide_enrol(_program(
-            series_ticker="KXNBAMENTION",
+            series_ticker="KXNBAMVP",
             reward_per_day_usd=500.0,
         ))
         self.assertEqual(enrol, 0)
@@ -198,6 +223,7 @@ class TestTopNPriorityWeighting(unittest.TestCase):
                 enrolled INTEGER, blocked_reason TEXT,
                 reward_per_day_usd REAL, last_seen TEXT
             );
+            -- period_seconds intentionally omitted: _ensure_schema must add it
             CREATE TABLE market_blacklist (
                 ticker TEXT PRIMARY KEY, expires_at TEXT, reason TEXT, added_at TEXT
             );
@@ -210,13 +236,16 @@ class TestTopNPriorityWeighting(unittest.TestCase):
         os.unlink(self.db_path)
 
     def _insert(self, market, series, reward, *, end_date="2099-12-31",
-                target_size=500, paid_out=0, enrolled=1):
+                start_date="2026-04-01", target_size=500, paid_out=0, enrolled=1):
         import sqlite3
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            """INSERT INTO lip_programs VALUES
-               (?, ?, ?, '2026-04-01', ?, ?, 0.5, ?, ?, ?, NULL, ?, '2026-04-28')""",
-            (market, market, series, end_date, reward, target_size,
+            """INSERT INTO lip_programs
+               (id, market_ticker, series_ticker, start_date, end_date,
+                period_reward_usd, discount_factor, target_size, paid_out,
+                enrolled, blocked_reason, reward_per_day_usd, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?, 0.5, ?, ?, ?, NULL, ?, '2026-04-28')""",
+            (market, market, series, start_date, end_date, reward, target_size,
              paid_out, enrolled, reward),
         )
         conn.commit()
@@ -264,14 +293,161 @@ class TestTopNPriorityWeighting(unittest.TestCase):
         self.assertIn("FINE-1", tickers)
 
     def test_priority_field_present_and_correct(self):
-        self._insert("CORN-1", "KXCORNW", 50.0)   # 2.0x in table
+        corn_pri = settings.SIZE_MULTIPLIER_BY_SERIES["KXCORNW"]
+        self._insert("CORN-1", "KXCORNW", 50.0)
         self._insert("RAND-1", "KXNOPRI", 50.0)   # default 1.0
         markets = top_n_to_quote(n=10, db_path=self.db_path)
         by_ticker = {m["market_ticker"]: m for m in markets}
-        self.assertEqual(by_ticker["CORN-1"]["series_priority"], 2.0)
+        self.assertEqual(by_ticker["CORN-1"]["series_priority"], corn_pri)
         self.assertEqual(by_ticker["RAND-1"]["series_priority"], 1.0)
-        self.assertAlmostEqual(by_ticker["CORN-1"]["priority_weighted_reward"], 100.0)
-        self.assertAlmostEqual(by_ticker["RAND-1"]["priority_weighted_reward"],  50.0)
+        # realized_mult=0.7 for unproven series; comp_mult=1.0 (no density data)
+        self.assertAlmostEqual(by_ticker["CORN-1"]["priority_weighted_reward"],
+                               50.0 * corn_pri * 0.7)
+        self.assertAlmostEqual(by_ticker["RAND-1"]["priority_weighted_reward"],
+                               50.0 * 0.7)
+
+    def test_not_yet_started_markets_excluded(self):
+        """Audit #2: an upcoming program (start_date in the future) is
+        persisted but must NOT be quotable until its window opens."""
+        self._insert("FUTURE-1", "KXFOO", 200.0, start_date="2098-01-01")
+        self._insert("LIVE-1",   "KXFOO",  10.0)
+        markets = top_n_to_quote(n=10, db_path=self.db_path)
+        tickers = {m["market_ticker"] for m in markets}
+        self.assertIn("LIVE-1", tickers)
+        self.assertNotIn("FUTURE-1", tickers)
+
+    def test_rows_carry_pool_and_period_seconds(self):
+        self._insert("LIVE-1", "KXFOO", 10.0)
+        m = top_n_to_quote(n=10, db_path=self.db_path)[0]
+        self.assertIn("period_reward_usd", m)
+        self.assertIn("period_seconds", m)   # NULL on legacy rows; column added by _ensure_schema
+        self.assertEqual(m["period_reward_usd"], 10.0)
+
+
+class TestActiveClause(unittest.TestCase):
+    def test_gates_both_ends_of_window(self):
+        c = is_active_clause("p")
+        self.assertIn("p.enrolled = 1", c)
+        self.assertIn("p.paid_out = 0", c)
+        self.assertIn("datetime(p.start_date) <= datetime('now')", c)
+        self.assertIn("datetime(p.end_date) > datetime('now')", c)
+
+
+class TestParseProgram(unittest.TestCase):
+    """Audit #2: exact window length, total pool preserved, malformed rows rejected."""
+
+    def _raw(self, **kw):
+        d = dict(id="p1", market_ticker="KXTEST-1", incentive_type="liquidity",
+                 period_reward=1_000_000,          # centi-cents → $100
+                 discount_factor_bps=5000, target_size_fp="500.00",
+                 start_date="2026-09-01T00:00:00Z", end_date="2026-09-02T12:00:00Z",
+                 paid_out=False)
+        d.update(kw)
+        return d
+
+    def test_exact_duration_not_floored_days(self):
+        p = _parse_program(self._raw())            # 36h window
+        self.assertEqual(p["period_seconds"], 36 * 3600)
+        self.assertEqual(p["period_reward_usd"], 100.0)          # total pool intact
+        self.assertAlmostEqual(p["reward_per_day_usd"], 100.0 / 1.5)  # old code: 100/1 (floor to 1 day)
+
+    def test_sub_day_window(self):
+        p = _parse_program(self._raw(end_date="2026-09-01T06:00:00Z"))   # 6h
+        self.assertEqual(p["period_seconds"], 6 * 3600)
+        self.assertAlmostEqual(p["reward_per_day_usd"], 400.0)
+
+    def test_offset_timezones_normalized(self):
+        p = _parse_program(self._raw(start_date="2026-09-01T00:00:00+02:00",
+                                     end_date="2026-09-01T00:00:00Z"))
+        self.assertEqual(p["period_seconds"], 2 * 3600)
+
+    def test_rejects_end_before_or_equal_start(self):
+        self.assertIsNone(_parse_program(self._raw(end_date="2026-09-01T00:00:00Z")))
+        self.assertIsNone(_parse_program(self._raw(end_date="2026-08-31T00:00:00Z")))
+
+    def test_rejects_missing_or_garbage_dates(self):
+        self.assertIsNone(_parse_program(self._raw(start_date=None)))
+        self.assertIsNone(_parse_program(self._raw(end_date="not a date")))
+        self.assertIsNone(_parse_program(self._raw(end_date="")))
+
+    def test_rejects_nonfinite_or_nonpositive_numbers(self):
+        self.assertIsNone(_parse_program(self._raw(period_reward=0)))
+        self.assertIsNone(_parse_program(self._raw(period_reward=-5)))
+        self.assertIsNone(_parse_program(self._raw(period_reward="nan")))
+        self.assertIsNone(_parse_program(self._raw(period_reward="inf")))
+        self.assertIsNone(_parse_program(self._raw(period_reward="abc")))
+        self.assertIsNone(_parse_program(self._raw(target_size_fp="0")))
+        self.assertIsNone(_parse_program(self._raw(target_size_fp=None)))
+
+    def test_rejects_discount_outside_unit_interval(self):
+        self.assertIsNone(_parse_program(self._raw(discount_factor_bps=0)))
+        self.assertIsNone(_parse_program(self._raw(discount_factor_bps=10_001)))
+        self.assertIsNone(_parse_program(self._raw(discount_factor_bps=None)))
+        self.assertEqual(_parse_program(self._raw(discount_factor_bps=10_000))["discount_factor"], 1.0)
+
+
+class TestDecideEnrolWindow(unittest.TestCase):
+    def test_expired_blocks(self):
+        enrol, reason = _decide_enrol(_program(start_date="2019-01-01T00:00:00Z",
+                                               end_date="2020-01-01T00:00:00Z"))
+        self.assertEqual((enrol, reason), (0, "expired"))
+
+    def test_expiry_compares_datetimes_not_strings(self):
+        # 'Z' vs '+00:00' spelling must not change the verdict
+        now = "2026-09-20T12:00:00+00:00"
+        enrol, reason = _decide_enrol(_program(end_date="2026-09-20T11:59:59Z"), now_iso=now)
+        self.assertEqual(reason, "expired")
+        enrol, reason = _decide_enrol(_program(end_date="2026-09-20T12:00:01Z"), now_iso=now)
+        self.assertEqual(enrol, 1)
+
+    def test_upcoming_is_enrolled_but_runtime_gated(self):
+        # Enrolment is our decision; the start gate lives in is_active_clause.
+        enrol, reason = _decide_enrol(_program(start_date=_iso(+1), end_date=_iso(+8)))
+        self.assertEqual((enrol, reason), (1, "ok"))
+
+    def test_malformed_window_blocks(self):
+        self.assertEqual(_decide_enrol(_program(end_date="garbage"))[1], "malformed_window")
+        self.assertEqual(_decide_enrol(_program(start_date=_iso(+8), end_date=_iso(+7)))[1],
+                         "malformed_window")
+
+    def test_missing_dates_tolerated(self):
+        # Rows from older fixtures / callers without a window still get a verdict.
+        p = _program(); p.pop("start_date"); p.pop("end_date")
+        self.assertEqual(_decide_enrol(p)[0], 1)
+
+
+class TestDiscoverStatuses(unittest.TestCase):
+    """Audit #2: query the statuses Kalshi actually defines, skip bad rows."""
+
+    class _FakeClient:
+        calls: list = []
+        rows: list = []
+
+        def get_unauth(self, path, params=None):
+            type(self).calls.append(dict(params or {}))
+            return {"incentive_programs": list(type(self).rows), "next_cursor": None}
+
+    def setUp(self):
+        self._FakeClient.calls = []
+        self._FakeClient.rows = []
+
+    def test_statuses_match_api_vocabulary(self):
+        self.assertEqual(INCENTIVE_STATUSES, ("active", "upcoming", "closed", "paid_out"))
+        with patch("engine.lip_discovery.KalshiClient", self._FakeClient):
+            discover(save=False)
+        self.assertEqual([c["status"] for c in self._FakeClient.calls], list(INCENTIVE_STATUSES))
+        for c in self._FakeClient.calls:
+            self.assertEqual(c["type"], "liquidity")
+
+    def test_malformed_row_skipped_not_fatal(self):
+        good = dict(id="ok", market_ticker="KXA-1", incentive_type="liquidity",
+                    period_reward=100_000, discount_factor_bps=5000, target_size_fp="100",
+                    start_date="2026-09-01T00:00:00Z", end_date="2026-09-08T00:00:00Z")
+        bad = dict(good, id="bad", market_ticker="KXB-1", end_date="2026-08-01T00:00:00Z")
+        self._FakeClient.rows = [bad, good, dict(good, id="vol", incentive_type="volume")]
+        with patch("engine.lip_discovery.KalshiClient", self._FakeClient):
+            out = discover(status="active", save=False)
+        self.assertEqual([p["id"] for p in out], ["ok"])
 
 
 if __name__ == "__main__":
