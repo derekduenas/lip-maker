@@ -48,11 +48,26 @@ from execution.kalshi_ws import BookLevel, BookState
 
 @dataclass
 class ProgramParams:
-    """The LIP parameters for one market (from /incentive_programs)."""
+    """The LIP parameters for one market (from /incentive_programs).
+
+    2026-09-20 audit #3: `period_reward_usd` is the TOTAL pool for the
+    program window and `period_seconds` is that window's exact length.
+    Payout accrues at pool/period_seconds dollars per second of qualified
+    presence, scaled by our share. The runner used to pass reward-per-DAY
+    here and then divide by 86400 again — a units mismatch that made every
+    estimated_payout_usd row meaningless.
+    """
     market_ticker:   str
-    target_size:     int      # contracts
+    target_size:     float    # contracts (fixed-point on Kalshi; may be fractional)
     discount_factor: float    # 0.0–1.0
-    period_reward_usd: float   # total USD for the whole Time Period
+    period_reward_usd: float  # total USD for the whole Time Period
+    period_seconds:  float = 86400.0   # window length; legacy callers pass a 1-day rate
+
+    @property
+    def pool_rate_usd_per_sec(self) -> float:
+        if self.period_seconds <= 0:
+            return 0.0
+        return self.period_reward_usd / self.period_seconds
 
 
 @dataclass
@@ -83,11 +98,11 @@ class SnapshotScore:
     no_total_qualifying_score:  float = 0.0
 
 
-def _find_cutoff_price(bids: list[BookLevel], target_size: int) -> Optional[int]:
+def _find_cutoff_price(bids: list[BookLevel], target_size: float) -> Optional[int]:
     """Walk bids from best down until cumulative size ≥ target_size.
     Returns the price_cents of the cutoff level, or None if book never reaches it.
     Bids must be sorted DESC by price."""
-    cum = 0
+    cum = 0.0
     for lvl in bids:
         cum += lvl.size
         if cum >= target_size:
@@ -108,7 +123,7 @@ def _score_bids(
       level_score = DiscountFactor^(ReferencePrice - Price) × Size
     Sum all levels to get total_score. Our levels separately to get our_score.
     """
-    def level_score(price: int, size: int) -> float:
+    def level_score(price: int, size: float) -> float:
         distance_ticks = reference_price - price  # non-negative since price ≤ reference
         return (discount_factor ** distance_ticks) * size
 
@@ -169,6 +184,32 @@ def score_snapshot(
 
     result.our_total_score = result.our_yes_normalized + result.our_no_normalized
     return result
+
+
+def snapshot_share(r: SnapshotScore) -> float:
+    """Our share of ONE snapshot's total credit, in [0, 1].
+
+    Each side normalizes to exactly 1.0 across all users, so a valid
+    snapshot's total credit across everyone is exactly 2.0. Our fraction of
+    that snapshot is therefore our_total_score / 2. Invalid snapshots pay
+    nobody."""
+    if not r.snapshot_valid:
+        return 0.0
+    return max(0.0, min(1.0, r.our_total_score / 2.0))
+
+
+def interval_payout_usd(share: float, params: ProgramParams, elapsed_sec: float) -> float:
+    """Dollars accrued over `elapsed_sec` of presence at snapshot share `share`.
+
+    Kalshi pays pool × (our summed snapshot credit / everyone's summed
+    credit). Per unit time that is share × pool/period_seconds. Bounded by
+    the pool itself and zero whenever we are not qualified (share == 0)."""
+    if share <= 0.0 or elapsed_sec <= 0.0:
+        return 0.0
+    if params.period_reward_usd <= 0.0 or params.period_seconds <= 0.0:
+        return 0.0
+    est = share * params.pool_rate_usd_per_sec * elapsed_sec
+    return max(0.0, min(params.period_reward_usd, est))
 
 
 def estimated_period_payout(

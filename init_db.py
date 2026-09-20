@@ -70,7 +70,9 @@ CREATE TABLE IF NOT EXISTS lip_snapshots (
     yes_qualified   INTEGER,            -- did total yes meet TargetSize
     no_qualified    INTEGER,            -- did total no meet TargetSize
     snapshot_valid  INTEGER NOT NULL,   -- both sides qualified (post-Feb28 rule)
-    estimated_payout_usd REAL           -- our_score × (period_reward × fraction_of_period)
+    estimated_payout_usd REAL,          -- our_share × (pool/period_seconds) × seconds since previous row
+    was_resting     INTEGER DEFAULT 0,  -- 1 = scored against ACTUAL two-sided resting orders
+    our_share       REAL                -- our fraction of this snapshot's total credit, 0–1
 );
 
 CREATE INDEX IF NOT EXISTS idx_snap_market ON lip_snapshots(market_ticker);

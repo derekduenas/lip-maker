@@ -33,6 +33,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,7 +48,8 @@ from engine.lip_discovery import discover, top_n_to_quote
 from engine.capital_allocator import select_optimal_portfolio
 from engine.depth_probe import filter_by_depth
 from engine.lip_scorer import (
-    OurQuotes, ProgramParams, score_snapshot,
+    OurQuotes, ProgramParams, SnapshotScore, score_snapshot,
+    interval_payout_usd, snapshot_share,
 )
 from engine.adaptive_sizer import AdaptiveSizer
 from engine.microprice import microprice_yes  # A.1: imbalance-weighted fair value
@@ -62,18 +64,86 @@ from execution.quote_manager import QuoteManager, QuoteTarget
 _log = logging.getLogger("lip_maker")
 
 
+def _program_params_from_market(m: dict) -> ProgramParams:
+    """Build ProgramParams in the right units (2026-09-20 audit #3).
+
+    Discovery rows carry the TOTAL pool (`period_reward_usd`) and the exact
+    window (`period_seconds`). Rows from older DBs or the capital allocator
+    may only carry `reward_per_day_usd`; express that rate as a 1-day window
+    so pool/period_seconds is still the correct $/sec."""
+    pool = m.get("period_reward_usd")
+    secs = m.get("period_seconds")
+    try:
+        secs_f = float(secs) if secs is not None else 0.0
+    except (TypeError, ValueError):
+        secs_f = 0.0
+    if pool is not None and secs_f > 0:
+        return ProgramParams(
+            market_ticker=m["market_ticker"],
+            target_size=float(m["target_size"]),
+            discount_factor=float(m["discount_factor"]),
+            period_reward_usd=float(pool),
+            period_seconds=secs_f,
+        )
+    return ProgramParams(
+        market_ticker=m["market_ticker"],
+        target_size=float(m["target_size"]),
+        discount_factor=float(m["discount_factor"]),
+        period_reward_usd=float(m["reward_per_day_usd"]),
+        period_seconds=86400.0,
+    )
+
+
+# Skip reasons from _quote_target_for that do NOT justify pulling resting
+# orders: the market is still one we want to be in, we just don't want to
+# re-price this instant. Everything else (fair_value, pre_settlement,
+# stale_book, no_params, unknown) means our resting orders are exposure
+# without a thesis and must be cancelled (2026-09-20 audit #7).
+TRANSIENT_SKIP_REASONS = frozenset({"volatility", "no_best"})
+
+
+@dataclass
+class ScoredMarket:
+    """One market's snapshot score plus how it was obtained."""
+    market_ticker: str
+    result: SnapshotScore
+    is_resting: bool          # two-sided ACTUAL orders resting ≥ min size
+    share: float              # our fraction of this snapshot's credit, 0–1 (0 unless resting+valid)
+    mode: str                 # "actual" | "hypothetical" | "none"
+
+    @property
+    def raw_our_score(self) -> float:
+        """Sum of (size × DF^N) raw units, comparable with total_score."""
+        if not self.is_resting:
+            return 0.0
+        r = self.result
+        return ((r.our_yes_normalized * (r.yes_total_qualifying_score or 0)) +
+                (r.our_no_normalized  * (r.no_total_qualifying_score  or 0)))
+
+
 class PaperRunner:
+    # Longest interval one snapshot row may claim accrual for. Rows are
+    # written at ≤5s cadence from book updates and every heartbeat (30s);
+    # a longer gap means we were NOT observing and must not claim it.
+    SNAPSHOT_MAX_INTERVAL_SEC = 60.0
+    SKIP_CANCEL_THROTTLE_SEC = 30.0
+
     def __init__(self, markets: list[dict]):
         self.markets = markets
         self.params_by_ticker = {
-            m["market_ticker"]: ProgramParams(
-                market_ticker=m["market_ticker"],
-                target_size=int(m["target_size"]),
-                discount_factor=float(m["discount_factor"]),
-                period_reward_usd=float(m["reward_per_day_usd"]),
-            )
+            m["market_ticker"]: _program_params_from_market(m)
             for m in markets
         }
+        # 2026-09-20 audit #7: last skip reason per ticker from
+        # _quote_target_for, so on_book_update can decide whether resting
+        # orders must be pulled. Counts per reason for the summary line.
+        self._skip_reason: dict[str, str] = {}
+        self.skip_counts: dict[str, int] = defaultdict(int)
+        self._skip_cancel_ts: dict[str, float] = {}
+        # audit #3: wall-clock of the last PERSISTED snapshot per ticker;
+        # each row accrues pool-rate × share × (now − last).
+        self._last_persist_ts: dict[str, float] = {}
+        self._ensure_snapshot_schema()
         # 2026-05-03 GOLDEN-FUNNEL: per-market size FLOOR from capital_allocator.
         # Ensures we always quote enough to cross the qualify cliff. Sizer can
         # size larger if observed competition demands; never smaller than this.
@@ -272,7 +342,31 @@ class PaperRunner:
                                  f"(gap {best - o.price_cents}¢)")
         return cancelled
 
-    def _actually_resting(self, ticker: str, target) -> bool:
+    def _ensure_snapshot_schema(self) -> None:
+        """Add lip_snapshots columns introduced after the original schema
+        (idempotent; silently skipped when the table does not exist yet)."""
+        try:
+            conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(lip_snapshots)").fetchall()}
+                if not cols:
+                    return
+                if "was_resting" not in cols:
+                    conn.execute("ALTER TABLE lip_snapshots ADD COLUMN was_resting INTEGER DEFAULT 0")
+                if "our_share" not in cols:
+                    conn.execute("ALTER TABLE lip_snapshots ADD COLUMN our_share REAL")
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            _log.debug(f"lip_snapshots schema check skipped: {e}")
+
+    def _live_resting(self, ticker: str) -> list:
+        """Resting orders we believe are on the venue (cancel not yet requested)."""
+        return [o for o in self.qm.resting.get(ticker, [])
+                if not getattr(o, "pending_cancel", False)]
+
+    def _actually_resting(self, ticker: str, target=None) -> bool:
         """Check if we have qualifying two-sided quotes resting on this market.
 
         2026-04-25 (Phantom-snapshot fix v2). Permissive: just checks
@@ -281,10 +375,12 @@ class PaperRunner:
         target computation and actual placement — strict price-match
         rejected too many legitimate resting cases.
 
-        Phase 2 (post-Apr-28): use ACTUAL resting prices/sizes in scorer
-        instead of target, for true precision.
+        2026-09-20 audit #3: `target` is no longer consulted at all — the
+        scorer now uses the ACTUAL resting prices/sizes (see _score_market),
+        so this is purely the two-sided-presence gate. Parameter kept for
+        call-site compatibility.
         """
-        orders = self.qm.resting.get(ticker, [])
+        orders = self._live_resting(ticker)
         yes = next((o for o in orders if o.side == "yes"), None)
         no  = next((o for o in orders if o.side == "no"),  None)
         if not (yes and no):
@@ -294,6 +390,179 @@ class PaperRunner:
         if no.size_contracts < settings.MIN_QUOTE_SIZE_CONTRACTS:
             return False
         return True
+
+    @staticmethod
+    def _augment(book: BookState, ours: OurQuotes) -> BookState:
+        """Copy of `book` with our quotes folded in. ONLY for quotes that
+        are not on the venue book (paper shadow orders, or a hypothetical
+        target we have not placed yet)."""
+        aug = BookState(market_ticker=book.market_ticker)
+        aug.yes_bids = [BookLevel(l.price_cents, l.size) for l in book.yes_bids]
+        aug.no_bids  = [BookLevel(l.price_cents, l.size) for l in book.no_bids]
+        for side_levels, our_levels in ((aug.yes_bids, ours.yes_bids),
+                                        (aug.no_bids,  ours.no_bids)):
+            for q in our_levels:
+                for lvl in side_levels:
+                    if lvl.price_cents == q.price_cents:
+                        lvl.size += q.size
+                        break
+                else:
+                    side_levels.append(BookLevel(q.price_cents, q.size))
+            side_levels.sort(key=lambda l: -l.price_cents)
+        return aug
+
+    def _score_market(self, book: BookState, params: ProgramParams,
+                      target: QuoteTarget | None = None) -> ScoredMarket:
+        """Single scoring path for book updates AND the heartbeat
+        (2026-09-20 audit #3).
+
+        - Orders resting → score what is ACTUALLY resting (price + size per
+          order, per side). In live mode those orders are already part of
+          the venue book, so the public book is scored as-is; adding them
+          again would double-count our depth, move the cutoff and inflate
+          our share. In paper mode shadow orders never reach the venue, so
+          the book is augmented to simulate presence.
+        - Nothing resting but a target exists → hypothetical score of the
+          target (respecting per-side size overrides) against an augmented
+          book. Persisted as was_resting=0 / share 0 (phantom).
+        - Neither → book validity only.
+        """
+        ticker = book.market_ticker
+        resting = self._live_resting(ticker)
+        is_resting = self._actually_resting(ticker)
+        if resting:
+            ours = OurQuotes(
+                yes_bids=[BookLevel(o.price_cents, float(o.size_contracts))
+                          for o in resting if o.side == "yes"],
+                no_bids=[BookLevel(o.price_cents, float(o.size_contracts))
+                         for o in resting if o.side == "no"],
+            )
+            scored_book = self._augment(book, ours) if self.qm.paper else book
+            mode = "actual"
+        elif target is not None:
+            yes_sz = (target.yes_size_override if target.yes_size_override is not None
+                      else target.size_contracts)
+            no_sz = (target.no_size_override if target.no_size_override is not None
+                     else target.size_contracts)
+            ours = OurQuotes(
+                yes_bids=([BookLevel(target.yes_bid_cents, float(yes_sz))]
+                          if target.yes_bid_cents is not None else []),
+                no_bids=([BookLevel(target.no_bid_cents, float(no_sz))]
+                         if target.no_bid_cents is not None else []),
+            )
+            scored_book = self._augment(book, ours)
+            mode = "hypothetical"
+        else:
+            ours = OurQuotes()
+            scored_book = book
+            mode = "none"
+        r = score_snapshot(scored_book, ours, params)
+        share = snapshot_share(r) if is_resting else 0.0
+        return ScoredMarket(ticker, r, is_resting, share, mode)
+
+    def _record_score(self, scored: ScoredMarket, now: float, *, feed_sizer: bool) -> None:
+        """Session stats + (book path only) sizer feedback. Only ACTUAL
+        resting presence on a valid snapshot counts — never phantom scores."""
+        tkr = scored.market_ticker
+        r = scored.result
+        self.snapshots_scored[tkr] += 1
+        if not (scored.is_resting and r.snapshot_valid):
+            return
+        self.snapshots_valid[tkr] += 1
+        self.our_score_sum[tkr] += r.our_total_score
+        if not feed_sizer:
+            return
+        our_yes_score = (r.our_yes_normalized * r.yes_total_qualifying_score
+                         if r.yes_total_qualifying_score else 0)
+        our_no_score  = (r.our_no_normalized * r.no_total_qualifying_score
+                         if r.no_total_qualifying_score else 0)
+        self.sizer.observe(
+            tkr,
+            yes_total_qual=r.yes_total_qualifying_score,
+            no_total_qual=r.no_total_qualifying_score,
+            our_yes_contribution=our_yes_score,
+            our_no_contribution=our_no_score,
+            ts=now,
+        )
+
+    def _persist_snapshot(self, ticker: str, scored: ScoredMarket,
+                          params: ProgramParams, now: float) -> bool:
+        """Write one lip_snapshots row (throttled to 1 per 5s per market).
+
+        2026-09-20 audit #3 (units): estimated_payout_usd is what this row's
+        interval is worth — share × (pool / period_seconds) × seconds since
+        the previous persisted row — bounded by the pool and zero whenever
+        we were not qualified. Summing the column over a program window
+        therefore estimates the payout in dollars. The old formula
+        (raw_score/2 × reward_per_day / 86400) mixed a raw-unit score with a
+        per-day rate and a per-day divisor and meant nothing.
+        """
+        key = int(now / 5)
+        if self._last_persist_key.get(ticker, -1) == key:
+            return False
+        self._last_persist_key[ticker] = key
+        last_ts = self._last_persist_ts.get(ticker)
+        elapsed = 0.0 if last_ts is None else min(max(0.0, now - last_ts),
+                                                  self.SNAPSHOT_MAX_INTERVAL_SEC)
+        self._last_persist_ts[ticker] = now
+        r = scored.result
+        payout = interval_payout_usd(scored.share, params, elapsed)
+        try:
+            conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
+            try:
+                conn.execute(
+                    """INSERT INTO lip_snapshots
+                       (market_ticker, captured_at, our_score, total_score,
+                        yes_qualified, no_qualified, snapshot_valid,
+                        estimated_payout_usd, was_resting, our_share)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (ticker,
+                     datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+                     scored.raw_our_score,
+                     r.yes_total_qualifying_score + r.no_total_qualifying_score,
+                     1 if (scored.is_resting and r.yes_qualified) else 0,
+                     1 if (scored.is_resting and r.no_qualified) else 0,
+                     1 if (scored.is_resting and r.snapshot_valid) else 0,
+                     payout,
+                     1 if scored.is_resting else 0,
+                     scored.share),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return True
+        except Exception as e:
+            self._snapshot_persist_failures += 1
+            _log.warning(f"snapshot persist failed for {ticker}: {e} "
+                         f"(total failures this session: {self._snapshot_persist_failures})")
+            return False
+
+    def _handle_skip(self, ticker: str, reason: str) -> bool:
+        """A quote target was NOT produced for `ticker` (2026-09-20 audit #7).
+
+        Transient reasons keep resting orders (we still want the market,
+        just not a reprice right now). Any other reason means the resting
+        orders are exposure we no longer have a thesis for: cancel them
+        (throttled so a flapping gate can't spam the API). Returns True
+        when a cancel was issued."""
+        self.skip_counts[reason] += 1
+        base = reason.split(":", 1)[0]
+        if base in TRANSIENT_SKIP_REASONS:
+            return False
+        if not self._live_resting(ticker):
+            return False
+        now = time.time()
+        if now - self._skip_cancel_ts.get(ticker, 0.0) < self.SKIP_CANCEL_THROTTLE_SEC:
+            return False
+        self._skip_cancel_ts[ticker] = now
+        self.qm.cancel_all(market_ticker=ticker)
+        _log.info(f"skip_cancel[{ticker}] reason={reason}: pulled resting orders")
+        return True
+
+    def _skip(self, ticker: str, reason: str):
+        """Record why _quote_target_for produced no target and return None."""
+        self._skip_reason[ticker] = reason
+        return None
 
     FUTURES_CACHE_SEC = 60   # match futures-feed.timer cadence
 
@@ -397,14 +666,23 @@ class PaperRunner:
                 no_range  >= settings.VOLATILITY_BACKOFF_TICKS)
 
     def _quote_target_for(self, book: BookState) -> QuoteTarget | None:
-        """Compute our desired quote using ADAPTIVE sizing to target 25% share."""
-        p = self.params_by_ticker.get(book.market_ticker)
+        """Compute our desired quote using ADAPTIVE sizing to target 25% share.
+
+        Returns None when we should not (re)quote; the reason is recorded in
+        self._skip_reason[ticker] so on_book_update can decide whether
+        resting orders must be pulled (audit #7)."""
+        tkr = book.market_ticker
+        self._skip_reason.pop(tkr, None)
+        p = self.params_by_ticker.get(tkr)
         if p is None:
-            return None
+            return self._skip(tkr, "no_params")
+        # 2026-09-20 audit #1: a book that lost a delta is not a book.
+        if getattr(book, "stale", False):
+            return self._skip(tkr, "stale_book")
         best_yes = book.best_yes_bid()
         best_no  = book.best_no_bid()
         if best_yes is None or best_no is None:
-            return None
+            return self._skip(tkr, "no_best")
 
         # A.1 (2026-05-14): cache microprice for downstream consumers
         # (A.2 reservation price, A.4 markout). Best-effort — None when
@@ -419,7 +697,7 @@ class PaperRunner:
         # a book update from immediately triggering a fresh placement.
         mins_until = self._minutes_until_settle(book.market_ticker)
         if mins_until is not None and 0 < mins_until <= settings.PRE_SETTLEMENT_CANCEL_MIN:
-            return None
+            return self._skip(tkr, "pre_settlement")
 
         # #98 Tick backoff: skip reprice when best is moving fast. Don't
         # chase a flickering market — protects against being the slow
@@ -434,7 +712,7 @@ class PaperRunner:
                           f"best moved >{settings.VOLATILITY_BACKOFF_TICKS}c "
                           f"in last {settings.VOLATILITY_WINDOW_SEC}s")
                 self._fv_skip_log_ts[f"vol:{book.market_ticker}"] = now_ts
-            return None
+            return self._skip(tkr, "volatility")
 
         # Quant audit: futures fair-value adverse-selection gate. Skip
         # entirely if futures clearly disagrees with our quote on the
@@ -449,7 +727,7 @@ class PaperRunner:
             if now_ts - last > 300:
                 _log.info(skip_reason)
                 self._fv_skip_log_ts[book.market_ticker] = now_ts
-            return None
+            return self._skip(tkr, "fair_value")
 
         # Adaptive size: target 25% of qualifying score per side.
         # Use the MIN of yes-side and no-side sizes so our two-sided quote
@@ -563,118 +841,31 @@ class PaperRunner:
 
         params = self.params_by_ticker.get(book.market_ticker)
         if params is None:
+            # Market dropped from our set (program ended / de-allocated):
+            # anything still resting there is unmonitored exposure.
+            self._handle_skip(book.market_ticker, "no_params")
             return
 
         # Compute our target quote
         target = self._quote_target_for(book)
         if target is None:
+            reason = self._skip_reason.get(book.market_ticker, "unknown")
+            self._handle_skip(book.market_ticker, reason)
+            if reason == "stale_book":
+                return  # nothing about this book can be trusted; no snapshot
+            # Score honestly whatever is (or isn't) still resting, but do
+            # not reprice.
+            scored = self._score_market(book, params, target=None)
+            self._record_score(scored, now, feed_sizer=True)
+            self._persist_snapshot(book.market_ticker, scored, params, now)
             return
 
-        # Simulate: what would we score if we had these quotes resting?
-        ours = OurQuotes(
-            yes_bids=[BookLevel(price_cents=target.yes_bid_cents, size=target.size_contracts)],
-            no_bids=[BookLevel(price_cents=target.no_bid_cents,  size=target.size_contracts)],
-        )
-        # IMPORTANT: to score our contribution we need to ADD our quotes to the
-        # book before scoring (otherwise Kalshi sees us as part of the book).
-        # In paper mode we're not on the book yet, so construct a book+us view.
-        augmented = BookState(market_ticker=book.market_ticker)
-        # Deep-copy the level lists so we don't mutate the source
-        augmented.yes_bids = [BookLevel(l.price_cents, l.size) for l in book.yes_bids]
-        augmented.no_bids  = [BookLevel(l.price_cents, l.size) for l in book.no_bids]
-        # Add our simulated resting size at the target price
-        for lvl in augmented.yes_bids:
-            if lvl.price_cents == target.yes_bid_cents:
-                lvl.size += target.size_contracts
-                break
-        else:
-            augmented.yes_bids.insert(0, BookLevel(target.yes_bid_cents, target.size_contracts))
-        augmented.yes_bids.sort(key=lambda l: -l.price_cents)
-        for lvl in augmented.no_bids:
-            if lvl.price_cents == target.no_bid_cents:
-                lvl.size += target.size_contracts
-                break
-        else:
-            augmented.no_bids.insert(0, BookLevel(target.no_bid_cents, target.size_contracts))
-        augmented.no_bids.sort(key=lambda l: -l.price_cents)
-
-        r = score_snapshot(augmented, ours, params)
-        self.snapshots_scored[book.market_ticker] += 1
-
-        # 2026-04-25 PHANTOM-SNAPSHOT FIX: check if we ACTUALLY have qualifying
-        # quotes resting. If not, the simulated score is fantasy — persist the
-        # snapshot honestly (our_score=0, snapshot_valid=0) and DON'T feed sizer.
-        is_resting = self._actually_resting(book.market_ticker, target)
-        if is_resting:
-            # 2026-05-03 UNIT-FIX: persist RAW our_score (not normalized 0-2).
-            # Was: r.our_total_score (= sum of normalized shares, max 2.0)
-            # Now: actual sum of (size × DF^N) raw units, comparable with total_score.
-            # Without this, our_score/total_score produced meaningless ~0.001 ratios
-            # that EST_REBATE_1H interpreted as 0.1% share when real share was ~50%.
-            persist_our_score = (
-                (r.our_yes_normalized * (r.yes_total_qualifying_score or 0)) +
-                (r.our_no_normalized  * (r.no_total_qualifying_score  or 0))
-            )
-            persist_yes_qual  = 1 if r.yes_qualified else 0
-            persist_no_qual   = 1 if r.no_qualified  else 0
-            persist_valid     = 1 if r.snapshot_valid else 0
-        else:
-            # Phantom — record the book state but mark our contribution as zero
-            persist_our_score = 0.0
-            persist_yes_qual  = 0
-            persist_no_qual   = 0
-            persist_valid     = 0
-
-        # Persist every snapshot to DB — throttle to 1/5s per market to cap volume.
-        now_ts_key = int(now / 5)
-        last_key = self._last_persist_key.get(book.market_ticker, -1)
-        if now_ts_key != last_key:
-            self._last_persist_key[book.market_ticker] = now_ts_key
-            try:
-                import sqlite3
-                conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
-                try:
-                    conn.execute(
-                        """INSERT INTO lip_snapshots
-                           (market_ticker, captured_at, our_score, total_score,
-                            yes_qualified, no_qualified, snapshot_valid,
-                            estimated_payout_usd, was_resting)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (book.market_ticker,
-                         datetime.now(timezone.utc).isoformat(),
-                         persist_our_score,
-                         r.yes_total_qualifying_score + r.no_total_qualifying_score,
-                         persist_yes_qual,
-                         persist_no_qual,
-                         persist_valid,
-                         (persist_our_score / 2.0) * params.period_reward_usd
-                          / max(1, 86400),
-                         1 if is_resting else 0),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-            except Exception as e:
-                self._snapshot_persist_failures += 1
-                _log.warning(f"snapshot persist failed for {book.market_ticker}: {e} "
-                             f"(total failures this session: {self._snapshot_persist_failures})")
-
-        # Sizer feedback — ONLY when actually resting (was learning from phantom).
-        if is_resting and r.snapshot_valid:
-            self.snapshots_valid[book.market_ticker] += 1
-            self.our_score_sum[book.market_ticker] += r.our_total_score
-            our_yes_score = r.our_yes_normalized * r.yes_total_qualifying_score \
-                            if r.yes_total_qualifying_score else 0
-            our_no_score  = r.our_no_normalized  * r.no_total_qualifying_score  \
-                            if r.no_total_qualifying_score  else 0
-            self.sizer.observe(
-                book.market_ticker,
-                yes_total_qual=r.yes_total_qualifying_score,
-                no_total_qual=r.no_total_qualifying_score,
-                our_yes_contribution=our_yes_score,
-                our_no_contribution=our_no_score,
-                ts=now,
-            )
+        # 2026-09-20 audit #3: score what is ACTUALLY resting (or the target
+        # hypothetically when nothing is), persist with real payout units,
+        # feed the sizer only from actual presence. Same path as heartbeat.
+        scored = self._score_market(book, params, target=target)
+        self._record_score(scored, now, feed_sizer=True)
+        self._persist_snapshot(book.market_ticker, scored, params, now)
 
         # 2026-05-02 PREDATOR C1: offload reconcile to thread executor.
         # Was: sync HTTP POST + sqlite I/O inside async WS callback,
@@ -691,8 +882,21 @@ class PaperRunner:
             self._reconcile_locks[ticker] = lock
         async with lock:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.qm.reconcile, target)
+            result = await loop.run_in_executor(None, self.qm.reconcile, target)
         self.reconciles[ticker] += 1
+        # 2026-09-20 audit #7: a risk veto inside reconcile (Sentinel,
+        # blacklist, full throttle) used to return {"action": "skip"} and
+        # leave whatever was resting untouched. Route it through the same
+        # exposure-pulling path as a skipped target. Capacity gates
+        # (gross/net/bankroll caps, spread, min size) are NOT vetoes —
+        # they refuse to add, not to keep.
+        try:
+            if isinstance(result, dict) and result.get("action") == "skip":
+                why = str(result.get("reason", ""))
+                if why.startswith(("SENTINEL", "BLACKLIST", "THROTTLE: size_scale=0")):
+                    self._handle_skip(ticker, f"risk_veto:{why.split(':', 1)[0]}")
+        except Exception as e:
+            _log.debug(f"risk_veto routing failed for {ticker}: {e}")
 
     async def heartbeat_snapshot_loop(self, ws, interval_sec: int = 30):
         """Periodically snapshot all quoted markets even if book hasn't updated.
@@ -700,8 +904,6 @@ class PaperRunner:
         just the noisy ones. Critical for honest share-estimation across the
         full paper portfolio.
         """
-        import sqlite3
-        from engine.lip_scorer import OurQuotes, score_snapshot
         last_resync = 0.0
         RESYNC_INTERVAL_SEC = 300  # 5 min — cheap (one Kalshi API call)
         # 2026-05-02 PREDATOR K4: hourly refresh of per-market target_share
@@ -805,88 +1007,14 @@ class PaperRunner:
                     book_age = now - (book.last_update_ts or now)
                     self._cancel_zombie_quotes(tkr, best_yes.price_cents,
                                                best_no.price_cents, book_age)
-                    # Construct augmented book with our hypothetical quote
-                    size_yes = self.sizer.size_for(tkr, "yes", params.target_size)
-                    size_no  = self.sizer.size_for(tkr, "no",  params.target_size)
-                    size = min(size_yes, size_no)
-                    # GOLDEN-FUNNEL qualify-cliff floor (heartbeat path)
-                    floor = self.optimal_size_floors.get(tkr, 0)
-                    if floor > size:
-                        size = floor
-                    ours = OurQuotes(
-                        yes_bids=[BookLevel(price_cents=best_yes.price_cents, size=size)],
-                        no_bids=[BookLevel(price_cents=best_no.price_cents,  size=size)],
-                    )
-                    augmented = BookState(market_ticker=tkr)
-                    augmented.yes_bids = [BookLevel(l.price_cents, l.size) for l in book.yes_bids]
-                    augmented.no_bids  = [BookLevel(l.price_cents, l.size) for l in book.no_bids]
-                    # Fold our size in
-                    for lvl in augmented.yes_bids:
-                        if lvl.price_cents == best_yes.price_cents:
-                            lvl.size += size; break
-                    else:
-                        augmented.yes_bids.insert(0, BookLevel(best_yes.price_cents, size))
-                    for lvl in augmented.no_bids:
-                        if lvl.price_cents == best_no.price_cents:
-                            lvl.size += size; break
-                    else:
-                        augmented.no_bids.insert(0, BookLevel(best_no.price_cents, size))
-                    augmented.yes_bids.sort(key=lambda l: -l.price_cents)
-                    augmented.no_bids.sort(key=lambda l: -l.price_cents)
-
-                    r = score_snapshot(augmented, ours, params)
-                    self.snapshots_scored[tkr] += 1
-
-                    # 2026-04-25 PHANTOM-SNAPSHOT FIX: heartbeat scoring needs
-                    # the same gate. Synthesize a target-equivalent for the check.
-                    class _T:  # lightweight target stub for _actually_resting
-                        yes_bid_cents = best_yes.price_cents
-                        no_bid_cents  = best_no.price_cents
-                        size_contracts = size
-                    is_resting = self._actually_resting(tkr, _T())
-                    if is_resting:
-                        # GOLDEN-FUNNEL UNIT-FIX: persist RAW score, not normalized.
-                        persist_our_score = (
-                            (r.our_yes_normalized * (r.yes_total_qualifying_score or 0)) +
-                            (r.our_no_normalized  * (r.no_total_qualifying_score  or 0))
-                        )
-                        persist_yes_qual = 1 if r.yes_qualified else 0
-                        persist_no_qual  = 1 if r.no_qualified  else 0
-                        persist_valid    = 1 if r.snapshot_valid else 0
-                    else:
-                        persist_our_score = 0.0
-                        persist_yes_qual = 0
-                        persist_no_qual  = 0
-                        persist_valid    = 0
-
-                    if is_resting and r.snapshot_valid:
-                        self.snapshots_valid[tkr] += 1
-                        self.our_score_sum[tkr] += r.our_total_score
-
-                    try:
-                        conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
-                        try:
-                            conn.execute(
-                                """INSERT INTO lip_snapshots
-                                   (market_ticker, captured_at, our_score, total_score,
-                                    yes_qualified, no_qualified, snapshot_valid,
-                                    estimated_payout_usd, was_resting)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (tkr, datetime.now(timezone.utc).isoformat(),
-                                 persist_our_score,
-                                 r.yes_total_qualifying_score + r.no_total_qualifying_score,
-                                 persist_yes_qual,
-                                 persist_no_qual,
-                                 persist_valid,
-                                 (persist_our_score / 2.0) * params.period_reward_usd
-                                    / max(1, 86400),
-                                 1 if is_resting else 0),
-                            )
-                            conn.commit()
-                        finally:
-                            conn.close()
-                    except Exception as e:
-                        _log.debug(f"heartbeat persist failed {tkr}: {e}")
+                    # 2026-09-20 audit #3: same scoring path as the book
+                    # handler — ACTUAL resting orders, no hypothetical size.
+                    # A stale book (lost delta) is not scored at all.
+                    if getattr(book, "stale", False):
+                        continue
+                    scored = self._score_market(book, params, target=None)
+                    self._record_score(scored, now, feed_sizer=False)
+                    self._persist_snapshot(tkr, scored, params, now)
 
                 # NEXUS port (2026-04-30): Tiered breaker awareness in heartbeat log.
                 # quote_manager._passes_safety has BINARY halt-at-MAX_DAILY_LOSS gate;
@@ -971,6 +1099,9 @@ class PaperRunner:
             total_est_day += est_day
             print(f"  {tkr[:38]:38s} {snaps:>5d} {valid:>5d} {share_pct*100:>7.1f}% ${est_day:>8.2f}")
         print(f"\n  Estimated total: ${total_est_day:.2f}/day = ~${total_est_day*30:.0f}/month")
+        if self.skip_counts:
+            top = sorted(self.skip_counts.items(), key=lambda kv: -kv[1])[:6]
+            print("  Quote skips: " + ", ".join(f"{k}={v}" for k, v in top))
         print(f"  Quote manager: {self.qm.summary()}")
 
 
@@ -1159,12 +1290,7 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                     for m in fresh:
                         tkr = m["market_ticker"]
                         if tkr in new_tickers:
-                            runner.params_by_ticker[tkr] = ProgramParams(
-                                market_ticker=tkr,
-                                target_size=int(m["target_size"]),
-                                discount_factor=float(m["discount_factor"]),
-                                period_reward_usd=float(m["reward_per_day_usd"]),
-                            )
+                            runner.params_by_ticker[tkr] = _program_params_from_market(m)
                             runner.optimal_size_floors[tkr] = int(
                                 m.get("optimal_size_per_side", 0) or 0
                             )

@@ -66,7 +66,9 @@ def _delta(ticker="MKT", sid=7, seq=2, side="yes", price="0.4900", delta="10.00"
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Fresh loop per call: pytest-asyncio tests elsewhere in the suite close
+    # the default loop, so get_event_loop() is not safe here.
+    return asyncio.run(coro)
 
 
 def _levels(side):
