@@ -8,10 +8,21 @@ Kalshi WS protocol (per docs.kalshi.com/websockets/orderbook-updates):
   - Connect to wss://api.elections.kalshi.com/trade-api/ws/v2
   - Send auth via KALSHI-ACCESS-* headers (RSA-PSS signed on path /trade-api/ws/v2)
   - Send subscribe command with channel + market_tickers
-  - Receive `orderbook_snapshot` with full book state (yes and no levels)
-  - Receive `orderbook_delta` messages with incremental updates
-  - Each message has a `seq` field; sequential seq per subscription
-  - Gap in seq → re-subscribe (triggers fresh snapshot)
+  - Receive `orderbook_snapshot` with full book state:
+        msg.yes_dollars_fp / msg.no_dollars_fp = [[price_dollars, size_fp], ...]
+  - Receive `orderbook_delta` messages with incremental updates:
+        msg.side, msg.price_dollars, msg.delta_fp  (fixed-point strings)
+  - Each message carries `sid` (subscription id) and `seq`; seq increments
+    by exactly 1 per message *per subscription*, not per market.
+  - Gap in seq → the local book has diverged from the venue. It is marked
+    `stale`, further deltas are dropped, and we re-subscribe to get a fresh
+    snapshot which clears the flag.
+
+2026-09-20 audit #1: the previous reader looked for legacy `price`/`delta`
+keys on deltas (v2 sends `price_dollars`/`delta_fp`) so every delta parsed
+to price=0/delta=0 and the book silently froze at the snapshot; sizes were
+rounded to int (Kalshi allows fractional contracts); and seq gaps of up to
+50 were tolerated per-market. All three are fixed here.
 
 Usage:
     async def on_book(book: BookState): ...
@@ -51,7 +62,11 @@ _log = logging.getLogger(__name__)
 class BookLevel:
     """A single price level on one side of the book."""
     price_cents: int
-    size: int  # contracts
+    size: float  # contracts — Kalshi v2 sends fixed-point, may be fractional
+
+
+# Sizes below this are treated as an empty level (fixed-point noise guard).
+_SIZE_EPS = 1e-9
 
 
 @dataclass
@@ -68,6 +83,18 @@ class BookState:
     last_update_ts: float = 0.0
     snapshot_count: int = 0
     delta_count: int = 0
+    # Subscription id that delivered the last snapshot. Deltas tagged with a
+    # different sid (e.g. from a superseded subscription) are dropped.
+    sid: Optional[int] = None
+    # True when a seq gap was detected and no snapshot has arrived since.
+    # A stale book must not be quoted against; consumers should pull quotes.
+    stale: bool = False
+    stale_since_ts: float = 0.0
+    gap_count: int = 0
+
+    def is_usable(self) -> bool:
+        """A book we may quote/score against: has a snapshot and is not stale."""
+        return self.snapshot_count > 0 and not self.stale
 
     def best_yes_bid(self) -> Optional[BookLevel]:
         return self.yes_bids[0] if self.yes_bids else None
@@ -93,7 +120,8 @@ class BookState:
         bys = by.size if by else None; yas = ya.size if ya else None
         return (f"Book({self.market_ticker}: "
                 f"yes_bid={byp}@{bys} ask={yap}@{yas} "
-                f"seq={self.last_seq} snap={self.snapshot_count} delta={self.delta_count})")
+                f"seq={self.last_seq} snap={self.snapshot_count} delta={self.delta_count}"
+                f"{' STALE' if self.stale else ''})")
 
 
 BookCallback = Callable[[BookState], Awaitable[None]]
@@ -119,6 +147,11 @@ class KalshiWS:
         self.books: dict[str, BookState] = {}  # market_ticker -> BookState
         self._cmd_id = 0
         self._sid_to_tickers: dict[int, list[str]] = {}  # subscription id -> tickers
+        self._pending_cmd_tickers: dict[int, list[str]] = {}  # cmd id -> tickers (until ack)
+        # Sequence tracking is PER SUBSCRIPTION (sid), not per market. Keyed
+        # by sid when the message carries one, else by ("ticker", t) fallback.
+        self._last_seq: dict = {}
+        self._last_resub_ts: dict = {}  # throttle key -> last resubscribe time
         self._stop = False
         self._ws = None
         self._private_key = None
@@ -198,11 +231,23 @@ class KalshiWS:
         }
         await self._ws.send(json.dumps(cmd))
         _log.info(f"subscribed (cmd_id={self._cmd_id}) {len(tickers)} tickers: {tickers[:3]}...")
+        self._pending_cmd_tickers[self._cmd_id] = list(tickers)
         # Initialize empty books so callbacks have somewhere to write
         for t in tickers:
             if t not in self.books:
                 self.books[t] = BookState(market_ticker=t)
         return self._cmd_id
+
+    async def _unsubscribe_sid(self, sid: int) -> None:
+        """Drop a superseded subscription so its deltas stop arriving."""
+        self._cmd_id += 1
+        cmd = {"id": self._cmd_id, "cmd": "unsubscribe", "params": {"sids": [sid]}}
+        try:
+            await self._ws.send(json.dumps(cmd))
+        except Exception as e:  # best effort; deltas on the old sid are dropped anyway
+            _log.warning(f"unsubscribe sid={sid} failed: {e}")
+        self._sid_to_tickers.pop(sid, None)
+        self._last_seq.pop(sid, None)
 
     def on_update(self, cb: BookCallback) -> None:
         self._callbacks.append(cb)
@@ -215,39 +260,85 @@ class KalshiWS:
 
     # ── Message handling ─────────────────────────────────────────────
     @staticmethod
-    def _parse_book_side(raw_side) -> list[BookLevel]:
+    def _price_to_cents(p_raw) -> Optional[int]:
+        """Normalize a price to integer cents.
+
+        str   → dollars fixed-point ("0.0010", "0.4900")
+        float → dollars (already parsed)
+        int   → legacy cents
+        Returns None when unparseable or outside [0, 100]."""
+        try:
+            if isinstance(p_raw, bool):
+                return None
+            if isinstance(p_raw, str):
+                cents = round(float(p_raw) * 100)
+            elif isinstance(p_raw, float):
+                cents = round(p_raw * 100)
+            elif isinstance(p_raw, int):
+                cents = p_raw
+            else:
+                return None
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= cents <= 100):
+            return None
+        return int(cents)
+
+    @staticmethod
+    def _size_to_float(s_raw) -> Optional[float]:
+        """Normalize a size (contracts). Fixed-point strings stay fractional —
+        Kalshi allows non-integer contract quantities, so rounding here would
+        misstate depth and shift the LIP cutoff."""
+        try:
+            if isinstance(s_raw, bool):
+                return None
+            v = float(s_raw)
+        except (TypeError, ValueError):
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return v
+
+    @classmethod
+    def _parse_book_side(cls, raw_side) -> list[BookLevel]:
         """Parse levels. Kalshi v2 dollar-fixed-point format:
-        [["0.0010", "501.00"], ["0.0020", "100.00"], ...]
+        [["0.0010", "501.00"], ["0.0020", "100.50"], ...]
         Prices in dollars-with-4-decimals, sizes with 2 decimals.
-        We normalize prices to integer cents, sizes to integer contracts."""
+        Dict levels accept v2 keys (`price_dollars`, `size_fp`) and legacy
+        (`price`, `size`). Prices normalize to integer cents; sizes stay float."""
         if raw_side is None:
             return []
         out = []
         for lvl in raw_side:
             if isinstance(lvl, (list, tuple)):
+                if len(lvl) < 2:
+                    continue
                 p_raw, s_raw = lvl[0], lvl[1]
             elif isinstance(lvl, dict):
-                p_raw = lvl.get("price", 0)
-                s_raw = lvl.get("size",  0)
+                p_raw = lvl.get("price_dollars", lvl.get("price_dollars_fp", lvl.get("price")))
+                s_raw = lvl.get("size_fp", lvl.get("size", lvl.get("quantity")))
             else:
                 continue
-            try:
-                # price can be str "0.0010" (dollars) or int (cents). Normalize to cents.
-                if isinstance(p_raw, str):
-                    price_dollars = float(p_raw)
-                    price_cents = round(price_dollars * 100)
-                elif isinstance(p_raw, float):
-                    # Already parsed dollars
-                    price_cents = round(p_raw * 100)
-                else:
-                    price_cents = int(p_raw)
-                # size likewise may be str
-                size = int(round(float(s_raw) if isinstance(s_raw, str) else s_raw))
-            except (TypeError, ValueError):
+            price_cents = cls._price_to_cents(p_raw)
+            size = cls._size_to_float(s_raw)
+            if price_cents is None or size is None:
                 continue
-            if size > 0 and 0 <= price_cents <= 100:
+            if size > _SIZE_EPS:
                 out.append(BookLevel(price_cents=price_cents, size=size))
         return out
+
+    @staticmethod
+    def _derive_asks(book: BookState) -> None:
+        """Asks are implied by the opposite side's bids (binaries clear at $1):
+        a NO bid at 25¢ is a sell-YES offer at 75¢."""
+        book.yes_asks = sorted(
+            [BookLevel(price_cents=100 - l.price_cents, size=l.size) for l in book.no_bids],
+            key=lambda l: l.price_cents,
+        )
+        book.no_asks = sorted(
+            [BookLevel(price_cents=100 - l.price_cents, size=l.size) for l in book.yes_bids],
+            key=lambda l: l.price_cents,
+        )
 
     def _apply_snapshot(self, book: BookState, msg: dict) -> None:
         """Fully replace the book state from a snapshot message.
@@ -257,80 +348,58 @@ class KalshiWS:
         because Kalshi binaries clear at $1: if someone bids NO at $0.25,
         that implies a sell-YES offer at $0.75.
         """
-        # Handle both v2 key names and potential legacy names
-        yes_side = msg.get("yes_dollars_fp") or msg.get("yes")
-        no_side  = msg.get("no_dollars_fp")  or msg.get("no")
+        # v2 key names first; legacy names as fallback. Use explicit None
+        # checks — an empty list is a valid (empty) side, not "missing".
+        yes_side = msg.get("yes_dollars_fp")
+        if yes_side is None:
+            yes_side = msg.get("yes_dollars", msg.get("yes"))
+        no_side = msg.get("no_dollars_fp")
+        if no_side is None:
+            no_side = msg.get("no_dollars", msg.get("no"))
 
-        book.yes_bids = sorted(
-            self._parse_book_side(yes_side),
-            key=lambda l: -l.price_cents,
-        )
-        book.no_bids = sorted(
-            self._parse_book_side(no_side),
-            key=lambda l: -l.price_cents,
-        )
-        # Derive yes_asks from no_bids: if someone offers 25c for no, that's 75c
-        # to buy yes (taker). This is how Kalshi orderbooks are structured.
-        book.yes_asks = sorted(
-            [BookLevel(price_cents=100 - l.price_cents, size=l.size) for l in book.no_bids],
-            key=lambda l: l.price_cents,
-        )
-        book.no_asks = sorted(
-            [BookLevel(price_cents=100 - l.price_cents, size=l.size) for l in book.yes_bids],
-            key=lambda l: l.price_cents,
-        )
+        book.yes_bids = sorted(self._parse_book_side(yes_side), key=lambda l: -l.price_cents)
+        book.no_bids  = sorted(self._parse_book_side(no_side),  key=lambda l: -l.price_cents)
+        self._derive_asks(book)
         book.snapshot_count += 1
         book.last_update_ts = time.time()
+        # A snapshot is authoritative: whatever divergence we had is gone.
+        book.stale = False
+        book.stale_since_ts = 0.0
 
-    def _apply_delta(self, book: BookState, msg: dict) -> None:
+    def _apply_delta(self, book: BookState, msg: dict) -> bool:
         """Apply a single delta update: add/update/remove one level.
 
-        Kalshi v2 delta format: { side: "yes"|"no", price: "0.0010"|int,
-        delta: int_change_in_size }. Price can be a fixed-point string."""
+        Kalshi v2 delta format:
+            { market_ticker, side: "yes"|"no", price_dollars: "0.4900",
+              delta_fp: "-12.50" }
+        Legacy `price` / `delta` keys are accepted as a fallback. Returns
+        False when the message could not be parsed (nothing applied)."""
         side = msg.get("side", "")
-        p_raw = msg.get("price", 0)
-        # Normalize price to cents
-        if isinstance(p_raw, str):
-            try:
-                price = round(float(p_raw) * 100)
-            except ValueError:
-                return
-        elif isinstance(p_raw, float):
-            price = round(p_raw * 100)
-        else:
-            price = int(p_raw)
-        try:
-            delta = int(msg.get("delta", 0))
-        except (TypeError, ValueError):
-            return
+        if side not in ("yes", "no"):
+            return False
+        p_raw = msg.get("price_dollars", msg.get("price_dollars_fp", msg.get("price")))
+        d_raw = msg.get("delta_fp", msg.get("delta"))
+        price = self._price_to_cents(p_raw)
+        delta = self._size_to_float(d_raw)
+        if price is None or delta is None:
+            return False
 
         target_list = book.yes_bids if side == "yes" else book.no_bids
-        # Find existing level
         for i, lvl in enumerate(target_list):
             if lvl.price_cents == price:
                 lvl.size += delta
-                if lvl.size <= 0:
+                if lvl.size <= _SIZE_EPS:
                     target_list.pop(i)
                 break
         else:
-            if delta > 0:
+            if delta > _SIZE_EPS:
                 target_list.append(BookLevel(price_cents=price, size=delta))
 
-        # Keep sorted (desc for bids)
-        target_list.sort(key=lambda l: -l.price_cents)
-
-        # Re-derive opposite side (asks from other side's bids)
-        book.yes_asks = sorted(
-            [BookLevel(price_cents=100 - l.price_cents, size=l.size) for l in book.no_bids],
-            key=lambda l: l.price_cents,
-        )
-        book.no_asks = sorted(
-            [BookLevel(price_cents=100 - l.price_cents, size=l.size) for l in book.yes_bids],
-            key=lambda l: l.price_cents,
-        )
-
+        target_list.sort(key=lambda l: -l.price_cents)   # desc for bids
+        self._derive_asks(book)
         book.delta_count += 1
         book.last_update_ts = time.time()
+        return True
 
     async def _handle_message(self, raw: str) -> None:
         try:
@@ -339,55 +408,130 @@ class KalshiWS:
             return
         mtype = msg.get("type", "")
         if mtype == "orderbook_snapshot":
-            m = msg.get("msg", {})
+            m = msg.get("msg", {}) or {}
             ticker = m.get("market_ticker", "")
-            seq = msg.get("seq", 0)
+            sid = msg.get("sid")
+            seq = msg.get("seq")
             book = self.books.setdefault(ticker, BookState(market_ticker=ticker))
+            # A snapshot re-bases the stream: record seq, never flag a gap.
+            self._seq_reset(sid, ticker, seq)
+            if sid is not None:
+                self._sid_to_tickers.setdefault(sid, [])
+                if ticker not in self._sid_to_tickers[sid]:
+                    self._sid_to_tickers[sid].append(ticker)
             self._apply_snapshot(book, m)
-            book.last_seq = seq
+            book.sid = sid if sid is not None else book.sid
+            book.last_seq = int(seq) if seq is not None else 0
             for cb in self._callbacks:
                 await cb(book)
         elif mtype == "orderbook_delta":
-            m = msg.get("msg", {})
+            m = msg.get("msg", {}) or {}
             ticker = m.get("market_ticker", "")
-            seq = msg.get("seq", 0)
+            sid = msg.get("sid")
+            seq = msg.get("seq")
             book = self.books.get(ticker)
             if book is None:
                 return
-            # Tolerate small seq gaps (compression/coalescing on Kalshi side).
-            # Only force re-subscribe on gap > 50 (genuine data loss).
-            # Raised from >10 — most gaps are Kalshi coalescing, not real loss,
-            # and re-subscribing causes more noise than it fixes.
-            if book.last_seq and seq > book.last_seq + 50:
-                # 2026-04-28 FIX: throttle re-subscribe AND reset last_seq=0 so
-                # the next snapshot starts fresh. Without this, every subsequent
-                # delta triggers another gap → resubscribe loop (saw 4 in 1ms
-                # for KXTRUMPTIME-26MAY02-H2 burning rate-limit).
-                import time as _t
-                last_sub = getattr(self, "_last_resub_ts", {}).get(ticker, 0)
-                if _t.time() - last_sub < 10:
-                    # Throttle: silently apply and move on
-                    book.last_seq = seq
-                    self._apply_delta(book, m)
-                    for cb in self._callbacks:
-                        await cb(book)
-                    return
-                if not hasattr(self, "_last_resub_ts"):
-                    self._last_resub_ts = {}
-                self._last_resub_ts[ticker] = _t.time()
-                _log.info(f"seq gap {ticker}: {book.last_seq}→{seq} (gap={seq-book.last_seq-1})")
-                book.last_seq = 0  # reset — next snapshot will set fresh
-                await self.subscribe_orderbook([ticker])
+            # Deltas from a superseded subscription (we resubscribed after a
+            # gap) must not be applied on top of the new snapshot.
+            if sid is not None and book.sid is not None and sid != book.sid:
                 return
-            self._apply_delta(book, m)
-            book.last_seq = seq
-            for cb in self._callbacks:
-                await cb(book)
+            verdict = self._seq_check(sid, ticker, seq)
+            if verdict == "dup":
+                return
+            if verdict == "gap":
+                await self._on_seq_gap(sid, ticker, seq)
+                return
+            if book.stale:
+                # Diverged and waiting for a snapshot; applying would only
+                # compound the divergence.
+                return
+            if self._apply_delta(book, m):
+                book.last_seq = int(seq) if seq is not None else book.last_seq
+                for cb in self._callbacks:
+                    await cb(book)
+            else:
+                _log.warning(f"unparseable delta {ticker}: {m}")
         elif mtype == "subscribed":
-            _log.info(f"subscribed ack: {msg}")
+            m = msg.get("msg", {}) or {}
+            sid = m.get("sid")
+            cmd_id = msg.get("id")
+            tickers = self._pending_cmd_tickers.pop(cmd_id, None)
+            if sid is not None and tickers is not None:
+                self._sid_to_tickers[sid] = list(tickers)
+            _log.info(f"subscribed ack: sid={sid} cmd_id={cmd_id} n={len(tickers or [])}")
         elif mtype == "error":
             _log.error(f"WS error: {msg}")
         # Other message types (trade, ticker, fill) ignored here
+
+    # ── Sequence tracking (per subscription) ─────────────────────────
+    @staticmethod
+    def _seq_key(sid, ticker: str):
+        return sid if sid is not None else ("ticker", ticker)
+
+    def _seq_reset(self, sid, ticker: str, seq) -> None:
+        if seq is None:
+            return
+        try:
+            self._last_seq[self._seq_key(sid, ticker)] = int(seq)
+        except (TypeError, ValueError):
+            pass
+
+    def _seq_check(self, sid, ticker: str, seq) -> str:
+        """Returns "ok", "dup" (seq already seen → drop) or "gap"."""
+        if seq is None:
+            return "ok"
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            return "ok"
+        key = self._seq_key(sid, ticker)
+        last = self._last_seq.get(key)
+        if last is None:
+            self._last_seq[key] = seq
+            return "ok"
+        if seq <= last:
+            return "dup"
+        tol = int(getattr(settings, "WS_SEQ_GAP_TOLERANCE", 0) or 0)
+        self._last_seq[key] = seq
+        if seq > last + 1 + tol:
+            return "gap"
+        return "ok"
+
+    async def _on_seq_gap(self, sid, ticker: str, seq) -> None:
+        """A delta was lost. Every book under this subscription has diverged:
+        flag them stale (consumers pull quotes), notify, and re-subscribe
+        (throttled) so a fresh snapshot arrives and clears the flag."""
+        if sid is not None and self._sid_to_tickers.get(sid):
+            affected = list(self._sid_to_tickers[sid])
+        else:
+            affected = [ticker]
+        now = time.time()
+        newly = []
+        for t in affected:
+            b = self.books.get(t)
+            if b is None:
+                continue
+            b.gap_count += 1
+            if not b.stale:
+                b.stale = True
+                b.stale_since_ts = now
+                newly.append(b)
+        _log.warning(f"seq gap sid={sid} at seq={seq} ({ticker}): "
+                     f"{len(affected)} book(s) marked stale")
+        for b in newly:
+            for cb in self._callbacks:
+                try:
+                    await cb(b)
+                except Exception as e:
+                    _log.error(f"stale callback failed for {b.market_ticker}: {e}")
+        key = self._seq_key(sid, ticker)
+        if now - self._last_resub_ts.get(key, 0.0) < 10:
+            return  # throttle: a resubscribe is already in flight
+        self._last_resub_ts[key] = now
+        if sid is not None:
+            await self._unsubscribe_sid(sid)
+        await self.subscribe_orderbook(affected)
 
     async def run(self) -> None:
         """Main receive loop. Call after connect() + subscribe_orderbook()."""

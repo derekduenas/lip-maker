@@ -148,6 +148,14 @@ ZOMBIE_GAP_CENTS          = 3
 # Cancel on stale data: if WS hasn't updated for this many seconds, pull quotes.
 STALE_DATA_PULL_SECONDS   = 10
 
+# WS sequence-gap tolerance (2026-09-20 audit #1). Kalshi's `seq` is a
+# per-subscription counter that increments by exactly 1 per message; any
+# skipped value means a delta was lost and the local book is no longer a
+# faithful replica. 0 = strict (any gap marks the book stale until the next
+# snapshot). Previously the reader tolerated gaps of 50 and kept applying
+# deltas to a book it knew had diverged.
+WS_SEQ_GAP_TOLERANCE      = 0
+
 # ── LIP program filters ───────────────────────────────────────────────────
 # Ignore markets where TimePeriodReward is too small to bother with.
 # Tuned from initial discovery (1,077 programs): $10/day is the natural
