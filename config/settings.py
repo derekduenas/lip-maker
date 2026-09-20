@@ -35,7 +35,15 @@ KALSHI_RATE_LIMIT_SEC = 0.1  # REST calls are rate-limited; WS isn't
 # PAPER_MODE: log intended quotes but never hit order endpoints.
 # SHADOW_MODE: also tracks LIP scoring against live book (data collection).
 # When both False → live quoting (real money).
-PAPER_MODE  = os.getenv("LIP_PAPER", "true").lower() == "true"
+_PAPER_ENV  = os.getenv("LIP_PAPER", "true").lower() == "true"
+# 2026-09-20 review: live execution is DISABLED until explicitly armed.
+# Setting LIP_PAPER=false alone is no longer enough; the operator must also
+# set LIP_LIVE_ACK to the exact phrase below. QuoteManager logs loudly when
+# live was requested but not armed. This branch is a repair branch — the
+# reviewer's assessment is "not ready for autonomous live trading".
+LIVE_ACK_PHRASE = "I_ACCEPT_LIVE_RISK"
+LIVE_ARMED  = (not _PAPER_ENV) and os.getenv("LIP_LIVE_ACK", "") == LIVE_ACK_PHRASE
+PAPER_MODE  = not LIVE_ARMED
 SHADOW_MODE = os.getenv("LIP_SHADOW", "true").lower() == "true"
 
 # ── Bankroll / risk ───────────────────────────────────────────────────────
@@ -147,6 +155,13 @@ ZOMBIE_GAP_CENTS          = 3
 
 # Cancel on stale data: if WS hasn't updated for this many seconds, pull quotes.
 STALE_DATA_PULL_SECONDS   = 10
+
+# Reward accrual caps (2026-09-20 review). The per-program cumulative cap is
+# the pool itself times this share. Kalshi's program terms may limit what a
+# single account can earn from one pool; that value must be taken from the
+# CURRENT terms (not verifiable from this sandbox), so the default is the
+# mathematical maximum. Set lower once the terms are confirmed.
+LIP_MAX_ACCOUNT_SHARE_OF_POOL = 1.0
 
 # WS sequence-gap tolerance (2026-09-20 audit #1). Kalshi's `seq` is a
 # per-subscription counter that increments by exactly 1 per message; any

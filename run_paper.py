@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import signal
 import sqlite3
 import os
@@ -40,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import settings
-from engine.lip_discovery import discover, top_n_to_quote
+from engine.lip_discovery import discover, top_n_to_quote, is_active_clause, _parse_ts
 # from engine.sniper_select import top_n_by_ev  # archived 2026-04-29 (audit: unused)
 # 2026-05-03 GOLDEN-FUNNEL: capital-aware ranker. Replaces fixed top-N with
 # greedy yield-per-dollar fill. N becomes OUTPUT not INPUT — adapts to
@@ -49,14 +50,14 @@ from engine.capital_allocator import select_optimal_portfolio
 from engine.depth_probe import filter_by_depth
 from engine.lip_scorer import (
     OurQuotes, ProgramParams, SnapshotScore, score_snapshot,
-    interval_payout_usd, snapshot_share,
+    interval_payout_usd, snapshot_share, _find_cutoff_price,
 )
 from engine.adaptive_sizer import AdaptiveSizer
 from engine.microprice import microprice_yes  # A.1: imbalance-weighted fair value
 from engine.reservation_price import (        # A.2: inventory-aware fair value
     reservation_price, realized_sigma_cents, suggest_quote_skew,
 )
-from execution.kalshi_ws import KalshiWS, BookState, BookLevel
+from execution.kalshi_ws import KalshiWS, BookState, BookLevel, FillEvent
 from execution.quote_manager import QuoteManager, QuoteTarget
 
 
@@ -77,6 +78,10 @@ def _program_params_from_market(m: dict) -> ProgramParams:
         secs_f = float(secs) if secs is not None else 0.0
     except (TypeError, ValueError):
         secs_f = 0.0
+    sd = _parse_ts(m.get("start_date"))
+    ed = _parse_ts(m.get("end_date"))
+    start_ts = sd.timestamp() if sd is not None else None
+    end_ts = ed.timestamp() if ed is not None else None
     if pool is not None and secs_f > 0:
         return ProgramParams(
             market_ticker=m["market_ticker"],
@@ -84,6 +89,7 @@ def _program_params_from_market(m: dict) -> ProgramParams:
             discount_factor=float(m["discount_factor"]),
             period_reward_usd=float(pool),
             period_seconds=secs_f,
+            start_ts=start_ts, end_ts=end_ts,
         )
     return ProgramParams(
         market_ticker=m["market_ticker"],
@@ -91,6 +97,7 @@ def _program_params_from_market(m: dict) -> ProgramParams:
         discount_factor=float(m["discount_factor"]),
         period_reward_usd=float(m["reward_per_day_usd"]),
         period_seconds=86400.0,
+        start_ts=start_ts, end_ts=end_ts,
     )
 
 
@@ -121,10 +128,26 @@ class ScoredMarket:
                 (r.our_no_normalized  * (r.no_total_qualifying_score  or 0)))
 
 
+@dataclass
+class AccrualState:
+    """Forward interval accounting for one market's LIP accrual
+    (2026-09-20 review). `last_share` is the share we OBSERVED at
+    `last_ts`; it is what the venue was paying us until we observed
+    something different, so the NEXT row credits it over [last_ts, now).
+    `last_ts is None` means the state is unknown (start, stale book,
+    disconnect, gap) and the next row credits nothing."""
+    program_key: Optional[float]      # program start_ts; a new window resets accrued
+    accrued_usd: float = 0.0          # cumulative for this program window
+    last_ts: Optional[float] = None
+    last_share: float = 0.0
+    breaks: int = 0
+
+
 class PaperRunner:
     # Longest interval one snapshot row may claim accrual for. Rows are
     # written at ≤5s cadence from book updates and every heartbeat (30s);
-    # a longer gap means we were NOT observing and must not claim it.
+    # a longer gap means we were NOT observing: the state is unknown and
+    # NOTHING is claimed for it (the chain restarts at the new row).
     SNAPSHOT_MAX_INTERVAL_SEC = 60.0
     SKIP_CANCEL_THROTTLE_SEC = 30.0
 
@@ -140,9 +163,8 @@ class PaperRunner:
         self._skip_reason: dict[str, str] = {}
         self.skip_counts: dict[str, int] = defaultdict(int)
         self._skip_cancel_ts: dict[str, float] = {}
-        # audit #3: wall-clock of the last PERSISTED snapshot per ticker;
-        # each row accrues pool-rate × share × (now − last).
-        self._last_persist_ts: dict[str, float] = {}
+        # 2026-09-20 review: per-market forward accrual chains.
+        self._accrual: dict[str, AccrualState] = {}
         self._ensure_snapshot_schema()
         # 2026-05-03 GOLDEN-FUNNEL: per-market size FLOOR from capital_allocator.
         # Ensures we always quote enough to cross the qualify cliff. Sizer can
@@ -489,24 +511,25 @@ class PaperRunner:
                           params: ProgramParams, now: float) -> bool:
         """Write one lip_snapshots row (throttled to 1 per 5s per market).
 
-        2026-09-20 audit #3 (units): estimated_payout_usd is what this row's
-        interval is worth — share × (pool / period_seconds) × seconds since
-        the previous persisted row — bounded by the pool and zero whenever
-        we were not qualified. Summing the column over a program window
-        therefore estimates the payout in dollars. The old formula
-        (raw_score/2 × reward_per_day / 86400) mixed a raw-unit score with a
-        per-day rate and a per-day divisor and meant nothing.
+        2026-09-20 review (interval accounting): estimated_payout_usd on row
+        N is what the interval [t_{N-1}, t_N) was worth at the share we
+        OBSERVED at t_{N-1} — forward attribution from the last known state,
+        never the new share applied backward. It is zero when the prior
+        state is unknown (first row, stale book, disconnect, gap longer than
+        SNAPSHOT_MAX_INTERVAL_SEC), clipped to the program window, and
+        capped so the cumulative estimate for a program never exceeds
+        pool × LIP_MAX_ACCOUNT_SHARE_OF_POOL. Summing the column over a
+        window therefore estimates the payout in dollars.
         """
         key = int(now / 5)
         if self._last_persist_key.get(ticker, -1) == key:
             return False
         self._last_persist_key[ticker] = key
-        last_ts = self._last_persist_ts.get(ticker)
-        elapsed = 0.0 if last_ts is None else min(max(0.0, now - last_ts),
-                                                  self.SNAPSHOT_MAX_INTERVAL_SEC)
-        self._last_persist_ts[ticker] = now
+        st = self._accrual_for(ticker, params)
+        payout, _note = self._accrue(st, params, now)
+        st.last_ts = now
+        st.last_share = scored.share
         r = scored.result
-        payout = interval_payout_usd(scored.share, params, elapsed)
         try:
             conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
             try:
@@ -537,27 +560,152 @@ class PaperRunner:
                          f"(total failures this session: {self._snapshot_persist_failures})")
             return False
 
-    def _handle_skip(self, ticker: str, reason: str) -> bool:
+    def _handle_skip(self, ticker: str, reason: str, *, force: bool = False) -> bool:
         """A quote target was NOT produced for `ticker` (2026-09-20 audit #7).
 
         Transient reasons keep resting orders (we still want the market,
         just not a reprice right now). Any other reason means the resting
         orders are exposure we no longer have a thesis for: cancel them
-        (throttled so a flapping gate can't spam the API). Returns True
-        when a cancel was issued."""
+        (throttled so a flapping gate can't spam the API; `force=True`
+        bypasses the throttle for stale/disconnect/retire, which are rare
+        transitions where waiting is the failure). Only orders we can prove
+        are ours are cancelled. Returns True when a cancel was issued."""
         self.skip_counts[reason] += 1
         base = reason.split(":", 1)[0]
         if base in TRANSIENT_SKIP_REASONS:
             return False
-        if not self._live_resting(ticker):
+        if not [o for o in self._live_resting(ticker) if o.is_ours]:
             return False
         now = time.time()
-        if now - self._skip_cancel_ts.get(ticker, 0.0) < self.SKIP_CANCEL_THROTTLE_SEC:
+        if not force and now - self._skip_cancel_ts.get(ticker, 0.0) < self.SKIP_CANCEL_THROTTLE_SEC:
             return False
         self._skip_cancel_ts[ticker] = now
-        self.qm.cancel_all(market_ticker=ticker)
+        self.qm.cancel_all(market_ticker=ticker, only_ours=True)
+        # From this instant our share is known to be zero (conservative:
+        # whatever was accrued between the last row and now is forfeited).
+        self._note_flat(ticker)
         _log.info(f"skip_cancel[{ticker}] reason={reason}: pulled resting orders")
         return True
+
+    def pull_all_exposure(self, reason: str) -> int:
+        """Cancel our resting orders on EVERY market (WS disconnect, shutdown
+        of trust). Bypasses throttles; breaks every accrual chain."""
+        n = 0
+        for tkr in list(self.qm.resting.keys()):
+            if self._handle_skip(tkr, reason, force=True):
+                n += 1
+            self._break_accrual(tkr, reason)
+        return n
+
+    def retire_market(self, ticker: str, reason: str) -> None:
+        """Stop managing a market: pull exposure, forget its params."""
+        self._handle_skip(ticker, f"retired:{reason}", force=True)
+        self.params_by_ticker.pop(ticker, None)
+        self.optimal_size_floors.pop(ticker, None)
+        self._accrual.pop(ticker, None)
+        self.markets = [m for m in self.markets if m.get("market_ticker") != ticker]
+        _log.info(f"retired {ticker}: {reason}")
+
+    def retire_inactive_markets(self, db_path: str | None = None) -> list[str]:
+        """Discovery freshness (2026-09-20 review): after every discovery
+        refresh, drop markets whose program is no longer active — ended,
+        paid out, or de-enrolled — instead of quoting them until restart."""
+        tickers = list(self.params_by_ticker.keys())
+        if not tickers:
+            return []
+        active: set[str] = set()
+        try:
+            conn = sqlite3.connect(db_path or settings.DB_PATH, timeout=5.0)
+            try:
+                for i in range(0, len(tickers), 400):
+                    chunk = tickers[i:i + 400]
+                    marks = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"SELECT market_ticker FROM lip_programs "
+                        f"WHERE market_ticker IN ({marks}) AND {is_active_clause()}",
+                        chunk,
+                    ).fetchall()
+                    active.update(r[0] for r in rows)
+            finally:
+                conn.close()
+        except Exception as e:
+            _log.warning(f"retire_inactive_markets: query failed, retiring nothing: {e}")
+            return []
+        retired = [t for t in tickers if t not in active]
+        for t in retired:
+            self.retire_market(t, "program_inactive")
+        return retired
+
+    # ── Accrual chain bookkeeping ─────────────────────────────────────
+    def _accrual_for(self, ticker: str, params: ProgramParams) -> AccrualState:
+        st = self._accrual.get(ticker)
+        if st is None or st.program_key != params.start_ts:
+            st = AccrualState(program_key=params.start_ts,
+                              accrued_usd=self._seed_accrued(ticker, params))
+            self._accrual[ticker] = st
+        return st
+
+    def _seed_accrued(self, ticker: str, params: ProgramParams) -> float:
+        """Cumulative estimate already written for this program window, so
+        the pool cap survives restarts."""
+        try:
+            conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
+            try:
+                if params.start_ts is not None:
+                    since = datetime.fromtimestamp(params.start_ts, tz=timezone.utc).isoformat()
+                    row = conn.execute(
+                        "SELECT COALESCE(SUM(estimated_payout_usd), 0) FROM lip_snapshots "
+                        "WHERE market_ticker = ? AND captured_at >= ?", (ticker, since)).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT COALESCE(SUM(estimated_payout_usd), 0) FROM lip_snapshots "
+                        "WHERE market_ticker = ?", (ticker,)).fetchone()
+                return float(row[0] or 0.0)
+            finally:
+                conn.close()
+        except Exception:
+            return 0.0
+
+    def _break_accrual(self, ticker: str, why: str) -> None:
+        """State became UNKNOWN (stale book, disconnect): nothing may be
+        credited until a fresh observation starts a new chain."""
+        st = self._accrual.get(ticker)
+        if st is not None and st.last_ts is not None:
+            st.last_ts = None
+            st.last_share = 0.0
+            st.breaks += 1
+
+    def _note_flat(self, ticker: str) -> None:
+        """We pulled our orders: from now on the share is a KNOWN zero."""
+        st = self._accrual.get(ticker)
+        if st is not None:
+            st.last_ts = time.time()
+            st.last_share = 0.0
+
+    def _accrue(self, st: AccrualState, params: ProgramParams, now: float) -> tuple[float, str]:
+        """Dollars earned over [st.last_ts, now) at st.last_share — the
+        state we last OBSERVED — clipped to the program window and to the
+        cumulative cap. Returns (payout, note)."""
+        if st.last_ts is None:
+            return 0.0, "no_prior_state"
+        gap = now - st.last_ts
+        if gap <= 0.0 or gap > self.SNAPSHOT_MAX_INTERVAL_SEC:
+            st.breaks += 1
+            return 0.0, "gap"
+        lo, hi = st.last_ts, now
+        if params.start_ts is not None:
+            lo = max(lo, params.start_ts)
+        if params.end_ts is not None:
+            hi = min(hi, params.end_ts)
+        dur = hi - lo
+        if dur <= 0.0:
+            return 0.0, "outside_window"
+        raw = interval_payout_usd(st.last_share, params, dur)
+        share_cap = max(0.0, min(1.0, float(getattr(settings, "LIP_MAX_ACCOUNT_SHARE_OF_POOL", 1.0))))
+        room = max(0.0, params.period_reward_usd * share_cap - st.accrued_usd)
+        payout = min(raw, room)
+        st.accrued_usd += payout
+        return payout, ("capped" if payout < raw else "ok")
 
     def _skip(self, ticker: str, reason: str):
         """Record why _quote_target_for produced no target and return None."""
@@ -679,6 +827,9 @@ class PaperRunner:
         # 2026-09-20 audit #1: a book that lost a delta is not a book.
         if getattr(book, "stale", False):
             return self._skip(tkr, "stale_book")
+        # 2026-09-20 review: sub-cent price grid — explicitly unsupported.
+        if getattr(book, "unsupported_grid", False):
+            return self._skip(tkr, "unsupported_grid")
         best_yes = book.best_yes_bid()
         best_no  = book.best_no_bid()
         if best_yes is None or best_no is None:
@@ -815,6 +966,21 @@ class PaperRunner:
                               f"yes_off={skew.yes_tick_offset} no_off={skew.no_tick_offset} "
                               f"reason={skew.reason}")
 
+        # 2026-09-20 review (qualification-aware placement): a quote that
+        # cannot qualify earns nothing and is pure adverse-selection
+        # exposure. Top a side up to the qualify cliff when the cap allows;
+        # otherwise do not quote (and pull what is resting).
+        q_reason, yes_size_override, no_size_override = self._qualification_adjust(
+            book, p, yes_bid_c, no_bid_c, size, yes_size_override, no_size_override,
+        )
+        if q_reason:
+            now_ts = time.time()
+            last = self._fv_skip_log_ts.get(f"qual:{tkr}", 0)
+            if now_ts - last > 300:
+                _log.info(f"{q_reason}[{tkr}] target={p.target_size:g} size={size}")
+                self._fv_skip_log_ts[f"qual:{tkr}"] = now_ts
+            return self._skip(tkr, q_reason)
+
         return QuoteTarget(
             market_ticker=book.market_ticker,
             yes_bid_cents=yes_bid_c,
@@ -824,40 +990,110 @@ class PaperRunner:
             no_size_override=no_size_override,
         )
 
+    def _qualification_adjust(self, book: BookState, p: ProgramParams,
+                              yes_bid_c: int, no_bid_c: int, size: int,
+                              yes_ov: int | None, no_ov: int | None
+                              ) -> tuple[str | None, int | None, int | None]:
+        """Check both sides of the intended quote against Kalshi's
+        qualification rule and return (skip_reason | None, yes_override,
+        no_override).
+
+        Per side: the book INCLUDING our quote must reach target_size
+        (otherwise the whole snapshot pays nobody) and our price must sit at
+        or inside the resulting cutoff. In live mode our own resting depth
+        is already inside the public book and is subtracted before the
+        target is added, so it is not counted twice. When a side is short
+        of the cliff, our size is raised to exactly close the gap, bounded
+        by the per-market gross cap; a gap larger than that is
+        `unqualifiable:<side>_depth`. A price that would fall beyond the
+        cutoff (only possible after an AS/throttle tick-back) is
+        `unqualifiable:<side>_beyond_cutoff`."""
+        ticker = book.market_ticker
+        ours_live = [] if self.qm.paper else self._live_resting(ticker)
+        series = ticker.split("-", 1)[0] if ticker else ""
+        cap_usd = float(settings.MAX_GROSS_PER_MARKET_BY_SERIES.get(
+            series, settings.MAX_GROSS_PER_MARKET_USD))
+        out: dict[str, int | None] = {"yes": yes_ov, "no": no_ov}
+        for side, levels, price in (("yes", book.yes_bids, yes_bid_c),
+                                    ("no", book.no_bids, no_bid_c)):
+            our_size = float(out[side] if out[side] is not None else size)
+            public: dict[int, float] = {}
+            for l in levels:
+                public[l.price_cents] = public.get(l.price_cents, 0.0) + float(l.size)
+            for o in ours_live:
+                if o.side == side and o.price_cents in public:
+                    public[o.price_cents] = max(0.0, public[o.price_cents] - float(o.size_contracts))
+            public_depth = sum(public.values())
+            if public_depth + our_size < p.target_size:
+                required = p.target_size - public_depth
+                max_side = int((cap_usd / 2.0) * 100.0 / max(1, price))
+                if required > max_side:
+                    return f"unqualifiable:{side}_depth", None, None
+                our_size = float(math.ceil(required))
+                out[side] = int(our_size)
+            merged = dict(public)
+            merged[price] = merged.get(price, 0.0) + our_size
+            aug = sorted([BookLevel(pc, sz) for pc, sz in merged.items() if sz > 1e-9],
+                         key=lambda l: -l.price_cents)
+            cutoff = _find_cutoff_price(aug, p.target_size)
+            if cutoff is None or price < cutoff:
+                return f"unqualifiable:{side}_beyond_cutoff", None, None
+        return None, out["yes"], out["no"]
+
+    def _exposure_gate(self, book: BookState) -> str | None:
+        """Exposure gates that run on EVERY book event, ahead of any scoring
+        or reprice throttle (2026-09-20 review, critical finding).
+
+        A stale / off-grid / blacklisted / retired market must pull its
+        resting orders the moment we learn about it. The 1-second scoring
+        throttle used to sit in front of these checks, so a stale
+        notification arriving right after a normal update was silently
+        dropped and the orders stayed on the venue. Returns the blocking
+        reason, or None when the event may proceed to scoring."""
+        tkr = book.market_ticker
+        self._refresh_blacklist()
+        if self._is_blacklisted(tkr):
+            self._handle_blacklisted(tkr)
+            return "blacklist"
+        if tkr not in self.params_by_ticker:
+            # Market dropped from our set (program ended / de-allocated):
+            # anything still resting there is unmonitored exposure.
+            self._handle_skip(tkr, "no_params", force=True)
+            return "no_params"
+        if getattr(book, "unsupported_grid", False):
+            self._handle_skip(tkr, "unsupported_grid", force=True)
+            self._break_accrual(tkr, "unsupported_grid")
+            return "unsupported_grid"
+        if getattr(book, "stale", False):
+            self._handle_skip(tkr, "stale_book", force=True)
+            self._break_accrual(tkr, "stale_book")
+            return "stale_book"
+        return None
+
     async def on_book_update(self, book: BookState):
         """Called by WS on every book change."""
         now = time.time()
-        # Throttle scoring to ~1/sec per market
-        if now - self.last_score_ts[book.market_ticker] < 1.0:
-            return
-        self.last_score_ts[book.market_ticker] = now
+        tkr = book.market_ticker
+        if self._exposure_gate(book) is not None:
+            return  # nothing about this book can be trusted; no snapshot
 
-        # Blacklist gate — check before doing any work. If blacklisted (macro
-        # blackout, pre-live audit, etc.) cancel existing quotes + skip reprice.
-        self._refresh_blacklist()
-        if self._is_blacklisted(book.market_ticker):
-            self._handle_blacklisted(book.market_ticker)
+        # Throttle SCORING / REPRICING to ~1/sec per market. Nothing below
+        # this line may be the only thing standing between us and a cancel.
+        if now - self.last_score_ts[tkr] < 1.0:
             return
-
-        params = self.params_by_ticker.get(book.market_ticker)
-        if params is None:
-            # Market dropped from our set (program ended / de-allocated):
-            # anything still resting there is unmonitored exposure.
-            self._handle_skip(book.market_ticker, "no_params")
-            return
+        self.last_score_ts[tkr] = now
+        params = self.params_by_ticker[tkr]
 
         # Compute our target quote
         target = self._quote_target_for(book)
         if target is None:
-            reason = self._skip_reason.get(book.market_ticker, "unknown")
-            self._handle_skip(book.market_ticker, reason)
-            if reason == "stale_book":
-                return  # nothing about this book can be trusted; no snapshot
+            reason = self._skip_reason.get(tkr, "unknown")
+            self._handle_skip(tkr, reason)
             # Score honestly whatever is (or isn't) still resting, but do
             # not reprice.
             scored = self._score_market(book, params, target=None)
             self._record_score(scored, now, feed_sizer=True)
-            self._persist_snapshot(book.market_ticker, scored, params, now)
+            self._persist_snapshot(tkr, scored, params, now)
             return
 
         # 2026-09-20 audit #3: score what is ACTUALLY resting (or the target
@@ -895,8 +1131,15 @@ class PaperRunner:
                 why = str(result.get("reason", ""))
                 if why.startswith(("SENTINEL", "BLACKLIST", "THROTTLE: size_scale=0")):
                     self._handle_skip(ticker, f"risk_veto:{why.split(':', 1)[0]}")
+            elif isinstance(result, dict) and (result.get("placed") or result.get("cancelled")):
+                # Resting state changed: the share credited FORWARD from
+                # here must be the post-reconcile one, not the pre-reconcile
+                # observation persisted a moment ago.
+                st = self._accrual.get(ticker)
+                if st is not None and st.last_ts is not None:
+                    st.last_share = self._score_market(book, params).share
         except Exception as e:
-            _log.debug(f"risk_veto routing failed for {ticker}: {e}")
+            _log.debug(f"post-reconcile bookkeeping failed for {ticker}: {e}")
 
     async def heartbeat_snapshot_loop(self, ws, interval_sec: int = 30):
         """Periodically snapshot all quoted markets even if book hasn't updated.
@@ -960,12 +1203,32 @@ class PaperRunner:
                             _log.info(f"K4 refreshed sizer target_share for {n} markets")
                     except Exception as e:
                         _log.warning(f"K4 sizer target refresh failed: {e}")
-                for tkr, params in self.params_by_ticker.items():
+                # 2026-09-20 review: exposure gates run here INDEPENDENTLY
+                # of scoring — a market that is skipped for scoring must
+                # still have its orders pulled.
+                # Orphan sweep: resting orders on tickers we no longer manage.
+                for tkr in list(self.qm.resting.keys()):
+                    if tkr not in self.params_by_ticker:
+                        self._handle_skip(tkr, "no_params", force=True)
+                ws_up = bool(getattr(ws, "connected", True))
+                for tkr, params in list(self.params_by_ticker.items()):
                     if self._is_blacklisted(tkr):
                         self._handle_blacklisted(tkr)
                         continue
+                    if not ws_up:
+                        self._handle_skip(tkr, "ws_disconnect", force=True)
+                        self._break_accrual(tkr, "ws_disconnect")
+                        continue
                     book = ws.books.get(tkr)
                     if book is None:
+                        continue
+                    if getattr(book, "unsupported_grid", False):
+                        self._handle_skip(tkr, "unsupported_grid", force=True)
+                        self._break_accrual(tkr, "unsupported_grid")
+                        continue
+                    if getattr(book, "stale", False):
+                        self._handle_skip(tkr, "stale_book", force=True)
+                        self._break_accrual(tkr, "stale_book")
                         continue
                     best_yes = book.best_yes_bid()
                     best_no = book.best_no_bid()
@@ -1009,9 +1272,6 @@ class PaperRunner:
                                                best_no.price_cents, book_age)
                     # 2026-09-20 audit #3: same scoring path as the book
                     # handler — ACTUAL resting orders, no hypothetical size.
-                    # A stale book (lost delta) is not scored at all.
-                    if getattr(book, "stale", False):
-                        continue
                     scored = self._score_market(book, params, target=None)
                     self._record_score(scored, now, feed_sizer=False)
                     self._persist_snapshot(tkr, scored, params, now)
@@ -1221,16 +1481,39 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     await ws.connect()
     ws.on_update(runner.on_book_update)
 
-    # 2026-04-22 (Architect audit): purge stale resting state on reconnect.
-    # Without this, post-disconnect resting orders are stale and reconcile()
-    # skips placement → silent dark periods on affected markets.
+    # 2026-09-20 review: the socket dropping means every book is stale and
+    # every resting order is unmanaged. Pull exposure IMMEDIATELY (before
+    # the reconnect sleep), not on the next scoring tick.
+    async def _on_ws_disconnect(tickers: list[str]) -> None:
+        loop_ = asyncio.get_running_loop()
+        n = await loop_.run_in_executor(None, runner.pull_all_exposure, "ws_disconnect")
+        _log.warning(f"WS disconnect: pulled resting orders on {n} tickers "
+                     f"({len(tickers)} subscribed)")
+    ws.on_disconnect(_on_ws_disconnect)
+
+    # 2026-04-22 (Architect audit): refresh resting state on reconnect so
+    # reconcile() doesn't skip placement against phantom entries.
+    # 2026-09-20 review: in live mode take the VENUE's truth (resync) rather
+    # than blindly dropping memory — a blind drop followed by placement
+    # would duplicate any order the disconnect-cancel failed to reach.
     async def _on_ws_reconnect(tickers: list[str]) -> None:
-        for t in tickers:
-            runner.qm.reset_for_market(t)
-        _log.warning(f"WS reconnect: purged resting state for {len(tickers)} tickers")
+        if runner.qm.paper:
+            for t in tickers:
+                runner.qm.reset_for_market(t)
+            _log.warning(f"WS reconnect: purged paper resting state for {len(tickers)} tickers")
+        else:
+            res = await asyncio.get_running_loop().run_in_executor(None, runner.qm.periodic_resync)
+            _log.warning(f"WS reconnect: resynced resting state from venue: {res}")
     ws.on_reconnect(_on_ws_reconnect)
 
+    # Private fill channel keeps resting sizes honest between resyncs.
+    async def _on_fill(ev: FillEvent) -> None:
+        runner.qm.apply_fill(ev.order_id, ev.market_ticker, ev.count)
+    ws.on_fill(_on_fill)
+
     await ws.subscribe_orderbook([m["market_ticker"] for m in markets])
+    if not runner.qm.paper:
+        await ws.subscribe_fills()
 
     # Run with periodic summaries
     stop = asyncio.Event()
@@ -1256,6 +1539,13 @@ async def main(duration_sec: int = 300, top_n: int = 50):
         while not stop.is_set():
             try:
                 discover(save=True)
+                # 2026-09-20 review (discovery freshness): programs that
+                # ended / paid out / got de-enrolled since the last refresh
+                # are retired now, not at the next restart.
+                retired = runner.retire_inactive_markets()
+                if retired:
+                    _log.warning(f"periodic_discover: retired {len(retired)} inactive "
+                                 f"markets: {retired[:5]}")
                 # PREDATOR: refresh saturated set per cycle so newly-saturated
                 # markets get filtered + freshly-drained ones get re-included.
                 saturated = _compute_saturated_tickers()

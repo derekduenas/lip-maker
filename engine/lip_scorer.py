@@ -62,6 +62,10 @@ class ProgramParams:
     discount_factor: float    # 0.0–1.0
     period_reward_usd: float  # total USD for the whole Time Period
     period_seconds:  float = 86400.0   # window length; legacy callers pass a 1-day rate
+    # Program window as epoch seconds (None when unknown). Accrual is clipped
+    # to [start_ts, end_ts): nothing is earned outside the window.
+    start_ts: Optional[float] = None
+    end_ts:   Optional[float] = None
 
     @property
     def pool_rate_usd_per_sec(self) -> float:

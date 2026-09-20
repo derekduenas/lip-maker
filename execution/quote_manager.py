@@ -67,27 +67,45 @@ class QuoteTarget:
 
 @dataclass
 class RestingOrder:
-    """A currently-open order we've placed."""
+    """A currently-open order we've placed.
+
+    2026-09-20 review: `size_contracts` is the REMAINING quantity on the
+    venue, as a float (Kalshi fills fractional contracts). It is decremented
+    by fill events and corrected from `remaining_count_fp` on every resync,
+    so the scorer sees what is actually still resting, not what we sent."""
     order_id:       str
     market_ticker:  str
     side:           str            # "yes" | "no"
     price_cents:    int
-    size_contracts: int
+    size_contracts: float          # remaining contracts
     placed_at:      float          # unix ts
     paper:          bool = True
     # 2026-05-02 PREDATOR C2: cancel was requested but API call failed.
     # Flag prevents placing a duplicate same-side order until next reconcile
     # cycle clears the in-memory state via periodic_resync.
     pending_cancel: bool = False
+    # Our client_order_id ("LIP-…") when we placed it; empty for orders
+    # rehydrated from the venue that we cannot prove are ours.
+    client_order_id: str = ""
+    # Venue price was not on the whole-cent grid; price_cents is the nearest
+    # cent for exposure math only — the order is never scored.
+    price_off_grid: bool = False
+
+    @property
+    def is_ours(self) -> bool:
+        return self.paper or self.client_order_id.startswith("LIP-")
+
+
+_QTY_EPS = 1e-9
 
 
 @dataclass
 class InventoryState:
     """Per-market inventory from fills."""
     market_ticker:     str
-    net_yes_contracts: int = 0     # signed; positive = long yes
+    net_yes_contracts: float = 0.0   # signed; positive = long yes (fractional ok)
     gross_usd:         float = 0.0
-    total_filled_vol:  int = 0     # absolute contracts traded
+    total_filled_vol:  float = 0.0   # absolute contracts traded
     last_updated:      float = 0.0
 
 
@@ -99,7 +117,15 @@ class QuoteManager:
     """
 
     def __init__(self, *, paper: bool = True, db_path: Optional[str] = None):
-        self.paper = paper if paper is not None else settings.PAPER_MODE
+        paper = paper if paper is not None else settings.PAPER_MODE
+        # 2026-09-20 review: live execution stays DISABLED until armed via
+        # LIP_PAPER=false AND LIP_LIVE_ACK (see settings.LIVE_ARMED). A
+        # caller asking for live without the ack gets paper, loudly.
+        if not paper and not getattr(settings, "LIVE_ARMED", False):
+            _log.error("LIVE execution requested but not armed "
+                       f"(LIP_LIVE_ACK != {settings.LIVE_ACK_PHRASE!r}) — forcing PAPER mode")
+            paper = True
+        self.paper = paper
         self.db_path = db_path or settings.DB_PATH
         self.client = KalshiClient() if not self.paper else None
         self.resting: dict[str, list[RestingOrder]] = {}   # ticker -> orders
@@ -121,96 +147,183 @@ class QuoteManager:
         if self.paper or self.client is None:
             return
         try:
-            cursor = None
-            rehydrated = 0
-            while True:
-                params = {"status": "resting", "limit": 200}
-                if cursor:
-                    params["cursor"] = cursor
-                resp = self.client.get("/portfolio/orders", params=params)
-                for raw in resp.get("orders", []):
-                    if raw.get("status") != "resting":
-                        continue
-                    side = raw.get("side", "").lower()
-                    if side not in ("yes", "no"):
-                        continue
-                    # Kalshi v2 uses decimal strings: "remaining_count_fp"
-                    # and prices as "yes_price_dollars" / "no_price_dollars".
-                    price_field = "yes_price_dollars" if side == "yes" else "no_price_dollars"
-                    price_str = raw.get(price_field)
-                    if price_str is None:
-                        continue
-                    price = int(round(float(price_str) * 100))
-                    ticker = raw.get("ticker", "")
-                    order_id = raw.get("order_id", "")
-                    try:
-                        qty = int(float(raw.get("remaining_count_fp")
-                                        or raw.get("initial_count_fp", 0)))
-                    except (TypeError, ValueError):
-                        qty = 0
-                    if not ticker or not order_id or qty <= 0:
-                        continue
-                    self.resting.setdefault(ticker, []).append(
-                        RestingOrder(
-                            order_id=order_id,
-                            market_ticker=ticker,
-                            side=side,
-                            price_cents=int(price),
-                            size_contracts=qty,
-                            placed_at=time.time(),  # we don't know real placement time
-                            paper=False,
-                        )
-                    )
-                    rehydrated += 1
-                cursor = resp.get("cursor")
-                if not cursor:
-                    break
-            _log.warning(f"cold-boot: rehydrated {rehydrated} resting orders "
+            live = self._fetch_live_orders()
+            for o in live.values():
+                self.resting.setdefault(o.market_ticker, []).append(o)
+            _log.warning(f"cold-boot: rehydrated {len(live)} resting orders "
                          f"across {len(self.resting)} tickers from Kalshi")
         except Exception as e:
             _log.warning(f"cold-boot reconcile FAILED ({e}) — starting with empty resting state")
 
+    @staticmethod
+    def _parse_live_order(raw: dict) -> Optional[RestingOrder]:
+        """One /portfolio/orders row → RestingOrder with the venue's REMAINING
+        quantity (fractional) and exact price handling.
+
+        Kalshi v2 uses fixed-point strings: `remaining_count_fp`,
+        `yes_price_dollars` / `no_price_dollars`; legacy integer fields are
+        accepted as fallback. Returns None for non-resting / unparseable /
+        fully-filled rows. A price off the whole-cent grid is kept (for
+        exposure math) but flagged `price_off_grid` — never silently rounded
+        into a neighbouring level."""
+        from execution.kalshi_ws import KalshiWS as _KW
+        if raw.get("status") != "resting":
+            return None
+        side = str(raw.get("side", "")).lower()
+        if side not in ("yes", "no"):
+            return None
+        ticker = raw.get("ticker") or raw.get("market_ticker") or ""
+        order_id = raw.get("order_id") or ""
+        if not ticker or not order_id:
+            return None
+        p_raw = raw.get(f"{side}_price_dollars")
+        if p_raw is None:
+            p_raw = raw.get(f"{side}_price_fp", raw.get(f"{side}_price"))
+        if p_raw is None:
+            return None
+        price_cents = _KW._price_to_cents(p_raw)
+        off_grid = False
+        if price_cents is None:
+            exact = _KW._price_to_cents_exact(p_raw)
+            if exact is None:
+                return None
+            price_cents = int(round(exact))
+            off_grid = True
+        rem = raw.get("remaining_count_fp")
+        if rem is None:
+            rem = raw.get("remaining_count")
+        if rem is None:
+            rem = raw.get("initial_count_fp", raw.get("initial_count"))
+        try:
+            qty = float(rem)
+        except (TypeError, ValueError):
+            return None
+        if qty != qty or qty <= _QTY_EPS:
+            return None
+        placed = time.time()
+        ct = raw.get("created_time")
+        if isinstance(ct, str) and ct:
+            try:
+                placed = datetime.fromisoformat(ct.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        return RestingOrder(
+            order_id=order_id, market_ticker=ticker, side=side,
+            price_cents=price_cents, size_contracts=qty, placed_at=placed,
+            paper=False, client_order_id=str(raw.get("client_order_id") or ""),
+            price_off_grid=off_grid,
+        )
+
+    def _fetch_live_orders(self) -> dict[str, RestingOrder]:
+        """All resting orders on the venue, keyed by order_id (paginated)."""
+        live: dict[str, RestingOrder] = {}
+        cursor = None
+        while True:
+            params = {"status": "resting", "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self.client.get("/portfolio/orders", params=params)
+            for raw in resp.get("orders", []) or []:
+                o = self._parse_live_order(raw)
+                if o is not None:
+                    live[o.order_id] = o
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+        return live
+
     def periodic_resync(self) -> dict:
-        """Reconcile self.resting against live Kalshi orders. Cures drift
-        from filled/cancelled orders that didn't get purged from memory.
+        """Reconcile self.resting against live Kalshi orders — the venue is
+        the truth for existence, REMAINING quantity and price.
 
-        Removes phantom entries (in memory but not on Kalshi) and ADDS any
-        live orders missing from memory (rare but happens after WS hiccup).
+        2026-09-20 review: the old version only compared order ids, so a
+        100-lot that had 74.5 filled stayed at size 100 locally and the
+        scorer kept crediting depth that no longer existed. Now, per order:
+          - gone on the venue          → purge (filled/cancelled elsewhere)
+          - remaining/price differ     → overwrite local from the venue
+          - live but unknown locally   → add (WS hiccup, manual order)
 
-        Run from heartbeat every ~5 min. Cheap (one /portfolio/orders call).
+        Run from heartbeat every ~5 min and on WS reconnect. Cheap (one
+        paginated /portfolio/orders call).
         """
         if self.paper or self.client is None:
             return {"skipped": "paper_mode"}
         try:
-            live_ids = set()
-            cursor = None
-            while True:
-                params = {"status": "resting", "limit": 200}
-                if cursor:
-                    params["cursor"] = cursor
-                resp = self.client.get("/portfolio/orders", params=params)
-                for raw in resp.get("orders", []):
-                    if raw.get("status") == "resting" and raw.get("order_id"):
-                        live_ids.add(raw["order_id"])
-                cursor = resp.get("cursor")
-                if not cursor:
-                    break
-            # Purge phantoms
-            phantoms = 0
+            live = self._fetch_live_orders()
+            phantoms = updated = added = 0
+            seen: set[str] = set()
             for ticker, orders in list(self.resting.items()):
-                kept = [o for o in orders if o.order_id in live_ids]
-                phantoms += len(orders) - len(kept)
+                kept = []
+                for o in orders:
+                    lo = live.get(o.order_id)
+                    if lo is None:
+                        phantoms += 1
+                        self._update_quote_status(o.order_id, "cancelled", notes="resync_gone")
+                        continue
+                    seen.add(o.order_id)
+                    if (abs(lo.size_contracts - o.size_contracts) > _QTY_EPS
+                            or lo.price_cents != o.price_cents
+                            or lo.price_off_grid != o.price_off_grid):
+                        _log.info(f"periodic_resync: {ticker} {o.side} oid={o.order_id[:12]} "
+                                  f"size {o.size_contracts:g}→{lo.size_contracts:g} "
+                                  f"price {o.price_cents}→{lo.price_cents}"
+                                  f"{' OFF-GRID' if lo.price_off_grid else ''}")
+                        o.size_contracts = lo.size_contracts
+                        o.price_cents = lo.price_cents
+                        o.price_off_grid = lo.price_off_grid
+                        updated += 1
+                    if lo.client_order_id and not o.client_order_id:
+                        o.client_order_id = lo.client_order_id
+                    kept.append(o)
                 if kept:
                     self.resting[ticker] = kept
                 else:
                     self.resting.pop(ticker, None)
-            if phantoms > 0:
-                _log.info(f"periodic_resync: purged {phantoms} phantom entries "
-                          f"from self.resting (cured drift)")
-            return {"phantoms_purged": phantoms, "live_count": len(live_ids)}
+            for oid, lo in live.items():
+                if oid in seen:
+                    continue
+                self.resting.setdefault(lo.market_ticker, []).append(lo)
+                added += 1
+                _log.warning(f"periodic_resync: adopted live order {lo.market_ticker} "
+                             f"{lo.side}@{lo.price_cents}c x{lo.size_contracts:g} "
+                             f"oid={oid[:12]} ours={lo.is_ours}")
+            if phantoms or updated or added:
+                _log.info(f"periodic_resync: phantoms={phantoms} updated={updated} "
+                          f"added={added} live={len(live)}")
+            return {"phantoms_purged": phantoms, "updated": updated,
+                    "added": added, "live_count": len(live)}
         except Exception as e:
             _log.warning(f"periodic_resync failed: {e}")
             return {"error": str(e)}
+
+    def apply_fill(self, order_id: str, market_ticker: str, count: float) -> Optional[RestingOrder]:
+        """Decrement a resting order's remaining size by a fill (WS `fill`
+        channel). Removes the order when nothing remains. Returns the order
+        touched, or None when it is not one we track."""
+        try:
+            count = float(count)
+        except (TypeError, ValueError):
+            return None
+        if count <= 0:
+            return None
+        lst = self.resting.get(market_ticker, [])
+        for o in lst:
+            if o.order_id != order_id:
+                continue
+            o.size_contracts = max(0.0, o.size_contracts - count)
+            if o.size_contracts <= _QTY_EPS:
+                lst.remove(o)
+                if not lst:
+                    self.resting.pop(market_ticker, None)
+                self._update_quote_status(order_id, "filled", notes="ws_fill_complete")
+                _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c fully filled oid={order_id[:12]}")
+            else:
+                _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c -{count:g} "
+                          f"→ {o.size_contracts:g} remaining oid={order_id[:12]}")
+            # Inventory changed; force the next _refresh_inventory to re-read.
+            self.inventory.pop(market_ticker, None)
+            return o
+        return None
 
     # ── Inventory tracking ────────────────────────────────────────────
     def _refresh_inventory(self, market_ticker: str) -> None:
@@ -239,12 +352,17 @@ class QuoteManager:
         try:
             conn = sqlite3.connect(self.db_path, timeout=5.0)
             try:
+                # 2026-09-20 review: prefer the fractional `count_real`
+                # column (fills_sync writes count_fp there) over the legacy
+                # truncated integer `count`; older ledgers lack the column.
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(fill_ledger)").fetchall()}
+                qty = "COALESCE(count_real, count)" if "count_real" in cols else "count"
                 row = conn.execute(
-                    """SELECT
-                           COALESCE(SUM(CASE WHEN side='yes' THEN count ELSE -count END), 0),
-                           COALESCE(SUM(count), 0),
-                           COALESCE(SUM(CASE WHEN side='yes' THEN count * yes_price_cents
-                                             ELSE count * no_price_cents END) / 100.0, 0)
+                    f"""SELECT
+                           COALESCE(SUM(CASE WHEN side='yes' THEN {qty} ELSE -{qty} END), 0),
+                           COALESCE(SUM({qty}), 0),
+                           COALESCE(SUM(CASE WHEN side='yes' THEN {qty} * yes_price_cents
+                                             ELSE {qty} * no_price_cents END) / 100.0, 0)
                        FROM fill_ledger
                        WHERE ticker = ?
                          AND ticker NOT IN (SELECT ticker FROM settlement_log)""",
@@ -254,8 +372,8 @@ class QuoteManager:
                 conn.close()
             self.inventory[market_ticker] = InventoryState(
                 market_ticker=market_ticker,
-                net_yes_contracts=int(row[0] or 0),
-                total_filled_vol=int(row[1] or 0),
+                net_yes_contracts=float(row[0] or 0),
+                total_filled_vol=float(row[1] or 0),
                 gross_usd=float(row[2] or 0),
                 last_updated=now,
             )
@@ -539,6 +657,9 @@ class QuoteManager:
         if price_cents <= 0 or price_cents >= 100:
             _log.debug(f"[SKIP] {market_ticker} {side}@{price_cents}c — edge price (Kalshi rejects)")
             return None
+        size_contracts = int(round(size_contracts))   # we only ever place whole lots
+        if size_contracts <= 0:
+            return None
         if self.paper:
             order_id = "PAPER-" + coid
             _log.info(f"[PAPER] PLACE {market_ticker} {side}@{price_cents}c size={size_contracts}")
@@ -569,8 +690,8 @@ class QuoteManager:
 
         rest = RestingOrder(
             order_id=order_id, market_ticker=market_ticker,
-            side=side, price_cents=price_cents, size_contracts=size_contracts,
-            placed_at=time.time(), paper=self.paper,
+            side=side, price_cents=price_cents, size_contracts=float(size_contracts),
+            placed_at=time.time(), paper=self.paper, client_order_id=coid,
         )
         # #127 (2026-04-28) UPSERT semantics: drop any existing entry for
         # this (ticker, side) before appending. Prevents accumulation when
@@ -699,7 +820,9 @@ class QuoteManager:
             need_replace = False
             if len(current_yes) != 1:
                 need_replace = True
-            elif current_yes[0].price_cents != target.yes_bid_cents or current_yes[0].size_contracts != yes_size:
+            elif (current_yes[0].price_cents != target.yes_bid_cents
+                  or abs(current_yes[0].size_contracts - yes_size) > _QTY_EPS):
+                # Includes the partial-fill case: remaining < target ⇒ top up.
                 need_replace = True
             if need_replace:
                 # 2026-05-02 PREDATOR C2: place ONLY if all cancels succeeded.
@@ -739,7 +862,8 @@ class QuoteManager:
             need_replace = False
             if len(current_no) != 1:
                 need_replace = True
-            elif current_no[0].price_cents != target.no_bid_cents or current_no[0].size_contracts != no_size:
+            elif (current_no[0].price_cents != target.no_bid_cents
+                  or abs(current_no[0].size_contracts - no_size) > _QTY_EPS):
                 need_replace = True
             if need_replace:
                 # 2026-05-02 PREDATOR C2: same race fix as yes side above.
@@ -767,14 +891,25 @@ class QuoteManager:
 
         return actions
 
-    def cancel_all(self, market_ticker: Optional[str] = None):
-        """Cancel every resting order, optionally scoped to one market."""
+    def cancel_all(self, market_ticker: Optional[str] = None, *, only_ours: bool = False) -> int:
+        """Cancel every resting order, optionally scoped to one market.
+
+        `only_ours=True` leaves orders we adopted from the venue but cannot
+        prove we placed (no LIP- client_order_id) — an operator's manual
+        order must not be swept by an exposure gate. Returns cancels issued."""
         if market_ticker:
             orders = list(self.resting.get(market_ticker, []))
         else:
             orders = [o for lst in self.resting.values() for o in lst]
+        n = 0
         for o in orders:
-            self._cancel_order(o)
+            if only_ours and not o.is_ours:
+                _log.warning(f"cancel_all: leaving foreign order {o.market_ticker} "
+                             f"{o.side}@{o.price_cents}c oid={o.order_id[:12]} (not ours)")
+                continue
+            if self._cancel_order(o):
+                n += 1
+        return n
 
     # ── Logging ───────────────────────────────────────────────────────
     def _log_quote_row(

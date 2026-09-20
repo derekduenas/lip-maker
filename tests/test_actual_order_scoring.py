@@ -257,13 +257,13 @@ class TestRewardUnits:
         t0 = 1_800_000_000.0
         assert runner._persist_snapshot(TKR, s, params, t0)
         assert runner._persist_snapshot(TKR, s, params, t0 + 5.0)
-        assert runner._persist_snapshot(TKR, s, params, t0 + 5.0 + 3600)   # long gap → capped
+        assert runner._persist_snapshot(TKR, s, params, t0 + 5.0 + 3600)   # long gap → unknown state
         rows = _rows(db)
         assert len(rows) == 3
         rate = 700.0 / (7 * 86400)
         assert rows[0][5] == 0.0                                        # first row claims nothing
-        assert rows[1][5] == pytest.approx(0.5 * rate * 5.0)
-        assert rows[2][5] == pytest.approx(0.5 * rate * PaperRunner.SNAPSHOT_MAX_INTERVAL_SEC)
+        assert rows[1][5] == pytest.approx(0.5 * rate * 5.0)            # prior share × interval
+        assert rows[2][5] == 0.0                                        # gap > max ⇒ nothing claimed
         assert all(r[6] == 1 for r in rows)                             # was_resting
         assert all(r[7] == pytest.approx(0.5) for r in rows)            # our_share
         assert rows[1][0] == pytest.approx(30 + 30)                     # raw score units
@@ -304,7 +304,7 @@ class TestSkipHandling:
     def test_non_transient_reasons_cancel(self, runner, reason):
         runner.qm.resting[TKR] = [_order("yes", 50, MIN), _order("no", 50, MIN)]
         assert runner._handle_skip(TKR, reason)
-        runner.qm.cancel_all.assert_called_once_with(market_ticker=TKR)
+        runner.qm.cancel_all.assert_called_once_with(market_ticker=TKR, only_ours=True)
 
     def test_cancel_throttled(self, runner):
         runner.qm.resting[TKR] = [_order("yes", 50, MIN), _order("no", 50, MIN)]
@@ -338,7 +338,7 @@ class TestSkipHandling:
         book = _book(yes=[(50, 60)], no=[(50, 60)])
         runner.last_score_ts[TKR] = 0
         asyncio.run(runner.on_book_update(book))
-        runner.qm.cancel_all.assert_called_once_with(market_ticker=TKR)
+        runner.qm.cancel_all.assert_called_once_with(market_ticker=TKR, only_ours=True)
         runner.qm.reconcile.assert_not_called()
         assert len(_rows(db)) == 1          # still recorded honestly
 
@@ -347,7 +347,7 @@ class TestSkipHandling:
         book = _book(yes=[(50, 60)], no=[(50, 60)]); book.stale = True
         runner.last_score_ts[TKR] = 0
         asyncio.run(runner.on_book_update(book))
-        runner.qm.cancel_all.assert_called_once_with(market_ticker=TKR)
+        runner.qm.cancel_all.assert_called_once_with(market_ticker=TKR, only_ours=True)
         assert _rows(db) == []
 
     def test_on_book_update_volatility_keeps_orders_and_scores_them(self, runner, db):

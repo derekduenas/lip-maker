@@ -86,15 +86,27 @@ class BookState:
     # Subscription id that delivered the last snapshot. Deltas tagged with a
     # different sid (e.g. from a superseded subscription) are dropped.
     sid: Optional[int] = None
-    # True when a seq gap was detected and no snapshot has arrived since.
-    # A stale book must not be quoted against; consumers should pull quotes.
+    # True when a seq gap / disconnect was detected and no snapshot has
+    # arrived since. A stale book must not be quoted against; consumers
+    # must pull quotes. `stale_reason` ∈ {"seq_gap", "disconnect"}.
     stale: bool = False
     stale_since_ts: float = 0.0
+    stale_reason: str = ""
     gap_count: int = 0
+    # 2026-09-20 review: this venue delivered a price that is not on the
+    # whole-cent grid (e.g. $0.4950). We do not represent sub-cent levels
+    # and the LIP scorer's DF^(ref − price) exponent is only verified for
+    # 1¢ ticks, so such a market is explicitly UNSUPPORTED: the level is
+    # never merged into a neighbouring cent, the book is flagged, and
+    # consumers must not quote or score it. Cleared by a snapshot whose
+    # levels are all on-grid.
+    unsupported_grid: bool = False
+    off_grid_count: int = 0
 
     def is_usable(self) -> bool:
-        """A book we may quote/score against: has a snapshot and is not stale."""
-        return self.snapshot_count > 0 and not self.stale
+        """A book we may quote/score against: has a snapshot, is not stale,
+        and every level sits on the supported whole-cent price grid."""
+        return self.snapshot_count > 0 and not self.stale and not self.unsupported_grid
 
     def best_yes_bid(self) -> Optional[BookLevel]:
         return self.yes_bids[0] if self.yes_bids else None
@@ -122,6 +134,19 @@ class BookState:
                 f"yes_bid={byp}@{bys} ask={yap}@{yas} "
                 f"seq={self.last_seq} snap={self.snapshot_count} delta={self.delta_count}"
                 f"{' STALE' if self.stale else ''})")
+
+
+@dataclass
+class FillEvent:
+    """One execution against one of our orders (private `fill` channel)."""
+    order_id: str
+    market_ticker: str
+    side: str                       # "yes" | "no" | ""
+    count: float                    # contracts filled in this event (fractional ok)
+    price_cents_exact: Optional[float]
+    is_taker: bool
+    trade_id: str
+    ts: float
 
 
 BookCallback = Callable[[BookState], Awaitable[None]]
@@ -162,6 +187,16 @@ class KalshiWS:
         # this, post-reconnect resting orders are stale and reconcile()
         # skips placement → silent dark periods.
         self._reconnect_callbacks: list[Callable[[list[str]], Awaitable[None]]] = []
+        # 2026-09-20 review: disconnect callbacks fire the moment the socket
+        # drops — BEFORE any reconnect attempt — so consumers can pull
+        # resting orders they can no longer manage. Every book is marked
+        # stale(reason="disconnect") at the same time.
+        self._disconnect_callbacks: list[Callable[[list[str]], Awaitable[None]]] = []
+        # Private `fill` channel: consumers keep resting sizes honest between
+        # REST resyncs (partial fills).
+        self._fill_callbacks: list[Callable[["FillEvent"], Awaitable[None]]] = []
+        self.connected: bool = False
+        self._grid_warned: set[str] = set()
         self._load_key()
 
     def _load_key(self):
@@ -209,12 +244,48 @@ class KalshiWS:
                 ping_interval=20,
                 ping_timeout=20,
             )
+        self.connected = True
         _log.info(f"WS connected to {self.url}")
 
     async def close(self) -> None:
         self._stop = True
+        self.connected = False
         if self._ws:
             await self._ws.close()
+
+    async def subscribe_fills(self) -> int:
+        """Subscribe to the private `fill` channel (all markets)."""
+        self._cmd_id += 1
+        cmd = {"id": self._cmd_id, "cmd": "subscribe", "params": {"channels": ["fill"]}}
+        await self._ws.send(json.dumps(cmd))
+        self._pending_cmd_tickers[self._cmd_id] = []
+        _log.info(f"subscribed fills (cmd_id={self._cmd_id})")
+        return self._cmd_id
+
+    def on_fill(self, cb: Callable[["FillEvent"], Awaitable[None]]) -> None:
+        self._fill_callbacks.append(cb)
+
+    def on_disconnect(self, cb: Callable[[list[str]], Awaitable[None]]) -> None:
+        """Register a hook fired immediately when the socket drops (before
+        reconnect). Receives every subscribed ticker."""
+        self._disconnect_callbacks.append(cb)
+
+    async def _mark_disconnected(self) -> None:
+        """Socket is gone: every local book is now an unverifiable replica."""
+        self.connected = False
+        now = time.time()
+        tickers = list(self.books.keys())
+        for b in self.books.values():
+            if not b.stale:
+                b.stale = True
+                b.stale_since_ts = now
+            b.stale_reason = "disconnect"
+        self._last_seq.clear()
+        for cb in self._disconnect_callbacks:
+            try:
+                await cb(tickers)
+            except Exception as e:
+                _log.error(f"disconnect callback failed: {e}")
 
     # ── Subscription ──────────────────────────────────────────────────
     async def subscribe_orderbook(self, tickers: list[str]) -> int:
@@ -260,10 +331,10 @@ class KalshiWS:
 
     # ── Message handling ─────────────────────────────────────────────
     @staticmethod
-    def _price_to_cents(p_raw) -> Optional[int]:
-        """Normalize a price to integer cents.
+    def _price_to_cents_exact(p_raw) -> Optional[float]:
+        """Normalize a price to EXACT cents (may be fractional).
 
-        str   → dollars fixed-point ("0.0010", "0.4900")
+        str   → dollars fixed-point ("0.0010", "0.4950")
         float → dollars (already parsed)
         int   → legacy cents
         Returns None when unparseable or outside [0, 100]."""
@@ -271,18 +342,41 @@ class KalshiWS:
             if isinstance(p_raw, bool):
                 return None
             if isinstance(p_raw, str):
-                cents = round(float(p_raw) * 100)
+                cents = float(p_raw) * 100.0
             elif isinstance(p_raw, float):
-                cents = round(p_raw * 100)
+                cents = p_raw * 100.0
             elif isinstance(p_raw, int):
-                cents = p_raw
+                cents = float(p_raw)
             else:
                 return None
         except (TypeError, ValueError):
             return None
-        if not (0 <= cents <= 100):
+        if cents != cents or not (0.0 <= cents <= 100.0):
             return None
-        return int(cents)
+        return cents
+
+    # Supported price grid: whole cents. Kalshi's standard tick is 1¢; the
+    # LIP formula's DF^(ReferencePrice − Price) exponent is verified only in
+    # cent units. Anything finer is rejected explicitly (never rounded).
+    _GRID_EPS = 1e-6
+
+    @classmethod
+    def _price_to_cents(cls, p_raw) -> Optional[int]:
+        """Integer cents for an ON-GRID price; None when unparseable, out of
+        range, or off the whole-cent grid. Use _price_to_cents_exact to tell
+        the last two cases apart."""
+        exact = cls._price_to_cents_exact(p_raw)
+        if exact is None:
+            return None
+        nearest = round(exact)
+        if abs(exact - nearest) > cls._GRID_EPS:
+            return None
+        return int(nearest)
+
+    @classmethod
+    def _is_off_grid(cls, p_raw) -> bool:
+        exact = cls._price_to_cents_exact(p_raw)
+        return exact is not None and abs(exact - round(exact)) > cls._GRID_EPS
 
     @staticmethod
     def _size_to_float(s_raw) -> Optional[float]:
@@ -300,12 +394,17 @@ class KalshiWS:
         return v
 
     @classmethod
-    def _parse_book_side(cls, raw_side) -> list[BookLevel]:
+    def _parse_book_side(cls, raw_side, off_grid: Optional[list] = None) -> list[BookLevel]:
         """Parse levels. Kalshi v2 dollar-fixed-point format:
         [["0.0010", "501.00"], ["0.0020", "100.50"], ...]
         Prices in dollars-with-4-decimals, sizes with 2 decimals.
         Dict levels accept v2 keys (`price_dollars`, `size_fp`) and legacy
-        (`price`, `size`). Prices normalize to integer cents; sizes stay float."""
+        (`price`, `size`). Prices normalize to integer cents; sizes stay float.
+
+        A price that is not on the whole-cent grid is NEVER merged into a
+        neighbouring cent (that would collapse distinct levels and shift the
+        LIP cutoff). It is dropped and, when `off_grid` is given, appended
+        to it so the caller can flag the book as unsupported."""
         if raw_side is None:
             return []
         out = []
@@ -319,13 +418,25 @@ class KalshiWS:
                 s_raw = lvl.get("size_fp", lvl.get("size", lvl.get("quantity")))
             else:
                 continue
-            price_cents = cls._price_to_cents(p_raw)
             size = cls._size_to_float(s_raw)
-            if price_cents is None or size is None:
+            if size is None:
+                continue
+            price_cents = cls._price_to_cents(p_raw)
+            if price_cents is None:
+                if off_grid is not None and cls._is_off_grid(p_raw):
+                    off_grid.append(p_raw)
                 continue
             if size > _SIZE_EPS:
                 out.append(BookLevel(price_cents=price_cents, size=size))
         return out
+
+    def _flag_off_grid(self, book: BookState, samples: list) -> None:
+        book.unsupported_grid = True
+        book.off_grid_count += len(samples)
+        if book.market_ticker not in self._grid_warned:
+            self._grid_warned.add(book.market_ticker)
+            _log.warning(f"UNSUPPORTED PRICE GRID {book.market_ticker}: off-cent "
+                         f"prices {samples[:3]} — market will not be quoted or scored")
 
     @staticmethod
     def _derive_asks(book: BookState) -> None:
@@ -357,14 +468,20 @@ class KalshiWS:
         if no_side is None:
             no_side = msg.get("no_dollars", msg.get("no"))
 
-        book.yes_bids = sorted(self._parse_book_side(yes_side), key=lambda l: -l.price_cents)
-        book.no_bids  = sorted(self._parse_book_side(no_side),  key=lambda l: -l.price_cents)
+        off: list = []
+        book.yes_bids = sorted(self._parse_book_side(yes_side, off), key=lambda l: -l.price_cents)
+        book.no_bids  = sorted(self._parse_book_side(no_side, off),  key=lambda l: -l.price_cents)
         self._derive_asks(book)
         book.snapshot_count += 1
         book.last_update_ts = time.time()
         # A snapshot is authoritative: whatever divergence we had is gone.
         book.stale = False
         book.stale_since_ts = 0.0
+        book.stale_reason = ""
+        # Grid support is re-evaluated from the full snapshot.
+        book.unsupported_grid = False
+        if off:
+            self._flag_off_grid(book, off)
 
     def _apply_delta(self, book: BookState, msg: dict) -> bool:
         """Apply a single delta update: add/update/remove one level.
@@ -379,9 +496,14 @@ class KalshiWS:
             return False
         p_raw = msg.get("price_dollars", msg.get("price_dollars_fp", msg.get("price")))
         d_raw = msg.get("delta_fp", msg.get("delta"))
-        price = self._price_to_cents(p_raw)
         delta = self._size_to_float(d_raw)
-        if price is None or delta is None:
+        if delta is None:
+            return False
+        price = self._price_to_cents(p_raw)
+        if price is None:
+            if self._is_off_grid(p_raw):
+                # Explicit rejection: do NOT fold $0.4950 into the 50¢ level.
+                self._flag_off_grid(book, [p_raw])
             return False
 
         target_list = book.yes_bids if side == "yes" else book.no_bids
@@ -446,12 +568,29 @@ class KalshiWS:
                 # Diverged and waiting for a snapshot; applying would only
                 # compound the divergence.
                 return
+            grid_ok_before = not book.unsupported_grid
             if self._apply_delta(book, m):
                 book.last_seq = int(seq) if seq is not None else book.last_seq
                 for cb in self._callbacks:
                     await cb(book)
-            else:
+            elif book.unsupported_grid and grid_ok_before:
+                # Transition to unsupported: consumers must pull quotes now.
+                book.last_seq = int(seq) if seq is not None else book.last_seq
+                for cb in self._callbacks:
+                    await cb(book)
+            elif not book.unsupported_grid:
                 _log.warning(f"unparseable delta {ticker}: {m}")
+        elif mtype == "fill":
+            m = msg.get("msg", {}) or {}
+            ev = self._parse_fill(m)
+            if ev is None:
+                _log.debug(f"unparseable fill: {m}")
+                return
+            for cb in self._fill_callbacks:
+                try:
+                    await cb(ev)
+                except Exception as e:
+                    _log.error(f"fill callback failed for {ev.order_id}: {e}")
         elif mtype == "subscribed":
             m = msg.get("msg", {}) or {}
             sid = m.get("sid")
@@ -463,6 +602,34 @@ class KalshiWS:
         elif mtype == "error":
             _log.error(f"WS error: {msg}")
         # Other message types (trade, ticker, fill) ignored here
+
+    @classmethod
+    def _parse_fill(cls, m: dict) -> Optional["FillEvent"]:
+        """Private `fill` channel payload → FillEvent. Accepts v2 fixed-point
+        keys (count_fp, *_price_dollars) with legacy fallbacks."""
+        order_id = m.get("order_id") or ""
+        ticker = m.get("market_ticker") or m.get("ticker") or ""
+        count = cls._size_to_float(m.get("count_fp", m.get("count")))
+        if not order_id or not ticker or count is None or count <= 0:
+            return None
+        side = str(m.get("side", "")).lower()
+        if side == "yes":
+            p_raw = m.get("yes_price_dollars", m.get("yes_price_fp", m.get("yes_price")))
+        elif side == "no":
+            p_raw = m.get("no_price_dollars", m.get("no_price_fp", m.get("no_price")))
+        else:
+            p_raw = None
+        price_exact = cls._price_to_cents_exact(p_raw) if p_raw is not None else None
+        return FillEvent(
+            order_id=order_id,
+            market_ticker=ticker,
+            side=side,
+            count=float(count),
+            price_cents_exact=price_exact,
+            is_taker=bool(m.get("is_taker", False)),
+            trade_id=str(m.get("trade_id", "") or ""),
+            ts=time.time(),
+        )
 
     # ── Sequence tracking (per subscription) ─────────────────────────
     @staticmethod
@@ -542,6 +709,9 @@ class KalshiWS:
                 await self._handle_message(raw)
             except websockets.ConnectionClosed as e:
                 _log.warning(f"WS closed: {e}; reconnecting in 3s")
+                # 2026-09-20 review: pull exposure FIRST. Books are stale
+                # from this instant and our resting orders are unmanaged.
+                await self._mark_disconnected()
                 await asyncio.sleep(3)
                 try:
                     await self.connect()
@@ -549,6 +719,8 @@ class KalshiWS:
                     tickers = list(self.books.keys())
                     if tickers:
                         await self.subscribe_orderbook(tickers)
+                    if self._fill_callbacks:
+                        await self.subscribe_fills()
                         # 2026-04-22 (Architect audit): notify consumers so
                         # they can purge stale resting state. Without this,
                         # QuoteManager.resting holds pre-disconnect orders
