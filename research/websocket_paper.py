@@ -11,8 +11,8 @@ async def run_session(output, program, config, seconds=60):
         raise ValueError('explicit capital and execution assumptions required')
     cfg=ReplayConfig(**config)
     from research.profit_ledger import number
-    if not 0<number(cfg.capital_usd)<=40:
-        raise ValueError('test seed cap is $40')
+    if not 0<number(cfg.capital_usd)<=5000:
+        raise ValueError('paper experiment cap is $5000')
     manifest=await capture(output,program['market_ticker'],seconds)
     if manifest.get('complete') is not True:
         return dict(status='BLOCKED',capture=manifest,live_eligible=False)

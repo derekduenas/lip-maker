@@ -1,0 +1,361 @@
+{
+  "status": "PROGRAM_EXPERIMENT_RESEARCH_ONLY",
+  "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+  "program_span_present": false,
+  "full_program_validated": false,
+  "selected_policy": null,
+  "live_eligible": false,
+  "results": [
+    {
+      "size": "10",
+      "policy": "do_nothing",
+      "result": {
+        "reward_model": {
+          "status": "MODELED_NOT_CREDITED",
+          "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+          "modeled_accrual_usd": "0",
+          "estimated_payout_if_stop_usd": "0",
+          "positive_share_seconds": "0",
+          "modeled_net_if_stop_usd": "0"
+        },
+        "status": "MODELED_RESEARCH_ONLY",
+        "fingerprint": "df41b30bda33580e66f5d6fd970f47530a989bf6dac2b9a1b25925e48b7aa990",
+        "config": {
+          "size": "10",
+          "capital_usd": "5000",
+          "latency_ms": 250,
+          "stale_ms": 2000,
+          "maker_fee_per_contract_usd": ".01",
+          "exit_fee_per_contract_usd": ".02",
+          "operating_cost_usd": "0",
+          "queue_multiplier": "1",
+          "policy": "do_nothing",
+          "max_spread_usd": "0.10",
+          "tick_usd": "0.01",
+          "quote_offset_ticks": 1,
+          "max_inventory_contracts": "200",
+          "max_net_contracts": "100",
+          "movement_window_ms": 5000,
+          "max_mid_move_usd": "0.03",
+          "qualification_target": "300",
+          "program_start_ms": 1789947900000,
+          "program_end_ms": 1789948800000
+        },
+        "inventory": {
+          "yes": "0",
+          "no": "0"
+        },
+        "spent_usd": "0",
+        "maker_fees_usd": "0",
+        "liquidation_complete": true,
+        "net_before_rewards_usd": "0",
+        "break_even_credited_reward_usd": "0",
+        "capture_gap": false,
+        "live_eligible": false,
+        "veto_counts": {},
+        "limitations": [
+          "Observed tape is a counterfactual approximation; no market impact modeled.",
+          "Fees are scenario assumptions. No simulated reward is credited.",
+          "Missing queue cancellations never improve our queue position."
+        ],
+        "fill_count": 0,
+        "decision_count": 0
+      }
+    },
+    {
+      "size": "10",
+      "policy": "join_best",
+      "result": {
+        "reward_model": {
+          "status": "MODELED_NOT_CREDITED",
+          "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+          "modeled_accrual_usd": "0.1235725819719342732033088361",
+          "estimated_payout_if_stop_usd": "0",
+          "positive_share_seconds": "162.657",
+          "modeled_net_if_stop_usd": "-21.646200"
+        },
+        "status": "MODELED_RESEARCH_ONLY",
+        "fingerprint": "3addbaf4b66337f711eb19d2e592ce69a795eb517ed042dbcf65e375a5a78ebd",
+        "config": {
+          "size": "10",
+          "capital_usd": "5000",
+          "latency_ms": 250,
+          "stale_ms": 2000,
+          "maker_fee_per_contract_usd": ".01",
+          "exit_fee_per_contract_usd": ".02",
+          "operating_cost_usd": "0",
+          "queue_multiplier": "1",
+          "policy": "join_best",
+          "max_spread_usd": "0.10",
+          "tick_usd": "0.01",
+          "quote_offset_ticks": 1,
+          "max_inventory_contracts": "200",
+          "max_net_contracts": "100",
+          "movement_window_ms": 5000,
+          "max_mid_move_usd": "0.03",
+          "qualification_target": "300",
+          "program_start_ms": 1789947900000,
+          "program_end_ms": 1789948800000
+        },
+        "inventory": {
+          "yes": "139.89",
+          "no": "108.90"
+        },
+        "spent_usd": "135.733900",
+        "maker_fees_usd": "2.4879",
+        "liquidation_complete": true,
+        "net_before_rewards_usd": "-21.646200",
+        "break_even_credited_reward_usd": "21.646200",
+        "capture_gap": false,
+        "live_eligible": false,
+        "veto_counts": {},
+        "limitations": [
+          "Observed tape is a counterfactual approximation; no market impact modeled.",
+          "Fees are scenario assumptions. No simulated reward is credited.",
+          "Missing queue cancellations never improve our queue position."
+        ],
+        "fill_count": 37,
+        "decision_count": 145
+      }
+    },
+    {
+      "size": "10",
+      "policy": "reward_depth",
+      "result": {
+        "reward_model": {
+          "status": "MODELED_NOT_CREDITED",
+          "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+          "modeled_accrual_usd": "0.08928268164209820012481532544",
+          "estimated_payout_if_stop_usd": "0",
+          "positive_share_seconds": "120.026",
+          "modeled_net_if_stop_usd": "-4.610300"
+        },
+        "status": "MODELED_RESEARCH_ONLY",
+        "fingerprint": "869cfd9a86d254fd86e119d051a95f14b610ad2d91fbcb3b676ff199858ae169",
+        "config": {
+          "size": "10",
+          "capital_usd": "5000",
+          "latency_ms": 250,
+          "stale_ms": 2000,
+          "maker_fee_per_contract_usd": ".01",
+          "exit_fee_per_contract_usd": ".02",
+          "operating_cost_usd": "0",
+          "queue_multiplier": "1",
+          "policy": "reward_depth",
+          "max_spread_usd": "0.10",
+          "tick_usd": "0.01",
+          "quote_offset_ticks": 1,
+          "max_inventory_contracts": "200",
+          "max_net_contracts": "100",
+          "movement_window_ms": 5000,
+          "max_mid_move_usd": "0.03",
+          "qualification_target": "300",
+          "program_start_ms": 1789947900000,
+          "program_end_ms": 1789948800000
+        },
+        "inventory": {
+          "yes": "55.61",
+          "no": "25.14"
+        },
+        "spent_usd": "44.570900",
+        "maker_fees_usd": "0.8075",
+        "liquidation_complete": true,
+        "net_before_rewards_usd": "-4.610300",
+        "break_even_credited_reward_usd": "4.610300",
+        "capture_gap": false,
+        "live_eligible": false,
+        "veto_counts": {
+          "rapid_mid_movement": 2500,
+          "wide_spread": 30
+        },
+        "limitations": [
+          "Observed tape is a counterfactual approximation; no market impact modeled.",
+          "Fees are scenario assumptions. No simulated reward is credited.",
+          "Missing queue cancellations never improve our queue position."
+        ],
+        "fill_count": 10,
+        "decision_count": 166
+      }
+    },
+    {
+      "size": "50",
+      "policy": "do_nothing",
+      "result": {
+        "reward_model": {
+          "status": "MODELED_NOT_CREDITED",
+          "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+          "modeled_accrual_usd": "0",
+          "estimated_payout_if_stop_usd": "0",
+          "positive_share_seconds": "0",
+          "modeled_net_if_stop_usd": "0"
+        },
+        "status": "MODELED_RESEARCH_ONLY",
+        "fingerprint": "274f9227691a8b0bbddef8d10334f30a2464a2099f7cf65df2555569e89ee31a",
+        "config": {
+          "size": "50",
+          "capital_usd": "5000",
+          "latency_ms": 250,
+          "stale_ms": 2000,
+          "maker_fee_per_contract_usd": ".01",
+          "exit_fee_per_contract_usd": ".02",
+          "operating_cost_usd": "0",
+          "queue_multiplier": "1",
+          "policy": "do_nothing",
+          "max_spread_usd": "0.10",
+          "tick_usd": "0.01",
+          "quote_offset_ticks": 1,
+          "max_inventory_contracts": "200",
+          "max_net_contracts": "100",
+          "movement_window_ms": 5000,
+          "max_mid_move_usd": "0.03",
+          "qualification_target": "300",
+          "program_start_ms": 1789947900000,
+          "program_end_ms": 1789948800000
+        },
+        "inventory": {
+          "yes": "0",
+          "no": "0"
+        },
+        "spent_usd": "0",
+        "maker_fees_usd": "0",
+        "liquidation_complete": true,
+        "net_before_rewards_usd": "0",
+        "break_even_credited_reward_usd": "0",
+        "capture_gap": false,
+        "live_eligible": false,
+        "veto_counts": {},
+        "limitations": [
+          "Observed tape is a counterfactual approximation; no market impact modeled.",
+          "Fees are scenario assumptions. No simulated reward is credited.",
+          "Missing queue cancellations never improve our queue position."
+        ],
+        "fill_count": 0,
+        "decision_count": 0
+      }
+    },
+    {
+      "size": "50",
+      "policy": "join_best",
+      "result": {
+        "reward_model": {
+          "status": "MODELED_NOT_CREDITED",
+          "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+          "modeled_accrual_usd": "0.5908250228032377213203383834",
+          "estimated_payout_if_stop_usd": "0",
+          "positive_share_seconds": "163.158",
+          "modeled_net_if_stop_usd": "-89.742900"
+        },
+        "status": "MODELED_RESEARCH_ONLY",
+        "fingerprint": "f25c8ca122643819517c169bd27efa989e00699842890dfffae9940f38e53500",
+        "config": {
+          "size": "50",
+          "capital_usd": "5000",
+          "latency_ms": 250,
+          "stale_ms": 2000,
+          "maker_fee_per_contract_usd": ".01",
+          "exit_fee_per_contract_usd": ".02",
+          "operating_cost_usd": "0",
+          "queue_multiplier": "1",
+          "policy": "join_best",
+          "max_spread_usd": "0.10",
+          "tick_usd": "0.01",
+          "quote_offset_ticks": 1,
+          "max_inventory_contracts": "200",
+          "max_net_contracts": "100",
+          "movement_window_ms": 5000,
+          "max_mid_move_usd": "0.03",
+          "qualification_target": "300",
+          "program_start_ms": 1789947900000,
+          "program_end_ms": 1789948800000
+        },
+        "inventory": {
+          "yes": "500.55",
+          "no": "337.33"
+        },
+        "spent_usd": "464.988100",
+        "maker_fees_usd": "8.3788",
+        "liquidation_complete": true,
+        "net_before_rewards_usd": "-89.742900",
+        "break_even_credited_reward_usd": "89.742900",
+        "capture_gap": false,
+        "live_eligible": false,
+        "veto_counts": {},
+        "limitations": [
+          "Observed tape is a counterfactual approximation; no market impact modeled.",
+          "Fees are scenario assumptions. No simulated reward is credited.",
+          "Missing queue cancellations never improve our queue position."
+        ],
+        "fill_count": 57,
+        "decision_count": 143
+      }
+    },
+    {
+      "size": "50",
+      "policy": "reward_depth",
+      "result": {
+        "reward_model": {
+          "status": "MODELED_NOT_CREDITED",
+          "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+          "modeled_accrual_usd": "0.1860120862059166052814279773",
+          "estimated_payout_if_stop_usd": "0",
+          "positive_share_seconds": "53.757",
+          "modeled_net_if_stop_usd": "-3.568800"
+        },
+        "status": "MODELED_RESEARCH_ONLY",
+        "fingerprint": "70a1259c82d51b86949be1731267c22c78145b015cf33337304a2c51ebef0bd9",
+        "config": {
+          "size": "50",
+          "capital_usd": "5000",
+          "latency_ms": 250,
+          "stale_ms": 2000,
+          "maker_fee_per_contract_usd": ".01",
+          "exit_fee_per_contract_usd": ".02",
+          "operating_cost_usd": "0",
+          "queue_multiplier": "1",
+          "policy": "reward_depth",
+          "max_spread_usd": "0.10",
+          "tick_usd": "0.01",
+          "quote_offset_ticks": 1,
+          "max_inventory_contracts": "200",
+          "max_net_contracts": "100",
+          "movement_window_ms": 5000,
+          "max_mid_move_usd": "0.03",
+          "qualification_target": "300",
+          "program_start_ms": 1789947900000,
+          "program_end_ms": 1789948800000
+        },
+        "inventory": {
+          "yes": "50.00",
+          "no": "55.14"
+        },
+        "spent_usd": "50.887800",
+        "maker_fees_usd": "1.0514",
+        "liquidation_complete": true,
+        "net_before_rewards_usd": "-3.568800",
+        "break_even_credited_reward_usd": "3.568800",
+        "capture_gap": false,
+        "live_eligible": false,
+        "veto_counts": {
+          "rapid_mid_movement": 2500,
+          "wide_spread": 30,
+          "inventory_limit": 2683,
+          "activation_inventory_limit": 1
+        },
+        "limitations": [
+          "Observed tape is a counterfactual approximation; no market impact modeled.",
+          "Fees are scenario assumptions. No simulated reward is credited.",
+          "Missing queue cancellations never improve our queue position."
+        ],
+        "fill_count": 8,
+        "decision_count": 45
+      }
+    }
+  ],
+  "limitations": [
+    "Alternatives each receive the same hypothetical capital; do not sum returns.",
+    "Reward-depth optimizes current reward share per funded dollar, not a calibrated net-profit forecast.",
+    "Inventory caps stop new risk; active inventory hedging/unwinding is not implemented.",
+    "Market lifecycle, complete scoring snapshots and realized credits remain unverified.",
+    "No policy is selected from these development results."
+  ]
+}

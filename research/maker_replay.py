@@ -43,7 +43,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
     operating, queue_mult = number(config.operating_cost_usd), number(config.queue_multiplier)
     if size <= 0 or budget < 0 or min(maker_fee,exit_fee,operating) < 0 or queue_mult < 1:
         raise ValueError('invalid replay economics')
-    if config.latency_ms < 0 or config.stale_ms <= 0 or config.policy not in ('join_best','spread_guard','do_nothing','defensive_maker'):
+    if config.latency_ms < 0 or config.stale_ms <= 0 or config.policy not in ('join_best','spread_guard','do_nothing','defensive_maker','reward_depth'):
         raise ValueError('invalid policy/timing')
     if not 0 <= number(config.max_spread_usd) <= 1:
         raise ValueError("invalid spread threshold")
@@ -59,6 +59,8 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             raise ValueError('invalid program window')
     if config.program_start_ms is not None and config.program_end_ms is not None and config.program_start_ms>=config.program_end_ms:
         raise ValueError('inverted program window')
+    if config.policy == 'reward_depth' and reward_program is None:
+        raise ValueError('reward_depth requires program metadata')
     history=[]
     vetoes={}
     def veto(reason):
@@ -133,7 +135,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             other = bid('no' if side == 'yes' else 'yes')
             if other is None or price + other >= 1:
                 continue  # post-only reject at simulated activation
-            if config.policy=='defensive_maker':
+            if config.policy in ('defensive_maker','reward_depth'):
                 gross=sum(positions.values())+sum(o['remaining'] for o in orders.values())+size
                 net=positions[side]-positions['no' if side=='yes' else 'yes']+size
                 if gross>gross_cap or net>net_cap:
@@ -203,7 +205,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             if config.policy == 'spread_guard' and allowed:
                 allowed = 1-y-n <= number(config.max_spread_usd)
             desired_prices={side:bid(side) if allowed else None for side in positions}
-            if config.policy=='defensive_maker' and allowed:
+            if config.policy in ('defensive_maker','reward_depth') and allowed:
                 mid=(y+1-n)/2
                 history=[(t,m) for t,m in history if now-t<=config.movement_window_ms]
                 history.append((now,mid))
@@ -215,6 +217,8 @@ def replay(events, config=ReplayConfig(), reward_program=None):
                 if sum(positions.values())+2*size>gross_cap or abs(positions['yes']-positions['no'])+size>net_cap:
                     allowed=False;veto('inventory_limit')
                 for side in positions:
+                    if config.policy == 'reward_depth':
+                        continue
                     price=((bid(side)-config.quote_offset_ticks*tick)//tick)*tick
                     cumulative=number(0);cutoff=None
                     for p,q in sorted(book.get(side+'_bids',[]),key=lambda x:number(x[0]),reverse=True):
@@ -224,6 +228,31 @@ def replay(events, config=ReplayConfig(), reward_program=None):
                     if cutoff is None or price<cutoff or price<=0:
                         allowed=False;veto('outside_modeled_qualification')
                     desired_prices[side]=price
+            if config.policy == 'reward_depth' and allowed:
+                from research.reward_optimizer import _side
+                # Search current eligible levels only, before seeing future trades.
+                # Fixed size comes from the predeclared experiment; do not resize
+                # existing orders using hindsight or reset their queue for free.
+                choices = []
+                for yo in range(4):
+                    for no in range(4):
+                        yp, np = y-yo*tick, n-no*tick
+                        if min(yp,np) <= 0:
+                            continue
+                        capital = size*(yp+np+2*maker_fee)
+                        if spent+fees+capital > budget:
+                            continue
+                        ys,yc,_ = _side(book['yes_bids'],yp,size,number(reward_program['target_size_fp']),number(reward_program['discount_factor_bps'])/10000,tick)
+                        ns,nc,_ = _side(book['no_bids'],np,size,number(reward_program['target_size_fp']),number(reward_program['discount_factor_bps'])/10000,tick)
+                        if yc is None or nc is None or ys <= 0 or ns <= 0:
+                            continue
+                        share=(ys+ns)/2
+                        choices.append((share/capital, -yp-np, yp, np))
+                if choices:
+                    _,_,yp,np=max(choices)
+                    desired_prices={'yes':yp,'no':np}
+                else:
+                    allowed=False;veto('no_reward_depth_candidate')
             if config.policy == 'do_nothing':
                 allowed = False
             for side in positions:

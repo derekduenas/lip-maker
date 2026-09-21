@@ -59,8 +59,13 @@ def main():
     paper.add_argument('--program', required=True)
     paper.add_argument('--config', required=True)
     paper.add_argument('--seconds', type=float, default=60)
+    experiment = sub.add_parser('program-experiment')
+    experiment.add_argument('--input', required=True, help='Events, program, fixed config and predeclared sizes JSON')
     args = p.parse_args()
-    if args.command == 'websocket-paper':
+    if args.command == 'program-experiment':
+        from research.program_experiment import run_program
+        result = run_program(**read(args.input))
+    elif args.command == 'websocket-paper':
         import asyncio
         from research.websocket_paper import run_session
         result = asyncio.run(run_session(args.output, read(args.program), read(args.config), args.seconds))
