@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 from research.profit_ledger import ProfitLedger
-from research.maker_replay import ReplayConfig, compare
+from research.maker_replay import ReplayConfig, compare, compare_challenger
 from research.market_evidence import markouts, summarize_markouts, evaluate_candidates
 
 
@@ -24,6 +24,7 @@ def main():
     report.add_argument('--books')
     replay = sub.add_parser('replay')
     replay.add_argument('--events', required=True)
+    replay.add_argument('--include-challenger', action='store_true')
     replay.add_argument('--config', required=True, help='Explicit fee, latency and queue scenario JSON')
     marks = sub.add_parser('markouts')
     marks.add_argument('--fills', required=True)
@@ -75,7 +76,8 @@ def main():
         required = {'maker_fee_per_contract_usd', 'exit_fee_per_contract_usd', 'latency_ms', 'queue_multiplier'}
         if not required <= cfg.keys():
             p.error('config must explicitly specify fees, latency_ms and queue_multiplier')
-        result = compare(read(args.events), ReplayConfig(**cfg))
+        run = compare_challenger if args.include_challenger else compare
+        result = run(read(args.events), ReplayConfig(**cfg))
     elif args.command == 'markouts':
         labels = markouts(read(args.fills), read(args.books))
         result = dict(labels=labels, summary=summarize_markouts(labels))

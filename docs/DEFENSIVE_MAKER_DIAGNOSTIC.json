@@ -1,0 +1,103 @@
+{
+  "status": "DEVELOPMENT_DIAGNOSTIC_ONLY",
+  "live_eligible": false,
+  "reward_credit_usd": "0",
+  "episodes": [
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "events": 5568,
+      "results": {
+        "do_nothing": {
+          "fills": 0,
+          "net_before_rewards_usd": "0",
+          "veto_counts": {},
+          "fingerprint": "ad84b29433f105611e839cab3c92773958ce6bae6b790d9db774337e6f467fa2"
+        },
+        "join_best": {
+          "fills": 18,
+          "net_before_rewards_usd": "-1.510000",
+          "veto_counts": {},
+          "fingerprint": "630b26c49ae4a2f8e1b1bcf52adaffba9fcc738b70fb1d433c87fc52f720033c"
+        },
+        "spread_guard": {
+          "fills": 18,
+          "net_before_rewards_usd": "-1.510000",
+          "veto_counts": {},
+          "fingerprint": "d680ac286303fc4ddf690cf103698ef0920d96af9f3290061ae4586b82c8ecb0"
+        },
+        "defensive_maker": {
+          "fills": 2,
+          "net_before_rewards_usd": "-0.0100",
+          "veto_counts": {
+            "outside_modeled_qualification": 1817,
+            "rapid_mid_movement": 2500,
+            "wide_spread": 30,
+            "inventory_limit": 2683,
+            "activation_inventory_limit": 1
+          },
+          "fingerprint": "91142ed0f0232bb116559b95194e39648a4cd9eecdfa51b19c8c8b47a735e136"
+        }
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "events": 1662,
+      "results": {
+        "do_nothing": {
+          "fills": 0,
+          "net_before_rewards_usd": "0",
+          "veto_counts": {},
+          "fingerprint": "14d284156e21afaf788deef9eed54be4800ec26942ddd4ce661a06393a58280f"
+        },
+        "join_best": {
+          "fills": 0,
+          "net_before_rewards_usd": "0",
+          "veto_counts": {},
+          "fingerprint": "83644042e9e1962135de9d5296251f958f404d6c71c84e5e9451571da72e454a"
+        },
+        "spread_guard": {
+          "fills": 0,
+          "net_before_rewards_usd": "0",
+          "veto_counts": {},
+          "fingerprint": "fb8c7e2bc5e173bee8fdc69c9230095a5e2ad5ccc0d6c6a11c1de9b766d4e048"
+        },
+        "defensive_maker": {
+          "fills": 0,
+          "net_before_rewards_usd": "0",
+          "veto_counts": {
+            "outside_modeled_qualification": 1930,
+            "wide_spread": 578,
+            "rapid_mid_movement": 768
+          },
+          "fingerprint": "a476f81facf0726c72fe5cd1a226b5f73d64d7d1426cc4a7cc908c026615c67f"
+        }
+      }
+    }
+  ],
+  "base_config": {
+    "size": "1",
+    "capital_usd": "10",
+    "latency_ms": 250,
+    "stale_ms": 2000,
+    "maker_fee_per_contract_usd": "0.01",
+    "exit_fee_per_contract_usd": "0.02",
+    "operating_cost_usd": "0",
+    "queue_multiplier": "1",
+    "policy": "join_best",
+    "max_spread_usd": "0.10",
+    "tick_usd": "0.01",
+    "quote_offset_ticks": 1,
+    "max_inventory_contracts": "4",
+    "max_net_contracts": "2",
+    "movement_window_ms": 5000,
+    "max_mid_move_usd": "0.03",
+    "qualification_target": "300",
+    "program_start_ms": null,
+    "program_end_ms": null
+  },
+  "limitations": [
+    "Previously inspected development episodes; no holdout.",
+    "Scenario fees, no reward entitlement established.",
+    "Fewer fills and smaller losses do not establish positive expected return."
+  ]
+}

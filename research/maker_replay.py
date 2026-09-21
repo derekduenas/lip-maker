@@ -24,6 +24,16 @@ class ReplayConfig:
     queue_multiplier: str = '1'
     policy: str = 'join_best'
     max_spread_usd: str = '0.10'
+    # Defensive challenger: explicit research limits, not venue entitlements.
+    tick_usd: str = '0.01'
+    quote_offset_ticks: int = 1
+    max_inventory_contracts: str = '4'
+    max_net_contracts: str = '2'
+    movement_window_ms: int = 5000
+    max_mid_move_usd: str = '0.03'
+    qualification_target: str = '300'
+    program_start_ms: int | None = None
+    program_end_ms: int | None = None
 
 
 def replay(events, config=ReplayConfig()):
@@ -33,10 +43,28 @@ def replay(events, config=ReplayConfig()):
     operating, queue_mult = number(config.operating_cost_usd), number(config.queue_multiplier)
     if size <= 0 or budget < 0 or min(maker_fee,exit_fee,operating) < 0 or queue_mult < 1:
         raise ValueError('invalid replay economics')
-    if config.latency_ms < 0 or config.stale_ms <= 0 or config.policy not in ('join_best','spread_guard','do_nothing'):
+    if config.latency_ms < 0 or config.stale_ms <= 0 or config.policy not in ('join_best','spread_guard','do_nothing','defensive_maker'):
         raise ValueError('invalid policy/timing')
     if not 0 <= number(config.max_spread_usd) <= 1:
         raise ValueError("invalid spread threshold")
+    tick=number(config.tick_usd)
+    gross_cap,net_cap=number(config.max_inventory_contracts),number(config.max_net_contracts)
+    target=number(config.qualification_target)
+    if not 0<tick<=1 or min(gross_cap,net_cap,target)<=0 or number(config.max_mid_move_usd)<0:
+        raise ValueError('invalid defensive limits')
+    if type(config.quote_offset_ticks) is not int or config.quote_offset_ticks<0 or config.movement_window_ms<=0:
+        raise ValueError('invalid defensive timing/offset')
+    for value in (config.program_start_ms,config.program_end_ms):
+        if value is not None and (type(value) is not int or value<0):
+            raise ValueError('invalid program window')
+    if config.program_start_ms is not None and config.program_end_ms is not None and config.program_start_ms>=config.program_end_ms:
+        raise ValueError('inverted program window')
+    history=[]
+    vetoes={}
+    def veto(reason):
+        vetoes[reason]=vetoes.get(reason,0)+1
+    def in_window(now):
+        return (config.program_start_ms is None or now>=config.program_start_ms) and (config.program_end_ms is None or now<config.program_end_ms)
     seen, timeline, last = {}, [], -1
     episodes = set()
     markets = set()
@@ -76,17 +104,26 @@ def replay(events, config=ReplayConfig()):
         if book is not None and now > book['ts_ms'] + config.stale_ms + config.latency_ms:
             orders.clear()
             pending.clear()
+        if config.program_end_ms is not None and now >= config.program_end_ms + config.latency_ms:
+            orders.clear()
+            pending.clear()
         for side in list(pending):
             due, price = pending[side]
             if due > now:
                 continue
             orders.pop(side, None)
             pending.pop(side)
-            if price is None or not fresh(now):
+            if price is None or not fresh(now) or not in_window(now):
                 continue
             other = bid('no' if side == 'yes' else 'yes')
             if other is None or price + other >= 1:
                 continue  # post-only reject at simulated activation
+            if config.policy=='defensive_maker':
+                gross=sum(positions.values())+sum(o['remaining'] for o in orders.values())+size
+                net=positions[side]-positions['no' if side=='yes' else 'yes']+size
+                if gross>gross_cap or net>net_cap:
+                    veto('activation_inventory_limit')
+                    continue
             reserved = sum(o['remaining']*(o['price']+maker_fee) for o in orders.values())
             if spent + fees + reserved + size*(price+maker_fee) > budget:
                 continue
@@ -98,6 +135,7 @@ def replay(events, config=ReplayConfig()):
         advance(now)
         if e['kind'] == 'gap':
             had_gap = True
+            history.clear()
             book = None
             pending = {s:(now+config.latency_ms,None) for s in orders}
             continue
@@ -112,13 +150,35 @@ def replay(events, config=ReplayConfig()):
             if not e.get('valid',True):
                 had_gap = True
             y,n = bid('yes'), bid('no')
-            allowed = fresh(now) and y is not None and n is not None and y+n<1
+            allowed = fresh(now) and in_window(now) and y is not None and n is not None and y+n<1
             if config.policy == 'spread_guard' and allowed:
                 allowed = 1-y-n <= number(config.max_spread_usd)
+            desired_prices={side:bid(side) if allowed else None for side in positions}
+            if config.policy=='defensive_maker' and allowed:
+                mid=(y+1-n)/2
+                history=[(t,m) for t,m in history if now-t<=config.movement_window_ms]
+                history.append((now,mid))
+                if max(m for _,m in history)-min(m for _,m in history)>number(config.max_mid_move_usd):
+                    allowed=False;veto('rapid_mid_movement')
+                if 1-y-n>number(config.max_spread_usd):
+                    allowed=False;veto('wide_spread')
+                # Require capacity for both intended bids, even if only one fills.
+                if sum(positions.values())+2*size>gross_cap or abs(positions['yes']-positions['no'])+size>net_cap:
+                    allowed=False;veto('inventory_limit')
+                for side in positions:
+                    price=((bid(side)-config.quote_offset_ticks*tick)//tick)*tick
+                    cumulative=number(0);cutoff=None
+                    for p,q in sorted(book.get(side+'_bids',[]),key=lambda x:number(x[0]),reverse=True):
+                        cumulative+=number(q)
+                        if cumulative>=target:
+                            cutoff=number(p);break
+                    if cutoff is None or price<cutoff or price<=0:
+                        allowed=False;veto('outside_modeled_qualification')
+                    desired_prices[side]=price
             if config.policy == 'do_nothing':
                 allowed = False
             for side in positions:
-                desired = bid(side) if allowed else None
+                desired = desired_prices[side] if allowed else None
                 if side in pending:
                     continue  # no overlapping cancel/replace commands
                 if side in orders and orders[side]['price'] == desired:
@@ -172,7 +232,7 @@ def replay(events, config=ReplayConfig()):
                 spent_usd=str(spent), maker_fees_usd=str(fees), liquidation_complete=complete,
                 net_before_rewards_usd=str(pnl) if pnl is not None else None,
                 break_even_credited_reward_usd=str(max(number(0),-pnl)) if pnl is not None else None,
-                capture_gap=had_gap, live_eligible=False,
+                capture_gap=had_gap, live_eligible=False, veto_counts=vetoes,
                 limitations=['Observed tape is a counterfactual approximation; no market impact modeled.',
                              'Fees are scenario assumptions. No simulated reward is credited.',
                              'Missing queue cancellations never improve our queue position.'])
@@ -181,3 +241,10 @@ def replay(events, config=ReplayConfig()):
 def compare(events, config=ReplayConfig()):
     return {policy: replay(events, ReplayConfig(**dict(asdict(config), policy=policy)))
             for policy in ('do_nothing','join_best','spread_guard')}
+
+
+def compare_challenger(events, config=ReplayConfig()):
+    """Preserve the original baselines and add one explicitly named challenger."""
+    result=compare(events,config)
+    result['defensive_maker']=replay(events,ReplayConfig(**dict(asdict(config),policy='defensive_maker')))
+    return result

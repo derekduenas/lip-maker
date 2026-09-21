@@ -108,3 +108,33 @@ For actual research, the episodes file is an array of objects containing `episod
 Declare the cutoff and the full array of scenario configurations before inspecting held-out outcomes. The workflow hashes the complete input, compares the three fixed policies, chooses only from development results, then reports held-out outcomes. Gaps, incomplete liquidation, a missing split or nonpositive development net prevent selection. Costs are scenario inputs, not a verified fee model. Episode means and worst-scenario means are descriptive, not compounded portfolio returns. There is no statistical promotion gate; live eligibility remains false even with positive modeled results. If the held-out result informs a code or parameter change, that data becomes development data for the next run.
 
 Actual credited rewards are not automatically assigned to alternate simulated policies. The attack reports break-even rewards separately. To establish a reward-dependent edge, collect real paper quote eligibility and actual account receipts under a fixed policy, verify program scoring and align economic windows. A simple positive modeled result is insufficient.
+
+### Defensive maker challenger
+
+`replay --include-challenger` retains the three original baselines and adds
+`defensive_maker`. Its explicit ReplayConfig parameters control tick size,
+one-tick-back quoting, gross inventory, directional inventory, a causal rolling
+midpoint movement veto, and a modeled depth qualification target. Optional
+program timestamps use a half-open window; expiration cancels even without a
+new book, with exposure retained during cancellation latency. This is an offline
+policy, not production routing or a verified implementation of Appendix A.
+
+The quote must fall at or above the marginal competing level reaching the target
+on both sides. This deliberately conservative diagnostic omits own-depth
+qualification contributions and cannot establish reward entitlement. It may
+reject economically useful orders. In-flight replacement decisions retain their
+latency and may become obsolete before activation; the simulator does not assume
+instantaneous cancellation. Inventory/capital and program windows are rechecked
+at activation. Fees remain explicit scenario assumptions.
+
+`DEFENSIVE_MAKER_DIAGNOSTIC.json` records the development-only comparison on two
+previously inspected public captures (7,230 normalized events). Copper:
+join-best 18 fills / -$1.51, defensive 2 fills / -$0.01 before rewards.
+Table tennis: zero fills for both. No reward was credited. These are simulated
+episode dollar results, not portfolio returns. No holdout, strategy promotion,
+profitability claim, or live execution follows from this comparison. Veto counts
+can overlap and are not mutually exclusive observations.
+
+Next evidence gate: freeze challenger parameters before collecting independent
+market episodes, stress latency/queue/fees, and require positive held-out net
+results including defensible inventory exits and verified reward treatment.
