@@ -44,6 +44,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings
 from execution.kalshi_auth import KalshiClient, KalshiAuthError
+from execution.order_request import (
+    MakerSafetyError, assert_maker_safe, build_limit_order, would_cross,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -818,8 +821,17 @@ class QuoteManager:
         side: str,
         price_cents: int,
         size_contracts: int,
+        best_opposing_bid_cents: Optional[int] = None,
     ) -> Optional[RestingOrder]:
-        """Place a single resting limit order."""
+        """Place a single resting limit order.
+
+        2026-09-21: the request body comes from execution.order_request, the
+        one place that defines what maker-safe means, and the order is proven
+        non-crossing locally before transmission (a YES buy at p crosses iff
+        p + best_no_bid >= 100). `best_opposing_bid_cents` is the other
+        side's bid; when it is unknown a LIVE order is refused rather than
+        sent on faith.
+        """
         coid = f"LIP-{uuid.uuid4().hex[:16]}"
         # 2026-04-30 audit fix: skip edge-priced orders (Kalshi rejects 0 and 100
         # cent prices as "invalid price"). Avoids ERROR-log spam + rate-limit hits.
@@ -830,23 +842,31 @@ class QuoteManager:
         if size_contracts <= 0:
             return None
         if self.paper:
+            # Paper still runs the maker check so a crossing quote is caught
+            # in paper rather than discovered live, but a missing opposing
+            # book must not stop paper data collection.
+            if best_opposing_bid_cents is not None:
+                chk = would_cross(side, price_cents,
+                                  best_opposing_bid_cents=best_opposing_bid_cents)
+                if not chk.safe:
+                    _log.warning(f"[PAPER] REFUSED non-maker quote {market_ticker} "
+                                 f"{side}@{price_cents}c: {chk.reason}")
+                    return None
             order_id = "PAPER-" + coid
             _log.info(f"[PAPER] PLACE {market_ticker} {side}@{price_cents}c size={size_contracts}")
         else:
-            body = {
-                "ticker": market_ticker,
-                "side":   side,
-                "action": "buy",
-                "type":   "limit",
-                "count":  size_contracts,
-                "post_only": True,  # NEXUS-OMNI V4 D1: never accidentally cross — pure maker
-                "client_order_id": coid,
-            }
-            # yes_price for yes side, no_price for no side
-            if side == "yes":
-                body["yes_price"] = price_cents
-            else:
-                body["no_price"] = price_cents
+            try:
+                body = build_limit_order(
+                    ticker=market_ticker, side=side, price_cents=price_cents,
+                    size_contracts=size_contracts, client_order_id=coid,
+                    best_opposing_bid_cents=best_opposing_bid_cents,
+                )
+                assert_maker_safe(body)
+            except MakerSafetyError as e:
+                _log.error(f"[LIVE] REFUSED {market_ticker} {side}@{price_cents}c: {e}")
+                self._log_quote_row(market_ticker, side, price_cents, size_contracts,
+                                    coid, "rejected", notes=f"maker_safety: {e}")
+                return None
             try:
                 resp = self.client.post("/portfolio/orders", body)
                 order_id = resp.get("order", {}).get("order_id", "")
@@ -1025,8 +1045,11 @@ class QuoteManager:
                                      f"oid={o.order_id[:12]} — marking pending_cancel, "
                                      f"skipping placement to avoid duplicate")
                 if all_cancelled:
+                    # The opposing bid is the other leg of our own two-sided
+                    # target: a YES buy crosses iff yes_bid + no_bid >= 100.
                     r = self._place_order(target.market_ticker, "yes",
-                                           target.yes_bid_cents, yes_size)
+                                           target.yes_bid_cents, yes_size,
+                                           best_opposing_bid_cents=target.no_bid_cents)
                     if r:
                         actions["placed"] += 1
                 else:
@@ -1063,7 +1086,8 @@ class QuoteManager:
                                      f"skipping placement to avoid duplicate")
                 if all_cancelled:
                     r = self._place_order(target.market_ticker, "no",
-                                           target.no_bid_cents, no_size)
+                                           target.no_bid_cents, no_size,
+                                           best_opposing_bid_cents=target.yes_bid_cents)
                     if r:
                         actions["placed"] += 1
                 else:

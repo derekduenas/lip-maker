@@ -17,6 +17,9 @@ from venue.base import (
     MarketMetadata, register_venue,
 )
 from execution.kalshi_auth import KalshiClient
+from execution.order_request import (
+    MakerSafetyError, assert_maker_safe, build_limit_order,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -102,28 +105,40 @@ class KalshiVenue(Venue):
     # ── Orders ──
 
     def place_order(self, ticker: str, side: str, price_cents: int,
-                    size_contracts: int, post_only: bool = True) -> OrderResult:
-        """Kalshi POST /portfolio/orders with post_only semantics via `no_self_trade`
-        / minimal-taker pattern — use the execution.quote_manager direct path
-        if you need finer control.
+                    size_contracts: int, post_only: bool = True,
+                    best_opposing_bid_cents: Optional[int] = None) -> OrderResult:
+        """Place a maker-only limit order via the shared request builder.
+
+        2026-09-21: this method used to substitute `no_self_trade` for
+        `post_only`, asserting the latter did not exist, while
+        execution/quote_manager.py sent `post_only`. The two adapters
+        disagreed about what maker protection means, and `no_self_trade` is
+        not maker protection — it only blocks trading against your OWN
+        resting order, not crossing a stranger's offer.
+
+        Both paths now build the body in execution.order_request, which
+        proves the order is non-crossing locally before it is sent. Maker
+        safety no longer depends on an API flag this environment cannot
+        verify (docs.kalshi.com is egress-blocked).
+
+        `best_opposing_bid_cents` is the other side's best bid. Without it a
+        maker order cannot be proven passive and is refused.
         """
         if side not in ("yes", "no"):
             return OrderResult(success=False, error=f"invalid side: {side}")
-        body = {
-            "ticker":             ticker,
-            "client_order_id":    f"innait-{uuid.uuid4().hex[:12]}",
-            "type":               "limit",
-            "side":                side,
-            "count":               int(size_contracts),
-            "time_in_force":      "GTC",
-        }
-        body["yes_price" if side == "yes" else "no_price"] = int(price_cents)
-        # Kalshi's API doesn't have a literal `post_only` flag on limit orders.
-        # `no_self_trade` is the closest — use it. Plus we rely on quote placement
-        # being BELOW best ask (buy) / ABOVE best bid (sell) at the quote_manager
-        # layer to enforce maker-only behavior.
-        if post_only:
-            body["no_self_trade"] = True
+        try:
+            body = build_limit_order(
+                ticker=ticker, side=side, price_cents=int(price_cents),
+                size_contracts=int(size_contracts),
+                client_order_id=f"innait-{uuid.uuid4().hex[:12]}",
+                best_opposing_bid_cents=best_opposing_bid_cents,
+                enforce_non_crossing=post_only,
+                time_in_force="GTC",
+            )
+            if post_only:
+                assert_maker_safe(body)
+        except MakerSafetyError as e:
+            return OrderResult(success=False, error=f"maker safety: {e}")
         try:
             resp = self._client.post("/portfolio/orders", body)
             order_id = (resp.get("order") or {}).get("order_id")
