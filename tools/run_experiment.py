@@ -385,6 +385,12 @@ def _arm_report(policy, runner, sim, quotes, refusals, fills_applied,
                                  if m["market_ticker"] == t), None)}
             for t in sorted(set(list(runner._econ_last)
                                 + list(runner._exec_last)))},
+        "placement": {
+            "capital_refusals": runner.qm.capital_refusals,
+            "live_blocked": runner.qm.live_blocked,
+            "skip_counts": dict(runner.skip_counts),
+            "safety_blocks": getattr(runner.qm, "safety_blocks", None),
+        },
         "execution": {"trades_observed": sim.trades_observed,
                       "modelled_fills": sim.fills_generated,
                       "fills_applied": fills_applied,

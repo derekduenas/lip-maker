@@ -245,8 +245,11 @@ def test_runner_never_chooses_more_than_the_account_can_fund(econ_db):
     sel = r._economic_choice(_book(), r.params_by_ticker[TKR], 45, 50, 50, 24.0)
     assert sel.chosen.capital_usd <= free, \
         "chose a quote the shared account cannot fund"
-    if sel.should_quote:
-        assert sel.chosen.candidate.size_contracts < 50   # sized down
+    # It may legitimately keep the full size when that size fits the free
+    # cash. The invariant under test is the capital bound above, not a
+    # particular size: an earlier version of this test also asserted the
+    # quote shrank, which only held because a bogus "supply the whole
+    # target" candidate was inflating the requirement.
 
 
 def test_runner_refuses_when_no_candidate_fits(econ_db):

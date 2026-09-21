@@ -111,6 +111,9 @@ class ExecutionEstimate:
     conservative: Optional[float]
     queue_ahead_displayed: float
     latency_sec: float
+    replenish_cap: Optional[float] = None
+    inventory_cap: Optional[float] = None
+    binding_cap: str = "flow"
     note: str = ""
 
     def explain(self) -> dict:
@@ -126,6 +129,9 @@ class ExecutionEstimate:
             "executions_conservative": self.conservative,
             "queue_ahead_displayed": self.queue_ahead_displayed,
             "latency_sec": self.latency_sec,
+            "replenish_cap": self.replenish_cap,
+            "inventory_cap": self.inventory_cap,
+            "binding_cap": self.binding_cap,
             "basis": ("public trade flow filtered to our price level and to "
                       "takers hitting our side; an UPPER BOUND on our "
                       "executions, not a measured fill rate"),
@@ -225,7 +231,26 @@ class ExecutionModel:
 
     def estimate(self, *, ticker: str, side: str, price_cents: int,
                  size: float, horizon_sec: float,
-                 queue_ahead_displayed: float = 0.0) -> ExecutionEstimate:
+                 queue_ahead_displayed: float = 0.0,
+                 replenish_sec: float = 0.0,
+                 max_cycles_from_inventory: Optional[float] = None
+                 ) -> ExecutionEstimate:
+        """Expected whole-order executions, capped by what a real policy can
+        actually do.
+
+        Flow alone gave absurd counts — 12,297 refills of an 18-lot in a few
+        hours — because `volume / (queue + size)` silently assumes we
+        replenish instantly, forever, with no latency, no capital and no
+        inventory limit. Being filled is not free:
+
+          REPLENISH  after a fill we must re-quote. At best that is one
+                     cycle per `replenish_sec`, so executions cannot exceed
+                     horizon / replenish_sec however much volume trades.
+          INVENTORY  each fill adds exposure. Once the net limit is reached
+                     we must stop and unwind, which caps cycles again.
+
+        Both caps are reported so a reader can see which one bound.
+        """
         w = self.window_sec(ticker)
         m = self._m.get(ticker)
         lvl = m.eligible.get((side, int(price_cents))) if m else None
@@ -238,7 +263,7 @@ class ExecutionModel:
         if not self.measured(ticker) or size <= 0:
             return ExecutionEstimate(
                 measured=False, eligible_rate_per_sec=None, optimistic=None,
-                base=None, conservative=None,
+                base=None, conservative=None, binding_cap="unmeasured",
                 note=("not observed long enough to estimate; caller must "
                       "treat executions as UNKNOWN"), **base_kw)
         zero_observed = eligible <= 0.0
@@ -252,15 +277,35 @@ class ExecutionModel:
         effective = max(0.0, float(horizon_sec) - self.latency_sec)
         volume = rate * effective
 
-        def execs(queue: float) -> float:
-            return max(0.0, volume - queue) / float(size)
+        caps = []
+        if replenish_sec and replenish_sec > 0:
+            caps.append(float(horizon_sec) / float(replenish_sec))
+        if max_cycles_from_inventory is not None:
+            caps.append(float(max_cycles_from_inventory))
+        cap = min(caps) if caps else None
 
+        def execs(queue: float) -> float:
+            raw = max(0.0, volume - queue) / float(size)
+            return min(raw, cap) if cap is not None else raw
+
+        raw_base = (max(0.0, volume - float(queue_ahead_displayed))
+                    / float(size))
+        if cap is not None and cap < raw_base:
+            binding = ("replenish" if (replenish_sec and replenish_sec > 0
+                                       and cap == float(horizon_sec) / float(replenish_sec))
+                       else "inventory")
+        else:
+            binding = "flow"
         return ExecutionEstimate(
             measured=True, eligible_rate_per_sec=rate,
             optimistic=execs(0.0),
             base=execs(float(queue_ahead_displayed)),
             conservative=execs(float(queue_ahead_displayed)
                                * CONSERVATIVE_QUEUE_MULT),
+            replenish_cap=(float(horizon_sec) / float(replenish_sec))
+                          if (replenish_sec and replenish_sec > 0) else None,
+            inventory_cap=max_cycles_from_inventory,
+            binding_cap=binding,
             note=(("no qualifying trade observed in "
                    f"{w:.0f}s; rate bounded by the rule of three "
                    f"({RULE_OF_THREE}/w), not assumed zero and not assumed "

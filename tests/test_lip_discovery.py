@@ -395,9 +395,18 @@ class TestDecideEnrolWindow(unittest.TestCase):
     def test_expiry_compares_datetimes_not_strings(self):
         # 'Z' vs '+00:00' spelling must not change the verdict
         now = "2026-09-20T12:00:00+00:00"
-        enrol, reason = _decide_enrol(_program(end_date="2026-09-20T11:59:59Z"), now_iso=now)
+        # start_date must be pinned too. The helper defaults it to
+        # (real now - 1 day), so against a hardcoded end_date this test
+        # passed only while the wall clock's time-of-day was earlier than
+        # 11:59:59Z, and read as "malformed_window" afterwards. The subject
+        # here is Z vs +00:00 spelling, not window ordering.
+        enrol, reason = _decide_enrol(
+            _program(start_date="2026-09-19T00:00:00Z",
+                     end_date="2026-09-20T11:59:59Z"), now_iso=now)
         self.assertEqual(reason, "expired")
-        enrol, reason = _decide_enrol(_program(end_date="2026-09-20T12:00:01Z"), now_iso=now)
+        enrol, reason = _decide_enrol(
+            _program(start_date="2026-09-19T00:00:00Z",
+                     end_date="2026-09-20T12:00:01Z"), now_iso=now)
         self.assertEqual(enrol, 1)
 
     def test_upcoming_is_enrolled_but_runtime_gated(self):

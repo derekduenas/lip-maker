@@ -244,6 +244,11 @@ class PaperRunner:
         # level and to takers hitting our side. Public volume bounds our
         # executions from above; it is not our fill rate.
         self.execution_model = ExecutionModel()
+        # Shortest realistic cancel/replace cycle. A fill does not
+        # instantly restore our resting size: we must observe it, cancel
+        # and re-place. Book cadence bounds this from below.
+        self.requote_cycle_sec: float = float(
+            getattr(settings, "REQUOTE_CYCLE_SEC", 5.0))
         self._snapshot_persist_failures: int = 0  # Architect audit: track silent drops
         # Futures fair-value cache (Quant audit): {prefix: (price, fetched_ts)}
         # Refreshed every 60s to match futures-feed.timer cadence.
@@ -1528,16 +1533,30 @@ class PaperRunner:
             horizon = 86400.0
             if p.end_ts is not None:
                 horizon = max(60.0, min(horizon, p.end_ts - time.time()))
-            # Candidate sizes. Multiples of the sizer's output explore
-            # "quote less"; the QUALIFYING size is what makes the reward
-            # term non-zero at all. LIP pays only when our depth helps the
-            # book reach the program's target, so a candidate set that never
-            # reaches it can only ever price a reward of ~zero and will
-            # reject every market for the wrong reason.
-            qualifying = max(1, int(p.target_size) - top)
-            sizes = sorted({max(1, size // 4), max(1, size // 2), size,
-                            int(size * 1.5), qualifying,
-                            int(qualifying * 1.25) + 1})
+            # Candidate sizes.
+            #
+            # An earlier version added `target_size - top` as a "qualifying"
+            # candidate. That was wrong: it assumed WE must supply the whole
+            # target. Under the program's rules existing liquidity counts
+            # toward qualification, and a side that already reaches
+            # TargetSize qualifies without us — our order only has to sit
+            # INSIDE the cutoff to earn a share. Forcing the target inflates
+            # the capital requirement by orders of magnitude.
+            #
+            # So the shortfall candidate is offered ONLY when a side does
+            # not reach the target on its own, which is the only case where
+            # our depth changes whether anything scores at all.
+            from engine.lip_scorer import _find_cutoff_price
+            shortfalls = []
+            for bids in (book.yes_bids, book.no_bids):
+                if _find_cutoff_price(bids, p.target_size) is None:
+                    have = sum(l.size for l in bids)
+                    shortfalls.append(max(1, int(p.target_size - have) + 1))
+            sizes = {max(1, size // 4), max(1, size // 2), size,
+                     int(size * 1.5)}
+            if shortfalls:
+                sizes.add(max(shortfalls))
+            sizes = sorted(n for n in sizes if n > 0)
             cands = [QuoteCandidate(n, yes_bid_c, no_bid_c) for n in sizes]
             cands.append(QuoteCandidate(0, None, None))
             avail = Decimal(str(self.account.available_usd()))
@@ -1564,6 +1583,10 @@ class PaperRunner:
                     book.market_ticker, size, horizon, queue_depth=top,
                     side="yes", price_cents=yes_bid_c),
                 fee_schedule=self._fee_schedule(),
+                book=book,
+                # We do not hold to settlement: the exit policy unwinds.
+                adverse_holding_hours=float(
+                    self.exit_policy.max_holding_sec) / 3600.0,
             )
         except Exception as e:
             _log.warning(f"economic selection failed for {book.market_ticker}: {e}")
@@ -1640,10 +1663,22 @@ class PaperRunner:
         if n > 0:
             return float(n) * horizon_sec / elapsed
         try:
+            # Caps on what a real policy can do. Without them the flow
+            # figure implied thousands of refills of one lot, which
+            # silently assumed instant replenishment, unlimited capital and
+            # no inventory limit.
+            n = float(size or 1.0)
+            inv_cap = None
+            try:
+                inv_cap = float(self.exit_policy.max_net_contracts) / n
+            except Exception:
+                inv_cap = None
             est = self.execution_model.estimate(
                 ticker=ticker, side=side, price_cents=int(price_cents),
-                size=float(size or 1.0), horizon_sec=float(horizon_sec),
-                queue_ahead_displayed=float(queue_depth))
+                size=n, horizon_sec=float(horizon_sec),
+                queue_ahead_displayed=float(queue_depth),
+                replenish_sec=self.requote_cycle_sec,
+                max_cycles_from_inventory=inv_cap)
             self._exec_last[ticker] = est.explain()
             return getattr(est, case, None)
         except Exception:

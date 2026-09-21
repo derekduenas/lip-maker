@@ -196,6 +196,43 @@ def _market_yield(*, market_id: str, our_size: int, top_book_size: int,
     )
 
 
+def rules_based_share(book, candidate: QuoteCandidate, *,
+                      target_size: float, discount_factor: float):
+    """Our snapshot share under the PROGRAM'S rules, or None without a book.
+
+    Replaces a raw depth ratio. Kalshi scores qualifying, distance-weighted
+    depth: a side qualifies only if cumulative depth reaches TargetSize
+    (that price is the cutoff), the reference is the level reaching
+    TargetSize/5, levels at price >= cutoff score
+    DiscountFactor^(reference-price) x size, and levels below the cutoff
+    score nothing. Each side normalises to 1.0, so a valid snapshot pays
+    2.0 and our fraction is our_total_score / 2.
+
+    Two things the ratio form got wrong, both measured on live books:
+      * it summed depth across BOTH sides into a one-sided denominator,
+        understating our share by about 2x;
+      * it counted depth outside the cutoff, which earns nobody anything.
+    """
+    if book is None or candidate.is_no_quote:
+        return None
+    try:
+        from engine.lip_scorer import (
+            OurQuotes, ProgramParams, score_snapshot, snapshot_share)
+        from execution.kalshi_ws import BookLevel
+        n = float(candidate.size_contracts)
+        ours = OurQuotes(
+            yes_bids=[BookLevel(int(candidate.yes_bid_cents), n)],
+            no_bids=[BookLevel(int(candidate.no_bid_cents), n)])
+        pp = ProgramParams(market_ticker=getattr(book, "market_ticker", ""),
+                           target_size=float(target_size),
+                           discount_factor=float(discount_factor),
+                           period_reward_usd=1.0, period_seconds=1.0)
+        return snapshot_share(score_snapshot(book, ours, pp))
+    except Exception as e:
+        _log.debug(f"rules-based share unavailable: {e}")
+        return None
+
+
 def evaluate(candidate: QuoteCandidate, *,
              market_id: str,
              horizon_sec: float,
@@ -210,7 +247,9 @@ def evaluate(candidate: QuoteCandidate, *,
              expected_fills_per_horizon: Optional[float] = None,
              fee_schedule=None,
              exit_policy=None,
+             adverse_holding_hours: Optional[float] = None,
              operating_cost_usd: Decimal = DEFAULT_OPERATING_COST_PER_QUOTE_USD,
+             book=None,
              ) -> Economics:
     """Expected net for one candidate over `horizon_sec`.
 
@@ -245,11 +284,26 @@ def evaluate(candidate: QuoteCandidate, *,
         hours_to_settle=hours_to_settle, midpoint=midpoint,
         calibration=calibration, observed_share=observed_share,
     )
-    # GROSS reward: MarketYield.expected_daily_rebate already nets the
-    # adverse cost, so we recompose the gross and subtract adverse ONCE.
-    gross_daily = (my.pool_per_day * my.our_share * my.qualify_prob
-                   * my.time_factor * my.calibration * my.series_priority)
-    expected_reward = _d(gross_daily) * _d(days)
+    # Reward, from the PROGRAM'S rules when a book is available.
+    #
+    #     payout = snapshot_share x pool_rate_usd_per_sec x horizon
+    #
+    # which is exactly lip_scorer.interval_payout_usd. The MarketYield
+    # chain is kept only as a fallback: its `our_share` is a raw depth
+    # ratio, and its time_factor is a heuristic decay that appears nowhere
+    # in the program rules.
+    share_rules = rules_based_share(book, candidate, target_size=target_size,
+                                    discount_factor=discount_factor)
+    if share_rules is not None:
+        share_used, share_source = share_rules, "program_rules"
+        expected_reward = (_d(share_rules) * _d(pool_rate_usd_per_sec)
+                           * _d(horizon_sec) * _d(calibration))
+    else:
+        share_used, share_source = my.our_share, "depth_ratio_fallback"
+        unknowns.append("no book: reward share fell back to a depth ratio")
+        gross_daily = (my.pool_per_day * my.our_share * my.qualify_prob
+                       * my.time_factor * my.calibration * my.series_priority)
+        expected_reward = _d(gross_daily) * _d(days)
 
     if observed_share is None:
         unknowns.append("observed_share (using theoretical depth share)")
@@ -282,7 +336,28 @@ def evaluate(candidate: QuoteCandidate, *,
     # filled is the event that hurts a maker, so both scale together. One
     # fill over the horizon reproduces the original holding-cost figure.
     turnover = max(Decimal("1"), _d(fills))
-    adverse = _d(my.adverse_cost_per_day) * _d(days) * turnover
+    # HORIZON CHECK. MarketYield.adverse_cost_per_day scales with
+    # sqrt(hours_to_settle/24) — it models drift on inventory held to
+    # SETTLEMENT. On a 437-day market that inflated the cost ~20x for a
+    # maker who does not hold to settlement at all: the wired exit policy
+    # unwinds within max_holding_sec. Adverse selection is therefore priced
+    # over the HOLDING period, capped by the exit policy, not over the life
+    # of the contract.
+    adverse_hours = (float(adverse_holding_hours)
+                     if adverse_holding_hours is not None
+                     else float(hours_to_settle))
+    adverse_hours = min(float(hours_to_settle), max(0.0, adverse_hours))
+    my_hold = _market_yield(
+        market_id=market_id, our_size=size, top_book_size=top_book_size,
+        target_size=target_size, discount_factor=discount_factor,
+        pool_per_day_usd=float(pool_rate_usd_per_sec) * 86400.0,
+        hours_to_settle=adverse_hours, midpoint=midpoint,
+        calibration=calibration, observed_share=observed_share,
+    )
+    adverse = _d(my_hold.adverse_cost_per_day) * _d(days) * turnover
+    notes.append(f"adverse selection priced over a {adverse_hours:.2f}h "
+                 "holding period (capped by the exit policy), not over the "
+                 f"{float(hours_to_settle):.0f}h life of the contract")
     expected_trading_pnl = -adverse
     notes.append(f"adverse selection scaled by turnover ({float(turnover):.2f} "
                  "fills), matching the fee treatment; one fill reproduces the "
@@ -342,10 +417,14 @@ def evaluate(candidate: QuoteCandidate, *,
             "displayed_depth_at_level": int(top_book_size),
             "aggregate_with_our_size": int(top_book_size) + size,
             "qualify_prob": round(float(my.qualify_prob), 6),
-            "our_share": round(float(my.our_share), 6),
-            "share_basis": ("our size enters the aggregate depth, so adding "
-                            "size raises qualification but dilutes the "
-                            "per-contract reward"),
+            "our_share": float(share_used),
+            "share_source": share_source,
+            "share_basis": (
+                "qualifying, distance-weighted depth under the program's "
+                "rules: levels below the cutoff score nothing and each side "
+                "normalises to 1.0"
+                if share_source == "program_rules" else
+                "RAW DEPTH RATIO fallback — no book available"),
             "time_factor": round(float(my.time_factor), 6),
             "calibration": float(calibration),
         },
@@ -366,6 +445,12 @@ def evaluate(candidate: QuoteCandidate, *,
             "caveat": ("public trade flow bounds our executions from above; "
                        "it does not establish the probability that our "
                        "specific order fills"),
+        },
+        "adverse_selection": {
+            "holding_hours_used": adverse_hours,
+            "contract_hours_to_settle": float(hours_to_settle),
+            "basis": ("sqrt-of-time drift on the position, over the holding "
+                      "period the exit policy permits, scaled by turnover"),
         },
         "inventory_exit": {
             "basis": "passive pairing at the opposing bid",
