@@ -36,6 +36,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -213,6 +214,17 @@ class PaperRunner:
         self.reconciles      = defaultdict(int)
         self.start_time      = time.time()
         self._last_persist_key: dict[str, int] = {}
+        # 2026-09-21 P4b wiring: inventory management is independent of
+        # quoting. A ticker enters this set when it holds inventory and
+        # leaves only when flat, so a retired or expired market is still
+        # unwound rather than held to settlement unattended.
+        from engine.inventory_exit import ExitPolicy
+        self._exit_watch: set[str] = set()
+        self._exit_reasons: dict[str, str] = {}
+        self.exit_actions: int = 0
+        self.exit_policy = ExitPolicy()
+        # Set by the main loop to the live WS book map.
+        self.books: dict = {}
         self._snapshot_persist_failures: int = 0  # Architect audit: track silent drops
         # Futures fair-value cache (Quant audit): {prefix: (price, fetched_ts)}
         # Refreshed every 60s to match futures-feed.timer cadence.
@@ -685,6 +697,12 @@ class PaperRunner:
             self._accrual.pop(k, None)
         self._accrual.pop(ticker, None)   # legacy ticker-keyed state
         self.markets = [m for m in self.markets if m.get("market_ticker") != ticker]
+        # Retiring stops us QUOTING. It does not make the inventory vanish:
+        # keep managing the exit until the position is flat.
+        if self._position_for(ticker) is not None:
+            self._exit_watch.add(ticker)
+            _log.warning(f"retired {ticker} but inventory remains — "
+                         "exit management continues")
         _log.info(f"retired {ticker}: {reason}")
 
     def retire_inactive_markets(self, db_path: str | None = None) -> list[str]:
@@ -843,6 +861,138 @@ class PaperRunner:
             if not self._actually_resting(ev.market_ticker):
                 self._note_flat(ev.market_ticker)
         return status
+
+    # ── Inventory exit (P4b wiring) ───────────────────────────────────
+    def _position_for(self, ticker: str):
+        """Build an inventory_exit.Position from unsettled fills.
+
+        Separate from QuoteManager.InventoryState, which carries only a
+        signed net and cannot express the paired quantity or the age of the
+        oldest lot — both of which the exit policy needs.
+        """
+        from engine.inventory_exit import Position
+        try:
+            conn = sqlite3.connect(self.qm.db_path, timeout=5.0)
+            try:
+                cols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(fill_ledger)").fetchall()}
+                if not cols:
+                    return None
+                qty = "COALESCE(count_real, count)" if "count_real" in cols else "count"
+                row = conn.execute(
+                    f"""SELECT
+                          COALESCE(SUM(CASE WHEN side='yes' THEN {qty} ELSE 0 END), 0),
+                          COALESCE(SUM(CASE WHEN side='no'  THEN {qty} ELSE 0 END), 0),
+                          MIN(created_at)
+                        FROM fill_ledger
+                        WHERE ticker = ?
+                          AND ticker NOT IN (SELECT ticker FROM settlement_log)""",
+                    (ticker,)).fetchone()
+            finally:
+                conn.close()
+        except Exception as e:
+            _log.warning(f"position read failed for {ticker}: {e}")
+            return None
+        if row is None:
+            return None
+        yes_q, no_q, oldest = row
+        if not yes_q and not no_q:
+            return None
+        ts = time.time()
+        if oldest:
+            try:
+                ts = _parse_ts(oldest).timestamp()
+            except Exception:
+                ts = time.time()
+        return Position(market_ticker=ticker,
+                        yes_qty=Decimal(str(yes_q or 0)),
+                        no_qty=Decimal(str(no_q or 0)),
+                        oldest_fill_ts=ts)
+
+    def manage_exits(self, now: float | None = None) -> dict:
+        """Reduce inventory exposure. Runs for EVERY market we hold, whether
+        or not we still quote it.
+
+        Entry eligibility and inventory-reduction eligibility are different
+        decisions. A program that ended, a market retired from discovery, or
+        a reward we no longer qualify for all stop us QUOTING; none of them
+        make the inventory disappear. Before this, retire_market dropped the
+        ticker entirely and its position was held to settlement unattended.
+        """
+        from engine.inventory_exit import reduces_exposure
+        now = time.time() if now is None else now
+        out = {"checked": 0, "exits": 0, "skipped": 0, "blocked": 0}
+        for tkr in sorted(self._exit_watch | set(self._ticker_programs)):
+            pos = self._position_for(tkr)
+            if pos is None or pos.net_yes == 0:
+                self._exit_watch.discard(tkr)
+                continue
+            self._exit_watch.add(tkr)
+            out["checked"] += 1
+            book = self.books.get(tkr) if hasattr(self, "books") else None
+            best_yes = book.yes_bids[0].price_cents if (book and book.yes_bids) else None
+            best_no = book.no_bids[0].price_cents if (book and book.no_bids) else None
+            decision = self.exit_policy.evaluate(
+                pos, now=now, best_yes_bid_cents=best_yes,
+                best_no_bid_cents=best_no, fee_schedule=self._fee_schedule())
+            if not decision.should_exit:
+                out["skipped"] += 1
+                self._exit_reasons[tkr] = decision.reason
+                continue
+
+            # Cancel any entry order on the side we are about to buy. Leaving
+            # it would double our intended size on that side and could turn a
+            # reduction into an increase.
+            conflicting = [o for o in self._live_resting(tkr)
+                           if o.is_ours and o.side == decision.side]
+            for o in conflicting:
+                self.qm._cancel_order(o)
+            if conflicting:
+                self._note_flat(tkr)
+
+            # Re-read AFTER cancelling: a fill may have landed in between, and
+            # the action must reduce the exposure that exists NOW, not the one
+            # we measured a moment ago.
+            fresh = self._position_for(tkr)
+            if fresh is None or fresh.net_yes == 0:
+                out["blocked"] += 1
+                self._exit_reasons[tkr] = "flattened_before_exit"
+                continue
+            qty = min(decision.qty, abs(fresh.net_yes))
+            if qty <= 0 or not reduces_exposure(fresh, decision.side, qty):
+                out["blocked"] += 1
+                self._exit_reasons[tkr] = "would_not_reduce_exposure"
+                _log.warning(f"exit[{tkr}] ABORTED: {decision.side} x{qty} would "
+                             f"not reduce net {fresh.net_yes}")
+                continue
+
+            placed = self.qm._place_order(
+                tkr, decision.side, int(decision.limit_price_cents), int(qty),
+                best_opposing_bid_cents=(best_no if decision.side == "yes" else best_yes),
+                program_id=self._akey(self.params_by_ticker[tkr])
+                if tkr in self.params_by_ticker else "",
+            )
+            if placed is None:
+                out["blocked"] += 1
+                self._exit_reasons[tkr] = "exit_order_refused"
+                continue
+            out["exits"] += 1
+            self.exit_actions += 1
+            self._exit_reasons[tkr] = decision.reason
+            _log.warning(f"exit[{tkr}] {decision.reason}: buy {decision.side} "
+                         f"x{qty} @{decision.limit_price_cents}c "
+                         f"(net was {fresh.net_yes}, est cost "
+                         f"${decision.estimated_cost_usd:.4f}"
+                         f"{', AGGRESSIVE' if decision.aggressive else ''})")
+        return out
+
+    @staticmethod
+    def _fee_schedule():
+        try:
+            from engine import fees
+            return fees.active_schedule()
+        except Exception:
+            return None
 
     # ── Program registry (P5b) ────────────────────────────────────────
     @staticmethod
@@ -1446,6 +1596,11 @@ class PaperRunner:
         """
         last_resync = 0.0
         RESYNC_INTERVAL_SEC = 300  # 5 min — cheap (one Kalshi API call)
+        # The exit path needs live books and must run on its own cadence,
+        # independent of whether a market is still quotable.
+        self.books = getattr(ws, "books", {}) or {}
+        last_exit_sweep = 0.0
+        EXIT_SWEEP_SEC = 60
         # 2026-05-02 PREDATOR K4: hourly refresh of per-market target_share
         # from realized 7d snapshot share so sizer chases REAL capacity not
         # a hardcoded 0.35.
@@ -1503,9 +1658,22 @@ class PaperRunner:
                 # 2026-09-20 review: exposure gates run here INDEPENDENTLY
                 # of scoring — a market that is skipped for scoring must
                 # still have its orders pulled.
+                # Inventory first, and unconditionally. This is deliberately
+                # ahead of the orphan sweep and outside the params loop: a
+                # position must be managed even when its program ended, its
+                # market was retired, or we are no longer reward-eligible.
+                if now - last_exit_sweep >= EXIT_SWEEP_SEC:
+                    last_exit_sweep = now
+                    self.books = getattr(ws, "books", {}) or self.books
+                    try:
+                        ex = self.manage_exits(now)
+                        if ex["exits"] or ex["blocked"]:
+                            _log.info(f"exit sweep: {ex}")
+                    except Exception as e:
+                        _log.warning(f"exit sweep failed: {e}")
                 # Orphan sweep: resting orders on tickers we no longer manage.
                 for tkr in list(self.qm.resting.keys()):
-                    if tkr not in self.params_by_ticker:
+                    if tkr not in self.params_by_ticker and tkr not in self._exit_watch:
                         self._handle_skip(tkr, "no_params", force=True)
                 ws_up = bool(getattr(ws, "connected", True))
                 stale_scan = self._discovery_staleness_reason(now)
