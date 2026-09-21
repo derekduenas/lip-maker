@@ -142,3 +142,41 @@ def test_observe_trades_parses_public_rows():
         {"count_fp": "10"},                      # no ticker, ignored
     ])
     assert n == 1
+
+
+# ── observing nothing is a measurement ────────────────────────────────────
+
+def test_watching_a_silent_market_establishes_a_window():
+    """Without this, silence is indistinguishable from not looking."""
+    m = ExecutionModel(min_observation_sec=60, latency_sec=0.0)
+    m.observe_market(T, ts=0.0)
+    m.observe_market(T, ts=600.0)
+    assert m.window_sec(T) == 600.0 and m.measured(T)
+
+
+def test_zero_observed_volume_is_bounded_not_assumed_zero():
+    """A market where nothing traded for ten minutes is not fee-free, but
+    it is also nowhere near a full round trip."""
+    m = ExecutionModel(min_observation_sec=60, latency_sec=0.0)
+    m.observe_market(T, ts=0.0)
+    m.observe_market(T, ts=600.0)
+    e = _est(m, size=15.0, horizon_sec=240.0)
+    assert e.measured and e.eligible_contracts == 0.0
+    assert 0.0 < e.base < 1.0, "zero observations produced 0 or a full fill"
+    assert "rule of three" in e.note
+
+
+def test_the_bound_tightens_the_longer_we_watch_silence():
+    def est(window):
+        m = ExecutionModel(min_observation_sec=60, latency_sec=0.0)
+        m.observe_market(T, ts=0.0)
+        m.observe_market(T, ts=window)
+        return _est(m, size=15.0, horizon_sec=240.0).base
+    assert est(3600.0) < est(600.0) < est(120.0)
+
+
+def test_a_first_timestamp_of_zero_is_not_treated_as_unset():
+    m = ExecutionModel(min_observation_sec=10, latency_sec=0.0)
+    m.observe_market(T, ts=0.0)
+    m.observe_market(T, ts=50.0)
+    assert m.window_sec(T) == 50.0

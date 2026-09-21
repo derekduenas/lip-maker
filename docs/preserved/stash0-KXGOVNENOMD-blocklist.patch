@@ -1,0 +1,18 @@
+diff --git a/config/settings.py b/config/settings.py
+index b6c4576..126b46c 100644
+--- a/config/settings.py
++++ b/config/settings.py
+@@ -246,6 +246,13 @@ SERIES_BLOCKLIST = {
+     # block per asymmetric-EV reasoning: $0-30/wk foregone rebate vs
+     # ~$150+ over 4wks if it keeps bleeding.
+     "KXSNLMENTION",
++    # 2026-05-14: 48h post-mortem caught KXGOVNENOMD as the next KXTRUEV-shape
++    # leak — 2 settled markets, 1 strike (LMAR) ate $172 alone, total true
++    # net -$235 with $0.01 rebate. Auto-prune escalator missed it (still 0
++    # bans/cycle, per project_series_auto_prune_redundant). Manual block as
++    # part of pause-and-pivot decision; engine going to PAPER while we
++    # decide if rebate model is salvageable at this scale.
++    "KXGOVNENOMD",
+ }
+ 
+ # 2026-05-13: series-level auto-escalator (tools/series_auto_prune.py).

@@ -53,9 +53,56 @@ formality: snapshots have no sequence, so gaps are undetectable, and queue
 position and the exact instant of a cross are unobservable. Fill evidence
 from a REST run is weaker than from a WS run, and the report says so.
 
-**To close that gap** set `KALSHI_KEY_ID` and place the RSA key at
-`config/kalshi_private_key.pem` (or point `KALSHI_PRIVATE_KEY_PATH` at it).
-Nothing else changes; the loop is WS-native.
+### Exact secure setup for WebSocket capture
+
+Checked 2026-09-21 without printing any secret: `KALSHI_KEY_ID` unset,
+`KALSHI_API_KEY` unset, `KALSHI_PRIVATE_KEY_PATH` unset, no `.env`, and no
+key file at the configured default. So WS capture is unavailable here and
+the loop runs on REST.
+
+To enable it:
+
+1. In the Kalshi web UI create an API key. Keep the **private** key it
+   gives you; Kalshi keeps only the public half.
+2. Save the private key outside the repo and lock it down:
+
+   ```bash
+   mkdir -p ~/.config/kalshi && chmod 700 ~/.config/kalshi
+   mv ~/Downloads/kalshi_private_key.pem ~/.config/kalshi/
+   chmod 600 ~/.config/kalshi/kalshi_private_key.pem
+   ```
+
+3. Export the id and the path (a shell profile or a `.env` that is **not**
+   committed — `.env` is already ignored):
+
+   ```bash
+   export KALSHI_KEY_ID="<the key id shown in the UI>"
+   export KALSHI_PRIVATE_KEY_PATH="$HOME/.config/kalshi/kalshi_private_key.pem"
+   ```
+
+4. Confirm without echoing anything secret:
+
+   ```bash
+   python -c "from config import settings; import pathlib; \
+     print('id set:', bool(settings.KALSHI_KEY_ID), \
+           '| key readable:', pathlib.Path(settings.KALSHI_KEY_PATH).exists())"
+   ```
+
+Nothing else changes; the loop is WS-native and will use it automatically.
+A read-only key is sufficient for capture, and live order placement stays
+blocked by the interlock regardless.
+
+## The entry-cutoff experiment
+
+```bash
+python tools/run_experiment.py --capture-sec 900
+```
+
+Captures one live stream, then replays it through every cutoff arm, each
+with its own independent $5,000 account and database. The policies and the
+market-selection spec are frozen in `engine/entry_cutoff.py` and
+`engine/experiment_spec.py`, and both fingerprints are written into every
+result so a reader can tell whether they were edited after the fact.
 
 ## Reading the report
 

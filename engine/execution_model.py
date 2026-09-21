@@ -62,6 +62,15 @@ from typing import Optional
 MIN_OBSERVATION_SEC = 60.0
 CONSERVATIVE_QUEUE_MULT = 2.0
 
+# Observing NOTHING is a measurement, not ignorance. With zero qualifying
+# events in a window W, the one-sided 95% upper bound on the event rate is
+# 3/W (the "rule of three"). We use that bound rather than either
+#   - assuming zero, which would make an illiquid market look fee-free, or
+#   - falling back to "one full fill", which charges a complete round trip
+#     to a market where nothing traded for ten minutes.
+RULE_OF_THREE = 3.0
+DEFAULT_TRADE_SIZE_CONTRACTS = 1.0
+
 
 @dataclass
 class _Level:
@@ -72,7 +81,9 @@ class _Level:
 
 @dataclass
 class _Market:
-    first_ts: float = 0.0
+    # None until the first observation. Using 0.0 as the sentinel made a
+    # ts of 0 indistinguishable from "unset" and reset the window start.
+    first_ts: Optional[float] = None
     last_ts: float = 0.0
     trades: int = 0
     contracts: float = 0.0
@@ -141,7 +152,9 @@ class ExecutionModel:
         if m is None:
             m = _Market(first_ts=ts)
             self._m[ticker] = m
-        m.last_ts = ts
+        if m.first_ts is None or ts < m.first_ts:
+            m.first_ts = ts
+        m.last_ts = max(m.last_ts, ts)
         m.trades += 1
         m.contracts += float(contracts)
         t = (taker_side or "").lower()
@@ -180,14 +193,35 @@ class ExecutionModel:
         return n
 
     # ── estimation ────────────────────────────────────────────────────
+    def observe_market(self, ticker: str, ts: Optional[float] = None) -> None:
+        """Record that we were WATCHING this market at `ts`, whether or not
+        anything traded. Without this a silent market has no observation
+        window at all, and silence cannot be distinguished from not looking.
+        """
+        ts = time.time() if ts is None else ts
+        m = self._m.get(ticker)
+        if m is None:
+            m = _Market(first_ts=ts)
+            self._m[ticker] = m
+        m.last_ts = max(m.last_ts, ts)
+        if m.first_ts is None or ts < m.first_ts:
+            m.first_ts = ts
+
     def window_sec(self, ticker: str) -> float:
         m = self._m.get(ticker)
-        return max(0.0, m.last_ts - m.first_ts) if m else 0.0
+        if m is None or m.first_ts is None:
+            return 0.0
+        return max(0.0, m.last_ts - m.first_ts)
 
     def measured(self, ticker: str) -> bool:
+        """True once we have WATCHED long enough — trades or no trades."""
+        return self.window_sec(ticker) >= self.min_observation_sec
+
+    def _avg_trade_size(self, ticker: str) -> float:
         m = self._m.get(ticker)
-        return bool(m and m.trades > 0
-                    and self.window_sec(ticker) >= self.min_observation_sec)
+        if not m or m.trades <= 0:
+            return DEFAULT_TRADE_SIZE_CONTRACTS
+        return max(DEFAULT_TRADE_SIZE_CONTRACTS, m.contracts / m.trades)
 
     def estimate(self, *, ticker: str, side: str, price_cents: int,
                  size: float, horizon_sec: float,
@@ -207,7 +241,14 @@ class ExecutionModel:
                 base=None, conservative=None,
                 note=("not observed long enough to estimate; caller must "
                       "treat executions as UNKNOWN"), **base_kw)
-        rate = eligible / w if w > 0 else 0.0
+        zero_observed = eligible <= 0.0
+        if zero_observed:
+            # Rule of three: no qualifying trade in w seconds bounds the
+            # rate at 3/w events/sec. Converted to contracts using this
+            # market's own average trade size.
+            rate = (RULE_OF_THREE * self._avg_trade_size(ticker) / w) if w > 0 else 0.0
+        else:
+            rate = eligible / w if w > 0 else 0.0
         effective = max(0.0, float(horizon_sec) - self.latency_sec)
         volume = rate * effective
 
@@ -220,8 +261,12 @@ class ExecutionModel:
             base=execs(float(queue_ahead_displayed)),
             conservative=execs(float(queue_ahead_displayed)
                                * CONSERVATIVE_QUEUE_MULT),
-            note=("queue position is unobservable (cancellations ahead of us "
-                  "are invisible); three cases reported"), **base_kw)
+            note=(("no qualifying trade observed in "
+                   f"{w:.0f}s; rate bounded by the rule of three "
+                   f"({RULE_OF_THREE}/w), not assumed zero and not assumed "
+                   "a full fill. ") if zero_observed else "")
+                 + ("queue position is unobservable (cancellations ahead of "
+                    "us are invisible); three cases reported"), **base_kw)
 
     def summary(self) -> dict:
         return {t: {"trades": m.trades, "contracts": round(m.contracts, 2),

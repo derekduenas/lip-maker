@@ -1,0 +1,312 @@
+{
+  "utc": "2026-09-21T04:30:00.463186+00:00",
+  "spec": {
+    "spec_fingerprint": "6ed709f8418a5d0e",
+    "frozen_utc": "2026-09-21",
+    "account_usd_per_arm": 5000.0,
+    "selection": {
+      "rank_by": "pool_rate_usd_per_sec",
+      "require_two_sided_book": true,
+      "require_market_open_now": true,
+      "strata": {
+        "short_window": "market duration < 30.0 min",
+        "long_dated": "market duration >= 30.0 min"
+      },
+      "n_per_stratum": 6,
+      "unknown_duration": "excluded, not bucketed"
+    },
+    "cutoff_policies": {
+      "fingerprint": "be3ad636dcbe6549",
+      "frozen_utc": "2026-09-21",
+      "policies": {
+        "control_30min": "cutoff_min = 30.0",
+        "fixed_60s": "cutoff_min = 1.0",
+        "proportional_20pct": "cutoff_min = min(30.0, max(1.0, 0.2 * duration_min)); duration_min = (close_time - open_time)/60 from the venue; unknown duration -> control"
+      },
+      "clock": "market close only; reward expiry is a separate clock",
+      "inventory": "exit management runs regardless of any cutoff"
+    },
+    "matching": "every arm replays the SAME captured book and trade stream, each with its own independent account"
+  },
+  "policy_fingerprint": "be3ad636dcbe6549",
+  "selection": {
+    "discovery": {
+      "source": "persisted",
+      "rows": 12349
+    },
+    "examined": 31,
+    "excluded": {
+      "unknown_duration": 0,
+      "one_sided_book": 0,
+      "no_book": 0,
+      "market_not_open": 16
+    },
+    "per_stratum": {
+      "short_window": 6,
+      "long_dated": 6
+    }
+  },
+  "markets": [
+    {
+      "ticker": "KXCRYPTOLEAD15M-26SEP210030-BTC",
+      "stratum": "short_window",
+      "pool_rate_usd_per_sec": 0.02222222,
+      "duration_min": 15.0
+    },
+    {
+      "ticker": "KXCRYPTOLEAD15M-26SEP210030-ETH",
+      "stratum": "short_window",
+      "pool_rate_usd_per_sec": 0.02222222,
+      "duration_min": 15.0
+    },
+    {
+      "ticker": "KXPLATINUM15M-26SEP210030-30",
+      "stratum": "short_window",
+      "pool_rate_usd_per_sec": 0.02222222,
+      "duration_min": 15.0
+    },
+    {
+      "ticker": "KXPALLADIUM15M-26SEP210030-30",
+      "stratum": "short_window",
+      "pool_rate_usd_per_sec": 0.02222222,
+      "duration_min": 15.0
+    },
+    {
+      "ticker": "KXCRYPTOLEAD15M-26SEP210030-SOL",
+      "stratum": "short_window",
+      "pool_rate_usd_per_sec": 0.02222222,
+      "duration_min": 15.0
+    },
+    {
+      "ticker": "KXCRYPTOLEAD15M-26SEP210030-HYPE",
+      "stratum": "short_window",
+      "pool_rate_usd_per_sec": 0.02222222,
+      "duration_min": 15.0
+    },
+    {
+      "ticker": "KXMLBSEASONGAMES-27-600",
+      "stratum": "long_dated",
+      "pool_rate_usd_per_sec": 0.00578704,
+      "duration_min": 630240.0
+    },
+    {
+      "ticker": "KXMLBSEASONGAMES-27-1215",
+      "stratum": "long_dated",
+      "pool_rate_usd_per_sec": 0.00578704,
+      "duration_min": 630240.0
+    },
+    {
+      "ticker": "KXMLBSEASONGAMES-27-2425",
+      "stratum": "long_dated",
+      "pool_rate_usd_per_sec": 0.00578704,
+      "duration_min": 630240.0
+    },
+    {
+      "ticker": "KXMLBSEASONGAMES-27-0",
+      "stratum": "long_dated",
+      "pool_rate_usd_per_sec": 0.00578704,
+      "duration_min": 630240.0
+    },
+    {
+      "ticker": "KXMLBSEASONGAMES-27-1930",
+      "stratum": "long_dated",
+      "pool_rate_usd_per_sec": 0.00578704,
+      "duration_min": 630240.0
+    },
+    {
+      "ticker": "KXTTELITEMATCH-26SEP210055JPEPGU-JPE",
+      "stratum": "long_dated",
+      "pool_rate_usd_per_sec": 0.0037037,
+      "duration_min": 10550.0
+    }
+  ],
+  "capture": {
+    "events": 198,
+    "book_snapshots": 192,
+    "trades": 802,
+    "polls": 16,
+    "fetch_errors": 0,
+    "stream_sec": 105.61013603210449,
+    "path": "data/experiments/stream-20260921T042813Z.jsonl"
+  },
+  "arms": {
+    "control_30min": {
+      "policy": "control_30min",
+      "cutoffs_applied": {
+        "KXCRYPTOLEAD15M-26SEP210030-ETH": 30.0,
+        "KXPLATINUM15M-26SEP210030-30": 30.0,
+        "KXCRYPTOLEAD15M-26SEP210030-BTC": 30.0,
+        "KXPALLADIUM15M-26SEP210030-30": 30.0,
+        "KXCRYPTOLEAD15M-26SEP210030-SOL": 30.0,
+        "KXMLBSEASONGAMES-27-600": 30.0,
+        "KXMLBSEASONGAMES-27-1215": 30.0,
+        "KXCRYPTOLEAD15M-26SEP210030-HYPE": 30.0,
+        "KXMLBSEASONGAMES-27-2425": 30.0,
+        "KXMLBSEASONGAMES-27-0": 30.0,
+        "KXMLBSEASONGAMES-27-1930": 30.0,
+        "KXTTELITEMATCH-26SEP210055JPEPGU-JPE": 30.0
+      },
+      "opportunities": {
+        "markets": 12,
+        "refusal_reasons": {
+          "pre_settlement": 96,
+          "uneconomic": 96
+        },
+        "economic_rejects": 6,
+        "unknown_close_skips": 0
+      },
+      "quoting": {
+        "quotes": 0,
+        "by_stratum": {},
+        "detail": []
+      },
+      "execution": {
+        "trades_observed": 802,
+        "modelled_fills": 0,
+        "fills_applied": 0,
+        "still_resting": 0
+      },
+      "qualified_resting_stream_sec": 0.0,
+      "account": {
+        "cash_usd": 5000.0,
+        "reserved_usd": 0.0,
+        "inventory_cost_usd": 0.0,
+        "available_usd": 5000.0
+      },
+      "inventory": {},
+      "exits": {
+        "actions": 0,
+        "reasons": {}
+      },
+      "reward_estimates_only": {
+        "bb1f335d-57b1-4d49-b1f7-05b202993a07": 0.0,
+        "b3e53d29-103e-475d-bee1-264877c4cfe0": 0.0,
+        "cd7cf435-c224-4b24-b9dc-52e26ccb9504": 0.0,
+        "ae0ccafc-88e1-4d68-954d-4cc1b7171b01": 0.0,
+        "9d2518f2-580e-423a-b174-38d002a3ffe2": 0.0,
+        "ef83960b-3aab-434e-8cb4-d84ec8683e2d": 0.0,
+        "b1f22e93-fbaa-4291-9245-a9048ae6b02e": 0.0,
+        "899d5dfd-e8d1-4264-a215-f0756d8971a8": 0.0,
+        "a8b8542e-6acd-44a0-90ab-cb2d4a5ee5c3": 0.0,
+        "5d4fe6f8-a98e-45b1-b1a9-134b8026ee70": 0.0,
+        "46a65335-0dae-422d-8ea1-928e642c86b1": 0.0,
+        "fb6cd006-575e-4c2a-addf-a3dd69529ba0": 0.0
+      },
+      "reward_payments": {}
+    },
+    "fixed_60s": {
+      "policy": "fixed_60s",
+      "cutoffs_applied": {
+        "KXMLBSEASONGAMES-27-600": 1.0,
+        "KXMLBSEASONGAMES-27-1215": 1.0,
+        "KXMLBSEASONGAMES-27-2425": 1.0,
+        "KXMLBSEASONGAMES-27-0": 1.0,
+        "KXMLBSEASONGAMES-27-1930": 1.0,
+        "KXTTELITEMATCH-26SEP210055JPEPGU-JPE": 1.0
+      },
+      "opportunities": {
+        "markets": 12,
+        "refusal_reasons": {
+          "uneconomic": 96
+        },
+        "economic_rejects": 6,
+        "unknown_close_skips": 0
+      },
+      "quoting": {
+        "quotes": 0,
+        "by_stratum": {},
+        "detail": []
+      },
+      "execution": {
+        "trades_observed": 802,
+        "modelled_fills": 0,
+        "fills_applied": 0,
+        "still_resting": 0
+      },
+      "qualified_resting_stream_sec": 0.0,
+      "account": {
+        "cash_usd": 5000.0,
+        "reserved_usd": 0.0,
+        "inventory_cost_usd": 0.0,
+        "available_usd": 5000.0
+      },
+      "inventory": {},
+      "exits": {
+        "actions": 0,
+        "reasons": {}
+      },
+      "reward_estimates_only": {
+        "ef83960b-3aab-434e-8cb4-d84ec8683e2d": 0.0,
+        "b1f22e93-fbaa-4291-9245-a9048ae6b02e": 0.0,
+        "a8b8542e-6acd-44a0-90ab-cb2d4a5ee5c3": 0.0,
+        "5d4fe6f8-a98e-45b1-b1a9-134b8026ee70": 0.0,
+        "46a65335-0dae-422d-8ea1-928e642c86b1": 0.0,
+        "fb6cd006-575e-4c2a-addf-a3dd69529ba0": 0.0
+      },
+      "reward_payments": {}
+    },
+    "proportional_20pct": {
+      "policy": "proportional_20pct",
+      "cutoffs_applied": {
+        "KXMLBSEASONGAMES-27-600": 30.0,
+        "KXMLBSEASONGAMES-27-1215": 30.0,
+        "KXMLBSEASONGAMES-27-2425": 30.0,
+        "KXMLBSEASONGAMES-27-0": 30.0,
+        "KXMLBSEASONGAMES-27-1930": 30.0,
+        "KXTTELITEMATCH-26SEP210055JPEPGU-JPE": 30.0
+      },
+      "opportunities": {
+        "markets": 12,
+        "refusal_reasons": {
+          "uneconomic": 96
+        },
+        "economic_rejects": 6,
+        "unknown_close_skips": 0
+      },
+      "quoting": {
+        "quotes": 0,
+        "by_stratum": {},
+        "detail": []
+      },
+      "execution": {
+        "trades_observed": 802,
+        "modelled_fills": 0,
+        "fills_applied": 0,
+        "still_resting": 0
+      },
+      "qualified_resting_stream_sec": 0.0,
+      "account": {
+        "cash_usd": 5000.0,
+        "reserved_usd": 0.0,
+        "inventory_cost_usd": 0.0,
+        "available_usd": 5000.0
+      },
+      "inventory": {},
+      "exits": {
+        "actions": 0,
+        "reasons": {}
+      },
+      "reward_estimates_only": {
+        "ef83960b-3aab-434e-8cb4-d84ec8683e2d": 0.0,
+        "b1f22e93-fbaa-4291-9245-a9048ae6b02e": 0.0,
+        "a8b8542e-6acd-44a0-90ab-cb2d4a5ee5c3": 0.0,
+        "5d4fe6f8-a98e-45b1-b1a9-134b8026ee70": 0.0,
+        "46a65335-0dae-422d-8ea1-928e642c86b1": 0.0,
+        "fb6cd006-575e-4c2a-addf-a3dd69529ba0": 0.0
+      },
+      "reward_payments": {}
+    }
+  },
+  "baseline": {
+    "policy": "do_nothing",
+    "net_usd": 0.0,
+    "note": "not quoting is always available and costs nothing"
+  },
+  "caveats": [
+    "Rewards are ESTIMATES. Nothing has been paid or reconciled.",
+    "Fills are MODELLED from captured public trades with a conservative queue assumption; they are not observed fills of our orders, which do not exist.",
+    "REST snapshots have no sequence and no queue position, so execution modelling is the weakest part of this evidence.",
+    "Replay is faster than wall clock; all durations are STREAM seconds from captured timestamps.",
+    "A bounded capture cannot span complete incentive periods for long-dated markets; their reward figures are partial."
+  ]
+}

@@ -210,6 +210,7 @@ async def run_session(args) -> dict:
     seen_orders: set[str] = set()
 
     async def on_book(book):
+        runner.execution_model.observe_market(book.market_ticker)
         try:
             await runner.on_book_update(book)
         except Exception as e:

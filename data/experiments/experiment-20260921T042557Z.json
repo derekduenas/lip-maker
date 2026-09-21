@@ -1,0 +1,19 @@
+{
+  "error": "no markets met the frozen selection spec",
+  "selection": {
+    "discovery": {
+      "source": "persisted",
+      "rows": 12349
+    },
+    "examined": 400,
+    "excluded": {
+      "unknown_duration": 0,
+      "one_sided_book": 400,
+      "no_book": 0
+    },
+    "per_stratum": {
+      "short_window": 0,
+      "long_dated": 0
+    }
+  }
+}

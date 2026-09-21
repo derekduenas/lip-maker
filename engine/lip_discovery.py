@@ -311,6 +311,32 @@ class DiscoveryResult:
     # Non-zero means ticker-keyed runtime state cannot represent reality.
     n_collisions: int = 0
     collision_samples: list[str] = field(default_factory=list)
+    # 2026-09-21: `programs` is a list of ROWS, and the same program id can
+    # be returned under more than one status filter across a full scan.
+    # Reporting len(programs) as "programs discovered" overstates the
+    # universe, so the counts are kept apart.
+    rows_returned: int = 0            # raw rows the API handed back
+    unique_program_ids: int = 0       # distinct /incentive_programs ids
+    duplicate_rows: int = 0           # rows whose id was already seen
+    pages_fetched: int = 0            # pages successfully fetched
+    pages_by_status: dict = field(default_factory=dict)
+    rows_by_status: dict = field(default_factory=dict)
+    unique_by_status: dict = field(default_factory=dict)
+
+    def counts(self) -> dict:
+        """The honest accounting, for any report that quotes a number."""
+        return {"rows_returned": self.rows_returned,
+                "unique_program_ids": self.unique_program_ids,
+                "duplicate_rows": self.duplicate_rows,
+                "rows_kept_as_liquidity": len(self.programs),
+                "rejected_malformed": self.n_rejected,
+                "pages_fetched": self.pages_fetched,
+                "pages_by_status": dict(self.pages_by_status),
+                "rows_by_status": dict(self.rows_by_status),
+                "unique_by_status": dict(self.unique_by_status),
+                "complete": self.complete,
+                "note": ("active/upcoming are CURRENT; closed/paid_out are "
+                         "HISTORICAL and dominate the row count")}
 
 
 def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
@@ -379,11 +405,19 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
     started = datetime.now(timezone.utc)
     started_ts = started.timestamp()
 
+    seen_ids: set = set()
+    rows_returned = 0
+    duplicate_rows = 0
+    pages_fetched = 0
+    pages_by_status: dict = {}
+    rows_by_status: dict = {}
+    unique_by_status: dict = {}
     for s in statuses:
         cursor = None
         page_n = 0
         status_total = 0
         status_kept = 0
+        status_unique = 0
         first_5_tickers = []
         while True:
             params = {"status": s, "type": "liquidity", "limit": 200}
@@ -397,9 +431,18 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
                 break
             batch = resp.get("incentive_programs", [])
             page_n += 1
+            pages_fetched += 1
             status_total += len(batch)
+            rows_returned += len(batch)
             for raw in batch:
                 tk = raw.get("market_ticker") or ""
+                pid = raw.get("id")
+                if pid is not None:
+                    if pid in seen_ids:
+                        duplicate_rows += 1
+                    else:
+                        seen_ids.add(pid)
+                        status_unique += 1
                 if len(first_5_tickers) < 5 and tk:
                     first_5_tickers.append(tk[:30])
                 if raw.get("incentive_type") != "liquidity":
@@ -421,8 +464,12 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
             cursor = resp.get("next_cursor")
             if not cursor:
                 break
+        pages_by_status[s] = page_n
+        rows_by_status[s] = status_total
+        unique_by_status[s] = status_unique
         _log.info(
             f"CHECKPOINT-1 status={s}  pages={page_n}  raw_returned={status_total}  "
+            f"unique_new_ids={status_unique}  "
             f"kept_as_liquidity={status_kept}  first_5={first_5_tickers}"
         )
 
@@ -569,6 +616,10 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
         finished_ts=datetime.now(timezone.utc).timestamp(), errors=errors,
         n_rejected=n_rejected, n_demoted=n_demoted,
         n_collisions=n_collisions, collision_samples=collision_samples,
+        rows_returned=rows_returned, unique_program_ids=len(seen_ids),
+        duplicate_rows=duplicate_rows, pages_fetched=pages_fetched,
+        pages_by_status=pages_by_status, rows_by_status=rows_by_status,
+        unique_by_status=unique_by_status,
     )
 
 
