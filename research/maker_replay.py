@@ -304,6 +304,21 @@ def replay(events, config=ReplayConfig(), reward_program=None):
         else:
             proceeds += value-q*exit_fee
     pnl = proceeds-spent-fees-operating if complete else None
+    # A distinct hold-to-settlement valuation avoids crossing both legs of a
+    # complementary pair. This is terminal economic value, never available cash.
+    paired = min(positions.values())
+    residual_proceeds = number(0)
+    residual_complete = True
+    for side, quantity in positions.items():
+        residual = quantity - paired
+        if residual <= 0:
+            continue
+        value = exit_value(book, side, residual) if fresh(end) and exit_book_observed else None
+        if value is None:
+            residual_complete = False
+        else:
+            residual_proceeds += value - residual*exit_fee
+    held_pair_pnl = paired + residual_proceeds-spent-fees-operating if residual_complete else None
     fingerprint = hashlib.sha256(json.dumps(dict(config=cfg, events=timeline, reward_program=reward_program), sort_keys=True).encode()).hexdigest()
     reward_result = None
     if reward_program is not None:
@@ -315,6 +330,9 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             positive_share_seconds=str(reward_seconds),
             modeled_net_if_stop_usd=str(pnl+payable) if pnl is not None else None)
     return dict(reward_model=reward_result, status='MODELED_RESEARCH_ONLY' , fingerprint=fingerprint, config=cfg,
+                paired_contracts=str(paired), paired_terminal_value_usd=str(paired),
+                paired_hold_net_before_rewards_usd=str(held_pair_pnl) if held_pair_pnl is not None else None,
+                paired_hold_assumption='Same-contract complementary settlement totals $1 per pair; no early cash release assumed.',
                 fills=fills, decisions=decisions, inventory={k:str(v) for k,v in positions.items()},
                 spent_usd=str(spent), maker_fees_usd=str(fees), liquidation_complete=complete,
                 net_before_rewards_usd=str(pnl) if pnl is not None else None,
