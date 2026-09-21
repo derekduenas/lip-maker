@@ -32,6 +32,7 @@ class ReplayConfig:
     movement_window_ms: int = 5000
     max_mid_move_usd: str = '0.03'
     qualification_target: str = '300'
+    min_pair_margin_usd: str = '0.01'
     program_start_ms: int | None = None
     program_end_ms: int | None = None
 
@@ -43,7 +44,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
     operating, queue_mult = number(config.operating_cost_usd), number(config.queue_multiplier)
     if size <= 0 or budget < 0 or min(maker_fee,exit_fee,operating) < 0 or queue_mult < 1:
         raise ValueError('invalid replay economics')
-    if config.latency_ms < 0 or config.stale_ms <= 0 or config.policy not in ('join_best','spread_guard','do_nothing','defensive_maker','reward_depth'):
+    if config.latency_ms < 0 or config.stale_ms <= 0 or config.policy not in ('join_best','spread_guard','do_nothing','defensive_maker','reward_depth','reward_inventory'):
         raise ValueError('invalid policy/timing')
     if not 0 <= number(config.max_spread_usd) <= 1:
         raise ValueError("invalid spread threshold")
@@ -59,8 +60,10 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             raise ValueError('invalid program window')
     if config.program_start_ms is not None and config.program_end_ms is not None and config.program_start_ms>=config.program_end_ms:
         raise ValueError('inverted program window')
-    if config.policy == 'reward_depth' and reward_program is None:
+    if config.policy in ('reward_depth','reward_inventory') and reward_program is None:
         raise ValueError('reward_depth requires program metadata')
+    if not 0 <= number(config.min_pair_margin_usd) < 1:
+        raise ValueError('invalid pair margin')
     history=[]
     vetoes={}
     def veto(reason):
@@ -105,6 +108,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
     book = None
     orders, pending = {}, {}
     positions = {'yes': number(0), 'no': number(0)}
+    lots = {'yes': [], 'no': []}
     spent = fees = number(0)
     fills, decisions = [], []
     had_gap = False
@@ -135,17 +139,28 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             other = bid('no' if side == 'yes' else 'yes')
             if other is None or price + other >= 1:
                 continue  # post-only reject at simulated activation
-            if config.policy in ('defensive_maker','reward_depth'):
-                gross=sum(positions.values())+sum(o['remaining'] for o in orders.values())+size
-                net=positions[side]-positions['no' if side=='yes' else 'yes']+size
+            order_size = size
+            if config.policy == 'reward_inventory':
+                opposite = 'no' if side == 'yes' else 'yes'
+                imbalance = positions[opposite] - positions[side]
+                if imbalance < 0:
+                    continue
+                if imbalance > 0:
+                    order_size = min(size, imbalance)
+                    worst = max(cost for qty, cost in lots[opposite])
+                    if price + maker_fee + worst > 1-number(config.min_pair_margin_usd):
+                        continue
+            if config.policy in ('defensive_maker','reward_depth','reward_inventory'):
+                gross=sum(positions.values())+sum(o['remaining'] for o in orders.values())+order_size
+                net=positions[side]-positions['no' if side=='yes' else 'yes']+order_size
                 if gross>gross_cap or net>net_cap:
                     veto('activation_inventory_limit')
                     continue
             reserved = sum(o['remaining']*(o['price']+maker_fee) for o in orders.values())
-            if spent + fees + reserved + size*(price+maker_fee) > budget:
+            if spent + fees + reserved + order_size*(price+maker_fee) > budget:
                 continue
             ahead = sum(number(q) for p,q in book.get(side+'_bids', []) if number(p)>=price)
-            orders[side] = dict(price=price, remaining=size, ahead=ahead*queue_mult, activated_ms=now)
+            orders[side] = dict(price=price, remaining=order_size, ahead=ahead*queue_mult, activated_ms=now)
 
     previous_time = None
     def accrue_until(now):
@@ -205,7 +220,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             if config.policy == 'spread_guard' and allowed:
                 allowed = 1-y-n <= number(config.max_spread_usd)
             desired_prices={side:bid(side) if allowed else None for side in positions}
-            if config.policy in ('defensive_maker','reward_depth') and allowed:
+            if config.policy in ('defensive_maker','reward_depth','reward_inventory') and allowed:
                 mid=(y+1-n)/2
                 history=[(t,m) for t,m in history if now-t<=config.movement_window_ms]
                 history.append((now,mid))
@@ -214,10 +229,10 @@ def replay(events, config=ReplayConfig(), reward_program=None):
                 if 1-y-n>number(config.max_spread_usd):
                     allowed=False;veto('wide_spread')
                 # Require capacity for both intended bids, even if only one fills.
-                if sum(positions.values())+2*size>gross_cap or abs(positions['yes']-positions['no'])+size>net_cap:
+                if not (config.policy == 'reward_inventory' and positions['yes'] != positions['no']) and (sum(positions.values())+2*size>gross_cap or abs(positions['yes']-positions['no'])+size>net_cap):
                     allowed=False;veto('inventory_limit')
                 for side in positions:
-                    if config.policy == 'reward_depth':
+                    if config.policy in ('reward_depth','reward_inventory'):
                         continue
                     price=((bid(side)-config.quote_offset_ticks*tick)//tick)*tick
                     cumulative=number(0);cutoff=None
@@ -228,7 +243,7 @@ def replay(events, config=ReplayConfig(), reward_program=None):
                     if cutoff is None or price<cutoff or price<=0:
                         allowed=False;veto('outside_modeled_qualification')
                     desired_prices[side]=price
-            if config.policy == 'reward_depth' and allowed:
+            if config.policy in ('reward_depth','reward_inventory') and allowed and not (config.policy == 'reward_inventory' and positions['yes'] != positions['no']):
                 from research.reward_optimizer import _side
                 # Search current eligible levels only, before seeing future trades.
                 # Fixed size comes from the predeclared experiment; do not resize
@@ -253,6 +268,14 @@ def replay(events, config=ReplayConfig(), reward_program=None):
                     desired_prices={'yes':yp,'no':np}
                 else:
                     allowed=False;veto('no_reward_depth_candidate')
+            if config.policy == 'reward_inventory' and allowed and positions['yes'] != positions['no']:
+                heavy = 'yes' if positions['yes'] > positions['no'] else 'no'
+                light = 'no' if heavy == 'yes' else 'yes'
+                worst = max(cost for qty, cost in lots[heavy])
+                ceiling = 1 - worst - maker_fee - number(config.min_pair_margin_usd)
+                hedge = min(bid(light), (ceiling // tick)*tick)
+                desired_prices = {heavy:None, light:hedge if hedge > 0 else None}
+                veto('inventory_pair_completion')
             if config.policy == 'do_nothing':
                 allowed = False
             for side in positions:
@@ -286,6 +309,15 @@ def replay(events, config=ReplayConfig(), reward_program=None):
             if take:
                 o['remaining'] -= take
                 positions[e['side']] += take
+                lots[e['side']].append([take, o['price']+maker_fee])
+                # Match opposing fills FIFO. Remaining lots define the cost
+                # ceiling for completing unmatched inventory, including fees.
+                while lots['yes'] and lots['no']:
+                    matched = min(lots['yes'][0][0], lots['no'][0][0])
+                    for leg in ('yes','no'):
+                        lots[leg][0][0] -= matched
+                        if lots[leg][0][0] == 0:
+                            lots[leg].pop(0)
                 spent += take*o['price']
                 fees += take*maker_fee
                 fills.append(dict(event_id='replay:'+e['event_id'], ts_ms=now,

@@ -25,6 +25,6 @@ def test_reward_depth_prefix_is_causal():
 
 def test_incomplete_program_is_not_promoted():
     r=run_program([book(),book(300)],program(),{'capital_usd':'5000'},[1,2])
-    assert len(r['results'])==6
+    assert len(r['results'])==8
     assert not r['program_span_present'] and not r['full_program_validated']
     assert r['selected_policy'] is None

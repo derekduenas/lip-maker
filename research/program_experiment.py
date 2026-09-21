@@ -11,7 +11,7 @@ def run_program(events, program, config, sizes):
     span=bool(events) and events[0]['ts_ms']<=start and events[-1]['ts_ms']>=end
     results=[]
     for size in sizes:
-        for policy in ('do_nothing','join_best','reward_depth'):
+        for policy in ('do_nothing','join_best','reward_depth','reward_inventory'):
             cfg=replace(ReplayConfig(**config),size=str(size),policy=policy,program_start_ms=start,program_end_ms=end)
             result=replay(events,cfg,program)
             results.append(dict(size=str(size),policy=policy,result=result))
