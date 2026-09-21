@@ -33,7 +33,6 @@ import json
 import logging
 import sqlite3
 import sys
-from unittest import mock
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import settings
 from engine import experiment_spec as SPEC
 from engine.entry_cutoff import ALL_POLICIES, policy_fingerprint
+from engine.event_clock import EventClock, scoped as scoped_clock
 from engine.lip_discovery import discover_result
 from engine.market_clock import MarketClock
 from execution.kalshi_ws import BookLevel, BookState, FillEvent
@@ -240,17 +240,16 @@ async def replay_arm(policy: str, markets, events, workdir: Path) -> dict:
         runner.market_clock = MarketClock(fetcher=fetcher)
 
         # Replay runs far faster than wall clock, but the runner's throttles
-        # (scoring, reprice, persist) are wall-clock based. Left alone they
-        # suppress almost every evaluation and the few that survive happen
-        # at the start, when nothing has been observed yet — which is how an
-        # earlier run recorded "measured=False" after 491 seconds of data.
-        # Driving time.time() from the STREAM makes those throttles behave
-        # as they would live.
-        clock = {"now": events[0]["t"] if events else time.time()}
+        # (scoring, reprice, persist) and its accounting are wall-clock
+        # based. Left alone they suppress almost every evaluation and the
+        # survivors run at the start, before anything has been observed.
+        #
+        # The clock is INJECTED into the strategy modules only. An earlier
+        # version patched the global time.time, which also reached
+        # networking and asyncio; EventClock.monotonic stays real so
+        # operational timeouts are never distorted.
+        clock = EventClock(events[0]["t"] if events else time.time())
         real_time = time.time
-
-        def stream_now():
-            return clock["now"]
 
         sim = PaperFillSimulator(latency_ms=250.0)
         books: dict[str, BookState] = {}
@@ -263,12 +262,10 @@ async def replay_arm(policy: str, markets, events, workdir: Path) -> dict:
         last_t = None
         t0 = events[0]["t"] if events else time.time()
 
-        patcher = mock.patch("time.time", stream_now)
-        patcher.start()
-        try:
+        with scoped_clock(clock):
           for ev in events:
             stream_t = ev["t"]
-            clock["now"] = stream_t
+            clock.set(stream_t)
             if last_t is not None:
                 dt = stream_t - last_t
                 # Qualified resting time, in STREAM seconds.
@@ -333,8 +330,6 @@ async def replay_arm(policy: str, markets, events, workdir: Path) -> dict:
                     except Exception as ex:
                         _log.debug(f"[{policy}] on_fill: {ex}")
 
-        finally:
-            patcher.stop()
 
         try:
             runner.manage_exits(real_time())
