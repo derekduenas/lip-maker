@@ -225,6 +225,10 @@ class PaperRunner:
         self.exit_policy = ExitPolicy()
         # Set by the main loop to the live WS book map.
         self.books: dict = {}
+        # Economic selection telemetry.
+        self.econ_rejects: int = 0
+        self._econ_last: dict[str, dict] = {}
+        self._last_share: dict[str, float] = {}
         self._snapshot_persist_failures: int = 0  # Architect audit: track silent drops
         # Futures fair-value cache (Quant audit): {prefix: (price, fetched_ts)}
         # Refreshed every 60s to match futures-feed.timer cadence.
@@ -1361,6 +1365,9 @@ class PaperRunner:
         yes_bid_c = best_yes.price_cents
         no_bid_c  = best_no.price_cents
         as_reason = "off"
+        # Bound unconditionally: the economic layer below needs it whether or
+        # not the reservation-price branch runs.
+        hours_settle = (mins_until / 60.0) if (mins_until is not None) else 24.0
         if settings.AS_RESERVATION_ENABLED:
             mp_tuple = self._last_microprice.get(book.market_ticker)
             mp = mp_tuple[0] if mp_tuple is not None else None
@@ -1408,6 +1415,33 @@ class PaperRunner:
                 self._fv_skip_log_ts[f"qual:{tkr}"] = now_ts
             return self._skip(tkr, q_reason)
 
+        # 2026-09-21: economic selection. Up to here the size came from
+        # reward capacity — the program's target and our share of it. Reward
+        # capacity is not profit. Before committing the account we ask what
+        # this quote is expected to NET over a stated horizon, and compare
+        # every candidate against the option of not quoting at all.
+        econ = self._economic_choice(book, p, yes_bid_c, no_bid_c, size,
+                                     hours_settle)
+        if econ is not None:
+            self._econ_last[tkr] = econ.explain()
+            if not econ.should_quote:
+                self.econ_rejects += 1
+                now_ts = time.time()
+                if now_ts - self._fv_skip_log_ts.get(f"econ:{tkr}", 0) > 300:
+                    _log.info(f"econ_reject[{tkr}] {econ.reason}")
+                    self._fv_skip_log_ts[f"econ:{tkr}"] = now_ts
+                return self._skip(tkr, "uneconomic")
+            chosen = econ.chosen.candidate.size_contracts
+            if chosen != size:
+                _log.info(f"econ_resize[{tkr}] {size} → {chosen}: {econ.reason}")
+                # Overrides were computed against the old size; the chosen
+                # size replaces them rather than being layered on top.
+                if yes_size_override is not None:
+                    yes_size_override = min(yes_size_override, chosen)
+                if no_size_override is not None:
+                    no_size_override = min(no_size_override, chosen)
+                size = chosen
+
         return QuoteTarget(
             market_ticker=book.market_ticker,
             yes_bid_cents=yes_bid_c,
@@ -1417,6 +1451,86 @@ class PaperRunner:
             no_size_override=no_size_override,
             program_id=self._akey(p),
         )
+
+    def _economic_choice(self, book, p, yes_bid_c, no_bid_c, size, hours_settle):
+        """Pick the quote with the best expected net per dollar, or none.
+
+        Candidates are sizes around the reward-derived one, plus no-quote.
+        Sizing down is a real option: our own depth dilutes our share, so a
+        smaller quote can net more per dollar committed.
+        """
+        try:
+            from engine.quote_economics import QuoteCandidate, select
+        except Exception:
+            return None
+        if yes_bid_c is None or no_bid_c is None or size <= 0:
+            return None
+        try:
+            top = 0
+            for lvl in (book.yes_bids[:1] + book.no_bids[:1]):
+                top += int(lvl.size)
+            midpoint = (yes_bid_c + (100 - no_bid_c)) / 200.0
+            horizon = 86400.0
+            if p.end_ts is not None:
+                horizon = max(60.0, min(horizon, p.end_ts - time.time()))
+            sizes = sorted({max(1, size // 4), max(1, size // 2), size,
+                            int(size * 1.5)})
+            cands = [QuoteCandidate(n, yes_bid_c, no_bid_c) for n in sizes]
+            cands.append(QuoteCandidate(0, None, None))
+            avail = Decimal(str(self.account.available_usd()))
+            return select(
+                cands,
+                available_capital_usd=avail,
+                max_market_capital_usd=self._max_market_capital(),
+                market_id=book.market_ticker,
+                horizon_sec=horizon,
+                pool_rate_usd_per_sec=p.pool_rate_usd_per_sec,
+                target_size=p.target_size,
+                discount_factor=p.discount_factor,
+                top_book_size=top,
+                midpoint=midpoint,
+                hours_to_settle=hours_settle,
+                calibration=self._calibration_for(book.market_ticker),
+                observed_share=self._observed_share(book.market_ticker),
+                expected_fills_per_horizon=self._expected_fills(book.market_ticker),
+                fee_schedule=self._fee_schedule(),
+            )
+        except Exception as e:
+            _log.warning(f"economic selection failed for {book.market_ticker}: {e}")
+            return None
+
+    def _max_market_capital(self):
+        try:
+            cash = Decimal(str(self.account.state().cash_usd))
+            pct = Decimal(str(getattr(settings, "MAX_BANKROLL_SHARE_PCT", 0.5)))
+            return cash * pct
+        except Exception:
+            return None
+
+    def _calibration_for(self, ticker: str) -> float:
+        """Observed-to-modelled reward ratio, when we have one. Defaults to
+        1.0 (no adjustment) rather than to an invented discount."""
+        try:
+            from engine.calibration_ewma import calibration_for
+            c = calibration_for(ticker)
+            return float(c) if c else 1.0
+        except Exception:
+            return 1.0
+
+    def _observed_share(self, ticker: str):
+        """Our realized share from snapshots, or None when unmeasured. None
+        is passed through as an unknown, never replaced by a guess."""
+        vals = [v for v in [self._last_share.get(ticker)] if v is not None]
+        return float(vals[0]) if vals else None
+
+    def _expected_fills(self, ticker: str):
+        """Fills per day observed for this market, or None. Unknown stays
+        unknown: the economics module prices that explicitly."""
+        n = self.fill_counts.get(ticker, 0)
+        elapsed = max(1.0, time.time() - self.start_time)
+        if n <= 0:
+            return None
+        return float(n) * 86400.0 / elapsed
 
     def _qualification_adjust(self, book: BookState, p: ProgramParams,
                               yes_bid_c: int, no_bid_c: int, size: int,
