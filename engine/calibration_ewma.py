@@ -72,11 +72,29 @@ CREATE INDEX IF NOT EXISTS idx_market_calibration_updated
     ON market_calibration(updated_at);
 """
 
+# Rows written before 2026-09-21 were built from model estimates passed as
+# `actual_usd`. They are quarantined rather than deleted: calib_for ignores
+# them, so consumers fall back to the flat prior until real payments arrive.
+PROV_PAID = "paid"
+PROV_CONTAMINATED = "contaminated_estimate"
+
 
 def ensure_schema(db_path: str = settings.DB_PATH) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(SCHEMA_DDL)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(market_calibration)").fetchall()}
+        if "provenance" not in cols:
+            conn.execute("ALTER TABLE market_calibration ADD COLUMN provenance TEXT")
+            # Everything that already exists was estimate-derived.
+            cur = conn.execute(
+                "UPDATE market_calibration SET provenance = ? WHERE provenance IS NULL",
+                (PROV_CONTAMINATED,))
+            if cur.rowcount:
+                _log.warning(
+                    f"calibration_ewma: quarantined {cur.rowcount} calibration rows "
+                    f"built from model estimates. calib_for() will return the "
+                    f"fallback prior for these keys until reconciled payments exist.")
         conn.commit()
     finally:
         conn.close()
@@ -90,19 +108,33 @@ def series_prefix(ticker_or_key: str) -> str:
 
 def update(key: str, predicted_usd: float, actual_usd: float,
            *, alpha: float = DEFAULT_ALPHA,
+           provenance: str = "",
            db_path: str = settings.DB_PATH) -> Optional[float]:
     """EWMA-update calibration for `key` from one settlement observation.
+
+    2026-09-21: `provenance` is REQUIRED and must be 'paid'. This function
+    used to be called by tools/settlement_reconciler.py with our own model's
+    rebate estimate passed as `actual_usd` and commented "what we actually
+    earned" — the model calibrated itself, so it could not detect its own
+    error, and the result fed capital_allocator sizing and attack_targets
+    ranking. Only an independently reconciled payment (see
+    engine/reward_provenance.record_payment) may calibrate.
 
     Args:
         key: series prefix or ticker (will be normalized to prefix).
         predicted_usd: model-projected rebate for this market.
-        actual_usd: actual paid rebate (from settlement_log.rebate_earned_usd).
+        actual_usd: actual PAID rebate, reconciled against a Kalshi record.
         alpha: EWMA smoothing factor (0.05 = slow, 0.5 = fast).
+        provenance: must be 'paid'; anything else is rejected.
 
     Returns:
-        New calibration value, or None if the observation was skipped
-        (predicted_usd too small to be a useful signal).
+        New calibration value, or None if the observation was skipped.
     """
+    if provenance != "paid":
+        _log.warning(
+            f"calibration_ewma.update[{key}] REJECTED: provenance={provenance!r}. "
+            f"Only reconciled payments may calibrate; model estimates may not.")
+        return None
     if predicted_usd is None or predicted_usd < MIN_PREDICTED_USD:
         return None
     if actual_usd is None:
@@ -117,11 +149,14 @@ def update(key: str, predicted_usd: float, actual_usd: float,
         conn = sqlite3.connect(db_path, timeout=3.0)
         try:
             row = conn.execute(
-                "SELECT calibration, n_samples FROM market_calibration WHERE key=?",
+                "SELECT calibration, n_samples, provenance "
+                "FROM market_calibration WHERE key=?",
                 (k,),
             ).fetchone()
-            if row is None:
-                # Seed at the observation itself; the EWMA will smooth subsequent updates
+            if row is None or row[2] != PROV_PAID:
+                # No row, or a quarantined estimate-derived row: seed fresh
+                # from this (paid) observation rather than blending onto a
+                # contaminated prior.
                 new_calib = ratio
                 new_n = 1
             else:
@@ -131,18 +166,19 @@ def update(key: str, predicted_usd: float, actual_usd: float,
             conn.execute(
                 """INSERT INTO market_calibration
                    (key, calibration, n_samples, last_ratio,
-                    last_predicted_usd, last_actual_usd, updated_at)
-                   VALUES (?,?,?,?,?,?,?)
+                    last_predicted_usd, last_actual_usd, updated_at, provenance)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(key) DO UPDATE SET
                        calibration=excluded.calibration,
                        n_samples=excluded.n_samples,
                        last_ratio=excluded.last_ratio,
                        last_predicted_usd=excluded.last_predicted_usd,
                        last_actual_usd=excluded.last_actual_usd,
-                       updated_at=excluded.updated_at""",
+                       updated_at=excluded.updated_at,
+                       provenance=excluded.provenance""",
                 (k, new_calib, new_n, ratio,
                  float(predicted_usd), actual_usd,
-                 datetime.now(timezone.utc).isoformat()),
+                 datetime.now(timezone.utc).isoformat(), PROV_PAID),
             )
             conn.commit()
             return new_calib
@@ -160,6 +196,8 @@ def calib_for(key: str, fallback: float,
       - PER_MARKET_CALIB_ENABLED is False (feature flag)
       - no row exists yet
       - n_samples is below min_samples (cold start)
+      - the row is quarantined (2026-09-21): built from model estimates
+        rather than reconciled payments
     """
     if not getattr(settings, "PER_MARKET_CALIB_ENABLED", False):
         return float(fallback)
@@ -167,10 +205,15 @@ def calib_for(key: str, fallback: float,
     try:
         conn = sqlite3.connect(db_path, timeout=2.0)
         try:
-            row = conn.execute(
-                "SELECT calibration, n_samples FROM market_calibration WHERE key=?",
-                (k,),
-            ).fetchone()
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(market_calibration)").fetchall()}
+            if "provenance" in cols:
+                row = conn.execute(
+                    "SELECT calibration, n_samples FROM market_calibration "
+                    "WHERE key=? AND provenance=?", (k, PROV_PAID)).fetchone()
+            else:
+                # Pre-migration DB: every row is estimate-derived. Refuse it.
+                row = None
         finally:
             conn.close()
     except sqlite3.OperationalError:
@@ -214,26 +257,32 @@ def _self_test() -> None:
     try:
         ensure_schema(path)
 
-        # First observation seeds the value
+        # An estimate must never calibrate (2026-09-21).
+        assert update("KXBRENTD", predicted_usd=10.0, actual_usd=2.5,
+                      db_path=path) is None
+        assert update("KXBRENTD", predicted_usd=10.0, actual_usd=2.5,
+                      provenance="estimate", db_path=path) is None
+
+        # First PAID observation seeds the value
         c = update("KXBRENTD-26JUN0117-T100", predicted_usd=10.0,
-                   actual_usd=2.5, db_path=path)
+                   actual_usd=2.5, provenance="paid", db_path=path)
         assert c is not None and abs(c - 0.25) < 0.001, c
 
         # EWMA toward 0.50: 0.05*0.50 + 0.95*0.25 = 0.2625
         c = update("KXBRENTD", predicted_usd=10.0,
-                   actual_usd=5.0, db_path=path)
+                   actual_usd=5.0, provenance="paid", db_path=path)
         assert abs(c - 0.2625) < 0.001, c
 
         # Several observations should drift slowly
         for _ in range(20):
             c = update("KXBRENTD", predicted_usd=10.0,
-                       actual_usd=5.0, db_path=path)
+                       actual_usd=5.0, provenance="paid", db_path=path)
         # After ~20 obs at 0.5, should be close to 0.5 (specifically ~0.41)
         assert c is not None and 0.35 < c < 0.55, c
 
         # Below-threshold predicted → skip
         c2 = update("KXTINY", predicted_usd=0.10,
-                    actual_usd=0.05, db_path=path)
+                    actual_usd=0.05, provenance="paid", db_path=path)
         assert c2 is None
 
         # Lookup with feature flag OFF (default) → fallback

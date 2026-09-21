@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import settings
 from execution.kalshi_auth import KalshiClient
 from engine.futures_feed import FUTURES_MAP
+from engine import reward_provenance as _prov
 
 _log = logging.getLogger(__name__)
 
@@ -132,30 +133,30 @@ def _estimate_rebate(conn: sqlite3.Connection, ticker: str) -> float:
 
 def backfill_rebates(db_path: str = settings.DB_PATH,
                      force: bool = False) -> dict:
-    """One-shot backfill — recompute rebate_earned_usd for existing
-    settlement_log rows. By default only updates rows still at 0;
-    pass force=True to recompute every row (use after multiplier change)."""
+    """One-shot backfill of the ESTIMATED rebate for existing rows.
+
+    2026-09-21: this wrote the estimate into rebate_earned_usd and
+    net_outcome_usd — i.e. into the columns the go-live gate sums. It now
+    writes rebate_estimated_usd / net_outcome_estimated_usd only. The paid
+    columns are never touched here.
+    """
+    _prov.ensure_schema(db_path)
     conn = sqlite3.connect(db_path, timeout=10.0)
     try:
         if force:
-            rows = conn.execute("SELECT ticker FROM settlement_log").fetchall()
+            rows = conn.execute("SELECT ticker, COALESCE(our_realized_usd, 0) "
+                                "FROM settlement_log").fetchall()
         else:
             rows = conn.execute(
-                """SELECT ticker FROM settlement_log
-                   WHERE rebate_earned_usd = 0 OR rebate_earned_usd IS NULL"""
+                """SELECT ticker, COALESCE(our_realized_usd, 0) FROM settlement_log
+                   WHERE rebate_estimated_usd = 0 OR rebate_estimated_usd IS NULL"""
             ).fetchall()
         updated = 0
         total_rebate = 0.0
-        for (tkr,) in rows:
+        for tkr, realized in rows:
             r = _estimate_rebate(conn, tkr)
             if r > 0:
-                conn.execute(
-                    """UPDATE settlement_log
-                       SET rebate_earned_usd = ?,
-                           net_outcome_usd = COALESCE(our_realized_usd, 0) + ?
-                       WHERE ticker = ?""",
-                    (r, r, tkr),
-                )
+                _prov.record_estimate(conn, tkr, r, realized_usd=float(realized or 0))
                 updated += 1
                 total_rebate += r
         conn.commit()
@@ -164,7 +165,7 @@ def backfill_rebates(db_path: str = settings.DB_PATH,
     return {
         "rows_scanned": len(rows),
         "rows_updated": updated,
-        "total_rebate_backfilled": round(total_rebate, 2),
+        "total_estimate_backfilled": round(total_rebate, 2),
     }
 
 
@@ -264,6 +265,11 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
+    conn.close()
+    # Provenance columns + one-time quarantine of estimates that older
+    # versions stored in the paid columns.
+    _prov.migrate_estimates(db_path)
+    conn = sqlite3.connect(db_path)
 
     recent = find_recently_settled(hours_back=72, db_path=db_path)  # #128b 2026-04-29: bump 30→72 to survive 2-day reconciler outages
     new_rows = 0
@@ -360,8 +366,15 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
         # our snapshot rate < Kalshi's 1Hz, but under-estimate is preferable
         # to over-estimate for safety-gate decisions. Verify against Kalshi
         # UI ground truth for known markets after first run.
-        rebate = _estimate_rebate(conn, tkr)
-        net = realized + rebate
+        rebate_estimate = _estimate_rebate(conn, tkr)
+        # 2026-09-21: this is a MODEL OUTPUT, not a payment. It goes into the
+        # *_estimated_* columns only. rebate_earned_usd / net_outcome_usd
+        # carry reconciled cash and stay at the realized-trading figure until
+        # engine.reward_provenance.record_payment() supplies a real payment.
+        # Those are the columns tools/go_live_check.py sums to authorize live
+        # trading, so an estimate must never reach them.
+        net_cash = realized
+        net_estimated = realized + rebate_estimate
 
         conn.execute(
             """INSERT OR IGNORE INTO settlement_log
@@ -369,14 +382,21 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
                 kalshi_result, futures_fair, futures_confidence, predicted_result,
                 prediction_correct, delta_kalshi_futures, our_position_yes,
                 our_position_no, our_realized_usd, rebate_earned_usd,
-                net_outcome_usd, recorded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                net_outcome_usd, recorded_at, rebate_estimated_usd,
+                net_outcome_estimated_usd, reward_provenance, reward_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (tkr, s["prefix"], s["close_time"], strike, settle_val,
              kalshi_result, fair, conf, predicted_result,
              prediction_correct, delta_kf, int(yes_n), int(no_n),
-             round(realized, 4), rebate, round(net, 4),
-             datetime.now(timezone.utc).isoformat()),
+             round(realized, 4), 0.0, round(net_cash, 4),
+             datetime.now(timezone.utc).isoformat(),
+             rebate_estimate, round(net_estimated, 4),
+             _prov.PROV_ESTIMATE, "model_estimate"),
         )
+        # Keep the estimate current on rows that already existed.
+        _prov.record_estimate(conn, tkr, rebate_estimate, realized_usd=realized)
+        rebate = rebate_estimate
+        net = net_cash
         new_rows += 1
         total_recorded += 1
         if prediction_correct is not None:
@@ -385,26 +405,18 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
                 correct += 1
         total_net_outcome += net
 
-        # A.5 hook (2026-05-14): update per-series calibration EWMA with the
-        # observed "capture rate" = rebate_earned / pool_per_day. The series
-        # prefix gets a learned calibration that replaces the global 0.25
-        # prior once n_samples ≥ 5 (set in calibration_ewma.calib_for).
-        try:
-            pool_row = conn.execute(
-                "SELECT reward_per_day_usd FROM lip_programs WHERE market_ticker = ?",
-                (tkr,),
-            ).fetchone()
-            pool_per_day = float(pool_row[0]) if pool_row and pool_row[0] else 0.0
-            if pool_per_day >= 0.50 and rebate >= 0:
-                from engine.calibration_ewma import update as _cal_update
-                _cal_update(
-                    key=s["prefix"],
-                    predicted_usd=pool_per_day,   # pool we competed for
-                    actual_usd=rebate,             # what we actually earned
-                    db_path=db_path,
-                )
-        except Exception as _e:
-            _log.debug(f"calibration_ewma hook failed for {tkr}: {_e}")
+        # A.5 hook (2026-05-14), CORRECTED 2026-09-21.
+        # This used to call calibration_ewma.update(actual_usd=rebate) with
+        # our own estimate, labelled "what we actually earned". That made the
+        # model calibrate itself: it could not detect its own error, and the
+        # result fed capital_allocator sizing and attack_targets ranking.
+        #
+        # Calibration now happens ONLY from reconciled payments, via
+        # engine.reward_provenance.record_payment() →
+        # tools/reward_payments.py. Nothing is calibrated here.
+        if rebate_estimate > 0:
+            _log.debug(f"{tkr}: reward estimate ${rebate_estimate:.4f} recorded as "
+                       f"ESTIMATE; calibration awaits a reconciled payment")
 
         # B.6 (2026-05-16): unwind any open hedge legs for this settled
         # ticker. Adapter respects AUTO_HEDGE_<venue> flags — paper/dry-run

@@ -77,6 +77,38 @@ class Report:
         return any(g.insufficient_data for g in self.gates)
 
 
+# ── Gate 0: reward evidence must be PAID, not modelled ────────────────────
+
+def _gate_paid_reward_evidence(db_path: str) -> GateResult:
+    """2026-09-21. The Sharpe and drawdown gates below sum
+    settlement_log.net_outcome_usd. Until 2026-09-21 that column carried our
+    own estimated rebate (settlement_reconciler wrote the model's output into
+    it), so this check could authorize real money on the strength of a model
+    calibrated against itself.
+
+    net_outcome_usd now contains realized trading cash plus RECONCILED
+    payments only. This gate additionally refuses to pass while no reconciled
+    payment exists at all: with zero paid evidence, any LIP-maker profit
+    claim rests entirely on an unvalidated estimator.
+    """
+    try:
+        from engine.reward_provenance import paid_total
+        paid = paid_total(db_path)
+    except Exception as e:
+        return GateResult("paid_reward_evidence", False, None, 1.0,
+                          f"could not read reward provenance: {e}",
+                          insufficient_data=True)
+    if paid > 0:
+        return GateResult("paid_reward_evidence", True, paid, 0.0,
+                          f"${paid:.2f} of reconciled reward payments on record")
+    return GateResult(
+        "paid_reward_evidence", False, 0.0, 0.0,
+        "no reconciled reward payment on record — every reward figure is a "
+        "model estimate. Record payments with tools/reward_payments.py before "
+        "treating LIP income as real.",
+        insufficient_data=True)
+
+
 # ── Gate 1: median t+60s markout ───────────────────────────────────────────
 
 def _gate_markout(db_path: str, cutoff_ts: float) -> GateResult:
@@ -291,6 +323,7 @@ def run_check(db_path: str = settings.DB_PATH, days: int = 14) -> Report:
     cutoff_ts = cutoff_dt.timestamp()
     cutoff_iso = cutoff_dt.isoformat()
     rep = Report(days=days)
+    rep.gates.append(_gate_paid_reward_evidence(db_path))
     rep.gates.append(_gate_markout(db_path, cutoff_ts))
     daily = _daily_pnl_series(db_path, cutoff_iso)
     daily_pnls = [v for _, v in daily]

@@ -85,13 +85,39 @@ own error and will converge on self-consistency rather than accuracy.
 its own comment records per-series variation of 0.18–0.68, i.e. a ~3.8x spread
 that the single constant flattens.
 
-**Blast radius** — the contaminated calibration drives real decisions:
-`engine/capital_allocator.py:352` (`kalshi_calib_for` → sizing) and
-`tools/attack_targets.py:186` (`calib_for` → ranking). So a fabricated
-"actual" changes which markets are chosen and how much capital they get.
+**Blast radius.** Larger than the handoff states. Two hops:
+
+*Hop 1 — `settlement_log` columns, read unconditionally today:*
+
+- **Go-live gating.** `tools/go_live_check.py:125` sums `net_outcome_usd` into
+  the Sharpe and max-drawdown gates. Per its own docstring all five gates must
+  pass to authorize live trading. **The go/no-go decision for real money is
+  computed from the estimate.** This is the single most serious consequence
+  and the handoff does not mention it.
+- **Series kill switches.** `engine/series_ev.py:63` (with `:81-86`
+  `DATA_PIPELINE_WIRED = True`, strict mode, which disables the fail-open so a
+  series can be blocked on the estimate alone); `tools/series_auto_prune.py:125,265`
+  → writes `market_blacklist`; `tools/bleed_monitor.py:123,181`.
+- **Ranking.** `engine/lip_discovery.py:531` `AVG(rebate_earned_usd)` →
+  `capture` prior; `:776-780` per-series enrichment.
+- **Cross-venue capital split.** `cross_venue/orchestrator.py:65-67`.
+- **Declared truth.** `monitor/reconciliation.py:163` labels
+  `SUM(rebate_earned_usd)` `← truth source`. The component meant to detect
+  estimate drift is anchored on the estimate.
+- The only external anchor is `tools/rebate_calibration_check.py:40-57`, a
+  frozen 6-day 2026-04 ground-truth table used to tune the very multiplier
+  that produces the estimate.
+
+*Hop 2 — `market_calibration`, currently inert but one flag from live:*
+`engine/capital_allocator.py:352` (sizing/portfolio selection, imported by the
+runner) and `tools/attack_targets.py:184-193` (ranking) consume `calib_for`,
+which is gated by `PER_MARKET_CALIB_ENABLED` — **default false**
+(`config/settings.py:469`). Flipping that env var silently activates sizing
+and selection on contaminated EWMA values.
 
 Severity: critical. This is the defect most likely to produce a confident
-false profitability claim. I agree with the handoff's ranking.
+false profitability claim, and it currently terminates in the live-trading
+authorization gate.
 
 ### V2 — HIGH, but latent rather than live. Two order adapters disagree on maker protection.
 
@@ -201,19 +227,61 @@ Notably `research/profit_ledger.py` already requires `program_id` on every
 event (`:32`) and groups by `(market, program_id)` (`:88`) — the research side
 got this right and the operating side did not.
 
-Severity medium: it requires genuinely overlapping programs to bite, which I
-could not confirm happens in practice (UNVERIFIABLE HERE — needs live data).
+Two additional failure modes found on closer inspection, both silent:
 
-### V7 — MEDIUM. Fee and cost inputs are assumptions carrying no provenance.
+- **`INSERT OR REPLACE` can delete a different program.** With
+  `UNIQUE(market_ticker, start_date)`, two distinct program `id`s sharing a
+  ticker and start date make SQLite's `REPLACE` **delete the conflicting row
+  and insert the new one** (`engine/lip_discovery.py:455-468`). A program id
+  disappears with no log line and no counter — the classic REPLACE-across-a-
+  secondary-constraint data loss.
+- **Row fan-out in unqualified joins.** `tools/backfill_calibration.py:35`,
+  `tools/backfill_net_calibration.py:38`, `tools/auto_calibrate.py:104` and
+  ~12 other tools join `lip_programs` on `market_ticker` alone. With two rows
+  per ticker, one settlement becomes two calibration observations and snapshot
+  counts double. `tools/settlement_reconciler.py:104` is worse: it
+  `GROUP BY p.market_ticker` while selecting bare non-aggregated
+  `period_reward_usd` / `start_date` / `end_date`, so SQLite picks an
+  arbitrary row's pool and pairs it with presence summed across both windows.
 
-`research/maker_replay.py:21` `exit_fee_per_contract_usd: str = '0.02'`,
-`:35` `min_pair_margin_usd: str = '0.01'`, plus a maker fee constant. These
-are declared defaults with no cited schedule, no market-specific variation,
-and no rounding rule. The operating loop has no fee model at all — it never
-computes a fee, because it never computes cash.
+Severity medium **only because** I could not confirm overlapping programs
+occur in practice (UNVERIFIABLE HERE — needs live data). If they do, this is
+high: it silently destroys state and double-counts calibration.
 
-Any net-profit number produced today is therefore a function of an
-unsourced constant.
+### V7 — HIGH (raised from the handoff's framing). Four incompatible fee models, one of which is zero.
+
+There is no fee module. Verified sites:
+
+| Where | Model |
+|---|---|
+| `tools/net_yield_logger.py:109` | **$0.00**, `# LIP maker orders are fee-free per Kalshi` — no source |
+| `research/maker_replay.py:20-21` | `$0.01` maker / `$0.02` exit **per contract**, explicitly labelled `NOT the exchange fee schedule` |
+| `dislocation/config.py:50` | **7% of value per fill** |
+| `engine/maker_rebate_scorer.py:44` | `0.07` — but sourced to **Gemini's** maker-rebate docs, not Kalshi |
+
+`net_yield_logger.py:110` computes `total_net_profit_usd = realized + rebate -
+fees` with `fees = 0.0`. That is the repo's daily net-yield metric, and it
+asserts fee-free maker trading with no citation. If that assumption is wrong,
+the headline profitability number is wrong by the entire fee bill.
+
+Two further defects:
+
+- **The round-up is implemented nowhere.** `dislocation/spread.py:63-66`
+  carries the comment `fee = ⌈0.07 × C × P × (1-P)⌉ cents per side` but the
+  code applies no `ceil`. For small per-fill contract counts the ceiling is
+  the dominant term, so costs are systematically understated.
+- `0.07` denotes a **Gemini taker rate** in one file and a **Kalshi cost
+  percentage** in another — numerically identical, semantically unrelated.
+
+The operating loop has no fee term at all: `run_paper.py`,
+`execution/quote_manager.py`, `engine/adaptive_sizer.py`, `lip_scorer.py`,
+`capital_allocator.py` and both `yield_equation.py` files contain zero fee
+references. Every sizing, ranking and yield projection in the production path
+is gross of fees.
+
+The actual Kalshi schedule is **UNVERIFIABLE HERE** (docs blocked), which is
+precisely why it must become one module with recorded provenance rather than
+four scattered constants.
 
 ## 3. Missing components needed for profitable operation
 
