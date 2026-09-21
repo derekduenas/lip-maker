@@ -164,8 +164,21 @@ modelled net. The earlier negatives were model artifacts.
 
 ## The actual blocker: a configuration mismatch
 
-`risk/sentinel.py` sizes against `settings.BANKROLL_USD`, which is **absent
-and defaults to 80**, while the shared account ledger holds **$5,000**.
+`risk/sentinel.py` sizes against `settings.BANKROLL_USD`. That is NOT an
+absent constant — I said so first and it was wrong. It is
+
+```python
+BANKROLL_USD = float(os.getenv("LIP_BANKROLL", "80"))
+```
+
+an env-driven setting whose variable `LIP_BANKROLL` is **unset in this
+environment**, so it falls back to its declared default of **80** while the
+shared account ledger holds **$5,000**. settings.py even carries a comment
+noting that several capital figures have coexisted.
+
+The distinction matters: there is an intended mechanism for this
+(`LIP_BANKROLL`), so the fix is a deliberate operator setting, not a code
+change.
 
 ```
 per-market cap = 10% x $80 = $8.00
@@ -177,9 +190,12 @@ On a tight two-sided book (yes+no = 97–99c) the minimum legal size costs
 $9.90 against an $8.00 cap. **The legal window is empty by $19 of bankroll**
 — the largest legal size is 8 contracts against a floor of 10.
 
-`BANKROLL_USD` is NOT changed here. Reconciling it with the $5,000 account is
-a risk decision, and raising it 62x to make quotes appear is precisely the
-loosening I was told not to do.
+`LIP_BANKROLL` is NOT set here and `BANKROLL_USD` is NOT changed in code.
+Reconciling the sentinel's bankroll with the $5,000 account is a risk
+decision — raising it 62x to make quotes appear is precisely the loosening
+I was told not to do. Whoever makes that call should note that every
+sentinel cap (gross, per-market, per-series, daily loss) scales from this
+one number.
 
 ## Opportunity census — the venue is NOT uniformly infeasible
 

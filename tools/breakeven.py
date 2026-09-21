@@ -109,8 +109,10 @@ def main() -> int:
     print("=" * 74)
     print("BREAK-EVEN THRESHOLDS")
     print("=" * 74)
-    print(f"sentinel bankroll  ${bank:,.2f}   (settings.BANKROLL_USD, "
-          f"{'ABSENT -> default 80' if not hasattr(settings,'BANKROLL_USD') else 'set'})")
+    import os
+    env = os.getenv("LIP_BANKROLL")
+    print(f"sentinel bankroll  ${bank:,.2f}   (settings.BANKROLL_USD from "
+          f"LIP_BANKROLL={'unset -> default' if env is None else env})")
     print(f"account ledger     ${ledger:,.2f}   (the shared account the "
           f"experiment funds)")
     print(f"per-market cap     {constitution.MAX_PER_MARKET_PCT:.0%} of bankroll")
