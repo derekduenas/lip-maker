@@ -1,0 +1,67 @@
+{
+  "program": {
+    "id": "p",
+    "market_ticker": "m",
+    "incentive_type": "liquidity",
+    "start_date": "2026-09-21T00:00:00Z",
+    "end_date": "2026-09-21T01:00:00Z",
+    "period_reward": 1000000,
+    "discount_factor_bps": 5000,
+    "target_size_fp": "100",
+    "paid_out": false
+  },
+  "book": {
+    "market": "m",
+    "ts": 1789948800,
+    "valid": true,
+    "status": "open",
+    "contains_own_orders": false,
+    "yes_bids": [
+      [
+        ".50",
+        "1"
+      ],
+      [
+        ".49",
+        "99"
+      ]
+    ],
+    "no_bids": [
+      [
+        ".40",
+        "1"
+      ],
+      [
+        ".39",
+        "99"
+      ]
+    ]
+  },
+  "candidates": [
+    {
+      "id": "a",
+      "yes_price": ".49",
+      "no_price": ".39",
+      "size": "100",
+      "qualified_fraction": "1",
+      "trading_pnl_usd": "-2",
+      "fees_usd": "1",
+      "operating_cost_usd": "0",
+      "uncertainty_reserve_usd": "1"
+    },
+    {
+      "id": "larger",
+      "yes_price": ".49",
+      "no_price": ".39",
+      "size": "200",
+      "qualified_fraction": "1",
+      "trading_pnl_usd": "-8",
+      "fees_usd": "2",
+      "operating_cost_usd": "0",
+      "uncertainty_reserve_usd": "2"
+    }
+  ],
+  "now": 1789948800,
+  "horizon_seconds": 3600,
+  "tick_usd": ".01"
+}

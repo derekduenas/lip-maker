@@ -50,8 +50,13 @@ def main():
     attack.add_argument('--episodes', required=True)
     attack.add_argument('--scenarios', required=True)
     attack.add_argument('--cutoff-ms', type=int, required=True)
+    reward_rank = sub.add_parser('rank-rewards')
+    reward_rank.add_argument('--input', required=True, help='Program, competitor book, candidate economics and timing JSON')
     args = p.parse_args()
-    if args.command == 'capture':
+    if args.command == 'rank-rewards':
+        from research.reward_optimizer import rank_quotes
+        result = rank_quotes(**read(args.input))
+    elif args.command == 'capture':
         import asyncio
         from research.venue_capture import capture
         result = asyncio.run(capture(args.output,args.market,args.seconds))

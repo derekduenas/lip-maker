@@ -4,34 +4,13 @@ Given a book state + our own resting quotes + program parameters, computes
 the score WE would earn on a single snapshot. Run once per second against
 the live WebSocket feed to estimate per-second LIP accrual.
 
-The formula, verbatim from CFTC filing Aug 2025 Appendix A (+ Feb 2026 amendment):
-
-1. Pick qualifying cutoff on each side:
-    Walk book from best price toward worse prices, accumulating size.
-    Once cumulative size ≥ TargetSize, that level is the "cutoff".
-    Orders AT or BETTER than the cutoff qualify; everything deeper is 0.
-    If the whole book doesn't accumulate TargetSize, NO orders on that side qualify.
-
-2. Score each qualifying bid:
-    Score(bid) = DiscountFactor ^ (ReferencePrice - Price(bid)) × Size(bid)
-    where ReferencePrice = best bid on that side (top of book).
-
-3. Normalize within the snapshot (per side):
-    NormalizedScore(user) = sum_user_bids_score / sum_all_bids_score
-    Each side independently normalizes to 1.0.
-
-4. Two-sided requirement (Feb 28, 2026 amendment):
-    If EITHER side fails TargetSize, THE SNAPSHOT IS EXCLUDED ENTIRELY —
-    no one earns anything. We can only score if both yes-side AND no-side
-    hit TargetSize.
-
-5. User's total snapshot score:
-    SnapshotScore = yes_normalized + no_normalized  (max 2.0 if alone on both sides)
-
-6. Time-period aggregation:
-    TimePeriodScore(user) = sum(SnapshotScore over all snapshots)
-                            / sum_all_users_TotalSnapshotScore
-    Payout(user) = TimePeriodScore × TimePeriodReward
+Model aligned with Kalshi Help Center, retrieved 2026-09-21:
+https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program
+Reference is the level reaching TargetSize/5, not necessarily the best bid.
+Orders at or above reference receive full weight. Deeper eligible orders receive
+DiscountFactor ** distance_in_ticks. Both sides must reach TargetSize.
+This cent-grid scorer does not support fractional tick markets. Snapshot shares
+are estimates; final payout also requires period rounding, minimum and caps.
 
 NOTE on asks: Kalshi scoring works on BID LIQUIDITY. For the YES side, the
 "bids" are yes_bids (people buying YES). For the NO side, the "bids" are
@@ -128,7 +107,7 @@ def _score_bids(
     Sum all levels to get total_score. Our levels separately to get our_score.
     """
     def level_score(price: int, size: float) -> float:
-        distance_ticks = reference_price - price  # non-negative since price ≤ reference
+        distance_ticks = max(0, reference_price - price)  # non-negative since price ≤ reference
         return (discount_factor ** distance_ticks) * size
 
     total = sum(level_score(l.price_cents, l.size) for l in all_bids if l.price_cents >= cutoff_price)
@@ -173,14 +152,14 @@ def score_snapshot(
         return result  # two-sided requirement failed
 
     # Score yes-side
-    ref_yes = book.yes_bids[0].price_cents if book.yes_bids else 0
+    ref_yes = _find_cutoff_price(book.yes_bids, target / 5)
     our_yes, total_yes = _score_bids(book.yes_bids, ours.yes_bids, ref_yes, df, yes_cutoff)
     if total_yes > 0:
         result.our_yes_normalized = our_yes / total_yes
     result.yes_total_qualifying_score = total_yes
 
     # Score no-side
-    ref_no = book.no_bids[0].price_cents if book.no_bids else 0
+    ref_no = _find_cutoff_price(book.no_bids, target / 5)
     our_no, total_no = _score_bids(book.no_bids, ours.no_bids, ref_no, df, no_cutoff)
     if total_no > 0:
         result.our_no_normalized = our_no / total_no
