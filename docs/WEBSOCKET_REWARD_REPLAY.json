@@ -1,0 +1,62 @@
+{
+  "status": "PREVIOUSLY_INSPECTED_DEVELOPMENT_TAPES",
+  "results": [
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "policy": "join_best",
+      "fills": 26,
+      "net_before_rewards_usd": "-2.080000",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+        "modeled_accrual_usd": "0.01247357710733124240858533735",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "162.533",
+        "modeled_net_if_stop_usd": "-2.080000"
+      }
+    },
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "policy": "defensive_maker",
+      "fills": 2,
+      "net_before_rewards_usd": "-0.0100",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+        "modeled_accrual_usd": "0.001428838293381755109524325715",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "24.316",
+        "modeled_net_if_stop_usd": "-0.0100"
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "policy": "join_best",
+      "fills": 0,
+      "net_before_rewards_usd": "0",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "75dd5413-97b9-474d-9a59-a98d62bcae9b",
+        "modeled_accrual_usd": "0.0003917720324462010338812529621",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "47.287",
+        "modeled_net_if_stop_usd": "0"
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "policy": "defensive_maker",
+      "fills": 0,
+      "net_before_rewards_usd": "0",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "75dd5413-97b9-474d-9a59-a98d62bcae9b",
+        "modeled_accrual_usd": "0.000002842877592392531461244216757",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "0.500",
+        "modeled_net_if_stop_usd": "0"
+      }
+    }
+  ],
+  "live_eligible": false
+}

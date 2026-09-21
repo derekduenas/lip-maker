@@ -36,7 +36,7 @@ class ReplayConfig:
     program_end_ms: int | None = None
 
 
-def replay(events, config=ReplayConfig()):
+def replay(events, config=ReplayConfig(), reward_program=None):
     cfg = asdict(config)
     size, budget = number(config.size), number(config.capital_usd)
     maker_fee, exit_fee = number(config.maker_fee_per_contract_usd), number(config.exit_fee_per_contract_usd)
@@ -85,6 +85,21 @@ def replay(events, config=ReplayConfig()):
         timeline.append(e)
     if len(markets) > 1 or len(episodes) > 1:
         raise ValueError('replay one market episode at a time')
+    reward_total = number(0)
+    reward_seconds = number(0)
+    reward_start = reward_end = reward_pool = reward_cap = None
+    if reward_program is not None:
+        from research.reward_optimizer import _seconds
+        if markets != {reward_program['market_ticker']} or reward_program['incentive_type'] != 'liquidity':
+            raise ValueError('reward program does not match replay')
+        reward_start = _seconds(reward_program['start_date']) * 1000
+        reward_end = _seconds(reward_program['end_date']) * 1000
+        reward_pool = number(reward_program['period_reward']) / 10000
+        reward_cap = reward_pool if reward_program.get('max_reward_per_account') is None else min(reward_pool, number(reward_program['max_reward_per_account']) / 10000)
+        if reward_end <= reward_start or reward_pool <= 0 or reward_cap < 0:
+            raise ValueError('invalid reward economics')
+        if not 0 < number(reward_program['discount_factor_bps']) <= 10000 or number(reward_program['target_size_fp']) <= 0:
+            raise ValueError('invalid reward scoring parameters')
     book = None
     orders, pending = {}, {}
     positions = {'yes': number(0), 'no': number(0)}
@@ -130,8 +145,42 @@ def replay(events, config=ReplayConfig()):
             ahead = sum(number(q) for p,q in book.get(side+'_bids', []) if number(p)>=price)
             orders[side] = dict(price=price, remaining=size, ahead=ahead*queue_mult, activated_ms=now)
 
+    previous_time = None
+    def accrue_until(now):
+        nonlocal reward_total, reward_seconds
+        if reward_program is None or previous_time is None or book is None or not book.get('valid', True):
+            return
+        from research.reward_optimizer import _side
+        # Stop at the earliest state deadline. Unobserved activation segments
+        # are not credited retroactively when the next market event arrives.
+        left = max(number(previous_time), reward_start)
+        right = min(number(now), reward_end, number(book['ts_ms'] + config.stale_ms))
+        if pending:
+            right = min(right, number(min(due for due, _ in pending.values())))
+        if right <= left:
+            return
+        y, n = bid('yes'), bid('no')
+        if y is None or n is None or y+n >= 1:
+            return
+        shares = []
+        for side in ('yes', 'no'):
+            order = orders.get(side)
+            price = order['price'] if order else bid(side)
+            quantity = order['remaining'] if order else number(0)
+            share, cutoff, _ = _side(book[side+'_bids'], price, quantity,
+                number(reward_program['target_size_fp']), number(reward_program['discount_factor_bps'])/10000, tick)
+            if cutoff is None:
+                return
+            shares.append(share)
+        share = sum(shares)/2
+        reward_total += reward_pool * share * (right-left)/(reward_end-reward_start)
+        if share > 0:
+            reward_seconds += (right-left)/1000
+
     for e in timeline:
         now = e['ts_ms']
+        accrue_until(now)
+        previous_time = now
         advance(now)
         if e['kind'] == 'gap':
             had_gap = True
@@ -226,8 +275,17 @@ def replay(events, config=ReplayConfig()):
         else:
             proceeds += value-q*exit_fee
     pnl = proceeds-spent-fees-operating if complete else None
-    fingerprint = hashlib.sha256(json.dumps(dict(config=cfg, events=timeline), sort_keys=True).encode()).hexdigest()
-    return dict(status='MODELED_RESEARCH_ONLY', fingerprint=fingerprint, config=cfg,
+    fingerprint = hashlib.sha256(json.dumps(dict(config=cfg, events=timeline, reward_program=reward_program), sort_keys=True).encode()).hexdigest()
+    reward_result = None
+    if reward_program is not None:
+        from decimal import ROUND_DOWN
+        floored = min(reward_total, reward_cap).quantize(number('.01'), rounding=ROUND_DOWN)
+        payable = floored if floored >= 1 else number(0)
+        reward_result = dict(status='MODELED_NOT_CREDITED', program_id=reward_program['id'],
+            modeled_accrual_usd=str(reward_total), estimated_payout_if_stop_usd=str(payable),
+            positive_share_seconds=str(reward_seconds),
+            modeled_net_if_stop_usd=str(pnl+payable) if pnl is not None else None)
+    return dict(reward_model=reward_result, status='MODELED_RESEARCH_ONLY' , fingerprint=fingerprint, config=cfg,
                 fills=fills, decisions=decisions, inventory={k:str(v) for k,v in positions.items()},
                 spent_usd=str(spent), maker_fees_usd=str(fees), liquidation_complete=complete,
                 net_before_rewards_usd=str(pnl) if pnl is not None else None,

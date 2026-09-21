@@ -54,8 +54,17 @@ def main():
     reward_rank.add_argument('--input', required=True, help='Program, competitor book, candidate economics and timing JSON')
     capital = sub.add_parser('compound-budget')
     capital.add_argument('--input', required=True, help='Receipt events and explicit capital limits JSON')
+    paper = sub.add_parser('websocket-paper')
+    paper.add_argument('--output', required=True)
+    paper.add_argument('--program', required=True)
+    paper.add_argument('--config', required=True)
+    paper.add_argument('--seconds', type=float, default=60)
     args = p.parse_args()
-    if args.command == 'compound-budget':
+    if args.command == 'websocket-paper':
+        import asyncio
+        from research.websocket_paper import run_session
+        result = asyncio.run(run_session(args.output, read(args.program), read(args.config), args.seconds))
+    elif args.command == 'compound-budget':
         from research.compound_capital import capital_budget
         result = capital_budget(**read(args.input))
     elif args.command == 'rank-rewards':
