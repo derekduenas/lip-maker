@@ -1,0 +1,4001 @@
+{
+  "status": "PUBLIC_BOOK_PAPER_PROBE_ONLY",
+  "started": 1789950069.2134078,
+  "ended": 1789950103.5106547,
+  "budget_usd": "40",
+  "reserve_usd": "5",
+  "catalog_count": 3519,
+  "selection": "Highest pool rate, at most one per series, minimum 10 minutes remaining",
+  "observations": [
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T01:00:00Z",
+        "id": "fe6fb681-d2e8-4398-8fc8-803d4ba60e47",
+        "incentive_description": "series_lip",
+        "incentive_type": "liquidity",
+        "market_id": "aaf3e650-fcf8-4ec8-acfe-b7267c113596",
+        "market_ticker": "KXTEMPMIAH-26SEP2021-T72.99",
+        "paid_out": false,
+        "period_reward": 1000000,
+        "start_date": "2026-09-21T00:02:07.27213Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-21T01:00:00Z",
+        "created_time": "2026-09-20T23:50:23.826084Z",
+        "event_ticker": "KXTEMPMIAH-26SEP2021",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-21T01:05:00Z",
+        "expiration_time": "2026-09-28T01:00:00Z",
+        "expiration_value": "",
+        "floor_strike": 72.99,
+        "last_price_dollars": "0.0000",
+        "latest_expiration_time": "2026-09-28T01:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.0900",
+        "no_bid_dollars": "0.0000",
+        "no_sub_title": "73\u00b0 or above",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T01:05:00Z",
+        "open_interest_fp": "0.00",
+        "open_time": "2026-09-21T00:00:00Z",
+        "previous_price_dollars": "0.0000",
+        "previous_yes_ask_dollars": "0.0000",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If the temperature recorded at Miami, FL for Sep 20, 2026 at 9 PM EDT as reported by Synoptic Data, is above 72.99\u00b0, then the market resolves to Yes.",
+        "rules_secondary": "The official final value for this market is determined strictly by the temperature reported by Synoptic Data, calculated in accordance with the Kalshi Weather Index Methodology. Alternative sources\u2014such as NWS Climatological Reports or Google Weather\u2014may serve as references, but are not authoritative and will not be used for market resolution.",
+        "settlement_timer_seconds": 3600,
+        "status": "active",
+        "strike_type": "greater",
+        "subtitle": "-1\u00b0 or below",
+        "ticker": "KXTEMPMIAH-26SEP2021-T72.99",
+        "title": "Will the temp in Miami be above 72.99\u00b0 on Sep 20, 2026 at 9pm EDT?",
+        "updated_time": "2026-09-21T00:00:01.488413Z",
+        "volume_24h_fp": "0.00",
+        "volume_fp": "0.00",
+        "yes_ask_dollars": "1.0000",
+        "yes_ask_size_fp": "0.00",
+        "yes_bid_dollars": "0.9100",
+        "yes_bid_size_fp": "2.00",
+        "yes_sub_title": "73\u00b0 or above"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950079.2860322,
+          "received": 1789950084.0425467,
+          "request_seconds": 4.756514549255371,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "10.00"
+                ],
+                [
+                  "0.0200",
+                  "1.00"
+                ],
+                [
+                  "0.0300",
+                  "1.00"
+                ],
+                [
+                  "0.0400",
+                  "1.00"
+                ],
+                [
+                  "0.0500",
+                  "3.00"
+                ],
+                [
+                  "0.0600",
+                  "10.00"
+                ],
+                [
+                  "0.0800",
+                  "2.00"
+                ],
+                [
+                  "0.1100",
+                  "4.00"
+                ],
+                [
+                  "0.1600",
+                  "2.00"
+                ],
+                [
+                  "0.2000",
+                  "27.00"
+                ],
+                [
+                  "0.2100",
+                  "2.00"
+                ],
+                [
+                  "0.2600",
+                  "6.00"
+                ],
+                [
+                  "0.3100",
+                  "4.00"
+                ],
+                [
+                  "0.3600",
+                  "3.00"
+                ],
+                [
+                  "0.4100",
+                  "1.00"
+                ],
+                [
+                  "0.4600",
+                  "1.00"
+                ],
+                [
+                  "0.8900",
+                  "27.00"
+                ],
+                [
+                  "0.9000",
+                  "25.00"
+                ],
+                [
+                  "0.9100",
+                  "2.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950084.0425503,
+          "received": 1789950088.5782914,
+          "request_seconds": 4.535741090774536,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "10.00"
+                ],
+                [
+                  "0.0200",
+                  "1.00"
+                ],
+                [
+                  "0.0300",
+                  "1.00"
+                ],
+                [
+                  "0.0400",
+                  "1.00"
+                ],
+                [
+                  "0.0500",
+                  "3.00"
+                ],
+                [
+                  "0.0600",
+                  "10.00"
+                ],
+                [
+                  "0.0800",
+                  "2.00"
+                ],
+                [
+                  "0.1100",
+                  "4.00"
+                ],
+                [
+                  "0.1600",
+                  "2.00"
+                ],
+                [
+                  "0.2000",
+                  "27.00"
+                ],
+                [
+                  "0.2100",
+                  "2.00"
+                ],
+                [
+                  "0.2600",
+                  "6.00"
+                ],
+                [
+                  "0.3100",
+                  "4.00"
+                ],
+                [
+                  "0.3600",
+                  "3.00"
+                ],
+                [
+                  "0.4100",
+                  "1.00"
+                ],
+                [
+                  "0.4600",
+                  "1.00"
+                ],
+                [
+                  "0.8900",
+                  "27.00"
+                ],
+                [
+                  "0.9000",
+                  "25.00"
+                ],
+                [
+                  "0.9100",
+                  "2.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T23:02:32.581857Z",
+        "id": "ef83960b-3aab-434e-8cb4-d84ec8683e2d",
+        "incentive_description": "series_lip",
+        "incentive_type": "liquidity",
+        "market_id": "a3b11a72-f355-4b18-a6b5-761c0b5a6ddf",
+        "market_ticker": "KXMLBSEASONGAMES-27-600",
+        "paid_out": false,
+        "period_reward": 5000000,
+        "start_date": "2026-09-20T23:02:32.581857Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2027-11-07T14:00:00Z",
+        "created_time": "2026-08-26T21:17:06.469331Z",
+        "early_close_condition": "This market will close and expire early once the event occurs.",
+        "event_ticker": "KXMLBSEASONGAMES-27",
+        "exchange_index": 0,
+        "expected_expiration_time": "2027-10-31T14:00:00Z",
+        "expiration_time": "2027-11-07T14:00:00Z",
+        "expiration_value": "",
+        "floor_strike": 600,
+        "last_price_dollars": "0.8300",
+        "latest_expiration_time": "2027-11-07T14:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.1800",
+        "no_bid_dollars": "0.1700",
+        "no_sub_title": "More than 600 games",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2027-10-31T14:00:00Z",
+        "open_interest_fp": "11227.89",
+        "open_time": "2026-08-26T22:00:00Z",
+        "previous_price_dollars": "0.8200",
+        "previous_yes_ask_dollars": "0.8300",
+        "previous_yes_bid_dollars": "0.8200",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If the number of MLB regular season games played is above 600 games in the 2027 MLB regular season, then the market resolves to Yes.",
+        "rules_secondary": "Kalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with Major League Baseball. All trademarks, logos, and brand names are the property of their respective owners.",
+        "settlement_timer_seconds": 300,
+        "status": "active",
+        "strike_type": "greater",
+        "ticker": "KXMLBSEASONGAMES-27-600",
+        "title": "Will more than 600 games be played in the 2027 Pro Baseball regular season?",
+        "updated_time": "2026-09-16T17:41:30.161412Z",
+        "volume_24h_fp": "105.03",
+        "volume_fp": "131851.79",
+        "yes_ask_dollars": "0.8300",
+        "yes_ask_size_fp": "27388.30",
+        "yes_bid_dollars": "0.8200",
+        "yes_bid_size_fp": "11519.00",
+        "yes_sub_title": "More than 600 games"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950079.2801423,
+          "received": 1789950084.1141915,
+          "request_seconds": 4.834049224853516,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "9400.01"
+                ],
+                [
+                  "0.0200",
+                  "2004.00"
+                ],
+                [
+                  "0.0300",
+                  "74.00"
+                ],
+                [
+                  "0.0400",
+                  "500.00"
+                ],
+                [
+                  "0.0500",
+                  "400.00"
+                ],
+                [
+                  "0.0600",
+                  "333.00"
+                ],
+                [
+                  "0.0700",
+                  "285.00"
+                ],
+                [
+                  "0.1500",
+                  "210.00"
+                ],
+                [
+                  "0.1600",
+                  "4.85"
+                ],
+                [
+                  "0.1700",
+                  "27388.30"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "6100.00"
+                ],
+                [
+                  "0.0200",
+                  "5000.00"
+                ],
+                [
+                  "0.1600",
+                  "10000.30"
+                ],
+                [
+                  "0.1700",
+                  "74.00"
+                ],
+                [
+                  "0.3800",
+                  "2457.00"
+                ],
+                [
+                  "0.7600",
+                  "800.00"
+                ],
+                [
+                  "0.8200",
+                  "11519.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002152770445547789186855461242",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "1.01",
+              "maximum_total_cost_to_break_even_usd": "1.01",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0000616580818563778150185980981",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0000616580818563778150185980981",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0000616580818563778150185980981",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0003082017550933759429108053064",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0003082017550933759429108053064",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0003082017550933759429108053064",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0006161820326669491955144774455",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0006161820326669491955144774455",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0006161820326669491955144774455",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.001231479206600246924998495333",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.001231479206600246924998495333",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.001231479206600246924998495333",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002152770445547789186855461242",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002152770445547789186855461242",
+              "remaining_seconds": "81668.46766543388",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950084.1141963,
+          "received": 1789950088.6142452,
+          "request_seconds": 4.500048875808716,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "9400.01"
+                ],
+                [
+                  "0.0200",
+                  "2004.00"
+                ],
+                [
+                  "0.0300",
+                  "74.00"
+                ],
+                [
+                  "0.0400",
+                  "500.00"
+                ],
+                [
+                  "0.0500",
+                  "400.00"
+                ],
+                [
+                  "0.0600",
+                  "333.00"
+                ],
+                [
+                  "0.0700",
+                  "285.00"
+                ],
+                [
+                  "0.1500",
+                  "210.00"
+                ],
+                [
+                  "0.1600",
+                  "4.85"
+                ],
+                [
+                  "0.1700",
+                  "27388.30"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "6100.00"
+                ],
+                [
+                  "0.0200",
+                  "5000.00"
+                ],
+                [
+                  "0.1600",
+                  "10000.30"
+                ],
+                [
+                  "0.1700",
+                  "74.00"
+                ],
+                [
+                  "0.3800",
+                  "2457.00"
+                ],
+                [
+                  "0.7600",
+                  "800.00"
+                ],
+                [
+                  "0.8200",
+                  "11519.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002152770445547789186855461242",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "1.01",
+              "maximum_total_cost_to_break_even_usd": "1.01",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0000616580818563778150185980981",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0000616580818563778150185980981",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0000616580818563778150185980981",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0003082017550933759429108053064",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0003082017550933759429108053064",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0003082017550933759429108053064",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0006161820326669491955144774455",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0006161820326669491955144774455",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0006161820326669491955144774455",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.001231479206600246924998495333",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.001231479206600246924998495333",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.001231479206600246924998495333",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002152770445547789186855461242",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.8200",
+              "no_price": "0.1700",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002152770445547789186855461242",
+              "remaining_seconds": "81663.9676117897",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T01:45:00Z",
+        "id": "f6144e7c-d673-4dfb-b2f7-375ad870fd71",
+        "incentive_description": "series_lip",
+        "incentive_type": "liquidity",
+        "market_id": "812ed379-1ce0-4fff-8421-8e0d55e254c4",
+        "market_ticker": "KXTTELITEMATCH-26SEP202045MSIOSO-MSI",
+        "paid_out": false,
+        "period_reward": 200000,
+        "start_date": "2026-09-21T00:15:00Z",
+        "target_size_fp": "300.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-28T00:45:00Z",
+        "created_time": "2026-09-20T16:51:06.364067Z",
+        "custom_strike": {
+          "table_tennis_competitor": "49847488-27df-56c8-bd4b-4af1ef3ba798"
+        },
+        "early_close_condition": "This market will close and expire after a winner is declared.",
+        "event_ticker": "KXTTELITEMATCH-26SEP202045MSIOSO",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-21T03:45:00Z",
+        "expiration_time": "2026-09-28T00:45:00Z",
+        "expiration_value": "",
+        "last_price_dollars": "0.4300",
+        "latest_expiration_time": "2026-09-28T00:45:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.5700",
+        "no_bid_dollars": "0.3800",
+        "no_sub_title": "Mateusz Sikon",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T03:45:00Z",
+        "open_interest_fp": "728.00",
+        "open_time": "2026-09-20T16:55:00Z",
+        "previous_price_dollars": "0.0000",
+        "previous_yes_ask_dollars": "0.0000",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If Mateusz Sikon wins the Mateusz Sikon vs Oliwier Sokolowski men's professional TT Elite Series table tennis match originally scheduled for Sep 20, 2026 at 8:45 PM EDT, then the market resolves to Yes.",
+        "rules_secondary": "If the match is postponed but begins within 48 hours of its originally scheduled start time, the market will remain open and resolve based on the official final result. If the match is cancelled or postponed more than 48 hours from its originally scheduled start, all markets will resolve to $0.50.\n\nKalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with the Governing League. All trademarks, logos, and brand names are the property of their respective owners.",
+        "settlement_timer_seconds": 180,
+        "status": "active",
+        "strike_type": "structured",
+        "ticker": "KXTTELITEMATCH-26SEP202045MSIOSO-MSI",
+        "title": "Mateusz Sikon wins",
+        "updated_time": "2026-09-20T16:55:00.529285Z",
+        "volume_24h_fp": "0.00",
+        "volume_fp": "728.00",
+        "yes_ask_dollars": "0.6200",
+        "yes_ask_size_fp": "450.00",
+        "yes_bid_dollars": "0.4300",
+        "yes_bid_size_fp": "918.00",
+        "yes_sub_title": "Mateusz Sikon"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950079.230303,
+          "received": 1789950084.1179874,
+          "request_seconds": 4.887684345245361,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "314.00"
+                ],
+                [
+                  "0.0200",
+                  "440.00"
+                ],
+                [
+                  "0.0300",
+                  "95.00"
+                ],
+                [
+                  "0.0400",
+                  "2.00"
+                ],
+                [
+                  "0.0500",
+                  "327.00"
+                ],
+                [
+                  "0.0600",
+                  "2.00"
+                ],
+                [
+                  "0.0800",
+                  "2.00"
+                ],
+                [
+                  "0.1000",
+                  "1.00"
+                ],
+                [
+                  "0.1100",
+                  "4.00"
+                ],
+                [
+                  "0.1400",
+                  "3.00"
+                ],
+                [
+                  "0.1600",
+                  "2.00"
+                ],
+                [
+                  "0.5100",
+                  "450.00"
+                ],
+                [
+                  "0.5200",
+                  "300.00"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "300.00"
+                ],
+                [
+                  "0.0200",
+                  "450.00"
+                ],
+                [
+                  "0.0300",
+                  "376.00"
+                ],
+                [
+                  "0.0400",
+                  "137.00"
+                ],
+                [
+                  "0.4300",
+                  "918.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "34.2000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.07243935309973045822102425875",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "1.34",
+              "maximum_total_cost_to_break_even_usd": "1.34",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "0.9500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002205199209020349289094386141",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "0.9500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002205199209020349289094386141",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "0.9500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002205199209020349289094386141",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "4.7500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.01090528035806262543736568211",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "4.7500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.01090528035806262543736568211",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "4.7500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.01090528035806262543736568211",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "9.5000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.02151696329254727474972191324",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "9.5000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.02151696329254727474972191324",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "9.5000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.02151696329254727474972191324",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "19.0000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.04191098081023454157782515992",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "19.0000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.04191098081023454157782515992",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "19.0000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.04191098081023454157782515992",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "34.2000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.07243935309973045822102425875",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.4300",
+              "no_price": "0.5200",
+              "capital_usd": "34.2000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.07243935309973045822102425875",
+              "remaining_seconds": "5015.882012605667",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950084.117989,
+          "received": 1789950088.6781244,
+          "request_seconds": 4.560135364532471,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "314.00"
+                ],
+                [
+                  "0.0200",
+                  "440.00"
+                ],
+                [
+                  "0.0300",
+                  "95.00"
+                ],
+                [
+                  "0.0400",
+                  "2.00"
+                ],
+                [
+                  "0.0500",
+                  "327.00"
+                ],
+                [
+                  "0.0600",
+                  "2.00"
+                ],
+                [
+                  "0.0800",
+                  "2.00"
+                ],
+                [
+                  "0.0900",
+                  "600.00"
+                ],
+                [
+                  "0.1000",
+                  "451.00"
+                ],
+                [
+                  "0.1100",
+                  "4.00"
+                ],
+                [
+                  "0.1400",
+                  "3.00"
+                ],
+                [
+                  "0.1600",
+                  "2.00"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "300.00"
+                ],
+                [
+                  "0.0200",
+                  "450.00"
+                ],
+                [
+                  "0.0300",
+                  "376.00"
+                ],
+                [
+                  "0.0400",
+                  "137.00"
+                ],
+                [
+                  "0.2100",
+                  "300.00"
+                ],
+                [
+                  "0.2200",
+                  "567.00"
+                ],
+                [
+                  "0.2300",
+                  "300.00"
+                ],
+                [
+                  "0.4300",
+                  "22.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 59,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "34.8100",
+              "qualified_fraction_assumption": "1",
+              "share": "0.7922171014253112436644609635",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "14.70",
+              "maximum_total_cost_to_break_even_usd": "14.70",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 61,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "34.7700",
+              "qualified_fraction_assumption": "1",
+              "share": "0.7543084084142285537252262735",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "14.00",
+              "maximum_total_cost_to_break_even_usd": "14.00",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 63,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.696375101099285304919481486",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "12.92",
+              "maximum_total_cost_to_break_even_usd": "12.92",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 59,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "34.8100",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.7922171014253112436644609635",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "7.35",
+              "maximum_total_cost_to_break_even_usd": "7.35",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 61,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "34.7700",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.7543084084142285537252262735",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "7.00",
+              "maximum_total_cost_to_break_even_usd": "7.00",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 63,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.696375101099285304919481486",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "6.46",
+              "maximum_total_cost_to_break_even_usd": "6.46",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 59,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "34.8100",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.7922171014253112436644609635",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "3.67",
+              "maximum_total_cost_to_break_even_usd": "3.67",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 61,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "34.7700",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.7543084084142285537252262735",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "3.50",
+              "maximum_total_cost_to_break_even_usd": "3.50",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 63,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.696375101099285304919481486",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "3.23",
+              "maximum_total_cost_to_break_even_usd": "3.23",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "0.5900",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "0.5900",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "0.5900",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "2.9500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "2.9500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "2.9500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "5.9000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "5.9000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "5.9000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "11.8000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "11.8000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.4300",
+              "no_price": "0.1600",
+              "capital_usd": "11.8000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 1,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "0.5700",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 1,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "0.5700",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 1,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "0.5700",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 5,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "2.8500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 5,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "2.8500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 5,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "2.8500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 10,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "5.7000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 10,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "5.7000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 10,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "5.7000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 20,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "11.4000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 20,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "11.4000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 1,
+              "size": 20,
+              "yes_price": "0.4200",
+              "no_price": "0.1500",
+              "capital_usd": "11.4000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 1,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "0.5500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 1,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "0.5500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 1,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "0.5500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002632586314580633029556154006",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 5,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "2.7500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 5,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "2.7500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 5,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "2.7500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.01302160402485942586564072210",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 10,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "5.5000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 10,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "5.5000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 10,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "5.5000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.02569853883619584721866188156",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 20,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "11.0000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 20,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "11.0000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 2,
+              "size": 20,
+              "yes_price": "0.4100",
+              "no_price": "0.1400",
+              "capital_usd": "11.0000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0500730994152046783625730994",
+              "remaining_seconds": "5011.321875572205",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T14:16:39.102209Z",
+        "id": "d70eef80-76ec-4289-9673-ee18a20a4f02",
+        "incentive_description": "series_lip",
+        "incentive_type": "liquidity",
+        "market_id": "2a459ee1-4e80-4e6f-aa93-92f26896b57a",
+        "market_ticker": "KXTRUMPAPPROVE-26SEP21-A40.4",
+        "paid_out": false,
+        "period_reward": 3000000,
+        "start_date": "2026-09-20T14:16:39.102209Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-21T16:59:00Z",
+        "created_time": "2026-09-20T14:00:30.43348Z",
+        "event_ticker": "KXTRUMPAPPROVE-26SEP21",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-21T17:00:00Z",
+        "expiration_time": "2026-09-21T16:59:00Z",
+        "expiration_value": "",
+        "floor_strike": 40.4,
+        "last_price_dollars": "0.0300",
+        "latest_expiration_time": "2026-09-21T16:59:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.9700",
+        "no_bid_dollars": "0.9600",
+        "no_sub_title": "Above 40.4%",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T16:59:00Z",
+        "open_interest_fp": "3258.95",
+        "open_time": "2026-09-20T14:01:00Z",
+        "previous_price_dollars": "0.0000",
+        "previous_yes_ask_dollars": "0.0000",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If Trump's RCP approval average is above 40.4% at exactly 1:00 PM ET on Sep 21, 2026, then the market resolves to Yes.",
+        "rules_secondary": "The value in the \"Approve\" column of the \"RCP Average\" row of the table titled \"President Trump Job Approval\" will be the sole resolution source for this event.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "greater",
+        "ticker": "KXTRUMPAPPROVE-26SEP21-A40.4",
+        "title": "Will Trump's RCP approval average be above 40.4 on Sep 21, 2026?",
+        "updated_time": "2026-09-20T14:01:01.216157Z",
+        "volume_24h_fp": "5559.29",
+        "volume_fp": "5559.29",
+        "yes_ask_dollars": "0.0400",
+        "yes_ask_size_fp": "5477.02",
+        "yes_bid_dollars": "0.0300",
+        "yes_bid_size_fp": "15509.45",
+        "yes_sub_title": "Above 40.4%"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950079.2791522,
+          "received": 1789950084.121912,
+          "request_seconds": 4.842759847640991,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "1984.00"
+                ],
+                [
+                  "0.0400",
+                  "148.00"
+                ],
+                [
+                  "0.0500",
+                  "140.00"
+                ],
+                [
+                  "0.1400",
+                  "351.38"
+                ],
+                [
+                  "0.1500",
+                  "152.12"
+                ],
+                [
+                  "0.1600",
+                  "43.00"
+                ],
+                [
+                  "0.2300",
+                  "117.12"
+                ],
+                [
+                  "0.2400",
+                  "29.00"
+                ],
+                [
+                  "0.5900",
+                  "11.00"
+                ],
+                [
+                  "0.7200",
+                  "111.00"
+                ],
+                [
+                  "0.9100",
+                  "200.00"
+                ],
+                [
+                  "0.9200",
+                  "42.00"
+                ],
+                [
+                  "0.9600",
+                  "5477.02"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "1641.00"
+                ],
+                [
+                  "0.0200",
+                  "4.18"
+                ],
+                [
+                  "0.0300",
+                  "15509.45"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0001235101854116052216994555857",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0001235101854116052216994555857",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0001235101854116052216994555857",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0006171763770224071484892662205",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0006171763770224071484892662205",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0006171763770224071484892662205",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.001233417804672840318598902867",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.001233417804672840318598902867",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.001233417804672840318598902867",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002463105284682649952015815690",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002463105284682649952015815690",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002463105284682649952015815690",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.004300683370165000681447432002",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.004300683370165000681447432002",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.004300683370165000681447432002",
+              "remaining_seconds": "50114.98029708862",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950084.1219137,
+          "received": 1789950088.6544464,
+          "request_seconds": 4.532532691955566,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "1984.00"
+                ],
+                [
+                  "0.0400",
+                  "148.00"
+                ],
+                [
+                  "0.0500",
+                  "140.00"
+                ],
+                [
+                  "0.1400",
+                  "351.38"
+                ],
+                [
+                  "0.1500",
+                  "152.12"
+                ],
+                [
+                  "0.1600",
+                  "43.00"
+                ],
+                [
+                  "0.2300",
+                  "117.12"
+                ],
+                [
+                  "0.2400",
+                  "29.00"
+                ],
+                [
+                  "0.5900",
+                  "11.00"
+                ],
+                [
+                  "0.7200",
+                  "111.00"
+                ],
+                [
+                  "0.9100",
+                  "200.00"
+                ],
+                [
+                  "0.9200",
+                  "42.00"
+                ],
+                [
+                  "0.9600",
+                  "5477.02"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "1641.00"
+                ],
+                [
+                  "0.0200",
+                  "4.18"
+                ],
+                [
+                  "0.0300",
+                  "15509.45"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0001235101854116052216994555857",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0001235101854116052216994555857",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "0.9900",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0001235101854116052216994555857",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0006171763770224071484892662205",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0006171763770224071484892662205",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "4.9500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0006171763770224071484892662205",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.001233417804672840318598902867",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.001233417804672840318598902867",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "9.9000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.001233417804672840318598902867",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.002463105284682649952015815690",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.002463105284682649952015815690",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "19.8000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.002463105284682649952015815690",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.004300683370165000681447432002",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.004300683370165000681447432002",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 35,
+              "yes_price": "0.0300",
+              "no_price": "0.9600",
+              "capital_usd": "34.6500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.004300683370165000681447432002",
+              "remaining_seconds": "50110.44776272774",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T03:59:00Z",
+        "id": "f9473af7-c4af-4029-b5c7-d572344c99f6",
+        "incentive_description": "series_lip",
+        "incentive_type": "liquidity",
+        "market_id": "324129cc-7910-4f6c-81c6-fb2fa154fdbc",
+        "market_ticker": "KXTOKENUSE-26SEP21-T138",
+        "paid_out": false,
+        "period_reward": 2000000,
+        "start_date": "2026-09-20T04:02:06.601665Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-21T03:59:00Z",
+        "created_time": "2026-09-14T14:14:27.366458Z",
+        "early_close_condition": "This market will close and expire early if the economic data is released.",
+        "event_ticker": "KXTOKENUSE-26SEP21",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-28T05:30:00Z",
+        "expiration_time": "2026-09-28T05:30:00Z",
+        "expiration_value": "",
+        "floor_strike": 138,
+        "last_price_dollars": "0.0200",
+        "latest_expiration_time": "2026-09-28T05:30:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "1.0000",
+        "no_bid_dollars": "0.9500",
+        "no_sub_title": "Above 138T tokens",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T05:30:00Z",
+        "open_interest_fp": "2211.00",
+        "open_time": "2026-09-14T15:00:00Z",
+        "previous_price_dollars": "0.0100",
+        "previous_yes_ask_dollars": "0.0800",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If the OpenRouter total token usage for Sep 14\u201320, 2026 is above 138T tokens, then the market resolves to Yes.",
+        "rules_secondary": "This event will resolve based on the value for the seven UTC calendar days from Sep 14\u201320, 2026, as observed at 10:00 AM ET on Sep 21, 2026.\n\nFor purposes of this market, \u201ctoken usage\u201d means the token usage included in OpenRouter's AI Model Rankings and does not represent total AI token usage across all providers or platforms.\n\nKalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with OpenRouter. All trademarks, logos, and brand names are the property of their respective owners.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "greater",
+        "ticker": "KXTOKENUSE-26SEP21-T138",
+        "title": "Will OpenRouter total token usage for Sep 14\u201320, 2026 be above 138T tokens?",
+        "updated_time": "2026-09-14T15:00:01.49024Z",
+        "volume_24h_fp": "5.00",
+        "volume_fp": "2411.00",
+        "yes_ask_dollars": "0.0500",
+        "yes_ask_size_fp": "1987.30",
+        "yes_bid_dollars": "0.0000",
+        "yes_bid_size_fp": "0.00",
+        "yes_sub_title": "Above 138T tokens"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950093.8901794,
+          "received": 1789950098.8943064,
+          "request_seconds": 5.004127025604248,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "2150.00"
+                ],
+                [
+                  "0.0200",
+                  "1620.00"
+                ],
+                [
+                  "0.0300",
+                  "510.00"
+                ],
+                [
+                  "0.0600",
+                  "148.00"
+                ],
+                [
+                  "0.0700",
+                  "100.00"
+                ],
+                [
+                  "0.2000",
+                  "35.00"
+                ],
+                [
+                  "0.3200",
+                  "21.00"
+                ],
+                [
+                  "0.9000",
+                  "500.00"
+                ],
+                [
+                  "0.9100",
+                  "200.00"
+                ],
+                [
+                  "0.9500",
+                  "1987.30"
+                ]
+              ],
+              "yes_dollars": []
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950098.894309,
+          "received": 1789950103.410109,
+          "request_seconds": 4.5157999992370605,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "2150.00"
+                ],
+                [
+                  "0.0200",
+                  "1620.00"
+                ],
+                [
+                  "0.0300",
+                  "510.00"
+                ],
+                [
+                  "0.0600",
+                  "148.00"
+                ],
+                [
+                  "0.0700",
+                  "100.00"
+                ],
+                [
+                  "0.2000",
+                  "35.00"
+                ],
+                [
+                  "0.3200",
+                  "21.00"
+                ],
+                [
+                  "0.9000",
+                  "500.00"
+                ],
+                [
+                  "0.9100",
+                  "200.00"
+                ],
+                [
+                  "0.9500",
+                  "1987.30"
+                ]
+              ],
+              "yes_dollars": []
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T05:59:00Z",
+        "id": "dbad2b2e-bb95-4abc-9a8f-363c7b76c33e",
+        "incentive_description": "new_event",
+        "incentive_type": "liquidity",
+        "market_id": "1ad1c6ab-99f0-414f-903a-5da5582d70b6",
+        "market_ticker": "KXDIESELD-26SEP21-T6.555",
+        "paid_out": false,
+        "period_reward": 1400000,
+        "start_date": "2026-09-20T12:02:26.875039Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-21T05:59:00Z",
+        "created_time": "2026-09-20T10:00:30.695067Z",
+        "early_close_condition": "This market will close and expire early if the economic data is released.",
+        "event_ticker": "KXDIESELD-26SEP21",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-28T07:30:00Z",
+        "expiration_time": "2026-09-28T07:30:00Z",
+        "expiration_value": "",
+        "floor_strike": 6.555,
+        "last_price_dollars": "0.0100",
+        "latest_expiration_time": "2026-09-28T07:30:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "1.0000",
+        "no_bid_dollars": "0.9900",
+        "no_sub_title": "Above $6.555",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T07:30:00Z",
+        "open_interest_fp": "4596.98",
+        "open_time": "2026-09-20T12:00:00Z",
+        "previous_price_dollars": "0.0000",
+        "previous_yes_ask_dollars": "0.0000",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If the Diesel Price on September 21, 2026 is above $6.555, then the market resolves to Yes.",
+        "rules_secondary": "",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "greater",
+        "ticker": "KXDIESELD-26SEP21-T6.555",
+        "title": "Will Diesel Price on September 21, 2026 be above $6.555?",
+        "updated_time": "2026-09-20T12:00:01.575775Z",
+        "volume_24h_fp": "6245.68",
+        "volume_fp": "6245.68",
+        "yes_ask_dollars": "0.0100",
+        "yes_ask_size_fp": "1004.00",
+        "yes_bid_dollars": "0.0000",
+        "yes_bid_size_fp": "0.00",
+        "yes_sub_title": "Above $6.555"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950093.9582634,
+          "received": 1789950098.9619093,
+          "request_seconds": 5.003645896911621,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "1784.00"
+                ],
+                [
+                  "0.0700",
+                  "257.00"
+                ],
+                [
+                  "0.1300",
+                  "15.00"
+                ],
+                [
+                  "0.1400",
+                  "50.00"
+                ],
+                [
+                  "0.3200",
+                  "21.00"
+                ],
+                [
+                  "0.4000",
+                  "50.00"
+                ],
+                [
+                  "0.5500",
+                  "25.00"
+                ],
+                [
+                  "0.6200",
+                  "16.00"
+                ],
+                [
+                  "0.6500",
+                  "20.00"
+                ],
+                [
+                  "0.7000",
+                  "23.00"
+                ],
+                [
+                  "0.7500",
+                  "25.00"
+                ],
+                [
+                  "0.9800",
+                  "1000.00"
+                ],
+                [
+                  "0.9900",
+                  "1004.00"
+                ]
+              ],
+              "yes_dollars": []
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950098.9619124,
+          "received": 1789950103.4382393,
+          "request_seconds": 4.476326942443848,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "1784.00"
+                ],
+                [
+                  "0.0700",
+                  "257.00"
+                ],
+                [
+                  "0.1300",
+                  "15.00"
+                ],
+                [
+                  "0.1400",
+                  "50.00"
+                ],
+                [
+                  "0.3200",
+                  "21.00"
+                ],
+                [
+                  "0.4000",
+                  "50.00"
+                ],
+                [
+                  "0.5500",
+                  "25.00"
+                ],
+                [
+                  "0.6200",
+                  "16.00"
+                ],
+                [
+                  "0.6500",
+                  "20.00"
+                ],
+                [
+                  "0.7000",
+                  "23.00"
+                ],
+                [
+                  "0.7500",
+                  "25.00"
+                ],
+                [
+                  "0.9800",
+                  "1000.00"
+                ],
+                [
+                  "0.9900",
+                  "1004.00"
+                ]
+              ],
+              "yes_dollars": []
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T14:00:00Z",
+        "id": "70dc7edf-f7f9-485a-9225-fc22b023b059",
+        "incentive_description": "new_event",
+        "incentive_type": "liquidity",
+        "market_id": "db1fca49-fd5c-4966-a05c-c83255d84b0e",
+        "market_ticker": "KXOPENSOURCESHARE-26SEP21-T90",
+        "paid_out": false,
+        "period_reward": 1350000,
+        "start_date": "2026-09-20T19:04:51.293894Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-21T14:00:00Z",
+        "created_time": "2026-09-20T18:24:07.765022Z",
+        "early_close_condition": "This market will close and expire early if the economic data is released.",
+        "event_ticker": "KXOPENSOURCESHARE-26SEP21",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-28T15:31:00Z",
+        "expiration_time": "2026-09-28T15:31:00Z",
+        "expiration_value": "",
+        "floor_strike": 90,
+        "last_price_dollars": "0.0000",
+        "latest_expiration_time": "2026-09-28T15:31:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "0.9800",
+        "no_bid_dollars": "0.9500",
+        "no_sub_title": "Above 90%",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T15:31:00Z",
+        "open_interest_fp": "0.00",
+        "open_time": "2026-09-20T19:00:00Z",
+        "previous_price_dollars": "0.0000",
+        "previous_yes_ask_dollars": "0.0000",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If the Open vs. Closed Token Volume (open weights share) for Sep 20, 2026 is above 90%, then the market resolves to Yes.",
+        "rules_secondary": "This event resolves using the Open Weights percentage in Vercel AI Gateway's Open vs. Closed Token Volume chart. At 10:00 AM ET on Sep 21, 2026, Kalshi will use the chart's updated value for Sep 20, 2026. \n\nKalshi is not affiliated, associated, authorized, endorsed by, or in any way officially connected with Vercel. All trademarks, logos, and brand names are the property of their respective owners.",
+        "settlement_timer_seconds": 1800,
+        "status": "active",
+        "strike_type": "greater",
+        "ticker": "KXOPENSOURCESHARE-26SEP21-T90",
+        "title": "Will Open vs. Closed Token Volume (open weights share) for Sep 20, 2026 be above 90%?",
+        "updated_time": "2026-09-20T19:00:02.343993Z",
+        "volume_24h_fp": "0.00",
+        "volume_fp": "0.00",
+        "yes_ask_dollars": "0.0500",
+        "yes_ask_size_fp": "2903.05",
+        "yes_bid_dollars": "0.0200",
+        "yes_bid_size_fp": "2159.00",
+        "yes_sub_title": "Above 90%"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950093.912302,
+          "received": 1789950098.9462261,
+          "request_seconds": 5.033924102783203,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "1714.00"
+                ],
+                [
+                  "0.0700",
+                  "100.00"
+                ],
+                [
+                  "0.2000",
+                  "35.00"
+                ],
+                [
+                  "0.2700",
+                  "1827.00"
+                ],
+                [
+                  "0.2800",
+                  "1000.00"
+                ],
+                [
+                  "0.2900",
+                  "200.00"
+                ],
+                [
+                  "0.3000",
+                  "200.00"
+                ],
+                [
+                  "0.3100",
+                  "22.00"
+                ],
+                [
+                  "0.9500",
+                  "2998.05"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "1000.00"
+                ],
+                [
+                  "0.0200",
+                  "2159.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "34.9200",
+              "qualified_fraction_assumption": "1",
+              "share": "0.01413311984150732016217300384",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "1.37",
+              "maximum_total_cost_to_break_even_usd": "1.37",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "0.9700",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0003982009426441830036301618970",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "0.9700",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0003982009426441830036301618970",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "0.9700",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0003982009426441830036301618970",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "4.8500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.001987754993760040816174535556",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "4.8500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.001987754993760040816174535556",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "4.8500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.001987754993760040816174535556",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "9.7000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.003967416186881782692084523250",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "9.7000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.003967416186881782692084523250",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "9.7000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.003967416186881782692084523250",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "19.4000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.00790265885265400154473673500",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "19.4000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.00790265885265400154473673500",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "19.4000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.00790265885265400154473673500",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "34.9200",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.01413311984150732016217300384",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "34.9200",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.01413311984150732016217300384",
+              "remaining_seconds": "49101.053773880005",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950098.9462287,
+          "received": 1789950103.486383,
+          "request_seconds": 4.540154218673706,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "1714.00"
+                ],
+                [
+                  "0.0700",
+                  "100.00"
+                ],
+                [
+                  "0.2000",
+                  "35.00"
+                ],
+                [
+                  "0.2700",
+                  "1827.00"
+                ],
+                [
+                  "0.2800",
+                  "1000.00"
+                ],
+                [
+                  "0.2900",
+                  "200.00"
+                ],
+                [
+                  "0.3000",
+                  "200.00"
+                ],
+                [
+                  "0.3100",
+                  "22.00"
+                ],
+                [
+                  "0.9500",
+                  "2998.05"
+                ]
+              ],
+              "yes_dollars": [
+                [
+                  "0.0100",
+                  "1000.00"
+                ],
+                [
+                  "0.0200",
+                  "2159.00"
+                ]
+              ]
+            }
+          },
+          "frontier": [
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "34.9200",
+              "qualified_fraction_assumption": "1",
+              "share": "0.01413311984150732016217300384",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "1.37",
+              "maximum_total_cost_to_break_even_usd": "1.37",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "0.9700",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.0003982009426441830036301618970",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "0.9700",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.0003982009426441830036301618970",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 1,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "0.9700",
+              "qualified_fraction_assumption": "1",
+              "share": "0.0003982009426441830036301618970",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "4.8500",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.001987754993760040816174535556",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "4.8500",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.001987754993760040816174535556",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 5,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "4.8500",
+              "qualified_fraction_assumption": "1",
+              "share": "0.001987754993760040816174535556",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "9.7000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.003967416186881782692084523250",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "9.7000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.003967416186881782692084523250",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 10,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "9.7000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.003967416186881782692084523250",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "19.4000",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.00790265885265400154473673500",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "19.4000",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.00790265885265400154473673500",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 20,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "19.4000",
+              "qualified_fraction_assumption": "1",
+              "share": "0.00790265885265400154473673500",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "34.9200",
+              "qualified_fraction_assumption": "0.25",
+              "share": "0.01413311984150732016217300384",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            },
+            {
+              "offset_ticks": 0,
+              "size": 36,
+              "yes_price": "0.0200",
+              "no_price": "0.9500",
+              "capital_usd": "34.9200",
+              "qualified_fraction_assumption": "0.50",
+              "share": "0.01413311984150732016217300384",
+              "remaining_seconds": "49096.51361703873",
+              "estimated_reward_usd": "0",
+              "maximum_total_cost_to_break_even_usd": "0",
+              "net_profit_usd": null,
+              "live_eligible": false
+            }
+          ],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    },
+    {
+      "program": {
+        "discount_factor_bps": 5000,
+        "end_date": "2026-09-21T14:00:00Z",
+        "id": "6d3c6691-f9a6-4a37-8e1c-6217ffa6d189",
+        "incentive_description": "series_lip",
+        "incentive_type": "liquidity",
+        "market_id": "5743543e-fdf9-402a-86ae-3eb9de1bd7ce",
+        "market_ticker": "KXRT-RES-98",
+        "paid_out": false,
+        "period_reward": 1000000,
+        "start_date": "2026-09-20T23:46:30.425452Z",
+        "target_size_fp": "1000.00"
+      },
+      "market": {
+        "can_close_early": true,
+        "close_time": "2026-09-21T14:00:00Z",
+        "created_time": "2026-09-16T21:59:11.260634Z",
+        "event_ticker": "KXRT-RES",
+        "exchange_index": 0,
+        "expected_expiration_time": "2026-09-21T14:00:00Z",
+        "expiration_time": "2026-09-28T14:00:00Z",
+        "expiration_value": "",
+        "floor_strike": 98,
+        "last_price_dollars": "0.0100",
+        "latest_expiration_time": "2026-09-28T14:00:00Z",
+        "liquidity_dollars": "0.0000",
+        "market_type": "binary",
+        "no_ask_dollars": "1.0000",
+        "no_bid_dollars": "0.9900",
+        "no_sub_title": "Above 98",
+        "notional_value_dollars": "1.0000",
+        "occurrence_datetime": "2026-09-21T14:00:00Z",
+        "open_interest_fp": "27742.60",
+        "open_time": "2026-09-16T23:00:00Z",
+        "previous_price_dollars": "0.0100",
+        "previous_yes_ask_dollars": "0.0100",
+        "previous_yes_bid_dollars": "0.0000",
+        "price_level_structure": "linear_cent",
+        "price_ranges": [
+          {
+            "end": "1.0000",
+            "start": "0.0000",
+            "step": "0.0100"
+          }
+        ],
+        "result": "",
+        "rules_primary": "If Resident Evil has a Tomatometer score of above 98 on Sep 21, 2026 at 10:00 AM ET, then the market resolves to Yes.",
+        "rules_secondary": "The \"Fresh!\" and \"Certified Fresh!\" subtitles are meant for illustrative purposes only. The Tomatometer score must be above the strike value to resolve as YES (for example, a score of 75 would resolve \"Above 75\" as No.) The market will be determined the Monday after wide release at 10:00 AM ET.\n\nThis market and these products have not been endorsed by Rotten Tomatoes. Any references to Rotten Tomatoes or any associated marks are descriptive only and do not indicate an endorsement of this product or any affiliation between Rotten Tomatoes and Kalshi.",
+        "settlement_timer_seconds": 3598,
+        "status": "active",
+        "strike_type": "greater",
+        "subtitle": "Above 98",
+        "ticker": "KXRT-RES-98",
+        "title": "Resident Evil Rotten Tomatoes score?",
+        "updated_time": "2026-09-16T23:00:00.891619Z",
+        "volume_24h_fp": "515.26",
+        "volume_fp": "31891.09",
+        "yes_ask_dollars": "0.0100",
+        "yes_ask_size_fp": "119139.85",
+        "yes_bid_dollars": "0.0000",
+        "yes_bid_size_fp": "0.00",
+        "yes_sub_title": "Above 98"
+      },
+      "snapshots": [
+        {
+          "request_started": 1789950093.9181216,
+          "received": 1789950098.978164,
+          "request_seconds": 5.060042381286621,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "114343.30"
+                ],
+                [
+                  "0.0200",
+                  "27626.00"
+                ],
+                [
+                  "0.0300",
+                  "11881.00"
+                ],
+                [
+                  "0.0400",
+                  "2.00"
+                ],
+                [
+                  "0.0500",
+                  "3.00"
+                ],
+                [
+                  "0.0600",
+                  "3.00"
+                ],
+                [
+                  "0.0700",
+                  "7100.00"
+                ],
+                [
+                  "0.0800",
+                  "4.00"
+                ],
+                [
+                  "0.1100",
+                  "3.00"
+                ],
+                [
+                  "0.1400",
+                  "93.51"
+                ],
+                [
+                  "0.1600",
+                  "2235.00"
+                ],
+                [
+                  "0.1800",
+                  "1.00"
+                ],
+                [
+                  "0.1900",
+                  "179.00"
+                ],
+                [
+                  "0.2000",
+                  "10.00"
+                ],
+                [
+                  "0.2100",
+                  "1.00"
+                ],
+                [
+                  "0.2600",
+                  "4.00"
+                ],
+                [
+                  "0.3100",
+                  "1.00"
+                ],
+                [
+                  "0.3500",
+                  "93.51"
+                ],
+                [
+                  "0.3600",
+                  "1.00"
+                ],
+                [
+                  "0.4300",
+                  "280.55"
+                ],
+                [
+                  "0.4600",
+                  "46.75"
+                ],
+                [
+                  "0.6600",
+                  "500.00"
+                ],
+                [
+                  "0.6700",
+                  "694.00"
+                ],
+                [
+                  "0.6800",
+                  "10.00"
+                ],
+                [
+                  "0.8900",
+                  "93.51"
+                ],
+                [
+                  "0.9600",
+                  "93.51"
+                ],
+                [
+                  "0.9900",
+                  "119139.85"
+                ]
+              ],
+              "yes_dollars": []
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        },
+        {
+          "request_started": 1789950098.9781675,
+          "received": 1789950103.5102563,
+          "request_seconds": 4.532088756561279,
+          "raw": {
+            "orderbook_fp": {
+              "no_dollars": [
+                [
+                  "0.0100",
+                  "114343.30"
+                ],
+                [
+                  "0.0200",
+                  "27626.00"
+                ],
+                [
+                  "0.0300",
+                  "11881.00"
+                ],
+                [
+                  "0.0400",
+                  "2.00"
+                ],
+                [
+                  "0.0500",
+                  "3.00"
+                ],
+                [
+                  "0.0600",
+                  "3.00"
+                ],
+                [
+                  "0.0700",
+                  "7100.00"
+                ],
+                [
+                  "0.0800",
+                  "4.00"
+                ],
+                [
+                  "0.1100",
+                  "3.00"
+                ],
+                [
+                  "0.1400",
+                  "93.51"
+                ],
+                [
+                  "0.1600",
+                  "2235.00"
+                ],
+                [
+                  "0.1800",
+                  "1.00"
+                ],
+                [
+                  "0.1900",
+                  "179.00"
+                ],
+                [
+                  "0.2000",
+                  "10.00"
+                ],
+                [
+                  "0.2100",
+                  "1.00"
+                ],
+                [
+                  "0.2600",
+                  "4.00"
+                ],
+                [
+                  "0.3100",
+                  "1.00"
+                ],
+                [
+                  "0.3500",
+                  "93.51"
+                ],
+                [
+                  "0.3600",
+                  "1.00"
+                ],
+                [
+                  "0.4300",
+                  "280.55"
+                ],
+                [
+                  "0.4600",
+                  "46.75"
+                ],
+                [
+                  "0.6600",
+                  "500.00"
+                ],
+                [
+                  "0.6700",
+                  "694.00"
+                ],
+                [
+                  "0.6800",
+                  "10.00"
+                ],
+                [
+                  "0.8900",
+                  "93.51"
+                ],
+                [
+                  "0.9600",
+                  "93.51"
+                ],
+                [
+                  "0.9900",
+                  "119139.85"
+                ]
+              ],
+              "yes_dollars": []
+            }
+          },
+          "frontier": [],
+          "blocked_reasons": [
+            "request_latency_exceeds_2s"
+          ],
+          "actionable": false
+        }
+      ]
+    }
+  ],
+  "live_eligible": false,
+  "limitations": [
+    "Not a full-market ranking or sequenced tape replay.",
+    "All public depth treated as competing liquidity for a hypothetical fresh paper account.",
+    "Snapshots are not simultaneous; receive timestamps are not exchange snapshot timestamps.",
+    "No fills inferred; no positive net-profit estimate without cost evidence.",
+    "Uptime and unchanged depth/share until expiry are scenarios, not forecasts.",
+    "Quotes are mutually exclusive alternatives; their capital and rewards must not be summed."
+  ]
+}
