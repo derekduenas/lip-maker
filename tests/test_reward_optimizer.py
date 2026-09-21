@@ -76,3 +76,34 @@ def test_cost_forecast_cannot_extend_past_program():
     p,b,c=inputs()
     with pytest.raises(ValueError):
         rank_quotes(p,b,[c],now=b['ts'],horizon_seconds=3601,tick_usd='.01')
+
+
+def test_crossed_public_book_blocks_even_non_crossing_proposal():
+    p,b,c=inputs();b['yes_bids']=[['.7','100']];b['no_bids']=[['.4','100']]
+    c.update(yes_price='.5',no_price='.2')
+    assert run(p,b,c)['blocked_reasons']==['crossed_or_locked_book']
+
+
+def test_nonqualifying_quotes_cannot_use_positive_pnl_to_pass():
+    p,b,c=inputs();c.update(yes_price='.1',no_price='.1',trading_pnl_usd='100')
+    r=run(p,b,c)['ranked'][0]
+    assert r['qualified']  # Public snapshot is valid, but our levels earn nothing.
+    assert r['modeled_share']=='0'
+    assert not r['research_candidate']
+
+
+def test_ineligible_high_forecast_does_not_outrank_valid_quote():
+    p,b,c=inputs();bad=dict(c,id='bad',yes_price='.65',no_price='.3',trading_pnl_usd='10000')
+    r=rank_quotes(p,b,[bad,c],now=b['ts'],horizon_seconds=3600,tick_usd='.01')
+    assert r['ranked'][0]['id']=='a'
+
+
+def test_empty_candidates_does_not_bypass_book_validation():
+    p,b,c=inputs();b['yes_bids']=[['.50','-1']]
+    with pytest.raises(ValueError):
+        rank_quotes(p,b,[],now=b['ts'],horizon_seconds=3600,tick_usd='.01')
+
+
+def test_zero_qualified_time_is_not_a_reward_candidate():
+    p,b,c=inputs();c.update(qualified_fraction='0',trading_pnl_usd='100')
+    assert not run(p,b,c)['ranked'][0]['research_candidate']

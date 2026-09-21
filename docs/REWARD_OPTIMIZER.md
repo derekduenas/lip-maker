@@ -48,3 +48,9 @@ independent validation remain necessary before live use. This module does not
 change production routing. Governing regulatory notices remain authoritative;
 the current Help Center was available but the notices listing did not expose
 its underlying filing text during this check.
+
+Review follow-up: crossed/locked books fail closed. Positive trading forecasts
+cannot make zero-share or zero-qualified-time quotes reward candidates. Eligible
+positive-net candidates sort before ineligible diagnostic rows. Every level is
+validated even with an empty candidate list. Added five adversarial regressions;
+33 focused scorer/optimizer tests pass. No live-routing changes.

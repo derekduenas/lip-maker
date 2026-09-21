@@ -3,7 +3,7 @@
 Caller supplies competitor-only books and quote-specific cost/uptime scenarios.
 Those forecasts are assumptions, not measurements or exchange payout promises.
 """
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN
 from datetime import datetime
 from research.profit_ledger import number as D
 
@@ -88,6 +88,19 @@ def rank_quotes(program, book, candidates, *, now, horizon_seconds, tick_usd, ma
     if horizon > end - now:
         raise ValueError("cost forecast horizon exceeds remaining program window")
     duration = horizon
+    # Validate the entire book even when there are no quote candidates.
+    best = {}
+    for side in ('yes', 'no'):
+        best[side] = D(0)
+        for raw_price, raw_size in book[side + '_bids']:
+            price, size = D(raw_price), D(raw_size)
+            if not 0 < price < 1 or size < 0 or price % tick:
+                raise ValueError('invalid or off-grid book')
+            if size > 0:
+                best[side] = max(best[side], price)
+    if best['yes'] + best['no'] >= 1:
+        result['blocked_reasons'].append('crossed_or_locked_book')
+        return result
     ids = set()
     for c in candidates:
         if c['id'] in ids:
@@ -99,8 +112,7 @@ def rank_quotes(program, book, candidates, *, now, horizon_seconds, tick_usd, ma
         fees, operating, reserve = (D(c[k]) for k in ('fees_usd', 'operating_cost_usd', 'uncertainty_reserve_usd'))
         if min(fees, operating, reserve) < 0:
             raise ValueError('negative costs')
-        best_y = max((D(p) for p,s in book['yes_bids'] if D(s)>0), default=D(0))
-        best_n = max((D(p) for p,s in book['no_bids'] if D(s)>0), default=D(0))
+        best_y, best_n = best['yes'], best['no']
         ys,ycut,yref = _side(book['yes_bids'], y,q,target,discount,tick)
         ns,ncut,nref = _side(book['no_bids'], n,q,target,discount,tick)
         qualified = ycut is not None and ncut is not None
@@ -111,7 +123,7 @@ def rank_quotes(program, book, candidates, *, now, horizon_seconds, tick_usd, ma
         payable = reward if reward >= 1 else D(0)
         capital = q*(y+n)+fees
         net = payable + D(c['trading_pnl_usd']) - fees - operating - reserve
-        rows = dict(c, qualified=qualified, post_only=post_only, modeled_share=str(share), reward_before_minimum_usd=str(reward), estimated_payable_reward_usd=str(payable), capital_usd=str(capital), conservative_scenario_net_usd=str(net), net_per_capital_hour=str(net/(capital*duration/3600)), horizon_seconds=str(duration), yes_cutoff=str(ycut), no_cutoff=str(ncut), yes_reference=str(yref), no_reference=str(nref), research_candidate=qualified and post_only and net>0)
+        rows = dict(c, qualified=qualified, post_only=post_only, modeled_share=str(share), reward_before_minimum_usd=str(reward), estimated_payable_reward_usd=str(payable), capital_usd=str(capital), conservative_scenario_net_usd=str(net), net_per_capital_hour=str(net/(capital*duration/3600)), horizon_seconds=str(duration), yes_cutoff=str(ycut), no_cutoff=str(ncut), yes_reference=str(yref), no_reference=str(nref), research_candidate=qualified and post_only and share>0 and uptime>0 and net>0)
         result['ranked'].append(rows)
-    result['ranked'].sort(key=lambda r:D(r['net_per_capital_hour']),reverse=True)
+    result['ranked'].sort(key=lambda r:(r['research_candidate'], D(r['net_per_capital_hour'])),reverse=True)
     return result
