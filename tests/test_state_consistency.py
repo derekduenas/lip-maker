@@ -667,3 +667,89 @@ class TestDiscoveryOffLoop:
         for name in ("retire_inactive_markets", "refresh_params", "note_discovery", "on_fill"):
             fn = getattr(PaperRunner, name)
             assert not asyncio.iscoroutinefunction(fn), f"{name} must not be async"
+
+
+# ── 7. Program identity: a collision must not destroy a row ───────────────
+
+class TestProgramIdentityCollision:
+    """2026-09-21. lip_programs has PRIMARY KEY(id) AND
+    UNIQUE(market_ticker, start_date). The old INSERT OR REPLACE resolved a
+    secondary-constraint conflict by DELETING the other program's row —
+    silent data loss with no log line and no counter."""
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        """Uses the PRODUCTION constraint set — the shared `db` fixture omits
+        UNIQUE(market_ticker, start_date), which is precisely the constraint
+        whose REPLACE resolution caused the data loss."""
+        path = tmp_path / "ident.db"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE lip_programs (
+                id TEXT PRIMARY KEY, market_ticker TEXT NOT NULL, series_ticker TEXT,
+                start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+                period_reward_usd REAL NOT NULL, period_seconds REAL,
+                discount_factor REAL NOT NULL, target_size REAL NOT NULL,
+                paid_out INTEGER NOT NULL DEFAULT 0,
+                enrolled INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT,
+                reward_per_day_usd REAL, last_seen TEXT NOT NULL,
+                UNIQUE(market_ticker, start_date)
+            );
+        """)
+        conn.commit(); conn.close()
+        monkeypatch.setattr(settings, "DB_PATH", str(path))
+        return str(path)
+
+    def _client(self, rows):
+        class C:
+            def __init__(self, r):
+                self.rows = r
+
+            def get_unauth(self, path, params=None):
+                s = (params or {}).get("status")
+                return {"incentive_programs": [x for x in self.rows
+                                               if x.get("_status") == s],
+                        "next_cursor": None}
+        return C(rows)
+
+    def _raw(self, pid, ticker=TKR, start="2026-01-01T00:00:00Z"):
+        return {"_status": "active", "id": pid, "market_ticker": ticker,
+                "incentive_type": "liquidity", "period_reward": 1_000_000,
+                "discount_factor_bps": 5000, "target_size_fp": "100",
+                "start_date": start, "end_date": "2028-01-01T00:00:00Z",
+                "paid_out": False}
+
+    def test_colliding_program_does_not_delete_the_existing_row(self, db):
+        client = self._client([self._raw("prog-A"), self._raw("prog-B")])
+        with patch.object(lip_discovery, "KalshiClient", lambda: client):
+            res = discover_result(save=True)
+        conn = sqlite3.connect(db)
+        ids = {r[0] for r in conn.execute(
+            "SELECT id FROM lip_programs WHERE market_ticker = ?", (TKR,))}
+        conn.close()
+        # The first survives; the second is refused and COUNTED, not silent.
+        assert "prog-A" in ids
+        assert res.n_collisions == 1
+        assert res.collision_samples and "prog-B" in res.collision_samples[0]
+
+    def test_distinct_windows_coexist_without_collision(self, db):
+        client = self._client([self._raw("prog-A", start="2026-01-01T00:00:00Z"),
+                               self._raw("prog-B", start="2026-06-01T00:00:00Z")])
+        with patch.object(lip_discovery, "KalshiClient", lambda: client):
+            res = discover_result(save=True)
+        conn = sqlite3.connect(db)
+        n = conn.execute("SELECT COUNT(*) FROM lip_programs WHERE market_ticker = ?",
+                         (TKR,)).fetchone()[0]
+        conn.close()
+        assert n == 2 and res.n_collisions == 0
+
+    def test_same_program_id_updates_in_place(self, db):
+        """Re-scanning the same program must refresh it, not duplicate it."""
+        client = self._client([self._raw("prog-A")])
+        with patch.object(lip_discovery, "KalshiClient", lambda: client):
+            discover_result(save=True)
+            discover_result(save=True)
+        conn = sqlite3.connect(db)
+        n = conn.execute("SELECT COUNT(*) FROM lip_programs").fetchone()[0]
+        conn.close()
+        assert n == 1

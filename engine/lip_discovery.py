@@ -307,6 +307,10 @@ class DiscoveryResult:
     errors: list[str] = field(default_factory=list)
     n_rejected: int = 0
     n_demoted: int = 0
+    # Two different program ids claiming the same (ticker, start_date).
+    # Non-zero means ticker-keyed runtime state cannot represent reality.
+    n_collisions: int = 0
+    collision_samples: list[str] = field(default_factory=list)
 
 
 def discover(*, status: str | None = None, save: bool = True) -> list[dict]:
@@ -435,6 +439,8 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
     n_enrolled = 0
     n_total = 0
     n_demoted = 0
+    n_collisions = 0
+    collision_samples: list[str] = []
     complete = (status is None) and not errors
     if save and programs:
         conn = sqlite3.connect(settings.DB_PATH)
@@ -451,13 +457,37 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
                         f"{p['market_ticker'][:35]}|{reason}|rew=${p['reward_per_day_usd']:.2f}|"
                         f"tgt={p['target_size']:.0f}|df={p['discount_factor']:.2f}"
                     )
-                conn.execute(
-                    """INSERT OR REPLACE INTO lip_programs
+                try:
+                    conn.execute(
+                    # 2026-09-21: was INSERT OR REPLACE. The table has
+                    # PRIMARY KEY(id) *and* UNIQUE(market_ticker, start_date),
+                    # so when two DIFFERENT program ids shared a ticker and
+                    # start date, SQLite's REPLACE resolved the secondary
+                    # conflict by DELETING the other program's row and
+                    # inserting this one — silent data loss, no log line, no
+                    # counter. An explicit upsert on the primary key cannot
+                    # delete a different program; a genuine secondary
+                    # collision now raises and is counted below.
+                    """INSERT INTO lip_programs
                        (id, market_ticker, series_ticker, start_date, end_date,
                         period_reward_usd, period_seconds, discount_factor,
                         target_size, paid_out, enrolled, blocked_reason,
                         reward_per_day_usd, last_seen)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           market_ticker=excluded.market_ticker,
+                           series_ticker=excluded.series_ticker,
+                           start_date=excluded.start_date,
+                           end_date=excluded.end_date,
+                           period_reward_usd=excluded.period_reward_usd,
+                           period_seconds=excluded.period_seconds,
+                           discount_factor=excluded.discount_factor,
+                           target_size=excluded.target_size,
+                           paid_out=excluded.paid_out,
+                           enrolled=excluded.enrolled,
+                           blocked_reason=excluded.blocked_reason,
+                           reward_per_day_usd=excluded.reward_per_day_usd,
+                           last_seen=excluded.last_seen""",
                     (
                         p["id"], p["market_ticker"], p["series_ticker"],
                         p["start_date"], p["end_date"], p["period_reward_usd"],
@@ -465,7 +495,22 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
                         p["paid_out"], enrol, reason if not enrol else None,
                         p["reward_per_day_usd"], now_iso,
                     ),
-                )
+                    )
+                except sqlite3.IntegrityError as e:
+                    # A different program id already occupies
+                    # (market_ticker, start_date). Previously this silently
+                    # destroyed that row. Keep both intact and say so.
+                    n_collisions += 1
+                    if len(collision_samples) < 5:
+                        collision_samples.append(
+                            f"{p['market_ticker'][:35]}@{p['start_date']} "
+                            f"id={p['id']}")
+                    _log.error(
+                        f"program identity collision for {p['market_ticker']} "
+                        f"start={p['start_date']} id={p['id']}: {e}. Existing row "
+                        f"kept; this program NOT stored. Two programs share a "
+                        f"ticker+window — state keyed by ticker alone cannot "
+                        f"represent both.")
             if complete:
                 # Complete universe: anything still enrolled that this scan
                 # did not touch is not a program the venue lists any more.
@@ -513,10 +558,17 @@ def discover_result(*, status: str | None = None, save: bool = True) -> Discover
     elif n_demoted:
         _log.info(f"discovery: demoted {n_demoted} enrolled rows absent from this scan")
 
+    if n_collisions:
+        _log.error(f"DISCOVERY: {n_collisions} program-identity collisions "
+                   f"({collision_samples[:3]}). Runtime state is keyed by ticker, "
+                   f"so simultaneous programs on one ticker cannot both be "
+                   f"tracked — see docs/CLAUDE_INDEPENDENT_ASSESSMENT.md V6.")
+
     return DiscoveryResult(
         programs=programs, complete=complete, started_ts=started_ts,
         finished_ts=datetime.now(timezone.utc).timestamp(), errors=errors,
         n_rejected=n_rejected, n_demoted=n_demoted,
+        n_collisions=n_collisions, collision_samples=collision_samples,
     )
 
 
