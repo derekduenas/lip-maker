@@ -49,6 +49,7 @@ from engine.lip_discovery import (
 # 2026-05-03 GOLDEN-FUNNEL: capital-aware ranker. Replaces fixed top-N with
 # greedy yield-per-dollar fill. N becomes OUTPUT not INPUT — adapts to
 # opportunity quality + budget. Toggle via LIP_USE_CAPITAL_ALLOC env (default true).
+from engine.account_ledger import AccountLedger
 from engine.capital_allocator import select_optimal_portfolio
 from engine.depth_probe import filter_by_depth
 from engine.lip_scorer import (
@@ -182,7 +183,15 @@ class PaperRunner:
         }
         # 2026-04-21: paper flag now controlled by LIP_PAPER env via settings.
         # When settings.PAPER_MODE is False, QuoteManager hits real Kalshi.
-        self.qm = QuoteManager(paper=settings.PAPER_MODE)
+        # 2026-09-21: one shared account. Capital is reserved when an order
+        # rests and released when it does not, so the portfolio cannot spend
+        # money it does not have. Events go to the same store the offline
+        # research reads, so paper and replay report from one history.
+        self.account = AccountLedger(
+            mode="paper" if settings.PAPER_MODE else "live",
+            event_db_path=str(Path(settings.DB_PATH).with_name("account_events.db")),
+        )
+        self.qm = QuoteManager(paper=settings.PAPER_MODE, account=self.account)
         # 2026-04-22: target_share 0.25→0.35 — toxicity filter V2 provides
         # adverse-selection backstop; higher target = more rebate on winners.
         self.sizer = AdaptiveSizer(target_share=0.35)
@@ -1526,6 +1535,16 @@ class PaperRunner:
         scan_age = ("never" if self.last_complete_scan_ts is None
                     else f"{time.time() - self.last_complete_scan_ts:.0f}s ago")
         print(f"  Last complete discovery scan: {scan_age}")
+        st = self.account.state()
+        print(f"  Account: cash ${st.cash_usd:.2f}  reserved ${st.reserved_usd:.2f}  "
+              f"available ${st.available_usd:.2f}  inventory-at-cost "
+              f"${st.inventory_cost_usd:.2f}  ({st.n_reservations} holds)")
+        if self.qm.capital_refusals:
+            print(f"  Orders refused for insufficient capital: {self.qm.capital_refusals}")
+        # Reward figures here are ESTIMATES. Reconciled payments are the only
+        # reward money (engine/reward_provenance.py); tools/reward_payments.py
+        # reports what is actually on record.
+        print("  NOTE: reward figures above are model estimates, not payments.")
         print(f"  Quote manager: {self.qm.summary()}")
 
 

@@ -47,6 +47,7 @@ from execution.kalshi_auth import KalshiClient, KalshiAuthError
 from execution.order_request import (
     MakerSafetyError, assert_maker_safe, build_limit_order, would_cross,
 )
+from engine.account_ledger import AccountLedger, InsufficientCapital
 
 _log = logging.getLogger(__name__)
 
@@ -122,7 +123,8 @@ class QuoteManager:
     Live mode (when PAPER_MODE=False): places/cancels real orders.
     """
 
-    def __init__(self, *, paper: bool = True, db_path: Optional[str] = None):
+    def __init__(self, *, paper: bool = True, db_path: Optional[str] = None,
+                 account: Optional["AccountLedger"] = None):
         paper = paper if paper is not None else settings.PAPER_MODE
         # 2026-09-20 review: live execution stays DISABLED until armed via
         # LIP_PAPER=false AND LIP_LIVE_ACK (see settings.LIVE_ARMED). A
@@ -154,6 +156,12 @@ class QuoteManager:
         self.fill_stats: dict[str, int] = {"applied": 0, "duplicate": 0,
                                            "untracked": 0, "unknown_order": 0}
         self.last_fill_status: str = ""
+        # 2026-09-21: shared cash + reservation ledger. When present, capital
+        # is reserved before an order rests and released when it does not,
+        # so two markets cannot each pass their own cap while jointly
+        # exceeding the cash that exists.
+        self.account = account
+        self.capital_refusals: int = 0
         # 2026-04-25 COLD-BOOT RECONCILIATION: rehydrate self.resting from
         # Kalshi's actual order book on init. Without this, a service
         # restart leaves us blind to live orders → next reconcile() places
@@ -490,6 +498,18 @@ class QuoteManager:
                 else:
                     _log.info(f"fill: {market_ticker} {o.side}@{o.price_cents}c -{count:g} "
                               f"→ {o.size_contracts:g} remaining oid={order_id[:12]}")
+                # 2026-09-21: the reservation becomes inventory and cash
+                # leaves the account. Runs inside apply_fill's trade_id
+                # idempotency guard, so a replayed fill cannot spend twice.
+                if self.account is not None:
+                    try:
+                        self.account.on_fill(
+                            o.client_order_id or order_id,
+                            market=market_ticker, program_id=market_ticker,
+                            side=o.side, price_cents=o.price_cents,
+                            quantity=count, fee_usd=0, trade_id=trade_id)
+                    except Exception as e:
+                        _log.warning(f"account fill accounting failed for {order_id}: {e}")
                 self.fill_stats["applied"] += 1
                 self.last_fill_status = "applied"
                 return o
@@ -556,7 +576,13 @@ class QuoteManager:
     # ── Balance + aggregate risk ──────────────────────────────────────
     def _get_balance(self) -> float:
         if self.paper:
-            return 10_000.0  # pretend $10k for paper risk math
+            # 2026-09-21: was a hardcoded 10_000.0. That made
+            # MAX_BANKROLL_SHARE_PCT (0.50) permit $5,000 of gross — 100% of
+            # the real account — in exactly the mode we evaluate in. Paper
+            # now reports the account ledger's actual cash.
+            if self.account is not None:
+                return float(self.account.state().cash_usd)
+            return float(getattr(settings, "ACCOUNT_OPENING_CASH_USD", 5000.0))
         # Refresh balance every 30 seconds to avoid spamming the API
         now = time.time()
         if now - self._last_balance_check > 30:
@@ -822,6 +848,7 @@ class QuoteManager:
         price_cents: int,
         size_contracts: int,
         best_opposing_bid_cents: Optional[int] = None,
+        program_id: str = "",
     ) -> Optional[RestingOrder]:
         """Place a single resting limit order.
 
@@ -841,6 +868,22 @@ class QuoteManager:
         size_contracts = int(round(size_contracts))   # we only ever place whole lots
         if size_contracts <= 0:
             return None
+        # 2026-09-21: reserve capital BEFORE the order can rest. A binary is
+        # fully collateralised, so the requirement is exactly price × size.
+        # Refusing here is what stops the portfolio spending money it does
+        # not have; per-market gross caps never could.
+        if self.account is not None:
+            try:
+                self.account.reserve(coid, market=market_ticker,
+                                     program_id=program_id or market_ticker,
+                                     price_cents=price_cents,
+                                     quantity=size_contracts)
+            except InsufficientCapital as e:
+                self.capital_refusals += 1
+                _log.warning(f"REFUSED {market_ticker} {side}@{price_cents}c "
+                             f"x{size_contracts}: {e}")
+                return None
+
         if self.paper:
             # Paper still runs the maker check so a crossing quote is caught
             # in paper rather than discovered live, but a missing opposing
@@ -851,6 +894,7 @@ class QuoteManager:
                 if not chk.safe:
                     _log.warning(f"[PAPER] REFUSED non-maker quote {market_ticker} "
                                  f"{side}@{price_cents}c: {chk.reason}")
+                    self._release_capital(coid)
                     return None
             order_id = "PAPER-" + coid
             _log.info(f"[PAPER] PLACE {market_ticker} {side}@{price_cents}c size={size_contracts}")
@@ -866,6 +910,7 @@ class QuoteManager:
                 _log.error(f"[LIVE] REFUSED {market_ticker} {side}@{price_cents}c: {e}")
                 self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                                     coid, "rejected", notes=f"maker_safety: {e}")
+                self._release_capital(coid)
                 return None
             try:
                 resp = self.client.post("/portfolio/orders", body)
@@ -875,6 +920,7 @@ class QuoteManager:
                 _log.error(f"order placement failed for {market_ticker} {side}@{price_cents}: {e}")
                 self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                                       coid, "rejected", notes=str(e))
+                self._release_capital(coid)
                 return None
 
         rest = RestingOrder(
@@ -901,6 +947,15 @@ class QuoteManager:
         self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                               order_id, "resting", notes=f"coid={coid}")
         return rest
+
+    def _release_capital(self, client_order_id: str) -> None:
+        """Return an order's reserved capital to the available pool.
+
+        Reservations are keyed by client_order_id because that exists before
+        the venue assigns an order_id — capital must be held from the moment
+        we decide to place, not from the moment the venue answers."""
+        if self.account is not None and client_order_id:
+            self.account.release(client_order_id)
 
     def _cancel_order(self, order: RestingOrder) -> bool:
         with self._state_lock:
@@ -939,6 +994,8 @@ class QuoteManager:
             except ValueError:
                 pass
             self._tombstone(order.order_id)   # an older REST snapshot must not re-adopt it
+            # The order is gone, so its capital is available again.
+            self._release_capital(order.client_order_id)
         # UPDATE existing row (don't INSERT a new cancelled one) — otherwise the
         # quotes table grows unbounded and confuses per-market counting.
         self._update_quote_status(order.order_id, "cancelled", notes="manager_cancel")

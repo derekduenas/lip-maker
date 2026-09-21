@@ -52,6 +52,14 @@ SHADOW_MODE = os.getenv("LIP_SHADOW", "true").lower() == "true"
 # deposit, set env: LIP_BANKROLL=5000 in lip-maker.service.
 BANKROLL_USD = float(os.getenv("LIP_BANKROLL", "80"))
 
+# 2026-09-21: the one account this system evaluates against. Previously three
+# different figures coexisted — BANKROLL_USD ($80 default), a hardcoded
+# $10,000 in QuoteManager._get_balance's paper branch, and the $5,000 the
+# project actually intends — which made MAX_BANKROLL_SHARE_PCT enforce 50% of
+# a fiction. engine/account_ledger.AccountLedger holds cash and reservations
+# against this number.
+ACCOUNT_OPENING_CASH_USD = float(os.getenv("LIP_ACCOUNT_USD", "5000"))
+
 # Ramp-up phase: caps start SMALL and expand as daily PnL is positive.
 # Day 0 deploy: 10% of bankroll gross. Day 7+ clean: 40%.
 # Controlled by `RAMP_PHASE` env (1..4) → 10% / 20% / 30% / 40%.
