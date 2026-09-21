@@ -1,0 +1,340 @@
+{
+  "status": "5000_USD_DEVELOPMENT_REPLAY_NOT_LIVE",
+  "account_usd": "5000",
+  "results": [
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "size_per_side": "10",
+      "config": {
+        "size": "10",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "08c27867da65226fe8cd302f1124c7ac9169fe3eb6148ce328f519d72ae008b1",
+      "fills": 37,
+      "inventory": {
+        "yes": "139.89",
+        "no": "108.90"
+      },
+      "spent_usd": "135.733900",
+      "net_before_rewards_usd": "-21.646200",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+        "modeled_accrual_usd": "0.1235725819719342732033088361",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "162.657",
+        "modeled_net_if_stop_usd": "-21.646200"
+      }
+    },
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "size_per_side": "50",
+      "config": {
+        "size": "50",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "5a267274597bfbc64fb84ca9d8d04c2377b611040277d6720d6698578667ce3d",
+      "fills": 57,
+      "inventory": {
+        "yes": "500.55",
+        "no": "337.33"
+      },
+      "spent_usd": "464.988100",
+      "net_before_rewards_usd": "-89.742900",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+        "modeled_accrual_usd": "0.5908250228032377213203383834",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "163.158",
+        "modeled_net_if_stop_usd": "-89.742900"
+      }
+    },
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "size_per_side": "100",
+      "config": {
+        "size": "100",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "92d526c5d3208ef5e7b3ceaa6ddb63205ba27b50030a786368104b36546cb21d",
+      "fills": 68,
+      "inventory": {
+        "yes": "820.69",
+        "no": "444.33"
+      },
+      "spent_usd": "719.294200",
+      "net_before_rewards_usd": "-147.599000",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+        "modeled_accrual_usd": "1.264882686413469775947465346",
+        "estimated_payout_if_stop_usd": "1.26",
+        "positive_share_seconds": "163.853",
+        "modeled_net_if_stop_usd": "-146.339000"
+      }
+    },
+    {
+      "market": "KXCOPPER15M-26SEP202000-00",
+      "size_per_side": "500",
+      "config": {
+        "size": "500",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "8f5ffa7c630c5653abf7a9571a11e106e154b555e9fa7e24a5aa160f6b61c8cc",
+      "fills": 93,
+      "inventory": {
+        "yes": "1487.62",
+        "no": "685.60"
+      },
+      "spent_usd": "1261.135900",
+      "net_before_rewards_usd": "-273.943900",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "890ec382-5266-46b0-ab52-7abf30356473",
+        "modeled_accrual_usd": "2.966265334165771964367369496",
+        "estimated_payout_if_stop_usd": "2.96",
+        "positive_share_seconds": "164.218",
+        "modeled_net_if_stop_usd": "-270.983900"
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "size_per_side": "10",
+      "config": {
+        "size": "10",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "64aea2dce38bed4549ccb001325ce0673b418fa37141b3d30c0f900c954932dc",
+      "fills": 0,
+      "inventory": {
+        "yes": "0",
+        "no": "0"
+      },
+      "spent_usd": "0",
+      "net_before_rewards_usd": "0",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "75dd5413-97b9-474d-9a59-a98d62bcae9b",
+        "modeled_accrual_usd": "0.003887333045504823441666263007",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "47.287",
+        "modeled_net_if_stop_usd": "0"
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "size_per_side": "50",
+      "config": {
+        "size": "50",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "9c0e755285696ec4ff575ab552e777b3ca0af654009117861741ad9eb442c10c",
+      "fills": 0,
+      "inventory": {
+        "yes": "0",
+        "no": "0"
+      },
+      "spent_usd": "0",
+      "net_before_rewards_usd": "0",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "75dd5413-97b9-474d-9a59-a98d62bcae9b",
+        "modeled_accrual_usd": "0.02731858573959157447948376806",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "47.462",
+        "modeled_net_if_stop_usd": "0"
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "size_per_side": "100",
+      "config": {
+        "size": "100",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "227b5edd9e5b2da52944397a455ce1a9919b81486861b3f0d7daab746af75c29",
+      "fills": 0,
+      "inventory": {
+        "yes": "0",
+        "no": "0"
+      },
+      "spent_usd": "0",
+      "net_before_rewards_usd": "0",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "75dd5413-97b9-474d-9a59-a98d62bcae9b",
+        "modeled_accrual_usd": "0.05279769401061057603243436726",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "47.462",
+        "modeled_net_if_stop_usd": "0"
+      }
+    },
+    {
+      "market": "KXTTELITEMATCH-26SEP201945ZNOAZM-AZM",
+      "size_per_side": "500",
+      "config": {
+        "size": "500",
+        "capital_usd": "5000",
+        "latency_ms": 250,
+        "stale_ms": 2000,
+        "maker_fee_per_contract_usd": "0.01",
+        "exit_fee_per_contract_usd": "0.02",
+        "operating_cost_usd": "0",
+        "queue_multiplier": "1",
+        "policy": "join_best",
+        "max_spread_usd": "0.10",
+        "tick_usd": "0.01",
+        "quote_offset_ticks": 1,
+        "max_inventory_contracts": "4",
+        "max_net_contracts": "2",
+        "movement_window_ms": 5000,
+        "max_mid_move_usd": "0.03",
+        "qualification_target": "300",
+        "program_start_ms": null,
+        "program_end_ms": null
+      },
+      "fingerprint": "6f59f83032ac3f395c463f07379b686f8478a5ab3e237c8a59195f449bfcab42",
+      "fills": 0,
+      "inventory": {
+        "yes": "0",
+        "no": "0"
+      },
+      "spent_usd": "0",
+      "net_before_rewards_usd": "0",
+      "reward_model": {
+        "status": "MODELED_NOT_CREDITED",
+        "program_id": "75dd5413-97b9-474d-9a59-a98d62bcae9b",
+        "modeled_accrual_usd": "0.1130155388323870491894572675",
+        "estimated_payout_if_stop_usd": "0",
+        "positive_share_seconds": "47.787",
+        "modeled_net_if_stop_usd": "0"
+      }
+    }
+  ],
+  "limitations": [
+    "Previously inspected short tapes; not a complete program or holdout.",
+    "No exchange scoring snapshots or verified fee schedule.",
+    "No market impact modeled; larger orders may change other traders behavior.",
+    "Rewards are modeled, not paid."
+  ]
+}
