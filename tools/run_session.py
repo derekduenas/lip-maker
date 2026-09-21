@@ -245,7 +245,7 @@ async def run_session(args) -> dict:
             # Feed observed flow BEFORE applying fills: the fill-rate
             # estimate the economics uses must come from the market, not
             # from an assumption.
-            runner.flow_stats.observe_trades(trades)
+            runner.execution_model.observe_trades(trades)
             for f in sim.apply_trades(trades):
                 ev = FillEvent(order_id=f["order_id"], market_ticker=f["market_ticker"],
                                side=f["side"], count=float(f["count"]),
@@ -324,7 +324,9 @@ def _report(runner, sim, feed, prov, markets, quote_log, fills_applied,
         "rewards_estimated_only": rewards,
         "exits": {"actions": runner.exit_actions,
                   "reasons": dict(runner._exit_reasons)},
-        "observed_flow": runner.flow_stats.summary(),
+        "observed_flow": runner.execution_model.summary(),
+        "execution_estimates": {k: v for k, v in
+                                list(runner._exec_last.items())[:20]},
         "economics_last_seen": {k: v for k, v in
                                 list(runner._econ_last.items())[:20]},
         "caveats": [

@@ -264,3 +264,55 @@ def test_unknown_share_is_passed_through_as_unknown(econ_db):
     sel = r._economic_choice(_book(), r.params_by_ticker[TKR], 45, 50, 50, 24.0)
     quoting = [e for e in sel.considered if not e.candidate.is_no_quote]
     assert any(any("observed_share" in u for u in e.unknowns) for e in quoting)
+
+
+# ── exposure limits on qualifying sizes ───────────────────────────────────
+
+def test_event_exposure_limit_discards_correlated_candidates():
+    """Strikes on one event are mutually exclusive outcomes: quoting several
+    is ONE correlated bet. A qualifying size is not exempt."""
+    sel = select([QuoteCandidate(200, 45, 50), QuoteCandidate(0, None, None)],
+                 available_capital_usd=D(5000),
+                 max_event_capital_usd=D("20"),
+                 event_capital_used_usd=D("19"),
+                 **{**BASE, "pool_rate_usd_per_sec": 5000.0 / 86400.0},
+                 expected_fills_per_horizon=1.0,
+                 fee_schedule=fees.active_schedule())
+    assert not sel.should_quote
+    assert "exposure limits" in sel.reason
+
+
+def test_qualification_is_not_forced_past_the_limits():
+    """Reaching the target is what makes reward non-zero, but it must not
+    override the account: if it does not fit, we do not quote."""
+    sel = select([QuoteCandidate(5000, 45, 50), QuoteCandidate(0, None, None)],
+                 available_capital_usd=D("50"),
+                 **{**BASE, "pool_rate_usd_per_sec": 50000.0 / 86400.0},
+                 expected_fills_per_horizon=1.0,
+                 fee_schedule=fees.active_schedule())
+    assert not sel.should_quote
+
+
+def test_event_key_groups_strikes_of_one_event(econ_db):
+    r = _runner(econ_db, pool=100.0)
+    assert r._event_key("KXTEMPMIAH-26SEP2101-T72.99") == "KXTEMPMIAH-26SEP2101"
+    assert (r._event_key("KXTEMPMIAH-26SEP2101-T70.99")
+            == r._event_key("KXTEMPMIAH-26SEP2101-T72.99"))
+    assert r._event_key("KXTEMPMIAH-26SEP2200-T70.99") != \
+        r._event_key("KXTEMPMIAH-26SEP2101-T70.99")
+
+
+def test_event_capital_counts_only_other_strikes_of_the_same_event(econ_db):
+    r = _runner(econ_db, pool=100.0)
+    a = "KXEV-26SEP21-T1"
+    r.account.reserve("o1", market="KXEV-26SEP21-T2", program_id="p",
+                      price_cents=50, quantity=10)          # same event
+    r.account.reserve("o2", market="KXOTHER-26SEP21-T1", program_id="p",
+                      price_cents=50, quantity=10)          # different event
+    r.account.reserve("o3", market=a, program_id="p",
+                      price_cents=50, quantity=10)          # this market
+    used = r._event_capital_used(a)
+    # Only the sibling strike counts: not this market, not the other event.
+    # A direct reserve() holds the premium alone; the maker-fee allowance is
+    # added by the placement path, not here.
+    assert used == D("5.00")

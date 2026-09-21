@@ -141,6 +141,116 @@ class FeeSchedule:
                 "charge_maker": self.charge_maker, "notes": self.notes}
 
 
+# ── the venue's full fee pipeline ─────────────────────────────────────────
+# VERIFIED 2026-09-20 against docs.kalshi.com/getting_started/fee_rounding.
+# The trade fee is only the FIRST of four stages, and a blanket substitution
+# of microdollars for cents models only that stage:
+#
+#   1. trade_fee     = ceil_6dp(model_fee)          -> $0.000001 granularity
+#   2. aligned_change= floor_precision(revenue - trade_fee)
+#                      precision: $0.01 non-direct members, $0.0001 direct
+#   3. rounding_fee  = (revenue - trade_fee) - aligned_change
+#   4. net_fee       = trade_fee + rounding_fee - rebate, floored at 0
+#
+# Stage 3 matters: flooring the BALANCE change to a cent means a non-direct
+# member can pay up to ~1c more than the trade fee on a single fill. Stage 4
+# is what stops that being a permanent overcharge — the accumulator carries
+# the overpayment across an order's fills and rebates it in whole precision
+# increments once enough has built up.
+
+PRECISION_NON_DIRECT = Decimal("0.01")
+PRECISION_DIRECT = Decimal("0.0001")
+FEE_GRANULARITY = Decimal("0.000001")
+
+
+def ceil_to(value: Decimal, step: Decimal) -> Decimal:
+    return (value / step).to_integral_value(rounding="ROUND_CEILING") * step
+
+
+def floor_to(value: Decimal, step: Decimal) -> Decimal:
+    return (value / step).to_integral_value(rounding="ROUND_FLOOR") * step
+
+
+@dataclass
+class FillFeeResult:
+    """One fill's fee, decomposed the way the venue computes it."""
+    trade_fee_usd: Decimal
+    rounding_fee_usd: Decimal
+    rebate_usd: Decimal
+    net_fee_usd: Decimal
+    aligned_change_usd: Decimal
+    precision: Decimal
+
+    def describe(self) -> dict:
+        return {"trade_fee_usd": str(self.trade_fee_usd),
+                "rounding_fee_usd": str(self.rounding_fee_usd),
+                "rebate_usd": str(self.rebate_usd),
+                "net_fee_usd": str(self.net_fee_usd),
+                "aligned_change_usd": str(self.aligned_change_usd),
+                "precision": str(self.precision)}
+
+
+class OrderFeeAccumulator:
+    """Carries rounding overpayment across one order's fills.
+
+    Without this, every fill of a multi-fill order would be charged its own
+    sub-cent round-up and none of it returned — which overstates the cost of
+    exactly the strategy that fills in small pieces.
+    """
+
+    def __init__(self, *, precision: Decimal = PRECISION_NON_DIRECT):
+        self.precision = precision
+        self.carried = ZERO          # overpaid rounding not yet rebated
+        self.fills = 0
+
+    def charge(self, *, revenue_usd, model_fee_usd) -> FillFeeResult:
+        """Apply the pipeline to one fill.
+
+        `revenue_usd` is the cash effect of the fill before fees, negative
+        for a buy (we pay premium).
+        """
+        revenue = Decimal(str(revenue_usd))
+        trade_fee = ceil_to(Decimal(str(model_fee_usd)), FEE_GRANULARITY)
+        pre = revenue - trade_fee
+        aligned = floor_to(pre, self.precision)
+        rounding_fee = pre - aligned
+        self.carried += rounding_fee
+        # Rebate whole precision increments once enough has accumulated.
+        rebate = floor_to(self.carried, self.precision)
+        if rebate < ZERO:
+            rebate = ZERO
+        self.carried -= rebate
+        net = trade_fee + rounding_fee - rebate
+        if net < ZERO:
+            net = ZERO
+        self.fills += 1
+        return FillFeeResult(trade_fee_usd=trade_fee,
+                             rounding_fee_usd=rounding_fee,
+                             rebate_usd=rebate, net_fee_usd=net,
+                             aligned_change_usd=aligned,
+                             precision=self.precision)
+
+
+# The rate is UNVERIFIED, so fee-dependent figures are reported as a RANGE
+# rather than a point. Low end: the tiered maker rate reported by search
+# summaries (5 basis points) — NOT verbatim from the schedule and possibly
+# the perps table, so it is a bound, not a fact. High end: the 0.07
+# quadratic form this repo has always used.
+RATE_RANGE_LOW = Decimal("0.0005")
+RATE_RANGE_HIGH = Decimal("0.07")
+
+
+def fee_range_usd(price_cents, contracts, *, is_taker: bool = False):
+    """(low, high) for one fill while the rate is unverified."""
+    s = active_schedule()
+    low = FeeSchedule(name="range_low", rate=RATE_RANGE_LOW, source="bound",
+                      rounding=s.rounding, charge_maker=s.charge_maker)
+    high = FeeSchedule(name="range_high", rate=RATE_RANGE_HIGH, source="bound",
+                       rounding=s.rounding, charge_maker=s.charge_maker)
+    return (low.fee_usd(price_cents, contracts, is_taker=is_taker),
+            high.fee_usd(price_cents, contracts, is_taker=is_taker))
+
+
 # The working assumption. `verified=False` is load-bearing: it is what
 # `require_verified=True` trips on, and what reports must surface.
 KALSHI_UNVERIFIED = FeeSchedule(

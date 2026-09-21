@@ -228,6 +228,7 @@ class PaperRunner:
         # Economic selection telemetry.
         self.econ_rejects: int = 0
         self._econ_last: dict[str, dict] = {}
+        self._exec_last: dict[str, dict] = {}
         self._last_share: dict[str, float] = {}
         from engine.market_clock import MarketClock
         from engine.entry_cutoff import POLICY_CONTROL
@@ -238,10 +239,11 @@ class PaperRunner:
         # nothing changes unless a paper experiment sets it explicitly.
         self.entry_cutoff_policy: str = POLICY_CONTROL
         self._cutoff_seen: dict[str, float] = {}
-        from engine.flow_stats import FlowStats
-        # Observed public trade flow, used to estimate fill rate before we
-        # have any fills of our own.
-        self.flow_stats = FlowStats()
+        from engine.execution_model import ExecutionModel
+        # Estimates OUR executions from public trades, filtered to our price
+        # level and to takers hitting our side. Public volume bounds our
+        # executions from above; it is not our fill rate.
+        self.execution_model = ExecutionModel()
         self._snapshot_persist_failures: int = 0  # Architect audit: track silent drops
         # Futures fair-value cache (Quant audit): {prefix: (price, fetched_ts)}
         # Refreshed every 60s to match futures-feed.timer cadence.
@@ -1543,6 +1545,9 @@ class PaperRunner:
                 cands,
                 available_capital_usd=avail,
                 max_market_capital_usd=self._max_market_capital(),
+                max_event_capital_usd=self._max_event_capital(),
+                event_capital_used_usd=self._event_capital_used(
+                    book.market_ticker),
                 market_id=book.market_ticker,
                 horizon_sec=horizon,
                 pool_rate_usd_per_sec=p.pool_rate_usd_per_sec,
@@ -1556,7 +1561,8 @@ class PaperRunner:
                 # Estimated per candidate size inside select(); this is the
                 # reference estimate for the sizer-derived candidate.
                 expected_fills_per_horizon=self._expected_fills(
-                    book.market_ticker, size, horizon, queue_depth=top),
+                    book.market_ticker, size, horizon, queue_depth=top,
+                    side="yes", price_cents=yes_bid_c),
                 fee_schedule=self._fee_schedule(),
             )
         except Exception as e:
@@ -1567,6 +1573,33 @@ class PaperRunner:
         try:
             cash = Decimal(str(self.account.state().cash_usd))
             pct = Decimal(str(getattr(settings, "MAX_BANKROLL_SHARE_PCT", 0.5)))
+            return cash * pct
+        except Exception:
+            return None
+
+    @staticmethod
+    def _event_key(ticker: str) -> str:
+        """Strikes on one event are mutually exclusive outcomes, so they are
+        ONE correlated bet. KXTEMPMIAH-26SEP2101-T72.99 -> KXTEMPMIAH-26SEP2101."""
+        parts = (ticker or "").split("-")
+        return "-".join(parts[:2]) if len(parts) >= 2 else (ticker or "")
+
+    def _event_capital_used(self, ticker: str) -> Decimal:
+        """Capital already reserved on OTHER strikes of the same event."""
+        key = self._event_key(ticker)
+        total = Decimal("0")
+        try:
+            for r in self.account.reservations():
+                if r.market != ticker and self._event_key(r.market) == key:
+                    total += r.amount_usd
+        except Exception:
+            return Decimal("0")
+        return total
+
+    def _max_event_capital(self):
+        try:
+            cash = Decimal(str(self.account.state().cash_usd))
+            pct = Decimal(str(getattr(settings, "MAX_EVENT_SHARE_PCT", 0.25)))
             return cash * pct
         except Exception:
             return None
@@ -1589,23 +1622,30 @@ class PaperRunner:
 
     def _expected_fills(self, ticker: str, size: float = 0.0,
                         horizon_sec: float = 86400.0,
-                        queue_depth: float = 0.0):
-        """Expected full-size fills over the horizon.
+                        queue_depth: float = 0.0,
+                        side: str = "yes", price_cents: int = 50,
+                        case: str = "base"):
+        """Expected whole-order executions over the horizon, or None.
 
-        Prefers our OWN realized fills once we have any. Otherwise uses the
-        market's observed public trade flow, which is measurable before we
-        have ever quoted — the placeholder it replaces (one full fill per
-        horizon) was an arbitrary constant that dominated every decision and
-        made the system refuse to quote, which meant it could never learn
-        the real rate. Still None when nothing has been observed: unknown
-        stays unknown."""
+        Our OWN realized fills take precedence once we have any. Otherwise
+        the execution model estimates from public trades filtered to our
+        price level and to takers hitting our side — an UPPER BOUND on our
+        executions, never described as our measured fill rate. `base`
+        assumes we joined behind the displayed depth; the optimistic and
+        conservative cases are available for sensitivity.
+
+        None means UNKNOWN and the economics prices it as such."""
         n = self.fill_counts.get(ticker, 0)
         elapsed = max(1.0, time.time() - self.start_time)
         if n > 0:
             return float(n) * horizon_sec / elapsed
         try:
-            return self.flow_stats.expected_fills(
-                ticker, size or 1.0, horizon_sec, queue_depth=queue_depth)
+            est = self.execution_model.estimate(
+                ticker=ticker, side=side, price_cents=int(price_cents),
+                size=float(size or 1.0), horizon_sec=float(horizon_sec),
+                queue_ahead_displayed=float(queue_depth))
+            self._exec_last[ticker] = est.explain()
+            return getattr(est, case, None)
         except Exception:
             return None
 

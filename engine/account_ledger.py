@@ -189,6 +189,13 @@ class AccountLedger:
                        event_id=f"reserve:{order_id}:{amount}")
             return amount
 
+    def reservations(self) -> list:
+        """Every open reservation. Used to measure correlated exposure:
+        strikes on one event are mutually exclusive, so capital committed
+        across them is one bet, not several."""
+        with self._lock:
+            return list(self._reservations.values())
+
     def release(self, order_id: str) -> Decimal:
         """Return an unfilled order's capital. Safe to call twice."""
         with self._lock:

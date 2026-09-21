@@ -206,3 +206,78 @@ class TestNetYieldNoLongerAssumesZero:
         fees.set_schedule(ASSUME_FREE_MAKER)
         assert _day_fees_usd(conn, "2026-09-20") == D("0")
         assert charged > 0
+
+
+class TestVenueFeePipeline:
+    """The documented pipeline has FOUR stages, and ceil_6dp is only the
+    first. VERIFIED against docs.kalshi.com/getting_started/fee_rounding,
+    including its worked example.
+
+        1. trade_fee      = ceil_6dp(model_fee)
+        2. aligned_change = floor_precision(revenue - trade_fee)
+        3. rounding_fee   = (revenue - trade_fee) - aligned_change
+        4. net_fee        = trade_fee + rounding_fee - rebate, floored at 0
+
+    Stage 3 is why a blanket substitution of microdollars for cents is
+    wrong in the other direction: flooring the BALANCE change to a cent
+    means a non-direct member can pay nearly a cent more than the trade fee
+    on one fill. Stage 4 is what keeps that from being permanent.
+    """
+
+    def test_reproduces_the_documented_worked_example(self):
+        from engine.fees import OrderFeeAccumulator
+        acc = OrderFeeAccumulator()
+        r = acc.charge(revenue_usd=D("-0.055000"), model_fee_usd=D("0.00363825"))
+        assert r.trade_fee_usd == D("0.003639")
+        assert r.aligned_change_usd == D("-0.06")
+        assert r.rounding_fee_usd == D("0.001361")
+        assert r.trade_fee_usd + r.rounding_fee_usd == D("0.005000")
+
+    def test_trade_fee_is_ceiled_to_a_millionth(self):
+        from engine.fees import ceil_to, FEE_GRANULARITY
+        assert ceil_to(D("0.0000001"), FEE_GRANULARITY) == D("0.000001")
+        assert ceil_to(D("0.003638001"), FEE_GRANULARITY) == D("0.003639")
+
+    def test_balance_change_is_floored_to_the_member_precision(self):
+        from engine.fees import OrderFeeAccumulator, PRECISION_DIRECT
+        direct = OrderFeeAccumulator(precision=PRECISION_DIRECT)
+        r = direct.charge(revenue_usd=D("-0.055000"), model_fee_usd=D("0.00363825"))
+        # A direct member is aligned to $0.0001, so far less is lost to
+        # rounding than a non-direct member's $0.01.
+        assert r.precision == PRECISION_DIRECT
+        assert r.rounding_fee_usd < D("0.001361")
+
+    def test_the_accumulator_rebates_overpaid_rounding_across_fills(self):
+        """Without this, an order that fills in many small pieces is charged
+        a fresh sub-cent round-up on each one and never refunded — which
+        overstates the cost of exactly this strategy."""
+        from engine.fees import OrderFeeAccumulator
+        acc = OrderFeeAccumulator()
+        rebates = D(0)
+        for _ in range(40):
+            r = acc.charge(revenue_usd=D("-0.055000"), model_fee_usd=D("0.00363825"))
+            rebates += r.rebate_usd
+        assert rebates > 0, "rounding overpayment was never rebated"
+
+    def test_net_fee_is_never_negative(self):
+        from engine.fees import OrderFeeAccumulator
+        acc = OrderFeeAccumulator()
+        acc.carried = D("5.00")          # a large carried credit
+        r = acc.charge(revenue_usd=D("-0.50"), model_fee_usd=D("0.001"))
+        assert r.net_fee_usd >= 0
+
+
+class TestUnverifiedRateIsReportedAsARange:
+    def test_range_brackets_the_working_assumption(self):
+        from engine.fees import fee_range_usd, RATE_RANGE_HIGH
+        lo, hi = fee_range_usd(50, 100)
+        assert lo < hi
+        assert hi == KALSHI_UNVERIFIED.fee_usd(50, 100)
+
+    def test_range_low_end_is_a_bound_not_a_fact(self):
+        """The low end comes from a search summary of the tier table, which
+        may describe the perps schedule. It is a bound; it must not be
+        promoted to the active schedule."""
+        from engine.fees import RATE_RANGE_LOW
+        assert KALSHI_UNVERIFIED.rate != RATE_RANGE_LOW
+        assert KALSHI_UNVERIFIED.verified is False

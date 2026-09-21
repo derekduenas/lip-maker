@@ -117,6 +117,10 @@ class Economics:
     capital_usd: Decimal = ZERO
     unknowns: tuple = ()
     notes: tuple = ()
+    # Every assumption the net depends on, carried WITH the number. A net
+    # figure quoted without these is not interpretable: it is the output of
+    # a model whose inputs decide the answer.
+    assumptions: dict = field(default_factory=dict)
 
     @property
     def net_usd(self) -> Decimal:
@@ -152,6 +156,7 @@ class Economics:
             "net_per_capital": float(self.net_per_capital),
             "unknowns": list(self.unknowns),
             "notes": list(self.notes),
+            "assumptions": dict(self.assumptions),
         }
 
 
@@ -311,8 +316,59 @@ def evaluate(candidate: QuoteCandidate, *,
     capital = ((_d(candidate.yes_bid_cents) + _d(candidate.no_bid_cents))
                / CENTS) * _d(size)
 
+    assumptions = {
+        "horizon_sec": float(horizon_sec),
+        "horizon_basis": ("min(1 day, time remaining in the reward window); "
+                          "reward, adverse selection and flow all scaled to "
+                          "this same horizon"),
+        "qualification": {
+            "target_size": float(target_size),
+            "discount_factor": float(discount_factor),
+            "displayed_depth_at_level": int(top_book_size),
+            "aggregate_with_our_size": int(top_book_size) + size,
+            "qualify_prob": round(float(my.qualify_prob), 6),
+            "our_share": round(float(my.our_share), 6),
+            "share_basis": ("our size enters the aggregate depth, so adding "
+                            "size raises qualification but dilutes the "
+                            "per-contract reward"),
+            "time_factor": round(float(my.time_factor), 6),
+            "calibration": float(calibration),
+        },
+        "fees": {
+            "schedule": getattr(fee_schedule, "name", None),
+            "rate": str(getattr(fee_schedule, "rate", "")),
+            "rounding": (fee_schedule.describe().get("rounding")
+                         if fee_schedule is not None else None),
+            "verified": bool(getattr(fee_schedule, "verified", False)),
+            "per_fill_usd": float(fee_per_fill),
+            "priced_at_avg_price_cents": avg_price,
+        },
+        "fill_model": {
+            "expected_fills_per_horizon": float(fills),
+            "source": ("caller-supplied estimate" if
+                       expected_fills_per_horizon is not None
+                       else "PLACEHOLDER 1.0 — unknown, see unknowns"),
+            "caveat": ("public trade flow bounds our executions from above; "
+                       "it does not establish the probability that our "
+                       "specific order fills"),
+        },
+        "inventory_exit": {
+            "basis": "passive pairing at the opposing bid",
+            "exit_fee_usd": float(exit_fee),
+            "spread_cost_usd": float(spread_cost),
+            "implied_cost_cents": implied_cost_cents,
+            "caveat": ("premium paid to complete a pair is not a loss (the "
+                       "pair settles at $1) so only fee and spread are "
+                       "charged; a forced liquidation would cost more"),
+        },
+        "uncertainty": {
+            "unknown_count": len(unknowns),
+            "fraction_of_reward_withheld": float(frac),
+        },
+    }
     return Economics(
         candidate=candidate, horizon_sec=horizon_sec,
+        assumptions=assumptions,
         expected_reward_usd=expected_reward,
         expected_trading_pnl_usd=expected_trading_pnl,
         expected_fees_usd=expected_fees,
@@ -327,6 +383,8 @@ def evaluate(candidate: QuoteCandidate, *,
 def select(candidates: Sequence[QuoteCandidate], *,
            available_capital_usd: Decimal,
            max_market_capital_usd: Optional[Decimal] = None,
+           max_event_capital_usd: Optional[Decimal] = None,
+           event_capital_used_usd: Decimal = ZERO,
            **kw) -> Selection:
     """Choose the best candidate, including not quoting.
 
@@ -334,6 +392,20 @@ def select(candidates: Sequence[QuoteCandidate], *,
     shared account. Absolute net breaks ties. A candidate is discarded if it
     does not fit the capital that is actually free, so the choice respects
     the account rather than assuming it.
+
+    Three limits, all hard:
+
+      account   the ledger's free cash right now;
+      market    a per-market cap;
+      event     capital already committed to OTHER strikes on the SAME
+                event, plus this candidate. Strikes on one event are
+                mutually exclusive outcomes, so quoting several of them is
+                one correlated bet, not several independent ones.
+
+    A qualifying size is never forced. Reaching a program's target is what
+    makes the reward non-zero, but if reaching it costs more capital or
+    correlated risk than the limits allow, the candidate is discarded like
+    any other and not quoting remains available.
     """
     evaluated: list[Economics] = []
     no_quote: Optional[Economics] = None
@@ -355,6 +427,10 @@ def select(candidates: Sequence[QuoteCandidate], *,
         if (max_market_capital_usd is not None
                 and e.capital_usd > _d(max_market_capital_usd)):
             continue
+        if (max_event_capital_usd is not None
+                and _d(event_capital_used_usd) + e.capital_usd
+                > _d(max_event_capital_usd)):
+            continue
         feasible.append(e)
 
     # Must beat doing nothing on an absolute basis first.
@@ -366,7 +442,9 @@ def select(candidates: Sequence[QuoteCandidate], *,
             reason = (f"best candidate {best.candidate.label()} nets "
                       f"${best.net_usd:.4f} <= no-quote ${no_quote.net_usd:.4f}")
         elif len(evaluated) > 1:
-            reason = "no candidate fits available capital"
+            reason = ("no candidate fits the capital and exposure limits "
+                      f"(free ${_d(available_capital_usd):.2f}, event used "
+                      f"${_d(event_capital_used_usd):.2f})")
         return Selection(chosen=no_quote, considered=evaluated, reason=reason)
 
     best = max(profitable, key=lambda e: (e.net_per_capital, e.net_usd))
