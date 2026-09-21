@@ -364,3 +364,37 @@ reduction.
 
 Deliberately *not* on this list: more synthetic tests as a substitute for
 evidence, and any live promotion. Paper-only interlocks stay.
+
+## 6. Implementation status (updated 2026-09-21, same session)
+
+| Item | Commit | State |
+|---|---|---|
+| P1 reward provenance + calibration quarantine | `8239a2c` | done |
+| P2 one maker-safe order contract | `52a47f4` | done |
+| P3 shared $5,000 ledger with reservations | `8a5c21d` | done |
+| P4a fee schedule with provenance + round-up | `19f44f5` | done |
+| P4b inventory exit policy | `ba3fbbf` | policy done, **not wired into the runner** |
+| P5a discovery upsert data loss | `7fe5524` | done |
+| P5b ticker-keyed runtime state | — | **open, now the top item** |
+| P6 complete-period validation | — | blocked on data access |
+
+Suite at `7fe5524`: **562 passed, 2 subtests, 0 failed.**
+
+### What is still true after all of it
+
+No profitability has been established, and nothing here attempts to. These
+changes remove ways the system could *manufacture* a profit number — an
+estimate labelled as paid, a fee assumed to be zero, a round-up skipped, an
+account whose size was fictional. Removing a false positive is not a true
+positive.
+
+### The next change, precisely
+
+`P5b`: `run_paper.py` keys `params_by_ticker` and `_accrual` by ticker;
+`ProgramParams` carries no program id; `_seed_accrued` sums `lip_snapshots`
+by `market_ticker` with no program column, so two overlapping windows pool
+each other's history and each other's cap. `research/profit_ledger.py`
+already requires `program_id` on every event and groups by
+`(market, program_id)` — the operating side should adopt that key. Doing so
+also lets the P4b exit policy attribute unwinds to the right program, which
+is why the two belong together.
