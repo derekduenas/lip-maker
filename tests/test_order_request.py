@@ -28,6 +28,76 @@ from execution.quote_manager import QuoteManager, QuoteTarget
 TKR = "KXTEST-26SEP30-T1"
 
 
+@pytest.fixture
+def allow_live(monkeypatch):
+    """Lift the live-execution interlock for tests that exercise the code
+    PAST it. The interlock itself is covered by TestLiveExecutionInterlock;
+    without this fixture those tests would pass for the wrong reason."""
+    import execution.order_request as orq
+    monkeypatch.setattr(orq, "MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
+    return True
+
+
+class TestLiveExecutionInterlock:
+    """A local non-crossing check is a preflight, not proof of maker
+    execution: the book can move between our observation and arrival. Live
+    transmission therefore stays blocked until exchange-enforced post_only
+    is verified."""
+
+    def test_enforcement_is_not_claimed_as_verified(self):
+        import execution.order_request as orq
+        # The FIELD is verified against the official schema...
+        assert orq.MAKER_ONLY_FIELD_VERIFIED is True
+        # ...but its enforcement semantics are not, and must not be
+        # promoted to "verified" by assumption.
+        assert orq.MAKER_ONLY_ENFORCEMENT_VERIFIED is False
+
+    def test_gate_raises_while_enforcement_unverified(self):
+        from execution.order_request import (
+            LiveExecutionBlocked, require_live_execution_allowed)
+        with pytest.raises(LiveExecutionBlocked) as e:
+            require_live_execution_allowed()
+        assert "PREFLIGHT" in str(e.value)
+
+    def test_gate_passes_once_enforcement_is_verified(self, allow_live):
+        from execution.order_request import require_live_execution_allowed
+        require_live_execution_allowed()          # must not raise
+
+    def test_live_placement_is_blocked_before_any_transmission(self, tmp_path):
+        # Construct paper (the LIP_LIVE_ACK arming interlock forces it), then
+        # flip to live exactly as the other live tests do.
+        qm = QuoteManager(paper=True, db_path=str(tmp_path / "q.db"))
+        qm.paper = False
+        qm.client = MagicMock()
+        qm._log_quote_row = MagicMock()
+        qm._passes_safety = lambda t: (True, "ok")
+        # A perfectly passive, non-crossing order still does not go out.
+        assert qm._place_order(TKR, "yes", 40, 10,
+                               best_opposing_bid_cents=50) is None
+        qm.client.post.assert_not_called()
+        assert qm.live_blocked == 1
+        assert "live_blocked" in qm._log_quote_row.call_args.kwargs["notes"]
+
+    def test_paper_is_unaffected_by_the_live_gate(self, tmp_path):
+        qm = QuoteManager(paper=True, db_path=str(tmp_path / "q.db"))
+        qm._log_quote_row = MagicMock()
+        assert qm._place_order(TKR, "yes", 40, 10,
+                               best_opposing_bid_cents=50) is not None
+        assert qm.live_blocked == 0
+
+
+class TestObsoleteSelfTradeField:
+    def test_no_self_trade_is_rejected_even_alongside_post_only(self):
+        """It is not merely weaker than post_only — it is not in the current
+        schema at all, so an adapter sending it has neither protection."""
+        from execution.order_request import MakerSafetyError, assert_maker_safe
+        body = {"action": "buy", "type": "limit", "post_only": True,
+                "no_self_trade": True}
+        with pytest.raises(MakerSafetyError) as e:
+            assert_maker_safe(body)
+        assert "self_trade_prevention_type" in str(e.value)
+
+
 def _order(**kw):
     base = dict(ticker=TKR, side="yes", price_cents=49, size_contracts=10,
                 client_order_id="LIP-abc", best_opposing_bid_cents=50)
@@ -141,7 +211,7 @@ class TestQuoteManagerUsesSharedContract:
         qm._log_quote_row = MagicMock()
         return qm
 
-    def test_live_order_body_comes_from_the_builder(self, tmp_path):
+    def test_live_order_body_comes_from_the_builder(self, tmp_path, allow_live):
         qm = self._qm(tmp_path, paper=False)
         qm._update_quote_status = MagicMock()
         r = qm._place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
@@ -150,17 +220,23 @@ class TestQuoteManagerUsesSharedContract:
         assert body[MAKER_ONLY_FIELD] is True and "no_self_trade" not in body
         assert body["yes_price"] == 49
 
-    def test_live_crossing_order_is_refused_before_transmission(self, tmp_path):
+    def test_live_crossing_order_is_refused_before_transmission(self, tmp_path,
+                                                                allow_live):
         qm = self._qm(tmp_path, paper=False)
         assert qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=50) is None
         qm.client.post.assert_not_called()
         note = qm._log_quote_row.call_args.kwargs["notes"]
         assert "maker_safety" in note
 
-    def test_live_order_without_opposing_book_is_refused(self, tmp_path):
+    def test_live_order_without_opposing_book_is_refused(self, tmp_path,
+                                                        allow_live):
+        """Refused for the MAKER reason, with the live gate lifted, so this
+        keeps testing the unknown-book rule rather than passing because
+        something upstream blocked it."""
         qm = self._qm(tmp_path, paper=False)
         assert qm._place_order(TKR, "yes", 49, 10) is None
         qm.client.post.assert_not_called()
+        assert "maker_safety" in qm._log_quote_row.call_args.kwargs["notes"]
 
     def test_paper_refuses_crossing_quote_too(self, tmp_path):
         """Catch a crossing quote in paper rather than discovering it live."""
@@ -188,7 +264,33 @@ class TestQuoteManagerUsesSharedContract:
 
 
 class TestVenueAdapterConsolidated:
-    def test_venue_adapter_no_longer_substitutes_no_self_trade(self, monkeypatch):
+    def test_venue_adapter_is_blocked_by_the_same_interlock(self):
+        """Both live paths must go through one gate; an adapter must not be
+        able to transmit just because it was imported instead of the other."""
+        from venue.kalshi import KalshiVenue
+        v = KalshiVenue.__new__(KalshiVenue)
+        v._client = MagicMock()
+        res = v.place_order(TKR, "yes", 40, 10, best_opposing_bid_cents=50)
+        assert not res.success and "live execution blocked" in res.error
+        v._client.post.assert_not_called()
+
+    def test_venue_adapter_sends_a_valid_time_in_force(self, allow_live):
+        """The verified enum is fill_or_kill/good_till_canceled/
+        immediate_or_cancel. The adapter used to send "GTC", which the venue
+        does not accept."""
+        from execution.order_request import TIME_IN_FORCE_VALUES
+        from venue.kalshi import KalshiVenue
+        v = KalshiVenue.__new__(KalshiVenue)
+        client = MagicMock()
+        client.post.return_value = {"order": {"order_id": "srv-9"}}
+        v._client = client
+        assert v.place_order(TKR, "yes", 49, 10,
+                             best_opposing_bid_cents=50).success
+        body = client.post.call_args[0][1]
+        assert body["time_in_force"] in TIME_IN_FORCE_VALUES
+
+    def test_venue_adapter_no_longer_substitutes_no_self_trade(self, monkeypatch,
+                                                             allow_live):
         from venue.kalshi import KalshiVenue
         v = KalshiVenue.__new__(KalshiVenue)      # skip auth in __init__
         client = MagicMock()
@@ -200,7 +302,7 @@ class TestVenueAdapterConsolidated:
         assert body[MAKER_ONLY_FIELD] is True
         assert "no_self_trade" not in body
 
-    def test_venue_adapter_refuses_a_crossing_order(self):
+    def test_venue_adapter_refuses_a_crossing_order(self, allow_live):
         from venue.kalshi import KalshiVenue
         v = KalshiVenue.__new__(KalshiVenue)
         v._client = MagicMock()
@@ -208,7 +310,7 @@ class TestVenueAdapterConsolidated:
         assert not res.success and "maker safety" in res.error
         v._client.post.assert_not_called()
 
-    def test_venue_adapter_refuses_without_opposing_book(self):
+    def test_venue_adapter_refuses_without_opposing_book(self, allow_live):
         from venue.kalshi import KalshiVenue
         v = KalshiVenue.__new__(KalshiVenue)
         v._client = MagicMock()

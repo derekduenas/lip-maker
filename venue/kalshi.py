@@ -18,7 +18,8 @@ from venue.base import (
 )
 from execution.kalshi_auth import KalshiClient
 from execution.order_request import (
-    MakerSafetyError, assert_maker_safe, build_limit_order,
+    LiveExecutionBlocked, MakerSafetyError, assert_maker_safe,
+    build_limit_order, require_live_execution_allowed,
 )
 
 _log = logging.getLogger(__name__)
@@ -116,10 +117,12 @@ class KalshiVenue(Venue):
         not maker protection — it only blocks trading against your OWN
         resting order, not crossing a stranger's offer.
 
-        Both paths now build the body in execution.order_request, which
-        proves the order is non-crossing locally before it is sent. Maker
-        safety no longer depends on an API flag this environment cannot
-        verify (docs.kalshi.com is egress-blocked).
+        Both paths now build the body in execution.order_request, and both
+        pass through the same live-execution interlock. The local
+        non-crossing test is a PREFLIGHT, not proof of maker execution — the
+        book can move between our observation and the order's arrival — so
+        live transmission stays blocked until exchange-enforced post_only is
+        verified.
 
         `best_opposing_bid_cents` is the other side's best bid. Without it a
         maker order cannot be proven passive and is refused.
@@ -127,13 +130,18 @@ class KalshiVenue(Venue):
         if side not in ("yes", "no"):
             return OrderResult(success=False, error=f"invalid side: {side}")
         try:
+            require_live_execution_allowed()
+        except LiveExecutionBlocked as e:
+            return OrderResult(success=False, error=f"live execution blocked: {e}")
+        try:
             body = build_limit_order(
                 ticker=ticker, side=side, price_cents=int(price_cents),
                 size_contracts=int(size_contracts),
                 client_order_id=f"innait-{uuid.uuid4().hex[:12]}",
                 best_opposing_bid_cents=best_opposing_bid_cents,
                 enforce_non_crossing=post_only,
-                time_in_force="GTC",
+                # Verified enum value; "GTC" is not accepted by the venue.
+                time_in_force="good_till_canceled",
             )
             if post_only:
                 assert_maker_safe(body)

@@ -45,7 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import settings
 from execution.kalshi_auth import KalshiClient, KalshiAuthError
 from execution.order_request import (
-    MakerSafetyError, assert_maker_safe, build_limit_order, would_cross,
+    LiveExecutionBlocked, MakerSafetyError, assert_maker_safe,
+    build_limit_order, require_live_execution_allowed, would_cross,
 )
 from engine.account_ledger import AccountLedger, InsufficientCapital
 
@@ -171,6 +172,8 @@ class QuoteManager:
         # exceeding the cash that exists.
         self.account = account
         self.capital_refusals: int = 0
+        # Live placements refused because maker enforcement is unverified.
+        self.live_blocked: int = 0
         # 2026-04-25 COLD-BOOT RECONCILIATION: rehydrate self.resting from
         # Kalshi's actual order book on init. Without this, a service
         # restart leaves us blind to live orders → next reconcile() places
@@ -909,6 +912,21 @@ class QuoteManager:
             order_id = "PAPER-" + coid
             _log.info(f"[PAPER] PLACE {market_ticker} {side}@{price_cents}c size={size_contracts}")
         else:
+            # 2026-09-20: a local non-crossing check is a PREFLIGHT, not a
+            # proof of maker execution — the book can move between our
+            # observation and the order's arrival. Live transmission is
+            # therefore refused until exchange-enforced post_only is
+            # verified. One chokepoint, before the body is even built.
+            try:
+                require_live_execution_allowed()
+            except LiveExecutionBlocked as e:
+                self.live_blocked += 1
+                _log.error(f"[LIVE] BLOCKED {market_ticker} "
+                           f"{side}@{price_cents}c: {e}")
+                self._log_quote_row(market_ticker, side, price_cents, size_contracts,
+                                    coid, "rejected", notes=f"live_blocked: {e}")
+                self._release_capital(coid)
+                return None
             try:
                 body = build_limit_order(
                     ticker=market_ticker, side=side, price_cents=price_cents,

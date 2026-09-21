@@ -1,0 +1,39 @@
+{
+  "captured_utc": "2026-09-21T02:47:56.910873+00:00",
+  "source_url": "https://docs.kalshi.com/openapi.yaml",
+  "spec_title": "Kalshi Trade API Manual Endpoints",
+  "spec_version": "3.30.0",
+  "sha256": "30e750f714ab37e17f453af11a659f12a300cf8d44241696c473b2e415aa227f",
+  "bytes": 357644,
+  "findings": {
+    "post_only_field_exists": true,
+    "post_only_location": "components.schemas.CreateOrderRequest.properties.post_only (type: boolean)",
+    "post_only_enforcement_documented": false,
+    "post_only_enforcement_note": "The CreateOrderRequest property carries NO description. The only documented post_only semantics in this spec belong to the QUOTE schema: 'If true, the quote creator's resting order will be cancelled rather than crossed if it would take liquidity. Defaults to false.' That is suggestive but is not a statement about ORDER behaviour.",
+    "no_self_trade_field_exists": false,
+    "self_trade_prevention_type_enum": [
+      "taker_at_cross",
+      "maker"
+    ],
+    "yes_price_bounds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 99
+    },
+    "time_in_force_enum": [
+      "fill_or_kill",
+      "good_till_canceled",
+      "immediate_or_cancel"
+    ],
+    "required_fields": [
+      "ticker",
+      "side",
+      "action"
+    ],
+    "legacy_endpoint": "/portfolio/orders",
+    "v2_endpoint": "/portfolio/events/orders",
+    "deprecation_note": "Spec: 'The legacy /portfolio/orders endpoint will be deprecated no earlier than May 6, 2026 - clients should migrate to this path.' That date has PASSED as of capture. This repo still uses /portfolio/orders."
+  },
+  "create_order_request_excerpt": "    CreateOrderRequest:\n      type: object\n      required:\n        - ticker\n        - side\n        - action\n      properties:\n        ticker:\n          type: string\n          x-oapi-codegen-extra-tags:\n            validate: required,min=1\n        client_order_id:\n          type: string\n          x-go-type-skip-optional-pointer: true\n        side:\n          type: string\n          enum: ['yes', 'no']\n          x-oapi-codegen-extra-tags:\n            validate: required,oneof=yes no\n        action:\n          type: string\n          enum: ['buy', 'sell']\n          x-oapi-codegen-extra-tags:\n            validate: required,oneof=buy sell\n        count:\n          type: integer\n          minimum: 1\n          description: Order quantity in contracts (whole contracts only). Provide count or count_fp; if both provided they must match.\n          x-go-type-skip-optional-pointer: true\n          x-oapi-codegen-extra-tags:\n            validate: omitempty,gte=1\n        count_fp:\n          $ref: '#/components/schemas/FixedPointCount'\n          nullable: true\n          description: String representation of the order quantity in contracts. Provide count or count_fp; if both provided they must match.\n        yes_price:\n          type: integer\n          minimum: 1\n          maximum: 99\n          x-go-type-skip-optional-pointer: true\n        no_price:\n          type: integer\n          minimum: 1\n          maximum: 99\n          x-go-type-skip-optional-pointer: true\n        yes_price_dollars:\n          $ref: '#/components/schemas/FixedPointDollars'\n          description: Submitting price of the Yes side in fixed-point dollars\n        no_price_dollars:\n          $ref: '#/components/schemas/FixedPointDollars'\n          description: Submitting price of the No side in fixed-point dollars\n        expiration_ts:\n          type: integer\n          format: int64\n          description: |\n            Optional Unix timestamp in seconds for when the order expires. To place\n            an expiring order, set `time_in_force` to `good_till_canceled` and\n            provide this `expiration_ts`. `GTT` is an internal execution type and is\n            not a valid API value for `time_in_force`. The `immediate_or_cancel`\n            time-in-force value cannot be combined with `expiration_ts`.\n        time_in_force:\n          type: string\n          description: |\n            Specifies how long the order remains active. Use `good_till_canceled`\n            with `expiration_ts` for an order that should rest until a specific\n            expiration time; without `expiration_ts`, `good_till_canceled` is a\n            true good-till-canceled order. `GTT` is not a valid API value.\n          enum: ['fill_or_kill', 'good_till_canceled', 'immediate_or_cancel']\n          x-oapi-codegen-extra-tags:\n            validate: omitempty,oneof=fill_or_kill good_till_canceled immediate_or_cancel\n          x-go-type-skip-optional-pointer: true\n        buy_max_cost:\n          type: integer\n          description: Maximum cost in cents. When specified, the order will automatically have Fill-or-Kill (FoK) behavior.\n        post_only:\n          type: boolean\n        reduce_only:\n          type: boolean\n        sell_position_floor:\n          type: integer\n          description: \"Deprecated: Use reduce_only instead. Only accepts value of 0.\"\n        self_trade_prevention_type:\n          allOf:\n            - $ref: '#/components/schemas/SelfTradePreventionType'\n          x-oapi-codegen-extra-tags:\n            validate: omitempty,oneof=taker_at_cross maker\n          x-go-type-skip-optional-pointer: true\n        order_group_id:\n          type: string\n          description: The order group this order is part of\n          x-go-type-skip-optional-pointer: true\n        cancel_order_on_pause:\n          type: boolean\n          description: If this flag is set to true, the order will be canceled if the order is open and trading on the exchange is paused for any reason.\n        subaccount:\n          type: integer\n          minimum: 0\n          default: 0\n          description: The subaccount number to use for this order. 0 is the primary subaccount.\n          x-go-type-skip-optional-pointer: true",
+  "self_trade_prevention_excerpt": "    SelfTradePreventionType:\n      type: string\n      enum: ['taker_at_cross', 'maker']\n      description: |\n        The self-trade prevention type for orders. `taker_at_cross` cancels the taker order when it would trade against another order from the same user; execution stops and any partial fills already matched are executed. `maker` cancels the resting maker order and continues matching.\n"
+}

@@ -14,26 +14,53 @@ does nothing to stop your bid crossing a stranger's ask and paying taker fees.
 A "maker" strategy running through that adapter could silently take liquidity
 — and a LIP maker that takes liquidity loses the rebate and pays the fee.
 
-Which flag Kalshi actually honours is UNVERIFIED. docs.kalshi.com is blocked
-by this environment's egress proxy (403 to CONNECT), so no claim about the
-current API could be checked. See docs/CLAUDE_INDEPENDENT_ASSESSMENT.md §0.
+What was verified (2026-09-20)
+------------------------------
+Egress to docs.kalshi.com works from this machine, so the earlier
+"UNVERIFIABLE" status is superseded. Against the official OpenAPI document
+(https://docs.kalshi.com/openapi.yaml, "Kalshi Trade API Manual Endpoints"
+v3.30.0, sha256 30e750f714ab37e1..., captured to
+docs/venue_evidence/kalshi_create_order_20260920.json):
 
-Design consequence of that uncertainty
---------------------------------------
-Do not make maker safety depend on a flag we cannot verify. This module makes
-the LOCAL, CHECKABLE invariant primary:
+  * `post_only` DOES exist on CreateOrderRequest as a boolean. The field
+    name this repo sends is correct.
+  * `no_self_trade` does NOT exist in the current schema at all. The
+    current field is `self_trade_prevention_type`, enum
+    ['taker_at_cross', 'maker']. venue/kalshi.py was therefore sending a
+    field that is both semantically wrong AND not in the API.
+  * yes_price / no_price are integers bounded 1..99, which is what the
+    0 < p < 100 guard below already enforced.
+  * The legacy POST /portfolio/orders path this repo uses carries a
+    deprecation notice ("no earlier than May 6, 2026" — already past),
+    directing clients to /portfolio/events/orders.
 
-    A buy order is maker-safe iff its limit price is strictly below the best
-    opposing offer, so it cannot execute on arrival.
+What is STILL NOT verified
+--------------------------
+The *enforcement semantics* of `post_only` on an ORDER. The property has no
+description in the spec. The only documented post_only behaviour belongs to
+the QUOTE schema ("the quote creator's resting order will be cancelled
+rather than crossed if it would take liquidity"). Suggestive, not a
+statement about orders. Establishing it requires observing a live rejection,
+which paper mode by definition cannot do.
 
-On Kalshi both sides are bids (buy YES / buy NO) and the two sides are
-mirror-priced: a NO bid at n implies a YES offer at 100 - n. So a YES buy at
-`p` crosses iff `p >= 100 - best_no_bid`, i.e. iff `p + best_no_bid >= 100`.
-That check needs no documentation to be correct — it follows from the
-contract paying $1.
+Why the local check is a PREFLIGHT, not a proof
+-----------------------------------------------
+    A local non-crossing test cannot guarantee maker execution.
 
-The exchange flag is then belt-and-braces, declared in one constant so that
-verifying or changing it later is a single edit rather than a hunt.
+We evaluate the book as of our last observation, then the order travels to
+Kalshi. Between those two instants another participant can lift the level we
+priced against, and our "passive" bid arrives marketable. The check below is
+therefore a necessary precondition we can enforce ourselves — it stops us
+sending an order that is ALREADY crossing when we build it — but the only
+thing that can stop a take on arrival is the exchange honouring post_only.
+
+The arithmetic itself is sound and needs no documentation: on Kalshi both
+sides are bids, mirror-priced, so a NO bid at n implies a YES offer at
+100 - n, and a YES buy at p crosses iff p + best_no_bid >= 100. What it
+cannot do is speak about the future.
+
+Consequence: live execution stays BLOCKED while enforcement is unproven.
+See require_live_execution_allowed().
 """
 from __future__ import annotations
 
@@ -43,15 +70,42 @@ from typing import Optional
 
 _log = logging.getLogger(__name__)
 
-# The field we believe requests maker-only (reject-if-would-cross) behaviour.
-# UNVERIFIED against current Kalshi docs — see module docstring. Isolated here
-# so that confirming it, renaming it, or migrating to a different order
-# endpoint is one edit in one file.
+# The field that requests maker-only behaviour. Isolated here so that
+# renaming it, or migrating to a different order endpoint, is one edit.
 MAKER_ONLY_FIELD = "post_only"
-MAKER_ONLY_VERIFIED = False
+
+# Provenance for the two claims we must keep apart.
+MAKER_ONLY_SPEC_SOURCE = "https://docs.kalshi.com/openapi.yaml"
+MAKER_ONLY_SPEC_VERSION = "3.30.0"
+MAKER_ONLY_SPEC_CAPTURED = "2026-09-20"
+MAKER_ONLY_SPEC_EVIDENCE = "docs/venue_evidence/kalshi_create_order_20260920.json"
+
+# The field EXISTS in the official CreateOrderRequest schema. Verified.
+MAKER_ONLY_FIELD_VERIFIED = True
+
+# Whether the exchange is known to REJECT/cancel an order that would cross.
+# The spec documents no semantics for post_only on an order, so this stays
+# False until a live rejection is observed. Do not promote a conservative
+# assumption into a verified fact: the whole point of the flag is the case
+# the local preflight cannot cover (the book moving in transit).
+MAKER_ONLY_ENFORCEMENT_VERIFIED = False
+
+# The obsolete field venue/kalshi.py sent. Kept as a named constant so the
+# guard below can name it in the error rather than hard-coding a string.
+OBSOLETE_STP_FIELD = "no_self_trade"
+CURRENT_STP_FIELD = "self_trade_prevention_type"
+CURRENT_STP_VALUES = ("taker_at_cross", "maker")
 
 # Kalshi binaries clear at $1: yes_price + no_price = 100 cents.
 CONTRACT_CENTS = 100
+
+# Verified against CreateOrderRequest.time_in_force in the official spec
+# (v3.30.0). "GTC" and "GTT" are NOT accepted values; the spec says so
+# explicitly for GTT. venue/kalshi.py was sending "GTC".
+TIME_IN_FORCE_VALUES = ("fill_or_kill", "good_till_canceled", "immediate_or_cancel")
+
+# Verified price bounds: yes_price / no_price are integers 1..99.
+PRICE_MIN_CENTS, PRICE_MAX_CENTS = 1, 99
 
 
 class MakerSafetyError(ValueError):
@@ -71,7 +125,13 @@ class CrossCheck:
 
 def would_cross(side: str, price_cents: int, *,
                 best_opposing_bid_cents: Optional[int]) -> CrossCheck:
-    """Would a buy of `side` at `price_cents` execute immediately?
+    """PREFLIGHT: would this buy be crossing AS OF THE BOOK WE LAST SAW?
+
+    This is not a guarantee of maker execution. It answers a question about
+    the past (the book at our last observation), and the order executes in
+    the future (on arrival at Kalshi). A level we priced against can be
+    lifted in transit, making a locally-passive order marketable. Only
+    exchange-side post_only can prevent that; see the module docstring.
 
     `best_opposing_bid_cents` is the best bid on the OTHER side of the same
     market (for a YES buy, pass the best NO bid). A NO bid at n implies a YES
@@ -141,16 +201,55 @@ def build_limit_order(*, ticker: str, side: str, price_cents: int,
     }
     body["yes_price" if side == "yes" else "no_price"] = price_cents
     if time_in_force:
+        if time_in_force not in TIME_IN_FORCE_VALUES:
+            raise MakerSafetyError(
+                f"time_in_force {time_in_force!r} is not accepted by the venue; "
+                f"valid values are {', '.join(TIME_IN_FORCE_VALUES)} "
+                f"(verified against {MAKER_ONLY_SPEC_SOURCE} "
+                f"v{MAKER_ONLY_SPEC_VERSION})")
         body["time_in_force"] = time_in_force
     return body
+
+
+class LiveExecutionBlocked(RuntimeError):
+    """Live order transmission attempted while maker enforcement is unproven."""
+
+
+def require_live_execution_allowed() -> None:
+    """Raise unless we may legitimately send a LIVE order.
+
+    The directive is explicit: a local non-crossing check cannot guarantee
+    maker execution, so exchange-enforced post_only must be verified before
+    live execution. The field is verified to exist; its enforcement is not.
+    Until a live rejection is observed, live transmission is refused here —
+    one chokepoint, so no adapter can quietly opt out.
+
+    Paper mode never reaches this: it sends nothing.
+    """
+    if not MAKER_ONLY_FIELD_VERIFIED:
+        raise LiveExecutionBlocked(
+            f"{MAKER_ONLY_FIELD} is not verified against the venue schema")
+    if not MAKER_ONLY_ENFORCEMENT_VERIFIED:
+        raise LiveExecutionBlocked(
+            f"LIVE EXECUTION BLOCKED: `{MAKER_ONLY_FIELD}` exists in "
+            f"{MAKER_ONLY_SPEC_SOURCE} v{MAKER_ONLY_SPEC_VERSION} but its "
+            "enforcement semantics for orders are undocumented. The local "
+            "non-crossing test is a PREFLIGHT against the last observed "
+            "book, not proof of maker execution — the book can move in "
+            "transit. Observe a real post_only rejection, record it in "
+            f"{MAKER_ONLY_SPEC_EVIDENCE}, then set "
+            "MAKER_ONLY_ENFORCEMENT_VERIFIED = True.")
 
 
 def assert_maker_safe(body: dict) -> None:
     """Last line of defence before transmission.
 
-    Rejects a body that lost its maker flag, or that carries `no_self_trade`
-    *instead of* the maker flag — the specific substitution that made
-    venue/kalshi.py unsafe.
+    Rejects a body that lost its maker flag, or that carries the obsolete
+    `no_self_trade` *instead of* the maker flag — the specific substitution
+    that made venue/kalshi.py unsafe. `no_self_trade` is not merely weaker;
+    it is not in the current schema at all (the field is
+    `self_trade_prevention_type`), so an adapter sending it has neither
+    self-trade prevention nor maker protection.
     """
     if body.get("action") != "buy":
         raise MakerSafetyError(f"only passive buys are supported, got {body.get('action')!r}")
@@ -158,8 +257,15 @@ def assert_maker_safe(body: dict) -> None:
         raise MakerSafetyError(f"maker orders must be limit, got {body.get('type')!r}")
     if not body.get(MAKER_ONLY_FIELD):
         extra = ""
-        if body.get("no_self_trade"):
-            extra = (" — `no_self_trade` only blocks trading against your OWN "
-                     "order; it does not prevent crossing a stranger's offer")
+        if body.get(OBSOLETE_STP_FIELD):
+            extra = (f" — `{OBSOLETE_STP_FIELD}` only blocks trading against "
+                     "your OWN order; it does not prevent crossing a "
+                     "stranger's offer, and it is not in the current schema "
+                     f"(that field is `{CURRENT_STP_FIELD}`: "
+                     f"{'/'.join(CURRENT_STP_VALUES)})")
         raise MakerSafetyError(
             f"order is missing {MAKER_ONLY_FIELD}{extra}")
+    if body.get(OBSOLETE_STP_FIELD):
+        raise MakerSafetyError(
+            f"`{OBSOLETE_STP_FIELD}` is not a field in the current Kalshi "
+            f"schema (v{MAKER_ONLY_SPEC_VERSION}); use `{CURRENT_STP_FIELD}`")
