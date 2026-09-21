@@ -1,0 +1,2116 @@
+{
+  "provenance": {
+    "started_utc": "2026-09-21T03:45:51.558486+00:00",
+    "args": {
+      "duration": 300,
+      "top_n": 12,
+      "poll_sec": 5.0,
+      "trade_poll_sec": 15.0,
+      "heartbeat_sec": 30,
+      "latency_ms": 250.0,
+      "capture_dir": "data/captures",
+      "reuse_discovery": true,
+      "report": ""
+    },
+    "paper_mode": true,
+    "live_armed": false,
+    "db_path": "/Users/derekduenas/lip-maker/data/lip_maker.db",
+    "opening_cash_usd": 5000.0,
+    "code_sha256": {
+      "run_paper.py": "29e9213827a80473",
+      "engine/quote_economics.py": "e86541215246d96a",
+      "execution/paper_fills.py": "5c1792bdfc71cc75",
+      "execution/quote_manager.py": "6ecce69a95a215ae"
+    },
+    "fee_schedule": {
+      "name": "kalshi_documented_unverified",
+      "source": "RATE unverified: kalshi.com/docs/kalshi-fee-schedule.pdf returned HTTP 429 on 2026-09-20. ROUNDING and maker-charging ARE verified \u2014 see docs/venue_evidence/kalshi_fees_20260920.json",
+      "verified": false
+    },
+    "finished_utc": "2026-09-21T03:51:00.158042+00:00"
+  },
+  "data_source": {
+    "books": "rest_snapshot",
+    "polls": 53,
+    "fetch_errors": 0,
+    "websocket_available": false,
+    "limitation": "REST snapshots: no sequence, no queue position, no per-tick causality. Fill evidence is weaker than a WebSocket run's.",
+    "book_capture": "data/captures/books-20260921T034551Z.jsonl",
+    "trade_capture": "data/captures/trades-20260921T034551Z.jsonl"
+  },
+  "discovery": {
+    "programs_seen": 12349,
+    "complete": true,
+    "rejected": 0,
+    "collisions": 0,
+    "markets_selected": 12
+  },
+  "quoting": {
+    "quotes_placed": 0,
+    "economic_rejects": 636,
+    "skip_counts": {
+      "uneconomic": 636
+    },
+    "capital_refusals": 0,
+    "live_blocked": 0,
+    "quotes": []
+  },
+  "execution": {
+    "trades_observed": 1032,
+    "fills_simulated": 0,
+    "fills_applied": 0,
+    "orders_still_resting": 0
+  },
+  "account": {
+    "cash_usd": 5000.0,
+    "reserved_usd": 0.0,
+    "inventory_cost_usd": 0.0,
+    "n_reservations": 0,
+    "available_usd": 5000.0
+  },
+  "inventory": {},
+  "rewards_estimated_only": {
+    "b1f22e93-fbaa-4291-9245-a9048ae6b02e": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "5d4fe6f8-a98e-45b1-b1a9-134b8026ee70": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "a8b8542e-6acd-44a0-90ab-cb2d4a5ee5c3": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "ef83960b-3aab-434e-8cb4-d84ec8683e2d": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "46a65335-0dae-422d-8ea1-928e642c86b1": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fb5868a5-6cdd-414d-b02d-b46714a03db3": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fd715a96-bdfa-4aab-91f9-bd3232563076": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fb1fb4c4-b9dc-45b7-aed0-707ce43f9eb8": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fa960dee-2628-47b5-8d2f-5098cc38d701": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "f7fc2dfd-af64-4267-bbf0-bd57dc97b1d9": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "f0bb908d-f2f2-4aaa-8a41-bd1e847c86d0": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "f0d6b593-fbcc-41ca-9cb9-79f4e49a5230": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    }
+  },
+  "exits": {
+    "actions": 0,
+    "reasons": {}
+  },
+  "observed_flow": {
+    "KXMLBSEASONGAMES-27-600": {
+      "contracts": 2374277.76,
+      "trades": 1638,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXMLBSEASONGAMES-27-1215": {
+      "contracts": 525291.3,
+      "trades": 1134,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXMLBSEASONGAMES-27-2425": {
+      "contracts": 539425.8,
+      "trades": 1332,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXMLBSEASONGAMES-27-0": {
+      "contracts": 2109618.44,
+      "trades": 2438,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXMLBSEASONGAMES-27-1930": {
+      "contracts": 1121224.14,
+      "trades": 2592,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXCABUILDPERMITS-27JAN27-T115000": {
+      "contracts": 50110.56,
+      "trades": 270,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXTXERCOTPEAK-27JAN01-T96000": {
+      "contracts": 812065.32,
+      "trades": 1116,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXPAMFGEMP-27APR30-T550000": {
+      "contracts": 276784.56,
+      "trades": 1314,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXPAMFGEMP-27APR30-T565000": {
+      "contracts": 252270.0,
+      "trades": 630,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXNYCASKRENT-27JAN31-T4100": {
+      "contracts": 316794.42,
+      "trades": 3600,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXBWAYATTENDANCE-27MAY23B-14700000": {
+      "contracts": 523677.42,
+      "trades": 2304,
+      "window_sec": 289.7,
+      "measured": true
+    },
+    "KXWAAEROEMP-27APR30-T81000": {
+      "contracts": 28800.0,
+      "trades": 198,
+      "window_sec": 289.7,
+      "measured": true
+    }
+  },
+  "economics_last_seen": {
+    "KXMLBSEASONGAMES-27-1215": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 69102.93177294731,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@78/21 nets $-64.9426 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@78/21",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.008513054776020589,
+          "expected_trading_pnl_usd": -0.0031392246204724333,
+          "expected_fees_usd": 32.4727173882557,
+          "expected_exit_cost_usd": 32.4727173882557,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0015323498596837059,
+          "net_usd": -64.94259329621553,
+          "capital_usd": 0.99,
+          "net_per_capital": -65.5985790870864,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@78/21",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.01702574306024119,
+          "expected_trading_pnl_usd": -0.006278449240944867,
+          "expected_fees_usd": 64.9454347765114,
+          "expected_exit_cost_usd": 64.9454347765114,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0030646337508434146,
+          "net_usd": -129.88418689295435,
+          "capital_usd": 1.98,
+          "net_per_capital": -65.59807418836078,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@78/21",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.15317893202820185,
+          "expected_trading_pnl_usd": -0.05650604316850379,
+          "expected_fees_usd": 584.5089129886026,
+          "expected_exit_cost_usd": 584.5089129886026,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.027572207765076334,
+          "net_usd": -1168.9497252961105,
+          "capital_usd": 17.82,
+          "net_per_capital": -65.59762768216109,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@78/21",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.31473912692437545,
+          "expected_trading_pnl_usd": -0.11615131095748003,
+          "expected_fees_usd": 1201.490543365461,
+          "expected_exit_cost_usd": 1201.490543365461,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.05665304284638758,
+          "net_usd": -2402.8401519578015,
+          "capital_usd": 36.63,
+          "net_per_capital": -65.59760174604972,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@78/21",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.637463689030968,
+          "expected_trading_pnl_usd": -0.2354418465354325,
+          "expected_fees_usd": 2435.4538041191777,
+          "expected_exit_cost_usd": 2435.4538041191777,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.11474346402557423,
+          "net_usd": -4870.621329859885,
+          "capital_usd": 74.25,
+          "net_per_capital": -65.5975936681466,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@78/21",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.9511894032164192,
+          "expected_trading_pnl_usd": -0.3515931574929125,
+          "expected_fees_usd": 3636.9443474846385,
+          "expected_exit_cost_usd": 3636.9443474846385,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.17121409257895548,
+          "net_usd": -7273.461312816133,
+          "capital_usd": 110.88,
+          "net_per_capital": -65.5975948125553,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 69102.93177294731,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXMLBSEASONGAMES-27-0": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 69102.9156370163,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@18/81 nets $-174.5124 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@18/81",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.006619727504935912,
+          "expected_trading_pnl_usd": -0.003259194227093072,
+          "expected_fees_usd": 87.25679523024606,
+          "expected_exit_cost_usd": 87.25679523024606,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.001191550950888464,
+          "net_usd": -174.51242147816515,
+          "capital_usd": 0.99,
+          "net_per_capital": -176.27517321026784,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@18/81",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.013239233406781811,
+          "expected_trading_pnl_usd": -0.006518388454186144,
+          "expected_fees_usd": 174.5135904604921,
+          "expected_exit_cost_usd": 174.5135904604921,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.002383062013220726,
+          "net_usd": -349.02384313804487,
+          "capital_usd": 1.98,
+          "net_per_capital": -176.2746682515378,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@18/81",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.11912119889379105,
+          "expected_trading_pnl_usd": -0.058665496087675295,
+          "expected_fees_usd": 1570.622314144429,
+          "expected_exit_cost_usd": 1570.622314144429,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.021441815800882388,
+          "net_usd": -3141.2066144018527,
+          "capital_usd": 17.82,
+          "net_per_capital": -176.2742207857381,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@18/81",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.2447824164357599,
+          "expected_trading_pnl_usd": -0.12059018640244366,
+          "expected_fees_usd": 3228.5014235191043,
+          "expected_exit_cost_usd": 3228.5014235191043,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.04406083495843678,
+          "net_usd": -6456.923715643134,
+          "capital_usd": 36.63,
+          "net_per_capital": -176.27419371125126,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@18/81",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.4958653647717868,
+          "expected_trading_pnl_usd": -0.24443956703198041,
+          "expected_fees_usd": 6544.259642268455,
+          "expected_exit_cost_usd": 6544.259642268455,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.08925576565892163,
+          "net_usd": -13088.358114504828,
+          "capital_usd": 74.25,
+          "net_per_capital": -176.27418336033438,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@18/81",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.7400345272942035,
+          "expected_trading_pnl_usd": -0.3650297534344241,
+          "expected_fees_usd": 9772.76106578756,
+          "expected_exit_cost_usd": 9772.76106578756,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.13320621491295664,
+          "net_usd": -19545.28133301617,
+          "capital_usd": 110.88,
+          "net_per_capital": -176.27418229632187,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 69102.9156370163,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXMLBSEASONGAMES-27-2425": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 69102.94730377197,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@47/52 nets $-70.5369 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@47/52",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.0061875361655791845,
+          "expected_trading_pnl_usd": -0.002099481905930572,
+          "expected_fees_usd": 35.26942555815739,
+          "expected_exit_cost_usd": 35.26942555815739,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.001113756509804253,
+          "net_usd": -70.53687681856493,
+          "capital_usd": 0.99,
+          "net_per_capital": -71.24937052380295,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@47/52",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.012374878719563156,
+          "expected_trading_pnl_usd": -0.004198963811861144,
+          "expected_fees_usd": 70.53885111631477,
+          "expected_exit_cost_usd": 70.53885111631477,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.002227478169521368,
+          "net_usd": -141.07275379589137,
+          "capital_usd": 1.98,
+          "net_per_capital": -71.24886555348048,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@47/52",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.11134603581976231,
+          "expected_trading_pnl_usd": -0.0377906743067503,
+          "expected_fees_usd": 634.8496600468329,
+          "expected_exit_cost_usd": 634.8496600468329,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.020042286447557216,
+          "net_usd": -1269.6468070186004,
+          "capital_usd": 17.82,
+          "net_per_capital": -71.24841790227836,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@47/52",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.22880996337391932,
+          "expected_trading_pnl_usd": -0.07768083051943117,
+          "expected_fees_usd": 1304.9687456518234,
+          "expected_exit_cost_usd": 1304.9687456518234,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.04118579340730547,
+          "net_usd": -2609.8285479641995,
+          "capital_usd": 36.63,
+          "net_per_capital": -71.24839060781325,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@47/52",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.46352855316357144,
+          "expected_trading_pnl_usd": -0.1574611429447929,
+          "expected_fees_usd": 2645.206916861804,
+          "expected_exit_cost_usd": 2645.206916861804,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.08343513956944286,
+          "net_usd": -5290.192201452958,
+          "capital_usd": 74.25,
+          "net_per_capital": -71.24837981754827,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@47/52",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.6918026284946323,
+          "expected_trading_pnl_usd": -0.2351419734642241,
+          "expected_fees_usd": 3950.1756625136272,
+          "expected_exit_cost_usd": 3950.1756625136272,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.12452447312903381,
+          "net_usd": -7900.020188845353,
+          "capital_usd": 110.88,
+          "net_per_capital": -71.24837832652736,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 69102.94730377197,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXMLBSEASONGAMES-27-600": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 69102.902384758,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@82/17 nets $-256.9743 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@82/17",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.0086644970748288,
+          "expected_trading_pnl_usd": -0.003299183707605633,
+          "expected_fees_usd": 128.48857237690723,
+          "expected_exit_cost_usd": 128.48857237690723,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.001559609473469184,
+          "net_usd": -256.9743390499207,
+          "capital_usd": 0.99,
+          "net_per_capital": -259.57003944436434,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@82/17",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.01732861450250786,
+          "expected_trading_pnl_usd": -0.006598367415211266,
+          "expected_fees_usd": 256.97714475381446,
+          "expected_exit_cost_usd": 256.97714475381446,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.003119150610451415,
+          "net_usd": -513.9476784111521,
+          "capital_usd": 1.98,
+          "net_per_capital": -259.5695345510869,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@82/17",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.1559028816868387,
+          "expected_trading_pnl_usd": -0.0593853067369014,
+          "expected_fees_usd": 2312.79430278433,
+          "expected_exit_cost_usd": 2312.79430278433,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.028062518703630968,
+          "net_usd": -4625.521150512413,
+          "capital_usd": 17.82,
+          "net_per_capital": -259.56908813200977,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@82/17",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.3203337404966937,
+          "expected_trading_pnl_usd": -0.12206979718140842,
+          "expected_fees_usd": 4754.077177945567,
+          "expected_exit_cost_usd": 4754.077177945567,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.057660073289404874,
+          "net_usd": -9508.014752021109,
+          "capital_usd": 36.63,
+          "net_per_capital": -259.56906229923857,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@82/17",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.6487854419760581,
+          "expected_trading_pnl_usd": -0.2474387780704225,
+          "expected_fees_usd": 9636.642928268042,
+          "expected_exit_cost_usd": 9636.642928268042,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.11678137955569047,
+          "net_usd": -19273.002291251734,
+          "capital_usd": 74.25,
+          "net_per_capital": -259.56905442763275,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@82/17",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.9680694591225092,
+          "expected_trading_pnl_usd": -0.3695085752518309,
+          "expected_fees_usd": 14390.720106213608,
+          "expected_exit_cost_usd": 14390.720106213608,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.17425250264205167,
+          "net_usd": -28781.016904045988,
+          "capital_usd": 110.88,
+          "net_per_capital": -259.56905577242054,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 69102.902384758,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXMLBSEASONGAMES-27-1930": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 69102.81214690208,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@67/32 nets $-173.7283 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@67/32",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.00841343207343502,
+          "expected_trading_pnl_usd": -0.002699328599488363,
+          "expected_fees_usd": 86.865748728999,
+          "expected_exit_cost_usd": 86.865748728999,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0015144177732183037,
+          "net_usd": -173.72829777229725,
+          "capital_usd": 0.99,
+          "net_per_capital": -175.48312906292654,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@67/32",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.01682650618179788,
+          "expected_trading_pnl_usd": -0.005398657198976726,
+          "expected_fees_usd": 173.731497457998,
+          "expected_exit_cost_usd": 173.731497457998,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0030287711127236186,
+          "net_usd": -347.4555958381259,
+          "capital_usd": 1.98,
+          "net_per_capital": -175.48262416066964,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@67/32",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.15138702730131973,
+          "expected_trading_pnl_usd": -0.04858791479079053,
+          "expected_fees_usd": 1563.5834771219818,
+          "expected_exit_cost_usd": 1563.5834771219818,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.027249664914237554,
+          "net_usd": -3127.0924047963676,
+          "capital_usd": 17.82,
+          "net_per_capital": -175.48217759800042,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@67/32",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.31105875935597554,
+          "expected_trading_pnl_usd": -0.09987515818106943,
+          "expected_fees_usd": 3214.032702972963,
+          "expected_exit_cost_usd": 3214.032702972963,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0559905766840756,
+          "net_usd": -6427.9112129214345,
+          "capital_usd": 36.63,
+          "net_per_capital": -175.48215159490675,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@67/32",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.6300155926782389,
+          "expected_trading_pnl_usd": -0.2024496449616272,
+          "expected_fees_usd": 6514.931154674925,
+          "expected_exit_cost_usd": 6514.931154674925,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.11340280668208301,
+          "net_usd": -13029.549146208814,
+          "capital_usd": 74.25,
+          "net_per_capital": -175.4821433832837,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@67/32",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.9400844761108581,
+          "expected_trading_pnl_usd": -0.30232480314269666,
+          "expected_fees_usd": 9728.963857647886,
+          "expected_exit_cost_usd": 9728.963857647886,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.16921520569995446,
+          "net_usd": -19457.460170828508,
+          "capital_usd": 110.88,
+          "net_per_capital": -175.48214439780398,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 69102.81214690208,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXTXERCOTPEAK-27JAN01-T96000": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@2/97 nets $-3.0806 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@2/97",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 5.175909846040901e-05,
+          "expected_trading_pnl_usd": -0.04943716487658741,
+          "expected_fees_usd": 1.515120850376618,
+          "expected_exit_cost_usd": 1.515120850376618,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 9.316637722873622e-06,
+          "net_usd": -3.080636423169086,
+          "capital_usd": 0.99,
+          "net_per_capital": -3.1117539627970565,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@2/97",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.00010351772658452118,
+          "expected_trading_pnl_usd": -0.09887432975317482,
+          "expected_fees_usd": 3.030241700753236,
+          "expected_exit_cost_usd": 3.030241700753236,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 1.8633190785213812e-05,
+          "net_usd": -6.1602728467238475,
+          "capital_usd": 1.98,
+          "net_per_capital": -3.1112489124867917,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@2/97",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0009315918160648877,
+          "expected_trading_pnl_usd": -0.8898689677785735,
+          "expected_fees_usd": 27.272175306779125,
+          "expected_exit_cost_usd": 27.272175306779125,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0001676865268916798,
+          "net_usd": -55.434455676047655,
+          "capital_usd": 17.82,
+          "net_per_capital": -3.110799981820856,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@2/97",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0019147734488664905,
+          "expected_trading_pnl_usd": -1.829175100433734,
+          "expected_fees_usd": 56.05947146393487,
+          "expected_exit_cost_usd": 56.05947146393487,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0003446592207959683,
+          "net_usd": -113.9475479140754,
+          "capital_usd": 36.63,
+          "net_per_capital": -3.110771168825427,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@2/97",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0038806276340619178,
+          "expected_trading_pnl_usd": -3.7077873657440557,
+          "expected_fees_usd": 113.63406377824636,
+          "expected_exit_cost_usd": 113.63406377824636,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0006985129741311452,
+          "net_usd": -230.97373280757685,
+          "capital_usd": 74.25,
+          "net_per_capital": -3.110757344209789,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@2/97",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0057940968775955105,
+          "expected_trading_pnl_usd": -5.5369624661777905,
+          "expected_fees_usd": 169.6935352421812,
+          "expected_exit_cost_usd": 169.6935352421812,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0010429374379671919,
+          "net_usd": -344.9202817911006,
+          "capital_usd": 110.88,
+          "net_per_capital": -3.1107529021563907,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXCABUILDPERMITS-27JAN27-T115000": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@24/75 nets $-28.5558 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@24/75",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0006385958846289632,
+          "expected_trading_pnl_usd": -0.042848994957120835,
+          "expected_fees_usd": 14.256215912212609,
+          "expected_exit_cost_usd": 14.256215912212609,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00011494725923321338,
+          "net_usd": -28.55575717075694,
+          "capital_usd": 0.99,
+          "net_per_capital": -28.84419916238075,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@24/75",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0012770961996852492,
+          "expected_trading_pnl_usd": -0.08569798991424167,
+          "expected_fees_usd": 28.512431824425217,
+          "expected_exit_cost_usd": 28.512431824425217,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00022987731594334486,
+          "net_usd": -57.110514419880936,
+          "capital_usd": 1.98,
+          "net_per_capital": -28.843694151455015,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@24/75",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.01148012126407646,
+          "expected_trading_pnl_usd": -0.7712819092281751,
+          "expected_fees_usd": 256.61188641982693,
+          "expected_exit_cost_usd": 256.61188641982693,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.002066421827533763,
+          "net_usd": -513.9866410494456,
+          "capital_usd": 17.82,
+          "net_per_capital": -28.843245850137237,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@24/75",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.023564564656540252,
+          "expected_trading_pnl_usd": -1.5854128134134708,
+          "expected_fees_usd": 527.4799887518665,
+          "expected_exit_cost_usd": 527.4799887518665,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0042416216381772455,
+          "net_usd": -1056.5270673741281,
+          "capital_usd": 36.63,
+          "net_per_capital": -28.84321778253148,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@24/75",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.047630926581250475,
+          "expected_trading_pnl_usd": -3.2136746217840626,
+          "expected_fees_usd": 1069.2161934159456,
+          "expected_exit_cost_usd": 1069.2161934159456,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.008573566784625085,
+          "net_usd": -2141.6080040938787,
+          "capital_usd": 74.25,
+          "net_per_capital": -28.8432054423418,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@24/75",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.07093352844776944,
+          "expected_trading_pnl_usd": -4.799087435197534,
+          "expected_fees_usd": 1596.6961821678121,
+          "expected_exit_cost_usd": 1596.6961821678121,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.012768035120598499,
+          "net_usd": -3198.1342862774945,
+          "capital_usd": 110.88,
+          "net_per_capital": -28.84320243756759,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXPAMFGEMP-27APR30-T550000": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@87/12 nets $-31.3063 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@87/12",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 7.757200414211045e-05,
+          "expected_trading_pnl_usd": -0.06516239125412833,
+          "expected_fees_usd": 15.62010253364237,
+          "expected_exit_cost_usd": 15.62010253364237,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 1.3962960745579881e-05,
+          "net_usd": -31.30630384949547,
+          "capital_usd": 0.99,
+          "net_per_capital": -31.622529140904515,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@87/12",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.00015514004486688276,
+          "expected_trading_pnl_usd": -0.13032478250825666,
+          "expected_fees_usd": 31.24020506728474,
+          "expected_exit_cost_usd": 31.24020506728474,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 2.7925208076038897e-05,
+          "net_usd": -62.611607702240946,
+          "capital_usd": 1.98,
+          "net_per_capital": -31.62202409204088,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@87/12",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0013956899194694412,
+          "expected_trading_pnl_usd": -1.1729230425743098,
+          "expected_fees_usd": 281.16184560556263,
+          "expected_exit_cost_usd": 281.16184560556263,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00025122418550449944,
+          "net_usd": -563.4964697879657,
+          "capital_usd": 17.82,
+          "net_per_capital": -31.621575184509858,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@87/12",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0028675268753919517,
+          "expected_trading_pnl_usd": -2.411008476402748,
+          "expected_fees_usd": 577.9437937447677,
+          "expected_exit_cost_usd": 577.9437937447677,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0005161548375705513,
+          "net_usd": -1158.2972445939004,
+          "capital_usd": 36.63,
+          "net_per_capital": -31.621546398959875,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@87/12",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.005806922300535411,
+          "expected_trading_pnl_usd": -4.887179344059625,
+          "expected_fees_usd": 1171.5076900231777,
+          "expected_exit_cost_usd": 1171.5076900231777,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.001045246014096374,
+          "net_usd": -2347.8987977141287,
+          "capital_usd": 74.25,
+          "net_per_capital": -31.621532629146515,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@87/12",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.008663496899961239,
+          "expected_trading_pnl_usd": -7.298187820462373,
+          "expected_fees_usd": 1749.4514837679453,
+          "expected_exit_cost_usd": 1749.4514837679453,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.001559429441993023,
+          "net_usd": -3506.1950512888952,
+          "capital_usd": 110.88,
+          "net_per_capital": -31.621528240339963,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXPAMFGEMP-27APR30-T565000": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@5/94 nets $-7.4631 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@5/94",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 3.76682626670702e-05,
+          "expected_trading_pnl_usd": -0.07037538242660026,
+          "expected_fees_usd": 3.695858117857931,
+          "expected_exit_cost_usd": 3.695858117857931,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 6.780287280072636e-06,
+          "net_usd": -7.463060730167076,
+          "capital_usd": 0.99,
+          "net_per_capital": -7.538445181986945,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@5/94",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 7.533559075374922e-05,
+          "expected_trading_pnl_usd": -0.1407507648532005,
+          "expected_fees_usd": 7.391716235715862,
+          "expected_exit_cost_usd": 7.391716235715862,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 1.356040633567486e-05,
+          "net_usd": -14.925121461100506,
+          "capital_usd": 1.98,
+          "net_per_capital": -7.537940131868943,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@5/94",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0006778857655835279,
+          "expected_trading_pnl_usd": -1.2667568836788046,
+          "expected_fees_usd": 66.52544612144276,
+          "expected_exit_cost_usd": 66.52544612144276,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00012201943780503502,
+          "net_usd": -134.31809326023654,
+          "capital_usd": 17.82,
+          "net_per_capital": -7.537491204278145,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@5/94",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0013931035582764573,
+          "expected_trading_pnl_usd": -2.603889149784209,
+          "expected_fees_usd": 136.74675036074345,
+          "expected_exit_cost_usd": 136.74675036074345,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0002507586404897623,
+          "net_usd": -276.0972475263533,
+          "capital_usd": 36.63,
+          "net_per_capital": -7.537462394931841,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@5/94",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0028225285859442466,
+          "expected_trading_pnl_usd": -5.278153681995019,
+          "expected_fees_usd": 277.18935883934483,
+          "expected_exit_cost_usd": 277.18935883934483,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0005080551454699644,
+          "net_usd": -559.6555568872442,
+          "capital_usd": 74.25,
+          "net_per_capital": -7.537448577605983,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@5/94",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.004213043983609323,
+          "expected_trading_pnl_usd": -7.882042831779228,
+          "expected_fees_usd": 413.93610920008825,
+          "expected_exit_cost_usd": 413.93610920008825,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0007583479170496781,
+          "net_usd": -835.7518065358893,
+          "capital_usd": 110.88,
+          "net_per_capital": -7.537444142639694,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXNYCASKRENT-27JAN31-T4100": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@23/76 nets $-227.7671 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@23/76",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0007728264084505114,
+          "expected_trading_pnl_usd": -0.04408534518463846,
+          "expected_fees_usd": 113.86132023755783,
+          "expected_exit_cost_usd": 113.86132023755783,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00013910875352109205,
+          "net_usd": -227.7670921026454,
+          "capital_usd": 0.99,
+          "net_per_capital": -230.06776980065192,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@23/76",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0015455064898332485,
+          "expected_trading_pnl_usd": -0.08817069036927692,
+          "expected_fees_usd": 227.72264047511567,
+          "expected_exit_cost_usd": 227.72264047511567,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0002781911681699847,
+          "net_usd": -455.53318432527897,
+          "capital_usd": 1.98,
+          "net_per_capital": -230.06726481074696,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@23/76",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.01388852117109154,
+          "expected_trading_pnl_usd": -0.7935362133234923,
+          "expected_fees_usd": 2049.5037642760412,
+          "expected_exit_cost_usd": 2049.5037642760412,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.002499933810796477,
+          "net_usd": -4099.790676178045,
+          "capital_usd": 17.82,
+          "net_per_capital": -230.06681684500816,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@23/76",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.02849744512776082,
+          "expected_trading_pnl_usd": -1.6311577718316232,
+          "expected_fees_usd": 4212.86884878964,
+          "expected_exit_cost_usd": 4212.86884878964,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.005129540122996948,
+          "net_usd": -8427.346487446108,
+          "capital_usd": 36.63,
+          "net_per_capital": -230.0667891740679,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@23/76",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.057558709990040674,
+          "expected_trading_pnl_usd": -3.306400888847885,
+          "expected_fees_usd": 8539.599017816838,
+          "expected_exit_cost_usd": 8539.599017816838,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.01036056779820732,
+          "net_usd": -17082.45823838033,
+          "capital_usd": 74.25,
+          "net_per_capital": -230.06677762128393,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@23/76",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.08565636305800448,
+          "expected_trading_pnl_usd": -4.9375586606795085,
+          "expected_fees_usd": 12752.467866606477,
+          "expected_exit_cost_usd": 12752.467866606477,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.015418145350440806,
+          "net_usd": -25509.804053655927,
+          "capital_usd": 110.88,
+          "net_per_capital": -230.06677537568478,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXWAAEROEMP-27APR30-T81000": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@95/4 nets $-0.3669 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@95/4",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 1.9316142564518943e-05,
+          "expected_trading_pnl_usd": -0.0711200952538717,
+          "expected_fees_usd": 0.1473782098861771,
+          "expected_exit_cost_usd": 0.1473782098861771,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 3.4769056616134096e-06,
+          "net_usd": -0.36686067578932297,
+          "capital_usd": 0.99,
+          "net_per_capital": -0.3705663391811343,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@95/4",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 3.8632039370334547e-05,
+          "expected_trading_pnl_usd": -0.1422401905077434,
+          "expected_fees_usd": 0.2947564197723542,
+          "expected_exit_cost_usd": 0.2947564197723542,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 6.953767086660219e-06,
+          "net_usd": -0.7327213517801681,
+          "capital_usd": 1.98,
+          "net_per_capital": -0.37006128877786265,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@95/4",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0003476529689065211,
+          "expected_trading_pnl_usd": -1.2801617145696904,
+          "expected_fees_usd": 2.6528077779511876,
+          "expected_exit_cost_usd": 2.6528077779511876,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 6.257753440317379e-05,
+          "net_usd": -6.586492195037562,
+          "capital_usd": 17.82,
+          "net_per_capital": -0.36961235662388114,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@95/4",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0007145336360252973,
+          "expected_trading_pnl_usd": -2.6314435243932532,
+          "expected_fees_usd": 5.452993765788552,
+          "expected_exit_cost_usd": 5.452993765788552,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00012861605448455352,
+          "net_usd": -13.537845138388816,
+          "capital_usd": 36.63,
+          "net_per_capital": -0.36958354186155656,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@95/4",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0014480290284939602,
+          "expected_trading_pnl_usd": -5.334007144040378,
+          "expected_fees_usd": 11.053365741463281,
+          "expected_exit_cost_usd": 11.053365741463281,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00026064522512891285,
+          "net_usd": -27.440551243163576,
+          "capital_usd": 74.25,
+          "net_per_capital": -0.36956971371264075,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@95/4",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0021618813993624537,
+          "expected_trading_pnl_usd": -7.965450668433631,
+          "expected_fees_usd": 16.506359507251833,
+          "expected_exit_cost_usd": 16.506359507251833,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00038913865188524167,
+          "net_usd": -40.97739694018982,
+          "capital_usd": 110.88,
+          "net_per_capital": -0.36956526821960517,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    },
+    "KXBWAYATTENDANCE-27MAY23B-14700000": {
+      "chosen": {
+        "candidate": "no_quote",
+        "horizon_sec": 86400.0,
+        "expected_reward_usd": 0.0,
+        "expected_trading_pnl_usd": 0.0,
+        "expected_fees_usd": 0.0,
+        "expected_exit_cost_usd": 0.0,
+        "operating_cost_usd": 0.0,
+        "uncertainty_allowance_usd": 0.0,
+        "net_usd": 0.0,
+        "capital_usd": 0.0,
+        "net_per_capital": 0.0,
+        "unknowns": [],
+        "notes": [
+          "baseline: no exposure, no reward"
+        ]
+      },
+      "reason": "best candidate 1@35/64 nets $-1090.9519 <= no-quote $0.0000",
+      "considered": [
+        {
+          "candidate": "1@35/64",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0005154867185625034,
+          "expected_trading_pnl_usd": -0.05046264631116514,
+          "expected_fees_usd": 545.4504173124634,
+          "expected_exit_cost_usd": 545.4504173124634,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 9.278760934125061e-05,
+          "net_usd": -1090.9518745721289,
+          "capital_usd": 0.99,
+          "net_per_capital": -1101.9715904768977,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "2@35/64",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0010307474951050364,
+          "expected_trading_pnl_usd": -0.10092529262233028,
+          "expected_fees_usd": 1090.9008346249268,
+          "expected_exit_cost_usd": 1090.9008346249268,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.00018553454911890654,
+          "net_usd": -2181.9027493295303,
+          "capital_usd": 1.98,
+          "net_per_capital": -1101.9710855199646,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "18@35/64",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.009244312596959717,
+          "expected_trading_pnl_usd": -0.9083276336009725,
+          "expected_fees_usd": 9818.107511624343,
+          "expected_exit_cost_usd": 9818.107511624343,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0016639762674527491,
+          "net_usd": -19637.116770545956,
+          "capital_usd": 17.82,
+          "net_per_capital": -1101.9706380777752,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "37@35/64",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.01892367663615468,
+          "expected_trading_pnl_usd": -1.8671179135131102,
+          "expected_fees_usd": 20181.665440561148,
+          "expected_exit_cost_usd": 20181.665440561148,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.0034062617945078426,
+          "net_usd": -40365.18348162097,
+          "capital_usd": 36.63,
+          "net_per_capital": -1101.9706110188633,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "75@35/64",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.03804438756603982,
+          "expected_trading_pnl_usd": -3.7846984733373854,
+          "expected_fees_usd": 40908.78129843476,
+          "expected_exit_cost_usd": 40908.78129843476,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.006847989761887168,
+          "net_usd": -81821.31709894504,
+          "capital_usd": 74.25,
+          "net_per_capital": -1101.9706006591925,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "112@35/64",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.056363117040273865,
+          "expected_trading_pnl_usd": -5.651816386850496,
+          "expected_fees_usd": 61090.44673899591,
+          "expected_exit_cost_usd": 61090.44673899591,
+          "operating_cost_usd": 0.001,
+          "uncertainty_allowance_usd": 0.010145361067249295,
+          "net_usd": -122186.50007662269,
+          "capital_usd": 110.88,
+          "net_per_capital": -1101.9705995366405,
+          "unknowns": [
+            "observed_share (using theoretical depth share)"
+          ],
+          "notes": [
+            "trading P&L term is the adverse-selection estimate (not double-counted elsewhere)",
+            "exit priced as passive pairing (no forced liquidation)"
+          ]
+        },
+        {
+          "candidate": "no_quote",
+          "horizon_sec": 86400.0,
+          "expected_reward_usd": 0.0,
+          "expected_trading_pnl_usd": 0.0,
+          "expected_fees_usd": 0.0,
+          "expected_exit_cost_usd": 0.0,
+          "operating_cost_usd": 0.0,
+          "uncertainty_allowance_usd": 0.0,
+          "net_usd": 0.0,
+          "capital_usd": 0.0,
+          "net_per_capital": 0.0,
+          "unknowns": [],
+          "notes": [
+            "baseline: no exposure, no reward"
+          ]
+        }
+      ]
+    }
+  },
+  "caveats": [
+    "Rewards are ESTIMATES computed from observed share. No reward has been paid or reconciled; do not read them as income.",
+    "Fills are SIMULATED from public trades with a conservative queue model that ignores cancellations ahead of us, so it under-fills rather than over-fills.",
+    "Paired inventory is riskless at settlement but is NOT spendable cash until the venue settles it.",
+    "No profitability conclusion should be drawn from a single bounded session."
+  ]
+}

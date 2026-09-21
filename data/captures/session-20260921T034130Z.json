@@ -1,0 +1,132 @@
+{
+  "provenance": {
+    "started_utc": "2026-09-21T03:37:11.026943+00:00",
+    "args": {
+      "duration": 240,
+      "top_n": 12,
+      "poll_sec": 5.0,
+      "trade_poll_sec": 15.0,
+      "heartbeat_sec": 30,
+      "latency_ms": 250.0,
+      "capture_dir": "data/captures",
+      "reuse_discovery": true,
+      "report": ""
+    },
+    "paper_mode": true,
+    "live_armed": false,
+    "db_path": "/Users/derekduenas/lip-maker/data/lip_maker.db",
+    "opening_cash_usd": 5000.0,
+    "code_sha256": {
+      "run_paper.py": "14d88466633dace6",
+      "engine/quote_economics.py": "e86541215246d96a",
+      "execution/paper_fills.py": "5c1792bdfc71cc75",
+      "execution/quote_manager.py": "6ecce69a95a215ae"
+    },
+    "fee_schedule": {
+      "name": "kalshi_documented_unverified",
+      "source": "RATE unverified: kalshi.com/docs/kalshi-fee-schedule.pdf returned HTTP 429 on 2026-09-20. ROUNDING and maker-charging ARE verified \u2014 see docs/venue_evidence/kalshi_fees_20260920.json",
+      "verified": false
+    },
+    "finished_utc": "2026-09-21T03:41:29.920115+00:00"
+  },
+  "data_source": {
+    "books": "rest_snapshot",
+    "polls": 43,
+    "fetch_errors": 0,
+    "websocket_available": false,
+    "limitation": "REST snapshots: no sequence, no queue position, no per-tick causality. Fill evidence is weaker than a WebSocket run's.",
+    "book_capture": "data/captures/books-20260921T033711Z.jsonl",
+    "trade_capture": "data/captures/trades-20260921T033711Z.jsonl"
+  },
+  "discovery": {
+    "programs_seen": 12349,
+    "complete": true,
+    "rejected": 0,
+    "collisions": 0,
+    "markets_selected": 12
+  },
+  "quoting": {
+    "quotes_placed": 0,
+    "economic_rejects": 516,
+    "skip_counts": {
+      "uneconomic": 516
+    },
+    "capital_refusals": 0,
+    "live_blocked": 0,
+    "quotes": []
+  },
+  "execution": {
+    "trades_observed": 1031,
+    "fills_simulated": 0,
+    "fills_applied": 0,
+    "orders_still_resting": 0
+  },
+  "account": {
+    "cash_usd": 5000.0,
+    "reserved_usd": 0.0,
+    "inventory_cost_usd": 0.0,
+    "n_reservations": 0,
+    "available_usd": 5000.0
+  },
+  "inventory": {},
+  "rewards_estimated_only": {
+    "b1f22e93-fbaa-4291-9245-a9048ae6b02e": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "5d4fe6f8-a98e-45b1-b1a9-134b8026ee70": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "ef83960b-3aab-434e-8cb4-d84ec8683e2d": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "a8b8542e-6acd-44a0-90ab-cb2d4a5ee5c3": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fd715a96-bdfa-4aab-91f9-bd3232563076": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "46a65335-0dae-422d-8ea1-928e642c86b1": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fb1fb4c4-b9dc-45b7-aed0-707ce43f9eb8": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fb5868a5-6cdd-414d-b02d-b46714a03db3": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "fa960dee-2628-47b5-8d2f-5098cc38d701": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "f7fc2dfd-af64-4267-bbf0-bd57dc97b1d9": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "f0bb908d-f2f2-4aaa-8a41-bd1e847c86d0": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    },
+    "f0d6b593-fbcc-41ca-9cb9-79f4e49a5230": {
+      "accrued_estimate_usd": 0.0,
+      "breaks": 0
+    }
+  },
+  "exits": {
+    "actions": 0,
+    "reasons": {}
+  },
+  "caveats": [
+    "Rewards are ESTIMATES computed from observed share. No reward has been paid or reconciled; do not read them as income.",
+    "Fills are SIMULATED from public trades with a conservative queue model that ignores cancellations ahead of us, so it under-fills rather than over-fills.",
+    "Paired inventory is riskless at settlement but is NOT spendable cash until the venue settles it.",
+    "No profitability conclusion should be drawn from a single bounded session."
+  ]
+}

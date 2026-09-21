@@ -73,13 +73,25 @@ class FeeSchedule:
     source: str
     verified: bool = False
     verified_at: str = ""
-    # Kalshi's published form rounds each fill's fee UP to the next whole
-    # cent. That round-up dominates for small fills and was implemented
-    # nowhere in this repo before 2026-09-21.
-    round_up_to_cent: bool = True
-    # Whether resting (maker) fills are charged at all. UNVERIFIED: the repo
-    # previously asserted maker-free with no citation. Default True =
-    # conservative (assume we pay).
+    # How each fill's fee is rounded.
+    #   "ceil_6dp"  — VERIFIED 2026-09-20 against
+    #                 https://docs.kalshi.com/getting_started/fee_rounding:
+    #                 "trade fee: ceil_6dp(model_fee) — rounded up to the
+    #                 nearest $0.000001". This is the exchange's actual rule.
+    #   "ceil_cent" — what this repo implemented on 2026-09-21 from a code
+    #                 comment. It is WRONG and punitive: for the small fills
+    #                 a LIP maker gets, rounding to a whole cent dominates
+    #                 the fee (1 contract @5c: 0.3325c raw becomes 1c).
+    #   "none"      — raw model fee, for A/B only.
+    rounding: str = "ceil_6dp"
+    # Retained so existing callers/tests that speak in cents keep working.
+    # True is equivalent to rounding="ceil_cent".
+    round_up_to_cent: bool = False
+    # Whether resting (maker) fills are charged at all.
+    # VERIFIED 2026-09-20 against help.kalshi.com/en/articles/13823805-fees:
+    # "Maker fees are charged for orders placed that are not immediately
+    # matched and are instead left as resting orders on the orderbook."
+    # This refutes the repo's uncited "fee-free per Kalshi" assumption.
     charge_maker: bool = True
     notes: str = ""
 
@@ -101,8 +113,15 @@ class FeeSchedule:
         if p <= 0 or p >= 1:
             return ZERO          # edge prices carry no risk premium
         raw_cents = self.rate * c * p * (Decimal(1) - p) * CENTS
-        if self.round_up_to_cent:
+        mode = "ceil_cent" if self.round_up_to_cent else self.rounding
+        if mode == "ceil_cent":
             cents = Decimal(math.ceil(raw_cents))
+        elif mode == "ceil_6dp":
+            # Ceil the DOLLAR fee to $0.000001, per the venue's rule.
+            dollars = raw_cents / CENTS
+            step = Decimal("0.000001")
+            cents = (dollars / step).to_integral_value(
+                rounding="ROUND_CEILING") * step * CENTS
         else:
             cents = raw_cents
         return cents / CENTS
@@ -116,6 +135,8 @@ class FeeSchedule:
     def describe(self) -> dict:
         return {"name": self.name, "rate": str(self.rate), "source": self.source,
                 "verified": self.verified, "verified_at": self.verified_at,
+                "rounding": ("ceil_cent" if self.round_up_to_cent
+                             else self.rounding),
                 "round_up_to_cent": self.round_up_to_cent,
                 "charge_maker": self.charge_maker, "notes": self.notes}
 
@@ -125,14 +146,19 @@ class FeeSchedule:
 KALSHI_UNVERIFIED = FeeSchedule(
     name="kalshi_documented_unverified",
     rate=Decimal("0.07"),
-    source=("form quoted in dislocation/spread.py:63-66 as Kalshi official; "
-            "NOT checked against docs.kalshi.com — egress blocked 2026-09-21"),
+    source=("RATE unverified: kalshi.com/docs/kalshi-fee-schedule.pdf "
+            "returned HTTP 429 on 2026-09-20. ROUNDING and maker-charging "
+            "ARE verified — see docs/venue_evidence/kalshi_fees_20260920.json"),
     verified=False,
-    round_up_to_cent=True,
+    rounding="ceil_6dp",
     charge_maker=True,
-    notes=("Conservative by choice: assumes maker fills are charged. The "
-           "previous assumption (tools/net_yield_logger.py: fees = 0.0, "
-           "'fee-free per Kalshi') had no source and inflated net yield."),
+    notes=("Maker fills ARE charged (verified, help.kalshi.com): this "
+           "refutes tools/net_yield_logger.py's uncited 'fee-free per "
+           "Kalshi'. Rounding is ceil to $0.000001 (verified, "
+           "docs.kalshi.com/getting_started/fee_rounding), NOT to the whole "
+           "cent as this repo briefly implemented — that overstated the fee "
+           "on small fills by orders of magnitude. The RATE constant 0.07 "
+           "remains unverified, so verified=False stands."),
 )
 
 # An explicit zero, for A/B-ing the old assumption. Never the default.

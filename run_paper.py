@@ -229,6 +229,10 @@ class PaperRunner:
         self.econ_rejects: int = 0
         self._econ_last: dict[str, dict] = {}
         self._last_share: dict[str, float] = {}
+        from engine.flow_stats import FlowStats
+        # Observed public trade flow, used to estimate fill rate before we
+        # have any fills of our own.
+        self.flow_stats = FlowStats()
         self._snapshot_persist_failures: int = 0  # Architect audit: track silent drops
         # Futures fair-value cache (Quant audit): {prefix: (price, fetched_ts)}
         # Refreshed every 60s to match futures-feed.timer cadence.
@@ -1473,8 +1477,16 @@ class PaperRunner:
             horizon = 86400.0
             if p.end_ts is not None:
                 horizon = max(60.0, min(horizon, p.end_ts - time.time()))
+            # Candidate sizes. Multiples of the sizer's output explore
+            # "quote less"; the QUALIFYING size is what makes the reward
+            # term non-zero at all. LIP pays only when our depth helps the
+            # book reach the program's target, so a candidate set that never
+            # reaches it can only ever price a reward of ~zero and will
+            # reject every market for the wrong reason.
+            qualifying = max(1, int(p.target_size) - top)
             sizes = sorted({max(1, size // 4), max(1, size // 2), size,
-                            int(size * 1.5)})
+                            int(size * 1.5), qualifying,
+                            int(qualifying * 1.25) + 1})
             cands = [QuoteCandidate(n, yes_bid_c, no_bid_c) for n in sizes]
             cands.append(QuoteCandidate(0, None, None))
             avail = Decimal(str(self.account.available_usd()))
@@ -1492,7 +1504,10 @@ class PaperRunner:
                 hours_to_settle=hours_settle,
                 calibration=self._calibration_for(book.market_ticker),
                 observed_share=self._observed_share(book.market_ticker),
-                expected_fills_per_horizon=self._expected_fills(book.market_ticker),
+                # Estimated per candidate size inside select(); this is the
+                # reference estimate for the sizer-derived candidate.
+                expected_fills_per_horizon=self._expected_fills(
+                    book.market_ticker, size, horizon, queue_depth=top),
                 fee_schedule=self._fee_schedule(),
             )
         except Exception as e:
@@ -1523,14 +1538,27 @@ class PaperRunner:
         vals = [v for v in [self._last_share.get(ticker)] if v is not None]
         return float(vals[0]) if vals else None
 
-    def _expected_fills(self, ticker: str):
-        """Fills per day observed for this market, or None. Unknown stays
-        unknown: the economics module prices that explicitly."""
+    def _expected_fills(self, ticker: str, size: float = 0.0,
+                        horizon_sec: float = 86400.0,
+                        queue_depth: float = 0.0):
+        """Expected full-size fills over the horizon.
+
+        Prefers our OWN realized fills once we have any. Otherwise uses the
+        market's observed public trade flow, which is measurable before we
+        have ever quoted — the placeholder it replaces (one full fill per
+        horizon) was an arbitrary constant that dominated every decision and
+        made the system refuse to quote, which meant it could never learn
+        the real rate. Still None when nothing has been observed: unknown
+        stays unknown."""
         n = self.fill_counts.get(ticker, 0)
         elapsed = max(1.0, time.time() - self.start_time)
-        if n <= 0:
+        if n > 0:
+            return float(n) * horizon_sec / elapsed
+        try:
+            return self.flow_stats.expected_fills(
+                ticker, size or 1.0, horizon_sec, queue_depth=queue_depth)
+        except Exception:
             return None
-        return float(n) * 86400.0 / elapsed
 
     def _qualification_adjust(self, book: BookState, p: ProgramParams,
                               yes_bid_c: int, no_bid_c: int, size: int,

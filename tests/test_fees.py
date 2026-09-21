@@ -38,8 +38,8 @@ def _restore_schedule():
 
 class TestFormula:
     def test_documented_form_at_fifty_cents(self):
-        # 0.07 x 10 x 0.5 x 0.5 = 0.175 dollars = 17.5c -> ceil 18c
-        assert fee_usd(50, 10) == D("0.18")
+        # 0.07 x 10 x 0.5 x 0.5 = $0.175, and ceil to $0.000001 leaves it.
+        assert fee_usd(50, 10) == D("0.1750")
 
     def test_quadratic_vanishes_at_the_edges(self):
         """P(1-P) is largest at 50c and ~0 near 0 and 100."""
@@ -56,38 +56,51 @@ class TestFormula:
         assert fee_usd(50, -5) == D("0")
 
 
-class TestRoundUp:
-    def test_round_up_is_applied(self):
-        """The defect: documented as ceil, implemented nowhere."""
-        # 1 contract @ 50c: raw 1.75c -> 2c
-        assert fee_usd(50, 1) == D("0.02")
+class TestRounding:
+    """VERIFIED 2026-09-20 against docs.kalshi.com/getting_started/fee_rounding:
+    the trade fee is ceil_6dp(model_fee) — rounded up to the nearest
+    $0.000001. NOT to the next whole cent.
 
-    def test_round_up_dominates_small_fills(self):
-        """1 contract at 5c costs 0.3325c raw; the ceiling makes it 1c —
-        a ~3x understatement if you skip it, and far worse in aggregate."""
-        raw = KALSHI_UNVERIFIED.rate * 1 * D("0.05") * D("0.95") * 100
-        assert raw < D("0.34")
-        assert fee_usd(5, 1) == D("0.01")
+    This repo briefly implemented ceil-to-cent from a code comment. For the
+    small fills a LIP maker actually gets, that rounding IS the fee: one
+    contract at 5c costs $0.003325, which cent-rounding inflates to $0.01,
+    a 3x overstatement. The repo had swung from understating fees to
+    overstating them, and both distort the decision to quote.
+    """
 
-    def test_unrounded_schedule_differs(self):
-        unrounded = FeeSchedule(name="t", rate=D("0.07"), source="test",
-                                round_up_to_cent=False)
-        assert unrounded.fee_usd(50, 1) == D("0.0175")
-        assert KALSHI_UNVERIFIED.fee_usd(50, 1) == D("0.02")
+    def test_default_rounds_to_a_millionth_of_a_dollar(self):
+        assert KALSHI_UNVERIFIED.describe()["rounding"] == "ceil_6dp"
 
-    def test_per_fill_rounding_beats_aggregate_rounding(self):
-        """Ten 1-contract fills cost more than one 10-contract fill. Any
-        code that sums contracts first and rounds once understates."""
-        ten_singles = sum((fee_usd(50, 1) for _ in range(10)), D(0))
-        one_block = fee_usd(50, 10)
-        assert ten_singles == D("0.20") and one_block == D("0.18")
-        assert ten_singles > one_block
+    def test_ceiling_is_applied_at_six_decimal_places(self):
+        # 1 contract @5c: 0.07 * 0.05 * 0.95 = $0.003325 exactly.
+        assert fee_usd(5, 1) == D("0.003325")
+
+    def test_a_sub_micro_fee_is_rounded_up_not_down(self):
+        tiny = FeeSchedule(name="t", rate=D("0.0000001"), source="test")
+        f = tiny.fee_usd(50, 1)
+        assert f > 0, "a non-zero fee was rounded away to nothing"
+        assert f == D("0.000001")
+
+    def test_cent_rounding_is_available_but_is_not_the_venue_rule(self):
+        """Kept only so the wrong assumption can be A/B'd against."""
+        cent = FeeSchedule(name="t", rate=D("0.07"), source="test",
+                           round_up_to_cent=True)
+        assert cent.fee_usd(5, 1) == D("0.01")
+        assert cent.fee_usd(5, 1) > KALSHI_UNVERIFIED.fee_usd(5, 1)
+
+    def test_unrounded_schedule_differs_only_below_a_millionth(self):
+        raw = FeeSchedule(name="t", rate=D("0.07"), source="test",
+                          rounding="none")
+        assert raw.fee_usd(50, 1) == D("0.0175")
+        assert KALSHI_UNVERIFIED.fee_usd(50, 1) == D("0.0175")
 
 
 class TestProvenance:
-    def test_default_schedule_is_not_verified(self):
+    def test_rate_is_still_not_verified(self):
+        """Rounding and maker-charging are verified; the RATE is not, and a
+        conservative assumption must not be promoted to a verified fact."""
         assert KALSHI_UNVERIFIED.verified is False
-        assert "egress blocked" in KALSHI_UNVERIFIED.source
+        assert "RATE unverified" in KALSHI_UNVERIFIED.source
 
     def test_require_verified_refuses_to_guess(self):
         with pytest.raises(UnverifiedFeeSchedule, match="unverified"):
@@ -99,7 +112,7 @@ class TestProvenance:
         fees.set_schedule(FeeSchedule(name="confirmed", rate=D("0.07"),
                                       source="operator confirmed", verified=True,
                                       verified_at="2026-09-21"))
-        assert fee_usd(50, 10, require_verified=True) == D("0.18")
+        assert fee_usd(50, 10, require_verified=True) == D("0.1750")
         assert provenance_warning() is None
 
     def test_warning_names_the_schedule(self):
@@ -108,25 +121,27 @@ class TestProvenance:
 
     def test_describe_carries_the_audit_fields(self):
         d = KALSHI_UNVERIFIED.describe()
-        assert d["verified"] is False and d["round_up_to_cent"] is True
+        assert d["verified"] is False and d["rounding"] == "ceil_6dp"
         assert d["charge_maker"] is True and d["source"]
 
 
 class TestMakerAssumption:
-    def test_default_is_conservative_and_charges_makers(self):
-        """The replaced assumption was fee-free makers, which inflates net
-        yield. Default now assumes we pay."""
+    def test_makers_are_charged_and_this_is_verified(self):
+        """VERIFIED against help.kalshi.com: 'Maker fees are charged for
+        orders placed that are not immediately matched and are instead left
+        as resting orders on the orderbook.' This refutes the repo's uncited
+        'LIP maker orders are fee-free per Kalshi'."""
         assert KALSHI_UNVERIFIED.charge_maker is True
         assert fee_usd(50, 10, is_taker=False) > 0
 
     def test_legacy_free_maker_schedule_available_for_ab(self):
         fees.set_schedule(ASSUME_FREE_MAKER)
         assert fee_usd(50, 10, is_taker=False) == D("0")
-        assert fee_usd(50, 10, is_taker=True) == D("0.18")   # takers still pay
+        assert fee_usd(50, 10, is_taker=True) == D("0.1750")
 
     def test_round_trip_charges_entry_and_exit(self):
         rt = round_trip_usd(50, 50, 10)
-        assert rt == D("0.36")      # maker in, taker out
+        assert rt == D("0.3500")     # maker in, taker out
 
 
 class TestNetYieldNoLongerAssumesZero:
@@ -153,10 +168,24 @@ class TestNetYieldNoLongerAssumesZero:
         total = _day_fees_usd(conn, "2026-09-20")
         assert total > 0
 
-    def test_each_fill_is_rounded_separately(self, tmp_path):
+    def test_fees_are_computed_per_fill_not_on_a_summed_position(self, tmp_path):
+        """Each fill is charged separately. Under the VERIFIED ceil_6dp rule
+        that happens to agree with charging the block at ordinary prices —
+        the two diverged only under the cent-rounding this repo briefly and
+        wrongly used. The property being pinned is that the logger iterates
+        fills; the arithmetic agreeing here is a fact about the rule, not an
+        excuse to sum contracts first."""
         from tools.net_yield_logger import _day_fees_usd
-        conn = self._db(tmp_path, [("yes", 1, 50, 50, 0)] * 10)
-        assert _day_fees_usd(conn, "2026-09-20") == D("0.20")   # not 0.18
+        singles = self._db(tmp_path, [("yes", 1, 50, 50, 0)] * 10)
+        assert _day_fees_usd(singles, "2026-09-20") == D("0.17500")
+
+    def test_per_fill_rounding_still_bites_below_a_millionth(self):
+        """Where the ceiling does apply, ten small fills cost more than one
+        block — so summing first would still understate."""
+        tiny = FeeSchedule(name="t", rate=D("0.0000001"), source="test")
+        ten = sum((tiny.fee_usd(50, 1) for _ in range(10)), D(0))
+        one = tiny.fee_usd(50, 10)
+        assert ten > one
 
     def test_other_days_excluded(self, tmp_path):
         from tools.net_yield_logger import _day_fees_usd

@@ -100,14 +100,34 @@ class TestSizeRule:
 
 
 class TestCostAwareness:
-    def test_tiny_exposure_at_an_extreme_price_not_worth_the_fee(self):
-        """Rule 3: never pay more to exit than the exposure is worth.
+    def test_cost_guard_does_not_bind_under_the_verified_fee_rule(self):
+        """Rule 3 still exists, but at the real fee it is structurally slack.
 
-        1 contract with the reducing side bid at 2c: the round-up makes the
-        fee 1c against 2c of exposure — half the position's value to close
-        it. Holding is cheaper."""
+        This test previously asserted the opposite. It relied on the repo's
+        cent-rounding, which put a 1c floor under a fee of $0.001372 and made
+        a 1-contract exit at 2c look like it cost half the position. Kalshi's
+        actual rule (VERIFIED: ceil to $0.000001) has no such floor.
+
+        With fee = rate x C x P x (1-P) and notional = P x C, the ratio the
+        guard tests is exactly rate x (1 - P), which at rate 0.07 can never
+        exceed 7% — below the 25% threshold at every price. So under this
+        schedule the guard cannot fire, and the correct behaviour for a stale
+        1-contract position at 2c is to EXIT it.
+        """
         d = _eval(_pos(yes=1, age_sec=3601), no_bid=2,
                   schedule=fees.KALSHI_UNVERIFIED)
+        assert d, "a cheap exit was blocked by a guard that cannot bind"
+        assert d.reason.startswith("max_holding_age")
+
+    def test_cost_guard_still_blocks_under_a_schedule_that_makes_exits_dear(self):
+        """The guard is not dead code — it binds whenever a schedule puts a
+        floor under small fees, which is what a flat or rounded fee does."""
+        from engine.fees import FeeSchedule
+        from decimal import Decimal as _D
+        dear = FeeSchedule(name="rounded_legacy", rate=_D("0.07"),
+                           source="pre-2026-09-20 cent rounding",
+                           round_up_to_cent=True)
+        d = _eval(_pos(yes=1, age_sec=3601), no_bid=2, schedule=dear)
         assert not d and "holding is cheaper" in d.reason
 
     def test_small_exposure_at_mid_price_is_still_worth_exiting(self):

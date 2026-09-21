@@ -1,0 +1,25 @@
+{
+  "captured_utc": "2026-09-21T03:33:01.083873+00:00",
+  "verified": {
+    "maker_fills_are_charged": {
+      "value": true,
+      "source": "https://help.kalshi.com/en/articles/13823805-fees",
+      "quote": "Maker fees are charged for orders placed that are not immediately matched and are instead left as resting orders on the orderbook. These fees are only charged when a trade is ultimately executed, there are no fees associated with canceling a resting order.",
+      "implication": "Refutes tools/net_yield_logger.py:109 ('LIP maker orders are fee-free per Kalshi', uncited). The conservative default charge_maker=True is correct and now has a source."
+    },
+    "fee_rounding": {
+      "value": "ceil to $0.000001 (6dp), NOT to the whole cent",
+      "source": "https://docs.kalshi.com/getting_started/fee_rounding",
+      "quote": "Trade fee: ceil_6dp(model_fee) - rounded up to the nearest $0.000001. Aligned change: floor_precision(revenue - trade_fee) floored to the user's target balance precision ($0.01 for non-direct members). Rounding fee = (revenue - trade_fee) - aligned_change. Net fee = trade fee + rounding fee - rebate, constrained non-negative.",
+      "implication": "engine/fees.py rounded each fill UP TO THE NEXT WHOLE CENT. For the small fills a LIP maker gets that is the dominant term and overstates cost by orders of magnitude (1 contract @5c: 0.3325c raw -> 1c). The repo swung from understating fees to overstating them."
+    }
+  },
+  "not_verified": {
+    "fee_rate_constant": {
+      "repo_value": "0.07",
+      "status": "UNVERIFIED",
+      "reason": "kalshi.com/docs/kalshi-fee-schedule.pdf returned HTTP 429 (rate limited) on repeated attempts. A search summary reported tier-0 maker 5.0bps / taker 12.0bps, but that is a summary, may describe the perps schedule, and is not a verbatim reading of the schedule. Not promoted.",
+      "consequence": "verified=False stands. Any profitability number remains fee-assumption-dependent and must say so."
+    }
+  }
+}
