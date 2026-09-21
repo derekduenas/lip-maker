@@ -42,6 +42,11 @@ T0 = 1_800_000_000.0
 
 # ── fixtures ──────────────────────────────────────────────────────────────
 
+def _iso_utc(ts: float) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     path = tmp_path / "rev.db"
@@ -90,6 +95,14 @@ def runner(db):
     r._is_blacklisted = MagicMock(return_value=False)
     r.qm.reconcile = MagicMock(return_value={"action": "ok"})
     r.last_complete_scan_ts = time.time()      # freshness gate satisfied
+    # Deterministic settlement clock. The runner asks the venue for
+    # close_time; an unknown close is (correctly) refused, which would
+    # otherwise mask every other skip reason under test.
+    from engine.market_clock import MarketClock
+    now = time.time()
+    r.market_clock = MarketClock(fetcher=lambda t: {
+        "open_time": _iso_utc(now - 3600),
+        "close_time": _iso_utc(now + 6 * 3600)})
     return r
 
 

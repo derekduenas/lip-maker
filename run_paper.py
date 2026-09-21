@@ -229,6 +229,15 @@ class PaperRunner:
         self.econ_rejects: int = 0
         self._econ_last: dict[str, dict] = {}
         self._last_share: dict[str, float] = {}
+        from engine.market_clock import MarketClock
+        from engine.entry_cutoff import POLICY_CONTROL
+        # The SETTLEMENT clock, from the venue. Distinct from reward expiry.
+        self.market_clock = MarketClock()
+        self.unknown_close_skips: int = 0
+        # Entry-cutoff policy. Defaults to the EXISTING live risk control so
+        # nothing changes unless a paper experiment sets it explicitly.
+        self.entry_cutoff_policy: str = POLICY_CONTROL
+        self._cutoff_seen: dict[str, float] = {}
         from engine.flow_stats import FlowStats
         # Observed public trade flow, used to estimate fill rate before we
         # have any fills of our own.
@@ -294,8 +303,29 @@ class PaperRunner:
         _log.info(f"blacklist: cancelled quotes for {ticker}")
 
     def _minutes_until_settle(self, ticker: str) -> float | None:
+        """Minutes until the CONTRACT closes, from the venue.
+
+        2026-09-21: this used to be `_minutes_until_settle_from_ticker`,
+        a regex over the ticker string. Measured against the API on live
+        markets it was wrong by days on some tickers and returned None on
+        others — and None meant the pre-settlement gate silently did not
+        fire while the economics assumed 24 hours to settle. The venue's
+        own close_time is authoritative; None now means UNKNOWN and callers
+        must treat it as unknown, never as 'far away'.
+
+        This is the SETTLEMENT clock. Reward expiry is a different clock
+        (`_program_window_reason`) and must not be substituted for it.
+        """
+        return self.market_clock.minutes_until_close(
+            ticker, ticker_parse=self._minutes_until_settle_from_ticker)
+
+    def _minutes_until_settle_from_ticker(self, ticker: str) -> float | None:
         """#104 — parse close time from ticker name. Returns minutes until
-        settle, or None if can't parse. Used by pre-settlement closing.
+        settle, or None if can't parse.
+
+        RETAINED AS A LABELLED FALLBACK ONLY (off by default). Measured
+        errors on live tickers: -4.1m vs 10,106m actual; 9,835m vs 10,676m
+        actual; None vs 10.9m actual.
 
         Format examples:
           KXBRENTD-26APR2817-T103     → Apr 28 2026 17:00 ET → 21:00 UTC
@@ -1002,6 +1032,19 @@ class PaperRunner:
         except Exception:
             return None
 
+    def _entry_cutoff_min(self, ticker: str, mins_until: float) -> float:
+        """Minutes before CLOSE at which new reward-driven entries stop.
+
+        Settlement clock only. Reward expiry is handled separately by
+        _program_window_reason, and neither stops inventory management.
+        """
+        from engine.entry_cutoff import cutoff_minutes
+        ct = self.market_clock.close_time(ticker)
+        d = self.market_clock.close_time(ticker).duration_min
+        dec = cutoff_minutes(self.entry_cutoff_policy, d)
+        self._cutoff_seen[ticker] = dec.cutoff_min
+        return dec.cutoff_min
+
     # ── Program registry (P5b) ────────────────────────────────────────
     @staticmethod
     def _akey(params: ProgramParams) -> str:
@@ -1282,7 +1325,13 @@ class PaperRunner:
         # X min before close. Heartbeat already cancelled; this prevents
         # a book update from immediately triggering a fresh placement.
         mins_until = self._minutes_until_settle(book.market_ticker)
-        if mins_until is not None and 0 < mins_until <= settings.PRE_SETTLEMENT_CANCEL_MIN:
+        if mins_until is None:
+            # UNKNOWN settlement time. Previously this fell through to
+            # quoting with a 24-hour assumption baked into the economics.
+            # We do not know the settlement risk, so we do not take it.
+            self.unknown_close_skips += 1
+            return self._skip(tkr, "settlement_time_unknown")
+        if 0 < mins_until <= self._entry_cutoff_min(tkr, mins_until):
             return self._skip(tkr, "pre_settlement")
 
         # #98 Tick backoff: skip reprice when best is moving fast. Don't

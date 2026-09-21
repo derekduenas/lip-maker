@@ -192,3 +192,29 @@ def test_exit_never_increases_exposure(runner, db):
                    no_qty=Decimal("0"), oldest_fill_ts=0.0)
     assert reduces_exposure(pos, "no", Decimal("10")) is True
     assert reduces_exposure(pos, "yes", Decimal("10")) is False
+
+
+# ── neither clock may disable inventory management ────────────────────────
+
+def test_reward_expiry_does_not_disable_inventory_management(runner, db):
+    """Reward expiry stops reward-driven ENTRY. It is not a settlement
+    event and it does not make a position disappear."""
+    _fill(db, "yes", 40, 10_000)
+    p = runner.params_by_ticker[TKR]
+    # Program window ended an hour ago; the contract is untouched.
+    object.__setattr__(p, "end_ts", time.time() - 3600) if hasattr(p, "__dataclass_fields__") else None
+    p.end_ts = time.time() - 3600
+    assert runner._program_window_reason(p, time.time()) is not None, \
+        "expected the reward window to read as expired"
+    out = runner.manage_exits(time.time())
+    assert out["checked"] == 1 and out["exits"] == 1, \
+        "inventory stopped being managed when the reward window closed"
+
+
+def test_settlement_cutoff_does_not_disable_inventory_management(runner, db):
+    """Being inside the entry cutoff stops new entries, not unwinding."""
+    from engine.entry_cutoff import POLICY_CONTROL
+    _fill(db, "yes", 40, 10_000)
+    runner.entry_cutoff_policy = POLICY_CONTROL
+    out = runner.manage_exits(time.time())
+    assert out["exits"] == 1
