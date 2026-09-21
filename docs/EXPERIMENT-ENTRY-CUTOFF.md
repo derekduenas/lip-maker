@@ -270,3 +270,38 @@ shows the strategy losing money on its merits. It shows:
 None of those is a verdict about the edge. The next measurement is
 prospective observation of the feasible candidates over complete incentive
 windows.
+
+## The bankroll setting explains the entire result
+
+`config/settings.py` documents the intended value itself:
+
+> `BANKROLL_USD` drives all risk caps. Read from `LIP_BANKROLL` env if set,
+> else fall back to a floor of $80 (current starting point). **After a
+> deposit, set env: `LIP_BANKROLL=5000` in lip-maker.service.**
+
+Same census, same 50-market book budget, minutes apart, only the env var
+differing:
+
+| bankroll | two-sided books | sentinel-feasible |
+|---|---|---|
+| `$80` (LIP_BANKROLL unset) | 41 | **3** |
+| `$5,000` (documented value) | 41 | **41** |
+
+At $5,000 every two-sided market in the sample admits a legal quote, with
+legal sizes of ~505 contracts, and the richest programs by pool rate become
+reachable: `KXTRUMPAPPROVE-26SEP21-*` at 0.068 $/sec (~$5,890/day pool,
+target 1,000).
+
+So the "zero quotes" result across this entire round was **not** the entry
+cutoff, and **not** the economics. It was the sentinel sizing against an $80
+bankroll while the experiment funded a $5,000 account.
+
+Nothing here changes that default. `LIP_BANKROLL` is an operator setting
+and every sentinel cap — gross, per-market, per-series, daily loss — scales
+from it.
+
+### One caution on stability
+
+Two censuses minutes apart at the same $80 bankroll returned 9 and then 3
+feasible markets. The feasible set moves with the spread, so any candidate
+list is a snapshot, not a standing inventory.
