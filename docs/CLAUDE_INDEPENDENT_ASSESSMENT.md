@@ -398,3 +398,99 @@ already requires `program_id` on every event and groups by
 `(market, program_id)` — the operating side should adopt that key. Doing so
 also lets the P4b exit policy attribute unwinds to the right program, which
 is why the two belong together.
+
+## 7. Continuation 2026-09-20 — the system was run against real market data
+
+Status table from §6 is superseded.
+
+| Item | Commit | State |
+|---|---|---|
+| P5b program-aware attribution | `6bdde1b` | done |
+| Maker safety corrected + live interlock | `e9cf60a` | done |
+| Shared-account audit | `8e285c4` | done |
+| P4b exit policy WIRED into the runner | `e430f6a` | done |
+| Economic selection connected to quoting | `5ff9f5b` | done |
+| One command, real data, causal fills | `c3aab76` | done |
+| P6 complete-period validation | — | still blocked: needs payment records |
+
+Suite 562 → 638, 0 failures.
+
+### Egress is NOT blocked — §0 was wrong about this machine
+
+docs.kalshi.com is reachable from here. Everything §4 listed as
+"cannot verify here" was verifiable, and verifying it changed real numbers.
+Recorded with provenance under `docs/venue_evidence/`.
+
+- `post_only` **exists** on `CreateOrderRequest` (OpenAPI v3.30.0). The
+  field name was right; `MAKER_ONLY_VERIFIED=False` was too pessimistic
+  about the field.
+- `no_self_trade` is **not in the schema at all**. The current field is
+  `self_trade_prevention_type` (`taker_at_cross`|`maker`).
+- `time_in_force` is an enum; `venue/kalshi.py` sent `"GTC"`, **not an
+  accepted value** — a live order from that path would have been rejected.
+- Maker fills **are charged**. This refutes `net_yield_logger.py:109`'s
+  uncited "fee-free per Kalshi".
+- Fee rounding is **ceil to $0.000001**, not to the next whole cent. §V7
+  correctly said the round-up was implemented nowhere; the fix implemented
+  the wrong round-up, overstating small fills ~3x.
+- The fee **rate** (`0.07`) is still unverified — the schedule PDF returns
+  429 — so `verified=False` stands.
+
+### The correction that matters
+
+A local non-crossing check **cannot guarantee maker execution**: it reads
+the book we last saw, and the order executes on arrival. The module called
+this "proven non-crossing" and made it primary. It is a *preflight*.
+`post_only`'s enforcement semantics for orders are undocumented, so
+`require_live_execution_allowed()` now blocks live transmission on both
+paths until a real rejection is observed.
+
+### What the real-data runs found
+
+Three sessions against live Kalshi (reports in `data/captures/`). 206,274
+programs discovered; 1,000+ real trades observed; **zero orders placed**.
+
+Two defects in the first cut of the economic layer, both found only by
+running it:
+
+1. **Candidates never included a qualifying size.** Sizes were multiples of
+   the sizer's output. On a program with `target_size` 1000 against 70
+   resting, `qualify_prob` was ~0.0001 and the reward term rounded to
+   nothing — every market rejected for the wrong reason.
+2. **An arbitrary fill-rate constant was deciding everything.** Unknown
+   meant "one full fill of the whole quote", which charges a full round
+   trip at qualifying size. Nothing was quoted; because nothing was quoted,
+   the rate could never be learned. `engine/flow_stats.py` now measures it
+   from public trade volume: `fills = volume / (queue_ahead + size)`.
+
+With both fixed, candidates net **positive** (+$0.58 at 90 contracts) and
+the layer resizes instead of refusing.
+
+### The headline finding, and the next testable change
+
+Ranking markets by **total pool** selects long-dated 2027 programs whose
+per-second reward rate rounds to nothing. Ranking by pool **rate** selects
+15-minute commodity and crypto markets paying ~70x more per second.
+
+But those are then refused by `PRE_SETTLEMENT_CANCEL_MIN = 30`. Measured
+against the live universe (4,600 open programs):
+
+> **90 of the top 100 programs by reward rate have windows shorter than 30
+> minutes, so the pre-settlement gate makes them permanently unquotable.**
+
+The strategy's best-paying opportunities are structurally excluded by one
+risk constant. That is a deliberate risk control and changing it is an
+operator decision, not a code change to make unilaterally.
+
+**Specific, testable improvement:** make the pre-settlement buffer a
+fraction of the program window rather than an absolute 30 minutes (e.g.
+cancel at the later of T-60s or 20% of the window), then measure realized
+adverse selection on 15-minute markets against the longer-dated control.
+The hypothesis is falsifiable: if short-window inventory is more toxic than
+the extra reward rate pays for, the constant was right.
+
+### Still true
+
+No profitability has been established, and nothing here attempts to. Zero
+orders were placed, so there is no realized P&L to report — only the
+demonstrated refusals and the reasons for them. Rewards remain estimates.
