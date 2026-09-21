@@ -161,13 +161,20 @@ class AccountLedger:
 
     # ── reservations ─────────────────────────────────────────────────
     def reserve(self, order_id: str, *, market: str, program_id: str,
-                price_cents, quantity, ts_ms: Optional[int] = None) -> Decimal:
+                price_cents, quantity, ts_ms: Optional[int] = None,
+                fee_allowance_usd=ZERO) -> Decimal:
         """Hold capital for an order about to rest. Raises InsufficientCapital.
 
         Idempotent by order_id: re-reserving the same id adjusts the existing
         hold rather than double-counting, so a retried placement cannot
-        silently consume the account twice."""
-        amount = contract_cost_usd(price_cents, quantity)
+        silently consume the account twice.
+
+        `fee_allowance_usd` is held ON TOP of the premium (2026-09-20 audit).
+        A binary's collateral is exact, but the fee is not part of it, so an
+        account reserving premium alone can be short the fee at fill time and
+        overstate what is available to other markets.
+        """
+        amount = contract_cost_usd(price_cents, quantity) + Decimal(str(fee_allowance_usd))
         with self._lock:
             prior = self._reservations.get(order_id)
             delta = amount - (prior.amount_usd if prior else ZERO)

@@ -49,6 +49,7 @@ from execution.order_request import (
     build_limit_order, require_live_execution_allowed, would_cross,
 )
 from engine.account_ledger import AccountLedger, InsufficientCapital
+from engine.fees import fee_usd
 
 _log = logging.getLogger(__name__)
 
@@ -174,6 +175,11 @@ class QuoteManager:
         self.capital_refusals: int = 0
         # Live placements refused because maker enforcement is unverified.
         self.live_blocked: int = 0
+        # Submissions whose outcome we do not know (transport failed after
+        # the request may have been accepted). Their capital stays reserved
+        # until reconciliation proves the order does not exist.
+        self.submit_unknown: int = 0
+        self._unknown_submissions: dict[str, tuple[str, float]] = {}
         # 2026-04-25 COLD-BOOT RECONCILIATION: rehydrate self.resting from
         # Kalshi's actual order book on init. Without this, a service
         # restart leaves us blind to live orders → next reconcile() places
@@ -343,6 +349,12 @@ class QuoteManager:
                         phantoms += 1
                         self._tombstone(o.order_id)
                         self._update_quote_status(o.order_id, "cancelled", notes="resync_gone")
+                        # 2026-09-20 audit: this is the AUTHORITATIVE moment
+                        # the order is known not to exist, so its capital is
+                        # freed here. Without this the reservation outlived
+                        # the order and the shared account starved.
+                        if o.client_order_id:
+                            self._release_capital(o.client_order_id)
                         continue
                     seen.add(o.order_id)
                     changed = False
@@ -376,6 +388,25 @@ class QuoteManager:
             if phantoms or updated or added or kept_local:
                 _log.info(f"periodic_resync: phantoms={phantoms} updated={updated} "
                           f"added={added} kept_local={kept_local} live={len(live)}")
+            # Resolve submissions whose outcome was unknown. The venue view
+            # is authoritative: a coid absent from it never rested, so its
+            # held capital is released now. One present was adopted above and
+            # keeps its reservation (same coid key).
+            if self._unknown_submissions:
+                live_coids = {lo.client_order_id for lo in live.values()
+                              if lo.client_order_id}
+                for coid in list(self._unknown_submissions):
+                    if coid in live_coids:
+                        self._unknown_submissions.pop(coid, None)
+                        _log.warning(f"unknown submission {coid} RESOLVED: the "
+                                     "order does exist; reservation retained")
+                        continue
+                    tkr, _ts = self._unknown_submissions.pop(coid)
+                    self._release_capital(coid)
+                    self._update_quote_status(coid, "cancelled",
+                                              notes="submit_unknown_resolved_absent")
+                    _log.info(f"unknown submission {coid} RESOLVED: absent from "
+                              f"venue for {tkr}; reservation released")
             self.uncertain_markets = set(self._fill_persistence_failed.values())
             self.inventory.clear()  # ledger-backed inventory must be re-read
             self._state_generation += 1
@@ -887,10 +918,19 @@ class QuoteManager:
         # not have; per-market gross caps never could.
         if self.account is not None:
             try:
+                # Hold the maker fee alongside the premium. A resting LIP
+                # order is intended to be a maker fill; if the schedule says
+                # a maker pays nothing this is zero, but the allowance is
+                # taken from the fee module rather than assumed.
+                try:
+                    allowance = fee_usd(price_cents, size_contracts, is_taker=False)
+                except Exception:
+                    allowance = 0
                 self.account.reserve(coid, market=market_ticker,
                                      program_id=program_id or market_ticker,
                                      price_cents=price_cents,
-                                     quantity=size_contracts)
+                                     quantity=size_contracts,
+                                     fee_allowance_usd=allowance)
             except InsufficientCapital as e:
                 self.capital_refusals += 1
                 _log.warning(f"REFUSED {market_ticker} {side}@{price_cents}c "
@@ -945,10 +985,23 @@ class QuoteManager:
                 order_id = resp.get("order", {}).get("order_id", "")
                 _log.info(f"[LIVE] PLACED {market_ticker} {side}@{price_cents}c size={size_contracts} order_id={order_id}")
             except Exception as e:
-                _log.error(f"order placement failed for {market_ticker} {side}@{price_cents}: {e}")
+                # 2026-09-20 audit: an exception here does NOT prove the order
+                # failed to reach the exchange. A timeout or reset can occur
+                # AFTER acceptance, leaving a live resting order we do not
+                # know about. Releasing the reservation would let the account
+                # spend the same dollars twice.
+                #
+                # So: keep the hold, mark the market uncertain, and let
+                # reconciliation against the venue decide. Capital is
+                # released only by an authoritative outcome.
+                self.submit_unknown += 1
+                self.uncertain_markets.add(market_ticker)
+                self._unknown_submissions[coid] = (market_ticker, time.time())
+                _log.error(f"order placement UNKNOWN for {market_ticker} "
+                           f"{side}@{price_cents}c: {e} — reservation HELD "
+                           f"(coid={coid}), market marked uncertain")
                 self._log_quote_row(market_ticker, side, price_cents, size_contracts,
-                                      coid, "rejected", notes=str(e))
-                self._release_capital(coid)
+                                      coid, "unknown", notes=f"submit_unknown: {e}")
                 return None
 
         rest = RestingOrder(

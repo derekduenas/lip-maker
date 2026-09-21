@@ -225,10 +225,17 @@ class TestQuoteManagerIntegration:
         return qm
 
     def test_placement_reserves_capital(self, tmp_path, acct):
+        """Premium PLUS the maker fee allowance (2026-09-20 audit). A binary's
+        collateral is exact, but the fee is not part of it: reserving premium
+        alone leaves the account short at fill time and overstates what other
+        markets may spend."""
+        from engine.fees import fee_usd
         qm = self._qm(tmp_path, acct)
         r = qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
         assert r is not None
-        assert acct.state().reserved_usd == D("5.00")
+        expected = D("5.00") + fee_usd(50, 10, is_taker=False)
+        assert acct.state().reserved_usd == expected
+        assert expected >= D("5.00")
 
     def test_placement_refused_when_capital_exhausted(self, tmp_path):
         a = AccountLedger(opening_cash_usd=1, mode="paper")
@@ -239,8 +246,9 @@ class TestQuoteManagerIntegration:
 
     def test_cancel_releases_capital(self, tmp_path, acct):
         qm = self._qm(tmp_path, acct)
+        from engine.fees import fee_usd
         r = qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
-        assert acct.state().reserved_usd == D("5.00")
+        assert acct.state().reserved_usd == D("5.00") + fee_usd(50, 10, is_taker=False)
         qm._cancel_order(r)
         assert acct.state().reserved_usd == D(0)
         assert acct.available_usd() == D(5000)
