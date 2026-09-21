@@ -20,6 +20,40 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings
+from engine import fees as fee_schedule
+
+
+def _day_fees_usd(conn: sqlite3.Connection, day_iso: str):
+    """Fees actually incurred on `day_iso`, from the fill ledger.
+
+    Each fill is charged under the active schedule, per fill, so the
+    per-fill round-up to the next cent is applied where it belongs. Summing
+    a day's contracts and rounding once would understate it badly — the
+    round-up is the dominant term for small maker fills.
+    """
+    from decimal import Decimal
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(fill_ledger)").fetchall()}
+    except sqlite3.OperationalError:
+        return Decimal("0")
+    if not cols:
+        return Decimal("0")
+    qty = "COALESCE(count_real, count)" if "count_real" in cols else "count"
+    taker = "COALESCE(is_taker, 0)" if "is_taker" in cols else "0"
+    try:
+        rows = conn.execute(
+            f"""SELECT side, {qty}, yes_price_cents, no_price_cents, {taker}
+                  FROM fill_ledger
+                 WHERE substr(created_at, 1, 10) = ?""", (day_iso,)).fetchall()
+    except sqlite3.OperationalError:
+        return Decimal("0")
+    total = Decimal("0")
+    for side, n, yp, npc, is_taker in rows:
+        price = yp if (side or "").lower() == "yes" else npc
+        if price is None or n is None:
+            continue
+        total += fee_schedule.fee_usd(price, n, is_taker=bool(is_taker))
+    return total
 
 _log = logging.getLogger(__name__)
 
@@ -103,10 +137,16 @@ def snapshot(day: str | None = None, db_path: str = settings.DB_PATH) -> dict:
     exposure = row[2] or 0
     balance  = row[3] or 0
 
+
     # Rebate accrual for the day
     rebate = compute_rebate_accrual_for_day(day, db_path)
 
-    fees = 0.0  # LIP maker orders are fee-free per Kalshi
+    # 2026-09-21: this was `fees = 0.0  # LIP maker orders are fee-free per
+    # Kalshi` — an uncited assumption feeding the repo's headline net-yield
+    # metric. It is now computed from engine/fees.py, the single schedule
+    # with recorded provenance, over the day's actual fills. If that schedule
+    # is wrong the number is wrong by a stated amount rather than silently.
+    fees = float(_day_fees_usd(conn, day))
     tnp = realized + rebate - fees
 
     # 7-day trailing TNP (excluding today, to avoid chasing own tail)
