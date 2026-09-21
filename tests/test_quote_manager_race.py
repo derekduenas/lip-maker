@@ -40,7 +40,8 @@ def test_cancel_failure_skips_placement_and_flags_pending(monkeypatch):
     place_calls = []
 
     # best_opposing_bid_cents added 2026-09-21 (maker-safety contract).
-    def fake_place(ticker, side, price, size, best_opposing_bid_cents=None):
+    def fake_place(ticker, side, price, size, best_opposing_bid_cents=None,
+                   program_id=""):
         place_calls.append((ticker, side, price, size))
         return None
     monkeypatch.setattr(qm, "_place_order", fake_place)
@@ -69,7 +70,7 @@ def test_cancel_success_does_place(monkeypatch):
     monkeypatch.setattr(qm, "_cancel_order", lambda o: True)
     place_calls = []
     monkeypatch.setattr(qm, "_place_order",
-                        lambda t, s, p, sz, best_opposing_bid_cents=None:
+                        lambda t, s, p, sz, best_opposing_bid_cents=None, program_id="":
                             place_calls.append((t, s, p, sz)))
     monkeypatch.setattr(qm, "_passes_safety", lambda t: (True, "ok"))
     monkeypatch.setattr(qm, "_refresh_inventory", lambda mkt: None)

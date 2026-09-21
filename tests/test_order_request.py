@@ -176,7 +176,8 @@ class TestQuoteManagerUsesSharedContract:
         qm = self._qm(tmp_path, paper=True)
         seen = {}
 
-        def spy(ticker, side, price, size, best_opposing_bid_cents=None):
+        def spy(ticker, side, price, size, best_opposing_bid_cents=None,
+                program_id=""):
             seen[side] = best_opposing_bid_cents
             return None
         qm._place_order = spy

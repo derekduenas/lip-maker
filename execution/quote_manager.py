@@ -64,6 +64,10 @@ class QuoteTarget:
     # absorbing offsetting fills. None = use size_contracts.
     yes_size_override: Optional[int] = None
     no_size_override:  Optional[int] = None
+    # 2026-09-21 P5b: the binding program this order set is placed for. One
+    # physical order set serves every program on the ticker, so this is an
+    # attribution label on ledger events, not a second reservation.
+    program_id:        str = ""
 
     def yes_size(self) -> int:
         return self.yes_size_override if self.yes_size_override is not None else self.size_contracts
@@ -97,6 +101,11 @@ class RestingOrder:
     # Venue price was not on the whole-cent grid; price_cents is the nearest
     # cent for exposure math only — the order is never scored.
     price_off_grid: bool = False
+    # 2026-09-21 P5b: the incentive program this order set was placed for.
+    # Capital and inventory stay MARKET-level (one order, one reservation);
+    # this is the attribution label on the resulting ledger events. Reward
+    # attribution is computed per program from lip_snapshots, not from here.
+    program_id:     str = ""
 
     @property
     def is_ours(self) -> bool:
@@ -505,7 +514,8 @@ class QuoteManager:
                     try:
                         self.account.on_fill(
                             o.client_order_id or order_id,
-                            market=market_ticker, program_id=market_ticker,
+                            market=market_ticker,
+                            program_id=getattr(o, "program_id", "") or market_ticker,
                             side=o.side, price_cents=o.price_cents,
                             quantity=count, fee_usd=0, trade_id=trade_id)
                     except Exception as e:
@@ -927,6 +937,7 @@ class QuoteManager:
             order_id=order_id, market_ticker=market_ticker,
             side=side, price_cents=price_cents, size_contracts=float(size_contracts),
             placed_at=time.time(), paper=self.paper, client_order_id=coid,
+            program_id=program_id or "",
         )
         # #127 (2026-04-28) UPSERT semantics: drop any existing entry for
         # this (ticker, side) before appending. Prevents accumulation when
@@ -1106,7 +1117,8 @@ class QuoteManager:
                     # target: a YES buy crosses iff yes_bid + no_bid >= 100.
                     r = self._place_order(target.market_ticker, "yes",
                                            target.yes_bid_cents, yes_size,
-                                           best_opposing_bid_cents=target.no_bid_cents)
+                                           best_opposing_bid_cents=target.no_bid_cents,
+                                           program_id=target.program_id)
                     if r:
                         actions["placed"] += 1
                 else:
@@ -1144,7 +1156,8 @@ class QuoteManager:
                 if all_cancelled:
                     r = self._place_order(target.market_ticker, "no",
                                            target.no_bid_cents, no_size,
-                                           best_opposing_bid_cents=target.yes_bid_cents)
+                                           best_opposing_bid_cents=target.yes_bid_cents,
+                                           program_id=target.program_id)
                     if r:
                         actions["placed"] += 1
                 else:

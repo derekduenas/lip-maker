@@ -89,6 +89,7 @@ def _program_params_from_market(m: dict) -> ProgramParams:
     if pool is not None and secs_f > 0:
         return ProgramParams(
             market_ticker=m["market_ticker"],
+            program_id=str(m.get("id") or ""),
             target_size=float(m["target_size"]),
             discount_factor=float(m["discount_factor"]),
             period_reward_usd=float(pool),
@@ -97,6 +98,7 @@ def _program_params_from_market(m: dict) -> ProgramParams:
         )
     return ProgramParams(
         market_ticker=m["market_ticker"],
+        program_id=str(m.get("id") or ""),
         target_size=float(m["target_size"]),
         discount_factor=float(m["discount_factor"]),
         period_reward_usd=float(m["reward_per_day_usd"]),
@@ -157,10 +159,18 @@ class PaperRunner:
 
     def __init__(self, markets: list[dict]):
         self.markets = markets
-        self.params_by_ticker = {
-            m["market_ticker"]: _program_params_from_market(m)
-            for m in markets
-        }
+        # 2026-09-21 P5b: programs are keyed by /incentive_programs id, not
+        # by ticker. Two programs can cover one ticker with different
+        # windows, targets and pools; ticker-keyed state made them pool each
+        # other's history and each other's cap. Orders, reservations and
+        # inventory stay MARKET-level (one physical order set per ticker) so
+        # overlapping programs cannot double-reserve the shared account.
+        self.programs_by_id: dict[str, ProgramParams] = {}
+        self._ticker_programs: dict[str, list[str]] = {}
+        # Derived view: the binding program used for sizing/quoting decisions.
+        self.params_by_ticker: dict[str, ProgramParams] = {}
+        for _m in markets:
+            self._register_program(_program_params_from_market(_m))
         # 2026-09-20 audit #7: last skip reason per ticker from
         # _quote_target_for, so on_book_update can decide whether resting
         # orders must be pulled. Counts per reason for the summary line.
@@ -393,6 +403,21 @@ class PaperRunner:
                     conn.execute("ALTER TABLE lip_snapshots ADD COLUMN was_resting INTEGER DEFAULT 0")
                 if "our_share" not in cols:
                     conn.execute("ALTER TABLE lip_snapshots ADD COLUMN our_share REAL")
+                if "program_id" not in cols:
+                    # 2026-09-21 P5b. Rows written before this column exist
+                    # with program_id NULL. They are AMBIGUOUS: the ticker
+                    # alone cannot say which overlapping program earned
+                    # them, and inventing an attribution would manufacture
+                    # evidence. They stay NULL (quarantined) and are never
+                    # reported as any program's attributed reward.
+                    #
+                    # They ARE still counted when seeding a program's
+                    # cumulative cap. That direction is deliberate: counting
+                    # them raises accrued-to-date, which brings us closer to
+                    # the cap and makes us claim LESS future reward. The
+                    # opposite choice would let a migration silently reset a
+                    # cap that had already been partly consumed.
+                    conn.execute("ALTER TABLE lip_snapshots ADD COLUMN program_id TEXT")
                 conn.commit()
             finally:
                 conn.close()
@@ -526,7 +551,8 @@ class PaperRunner:
         )
 
     def _persist_snapshot(self, ticker: str, scored: ScoredMarket,
-                          params: ProgramParams, now: float) -> bool:
+                          params: ProgramParams, now: float,
+                          book: "BookState | None" = None) -> bool:
         """Write one lip_snapshots row (throttled to 1 per 5s per market).
 
         2026-09-20 review (interval accounting): estimated_payout_usd on row
@@ -543,31 +569,64 @@ class PaperRunner:
         if self._last_persist_key.get(ticker, -1) == key:
             return False
         self._last_persist_key[ticker] = key
-        st = self._accrual_for(ticker, params)
-        payout, _note = self._accrue(st, params, now)
-        st.last_ts = now
-        st.last_share = scored.share
-        r = scored.result
+
+        # P5b: one row PER PROGRAM. Overlapping programs judge the same
+        # order set by their own target_size and discount_factor, so each
+        # gets its own share, its own accrual chain and its own cap. The
+        # binding program reuses `scored`; any other program is re-scored
+        # against the same book under its own parameters, because a share
+        # computed at another program's target is not this program's share.
+        programs = self.programs_for(ticker) or [params]
+        binding_key = self._akey(params)
+        rows: list[tuple] = []
+        for prog in programs:
+            sc = scored
+            if self._akey(prog) != binding_key and book is not None:
+                try:
+                    sc = self._score_market(book, prog, target=None)
+                except Exception as e:      # never let attribution break the loop
+                    _log.warning(f"per-program rescore failed {ticker}/"
+                                 f"{self._akey(prog)}: {e}")
+                    continue
+            st = self._accrual_for(ticker, prog)
+            payout, _note = self._accrue(st, prog, now)
+            st.last_ts = now
+            st.last_share = sc.share
+            r = sc.result
+            rows.append((
+                ticker,
+                datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+                sc.raw_our_score,
+                r.yes_total_qualifying_score + r.no_total_qualifying_score,
+                1 if (sc.is_resting and r.yes_qualified) else 0,
+                1 if (sc.is_resting and r.no_qualified) else 0,
+                1 if (sc.is_resting and r.snapshot_valid) else 0,
+                payout,
+                1 if sc.is_resting else 0,
+                sc.share,
+                prog.program_id or None,
+            ))
         try:
             conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
             try:
-                conn.execute(
-                    """INSERT INTO lip_snapshots
-                       (market_ticker, captured_at, our_score, total_score,
-                        yes_qualified, no_qualified, snapshot_valid,
-                        estimated_payout_usd, was_resting, our_share)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (ticker,
-                     datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
-                     scored.raw_our_score,
-                     r.yes_total_qualifying_score + r.no_total_qualifying_score,
-                     1 if (scored.is_resting and r.yes_qualified) else 0,
-                     1 if (scored.is_resting and r.no_qualified) else 0,
-                     1 if (scored.is_resting and r.snapshot_valid) else 0,
-                     payout,
-                     1 if scored.is_resting else 0,
-                     scored.share),
-                )
+                cols = {c[1] for c in conn.execute(
+                    "PRAGMA table_info(lip_snapshots)").fetchall()}
+                if "program_id" in cols:
+                    conn.executemany(
+                        """INSERT INTO lip_snapshots
+                           (market_ticker, captured_at, our_score, total_score,
+                            yes_qualified, no_qualified, snapshot_valid,
+                            estimated_payout_usd, was_resting, our_share,
+                            program_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                else:
+                    conn.executemany(
+                        """INSERT INTO lip_snapshots
+                           (market_ticker, captured_at, our_score, total_score,
+                            yes_qualified, no_qualified, snapshot_valid,
+                            estimated_payout_usd, was_resting, our_share)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [r[:-1] for r in rows])
                 conn.commit()
             finally:
                 conn.close()
@@ -620,7 +679,11 @@ class PaperRunner:
         self._handle_skip(ticker, f"retired:{reason}", force=True)
         self.params_by_ticker.pop(ticker, None)
         self.optimal_size_floors.pop(ticker, None)
-        self._accrual.pop(ticker, None)
+        # P5b: drop EVERY program on this ticker, not one ticker-keyed entry.
+        for k in self._ticker_programs.pop(ticker, []):
+            self.programs_by_id.pop(k, None)
+            self._accrual.pop(k, None)
+        self._accrual.pop(ticker, None)   # legacy ticker-keyed state
         self.markets = [m for m in self.markets if m.get("market_ticker") != ticker]
         _log.info(f"retired {ticker}: {reason}")
 
@@ -699,17 +762,30 @@ class PaperRunner:
         `fresh - current`, so an existing ticker kept its stale parameters
         indefinitely. When the program WINDOW changes the accrual chain is
         reset (a new window means a new pool and a new cumulative cap)."""
-        changed = reprogrammed = 0
+        changed = reprogrammed = added = 0
         for m in markets:
             tkr = m.get("market_ticker")
-            old = self.params_by_ticker.get(tkr) if tkr else None
-            if old is None:
-                continue
+            if not tkr or tkr not in self._ticker_programs:
+                continue        # not a market we manage; discovery adds those
             new = _program_params_from_market(m)
+            key = self._akey(new)
+            old = self.programs_by_id.get(key)
+            if old is None:
+                # P5b: a SECOND program on a ticker we already quote. The
+                # old code overwrote params_by_ticker here, so one of two
+                # overlapping programs was silently discarded. Both are now
+                # registered and accrue independently.
+                self._register_program(new)
+                added += 1
+                _log.warning(f"refresh_params[{tkr}]: ADDITIONAL PROGRAM "
+                             f"{key} pool ${new.period_reward_usd:.2f} "
+                             f"target {new.target_size:g} — now "
+                             f"{len(self.programs_for(tkr))} programs on this ticker")
+                continue
             if new == old:
                 continue
             new_window = (new.start_ts != old.start_ts or new.end_ts != old.end_ts)
-            self.params_by_ticker[tkr] = new
+            self._register_program(new)
             for i, existing in enumerate(self.markets):
                 if existing.get("market_ticker") == tkr:
                     self.markets[i] = m
@@ -717,9 +793,9 @@ class PaperRunner:
             self.optimal_size_floors[tkr] = int(m.get("optimal_size_per_side", 0) or 0)
             changed += 1
             if new_window:
-                # Different program on the same ticker: the previous
-                # window's accrual and cap must not carry over.
-                self._accrual.pop(tkr, None)
+                # Same program id, different window: the previous window's
+                # accrual and cap must not carry over.
+                self._accrual.pop(key, None)
                 reprogrammed += 1
                 _log.warning(f"refresh_params[{tkr}]: NEW PROGRAM WINDOW "
                              f"pool ${old.period_reward_usd:.2f}→${new.period_reward_usd:.2f} "
@@ -728,7 +804,7 @@ class PaperRunner:
                 _log.info(f"refresh_params[{tkr}]: pool ${old.period_reward_usd:.2f}→"
                           f"${new.period_reward_usd:.2f} target {old.target_size:g}→"
                           f"{new.target_size:g} df {old.discount_factor:g}→{new.discount_factor:g}")
-        return {"changed": changed, "reprogrammed": reprogrammed}
+        return {"changed": changed, "reprogrammed": reprogrammed, "added": added}
 
     def on_fill(self, ev: FillEvent) -> str:
         """Apply an execution and immediately reconcile dependent state
@@ -768,30 +844,89 @@ class PaperRunner:
                 self._note_flat(ev.market_ticker)
         return status
 
+    # ── Program registry (P5b) ────────────────────────────────────────
+    @staticmethod
+    def _akey(params: ProgramParams) -> str:
+        """Accrual/attribution key. Falls back to the ticker only when the
+        discovery row carried no program id, so legacy callers still work —
+        such state is attributed to the ticker, never to a program."""
+        return params.program_id or params.market_ticker
+
+    def _register_program(self, params: ProgramParams) -> str:
+        """Add/replace one program. Overlapping programs on one ticker are
+        BOTH kept; the binding program (largest target) drives quoting."""
+        key = self._akey(params)
+        self.programs_by_id[key] = params
+        lst = self._ticker_programs.setdefault(params.market_ticker, [])
+        if key not in lst:
+            lst.append(key)
+        binding = self._binding_program(params.market_ticker)
+        if binding is not None:
+            self.params_by_ticker[params.market_ticker] = binding
+        return key
+
+    def programs_for(self, ticker: str) -> list[ProgramParams]:
+        """Every live program covering this ticker, registration order."""
+        return [self.programs_by_id[k]
+                for k in self._ticker_programs.get(ticker, ())
+                if k in self.programs_by_id]
+
+    def _binding_program(self, ticker: str) -> ProgramParams | None:
+        """The program our single order set must satisfy.
+
+        One physical order set serves every program on the ticker, so it is
+        sized to the most demanding qualifying target; a quote that meets the
+        largest target also meets the smaller ones. Reward is still accrued
+        per program under that program's own rules.
+        """
+        progs = self.programs_for(ticker)
+        if not progs:
+            return None
+        return max(progs, key=lambda q: (q.target_size, q.period_reward_usd))
+
+    def _program_keys(self, ticker: str) -> list[str]:
+        return [k for k in self._ticker_programs.get(ticker, ())
+                if k in self.programs_by_id]
+
     # ── Accrual chain bookkeeping ─────────────────────────────────────
     def _accrual_for(self, ticker: str, params: ProgramParams) -> AccrualState:
-        st = self._accrual.get(ticker)
+        """Accrual state for ONE program (P5b), not for the ticker."""
+        key = self._akey(params)
+        st = self._accrual.get(key)
         if st is None or st.program_key != params.start_ts:
             st = AccrualState(program_key=params.start_ts,
                               accrued_usd=self._seed_accrued(ticker, params))
-            self._accrual[ticker] = st
+            self._accrual[key] = st
         return st
 
     def _seed_accrued(self, ticker: str, params: ProgramParams) -> float:
-        """Cumulative estimate already written for this program window, so
-        the pool cap survives restarts."""
+        """Cumulative estimate already written for THIS program, so the pool
+        cap survives restarts (P5b).
+
+        Counts rows attributed to this program_id, plus legacy rows whose
+        program_id is NULL (pre-P5b, unattributable). Rows belonging to a
+        DIFFERENT program on the same ticker are excluded — that pooling was
+        the defect. See _ensure_snapshot_schema for why ambiguous rows still
+        count toward the cap.
+        """
+        pid = params.program_id or ""
         try:
             conn = sqlite3.connect(settings.DB_PATH, timeout=5.0)
             try:
+                cols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(lip_snapshots)").fetchall()}
+                if "program_id" in cols and pid:
+                    where = ("market_ticker = ? AND (program_id = ? OR program_id IS NULL)")
+                    args: tuple = (ticker, pid)
+                else:
+                    where, args = "market_ticker = ?", (ticker,)
                 if params.start_ts is not None:
                     since = datetime.fromtimestamp(params.start_ts, tz=timezone.utc).isoformat()
-                    row = conn.execute(
-                        "SELECT COALESCE(SUM(estimated_payout_usd), 0) FROM lip_snapshots "
-                        "WHERE market_ticker = ? AND captured_at >= ?", (ticker, since)).fetchone()
-                else:
-                    row = conn.execute(
-                        "SELECT COALESCE(SUM(estimated_payout_usd), 0) FROM lip_snapshots "
-                        "WHERE market_ticker = ?", (ticker,)).fetchone()
+                    where += " AND captured_at >= ?"
+                    args = args + (since,)
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(estimated_payout_usd), 0) FROM lip_snapshots "
+                    f"WHERE {where}", args).fetchone()
                 return float(row[0] or 0.0)
             finally:
                 conn.close()
@@ -800,19 +935,29 @@ class PaperRunner:
 
     def _break_accrual(self, ticker: str, why: str) -> None:
         """State became UNKNOWN (stale book, disconnect): nothing may be
-        credited until a fresh observation starts a new chain."""
-        st = self._accrual.get(ticker)
-        if st is not None and st.last_ts is not None:
-            st.last_ts = None
-            st.last_share = 0.0
-            st.breaks += 1
+        credited until a fresh observation starts a new chain.
+
+        P5b: one physical book feeds every program on the ticker, so an
+        unknown state breaks EVERY program's chain, not just the binding
+        one. Missing a break would let a program claim an interval we did
+        not observe."""
+        for key in self._program_keys(ticker) or [ticker]:
+            st = self._accrual.get(key)
+            if st is not None and st.last_ts is not None:
+                st.last_ts = None
+                st.last_share = 0.0
+                st.breaks += 1
 
     def _note_flat(self, ticker: str) -> None:
-        """We pulled our orders: from now on the share is a KNOWN zero."""
-        st = self._accrual.get(ticker)
-        if st is not None:
-            st.last_ts = time.time()
-            st.last_share = 0.0
+        """We pulled our orders: from now on the share is a KNOWN zero.
+
+        P5b: applies to every program on the ticker — one order set."""
+        now = time.time()
+        for key in self._program_keys(ticker) or [ticker]:
+            st = self._accrual.get(key)
+            if st is not None:
+                st.last_ts = now
+                st.last_share = 0.0
 
     def _accrue(self, st: AccrualState, params: ProgramParams, now: float) -> tuple[float, str]:
         """Dollars earned over [st.last_ts, now) at st.last_share — the
@@ -1120,6 +1265,7 @@ class PaperRunner:
             size_contracts=size,
             yes_size_override=yes_size_override,
             no_size_override=no_size_override,
+            program_id=self._akey(p),
         )
 
     def _qualification_adjust(self, book: BookState, p: ProgramParams,
@@ -1244,7 +1390,7 @@ class PaperRunner:
             # not reprice.
             scored = self._score_market(book, params, target=None)
             self._record_score(scored, now, feed_sizer=True)
-            self._persist_snapshot(tkr, scored, params, now)
+            self._persist_snapshot(tkr, scored, params, now, book=book)
             return
 
         # 2026-09-20 audit #3: score what is ACTUALLY resting (or the target
@@ -1252,7 +1398,7 @@ class PaperRunner:
         # feed the sizer only from actual presence. Same path as heartbeat.
         scored = self._score_market(book, params, target=target)
         self._record_score(scored, now, feed_sizer=True)
-        self._persist_snapshot(book.market_ticker, scored, params, now)
+        self._persist_snapshot(book.market_ticker, scored, params, now, book=book)
 
         # 2026-05-02 PREDATOR C1: offload reconcile to thread executor.
         # Was: sync HTTP POST + sqlite I/O inside async WS callback,
@@ -1442,7 +1588,7 @@ class PaperRunner:
                     # handler — ACTUAL resting orders, no hypothetical size.
                     scored = self._score_market(book, params, target=None)
                     self._record_score(scored, now, feed_sizer=False)
-                    self._persist_snapshot(tkr, scored, params, now)
+                    self._persist_snapshot(tkr, scored, params, now, book=book)
 
                 # NEXUS port (2026-04-30): Tiered breaker awareness in heartbeat log.
                 # quote_manager._passes_safety has BINARY halt-at-MAX_DAILY_LOSS gate;
@@ -1773,9 +1919,10 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                                  f"markets: {retired[:5]}")
                 # Existing tickers get REFRESHED parameters, not just new ones.
                 upd = runner.refresh_params(fresh)
-                if upd["changed"]:
+                if upd["changed"] or upd.get("added"):
                     _log.info(f"periodic_discover: refreshed params for {upd['changed']} "
-                              f"existing markets ({upd['reprogrammed']} new program windows)")
+                              f"existing markets ({upd['reprogrammed']} new program windows, "
+                              f"{upd.get('added', 0)} additional overlapping programs)")
                 current_tickers = set(runner.params_by_ticker.keys())
                 fresh_tickers = {m["market_ticker"] for m in fresh}
                 new_tickers = fresh_tickers - current_tickers
@@ -1784,7 +1931,7 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                     for m in fresh:
                         tkr = m["market_ticker"]
                         if tkr in new_tickers:
-                            runner.params_by_ticker[tkr] = _program_params_from_market(m)
+                            runner._register_program(_program_params_from_market(m))
                             runner.optimal_size_floors[tkr] = int(
                                 m.get("optimal_size_per_side", 0) or 0
                             )

@@ -40,6 +40,11 @@ class ProgramParams:
     target_size:     float    # contracts (fixed-point on Kalshi; may be fractional)
     discount_factor: float    # 0.0–1.0
     period_reward_usd: float  # total USD for the whole Time Period
+    # 2026-09-21 P5b: the /incentive_programs row id. Two programs may cover
+    # the same ticker with different windows, targets and pools, so the
+    # ticker alone cannot key runtime state. Defaults to "" for legacy
+    # callers; the runner always supplies it.
+    program_id:      str = ""
     period_seconds:  float = 86400.0   # window length; legacy callers pass a 1-day rate
     # Program window as epoch seconds (None when unknown). Accrual is clipped
     # to [start_ts, end_ts): nothing is earned outside the window.
