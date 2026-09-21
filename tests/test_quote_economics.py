@@ -316,3 +316,36 @@ def test_event_capital_counts_only_other_strikes_of_the_same_event(econ_db):
     # A direct reserve() holds the premium alone; the maker-fee allowance is
     # added by the placement path, not here.
     assert used == D("5.00")
+
+
+# ── turnover consistency ──────────────────────────────────────────────────
+
+def test_adverse_selection_scales_with_turnover_like_fees():
+    """Charging a fee on every fill while charging adverse selection once
+    made the model inconsistent exactly where it mattered: a small quote
+    refilled thousands of times showed thousands of fees against a single
+    day of adverse selection."""
+    one = _ev(expected_fills_per_horizon=1.0, fee_schedule=fees.active_schedule())
+    many = _ev(expected_fills_per_horizon=100.0, fee_schedule=fees.active_schedule())
+    fee_ratio = many.expected_fees_usd / one.expected_fees_usd
+    pnl_ratio = many.expected_trading_pnl_usd / one.expected_trading_pnl_usd
+    assert fee_ratio == pytest.approx(float(pnl_ratio), rel=1e-6)
+
+
+def test_one_fill_reproduces_the_unscaled_holding_cost():
+    from cross_venue.yield_equation import MarketYield
+    e = _ev(size=50, expected_fills_per_horizon=1.0)
+    my = MarketYield(market_id=BASE["market_id"], pool_per_day=100.0,
+                     our_size=50, top_book_size=200, target_size=100,
+                     discount_factor=0.5, hours_to_settle=24.0,
+                     midpoint=0.5, calibration=1.0)
+    assert float(e.expected_trading_pnl_usd) == pytest.approx(
+        -my.adverse_cost_per_day, rel=1e-6)
+
+
+def test_sub_one_turnover_does_not_discount_adverse_selection():
+    """A fill rate below one must not make the position look safer than
+    holding it once."""
+    low = _ev(expected_fills_per_horizon=0.01)
+    one = _ev(expected_fills_per_horizon=1.0)
+    assert low.expected_trading_pnl_usd == one.expected_trading_pnl_usd

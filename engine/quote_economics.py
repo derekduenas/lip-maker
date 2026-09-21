@@ -251,18 +251,12 @@ def evaluate(candidate: QuoteCandidate, *,
                    * my.time_factor * my.calibration * my.series_priority)
     expected_reward = _d(gross_daily) * _d(days)
 
-    # Trading P&L. For a passive maker this is the adverse-selection cost:
-    # we are filled when the market is moving against the side we showed.
-    # This IS the trading-P&L term; nothing else subtracts adverse selection.
-    adverse = _d(my.adverse_cost_per_day) * _d(days)
-    expected_trading_pnl = -adverse
-    notes.append("trading P&L term is the adverse-selection estimate "
-                 "(not double-counted elsewhere)")
-
     if observed_share is None:
         unknowns.append("observed_share (using theoretical depth share)")
 
-    # ── fees ─────────────────────────────────────────────────────────────
+    # ── how many times we expect to be filled ────────────────────────────
+    # Needed BEFORE the trading-P&L term, because adverse selection scales
+    # with turnover just as fees do.
     fills = expected_fills_per_horizon
     if fills is None:
         unknowns.append("expected_fills_per_horizon")
@@ -274,6 +268,27 @@ def evaluate(candidate: QuoteCandidate, *,
                      "declared as an unknown rather than assumed zero")
     avg_price = int(round((candidate.yes_bid_cents + (100 - candidate.no_bid_cents)) / 2))
     avg_price = min(99, max(1, avg_price))
+
+    # ── trading P&L (adverse selection), scaled by turnover ──────────────
+    # For a passive maker this is the cost of being filled when the market
+    # is moving against the side we showed. It IS the trading-P&L term;
+    # nothing else subtracts adverse selection.
+    #
+    # MarketYield.adverse_cost_per_day is a HOLDING cost on one position
+    # over a day. Charging it once while charging a fee on every fill made
+    # the model internally inconsistent exactly where it mattered: a small
+    # quote refilled thousands of times showed thousands of fees against a
+    # single day of adverse selection, and came out absurdly negative. Being
+    # filled is the event that hurts a maker, so both scale together. One
+    # fill over the horizon reproduces the original holding-cost figure.
+    turnover = max(Decimal("1"), _d(fills))
+    adverse = _d(my.adverse_cost_per_day) * _d(days) * turnover
+    expected_trading_pnl = -adverse
+    notes.append(f"adverse selection scaled by turnover ({float(turnover):.2f} "
+                 "fills), matching the fee treatment; one fill reproduces the "
+                 "unscaled holding cost")
+
+    # ── fees ─────────────────────────────────────────────────────────────
     fee_per_fill = ZERO
     if fee_schedule is not None:
         try:

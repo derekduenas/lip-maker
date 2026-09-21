@@ -33,6 +33,7 @@ import json
 import logging
 import sqlite3
 import sys
+from unittest import mock
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -238,6 +239,19 @@ async def replay_arm(policy: str, markets, events, workdir: Path) -> dict:
             return {"open_time": iso(o), "close_time": iso(c)}
         runner.market_clock = MarketClock(fetcher=fetcher)
 
+        # Replay runs far faster than wall clock, but the runner's throttles
+        # (scoring, reprice, persist) are wall-clock based. Left alone they
+        # suppress almost every evaluation and the few that survive happen
+        # at the start, when nothing has been observed yet — which is how an
+        # earlier run recorded "measured=False" after 491 seconds of data.
+        # Driving time.time() from the STREAM makes those throttles behave
+        # as they would live.
+        clock = {"now": events[0]["t"] if events else time.time()}
+        real_time = time.time
+
+        def stream_now():
+            return clock["now"]
+
         sim = PaperFillSimulator(latency_ms=250.0)
         books: dict[str, BookState] = {}
         runner.books = books
@@ -249,8 +263,12 @@ async def replay_arm(policy: str, markets, events, workdir: Path) -> dict:
         last_t = None
         t0 = events[0]["t"] if events else time.time()
 
-        for ev in events:
+        patcher = mock.patch("time.time", stream_now)
+        patcher.start()
+        try:
+          for ev in events:
             stream_t = ev["t"]
+            clock["now"] = stream_t
             if last_t is not None:
                 dt = stream_t - last_t
                 # Qualified resting time, in STREAM seconds.
@@ -315,8 +333,11 @@ async def replay_arm(policy: str, markets, events, workdir: Path) -> dict:
                     except Exception as ex:
                         _log.debug(f"[{policy}] on_fill: {ex}")
 
+        finally:
+            patcher.stop()
+
         try:
-            runner.manage_exits(time.time())
+            runner.manage_exits(real_time())
         except Exception as e:
             _log.debug(f"[{policy}] manage_exits: {e}")
 
@@ -376,6 +397,7 @@ def _arm_report(policy, runner, sim, quotes, refusals, fills_applied,
         "inventory": inv,
         "exits": {"actions": runner.exit_actions,
                   "reasons": dict(runner._exit_reasons)},
+        "observation": runner.execution_model.summary(),
         "reward_estimates_only": rewards,
         "reward_payments": {},        # none: nothing has been paid
     }
@@ -395,12 +417,31 @@ async def run(args) -> dict:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     stream_path = outdir / f"stream-{stamp}.jsonl"
 
-    _log.info(f"capturing {args.capture_sec}s ...")
-    cap = await capture(markets, args.capture_sec, stream_path,
-                        args.poll_sec, args.trade_poll_sec)
-    _log.info(f"captured {cap['book_snapshots']} snapshots, {cap['trades']} trades")
-
-    events = [json.loads(l) for l in stream_path.read_text().splitlines() if l]
+    if args.stream:
+        # Replay an existing capture. Same data, so a change to the runner
+        # can be compared against a previous run without the market moving
+        # underneath it.
+        stream_path = Path(args.stream)
+        events = [json.loads(l) for l in stream_path.read_text().splitlines() if l]
+        cap = {"events": len(events), "reused": True, "path": str(stream_path),
+               "book_snapshots": sum(1 for e in events if e["kind"] == "book"),
+               "trades": sum(len(e["trades"]) for e in events
+                             if e["kind"] == "trades"),
+               "polls": None, "fetch_errors": None,
+               "stream_sec": (events[-1]["t"] - events[0]["t"]) if events else 0.0}
+        _log.info(f"reusing capture {stream_path} ({cap['book_snapshots']} "
+                  f"snapshots, {cap['trades']} trades)")
+        tickers_in_stream = {e["ticker"] for e in events if e["kind"] == "book"}
+        markets = [m for m in markets if m["market_ticker"] in tickers_in_stream]
+        if not markets:
+            return {"error": "no selected market appears in the reused stream",
+                    "selection": sel, "capture": cap}
+    else:
+        _log.info(f"capturing {args.capture_sec}s ...")
+        cap = await capture(markets, args.capture_sec, stream_path,
+                            args.poll_sec, args.trade_poll_sec)
+        _log.info(f"captured {cap['book_snapshots']} snapshots, {cap['trades']} trades")
+        events = [json.loads(l) for l in stream_path.read_text().splitlines() if l]
     arms = {}
     workdir = outdir / f"arms-{stamp}"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -445,6 +486,8 @@ def main() -> int:
     ap.add_argument("--trade-poll-sec", type=float, default=15.0)
     ap.add_argument("--outdir", default="data/experiments")
     ap.add_argument("--reuse-discovery", action="store_true")
+    ap.add_argument("--stream", default="",
+                    help="replay an existing stream-*.jsonl instead of capturing")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
