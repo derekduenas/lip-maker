@@ -52,8 +52,13 @@ def main():
     attack.add_argument('--cutoff-ms', type=int, required=True)
     reward_rank = sub.add_parser('rank-rewards')
     reward_rank.add_argument('--input', required=True, help='Program, competitor book, candidate economics and timing JSON')
+    capital = sub.add_parser('compound-budget')
+    capital.add_argument('--input', required=True, help='Receipt events and explicit capital limits JSON')
     args = p.parse_args()
-    if args.command == 'rank-rewards':
+    if args.command == 'compound-budget':
+        from research.compound_capital import capital_budget
+        result = capital_budget(**read(args.input))
+    elif args.command == 'rank-rewards':
         from research.reward_optimizer import rank_quotes
         result = rank_quotes(**read(args.input))
     elif args.command == 'capture':
