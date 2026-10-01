@@ -1,0 +1,20 @@
+[Unit]
+Description=Kalshi paper/demo unattended quote loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lip
+Group=lip
+WorkingDirectory=/opt/lip-maker
+Environment=LIP_PAPER=true
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m mm.unattended --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

@@ -472,6 +472,12 @@ Implemented, paper by default, live writes blocked:
 * Disconnect path: FIX logon tag 8013 behind a default-off flag (no socket),
   `SafeSender` order groups on the market's shard, `DeadMan`, and
   `python -m mm.safety.supervisor` which logs `cancel_all` and does not send.
+* Unattended paper/demo loop (`docs/UNATTENDED.md`, `deploy/lip-unattended.service`,
+  `Dockerfile`). Startup cancels before quoting. Websocket reference moves
+  of one tick requote inline; REST is the fallback when the socket is stale.
+  `optimize_sizes` sizes at the LIP reference. 15-minute programs stay in a
+  bucket that is off unless asked. A 24h reward-to-markout ratio under 1
+  cancels and latches.
 
 Not done, and required before any of the $500–$1,000 live checklist:
 
