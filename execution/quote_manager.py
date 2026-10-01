@@ -857,7 +857,15 @@ class QuoteManager:
             # Net inventory value at current mid price ≈ net × 50c (pessimistic mid)
             net_usd = abs(inv.net_yes_contracts) * 0.50
             if net_usd > settings.MAX_NET_INVENTORY_USD:
-                return False, f"net_inv ${net_usd:.2f} > cap ${settings.MAX_NET_INVENTORY_USD}"
+                # 2026-09-30: a target that quotes ONLY the reducing side
+                # (buying NO while long YES completes pairs) must pass, or
+                # the cap blocks the very orders that unwind it. Any target
+                # that still bids the heavy side is refused as before.
+                heavy_bid = (target.yes_bid_cents if inv.net_yes_contracts > 0
+                             else target.no_bid_cents)
+                if not (getattr(settings, "INVENTORY_SIDE_CAP_ENABLED", False)
+                        and heavy_bid is None):
+                    return False, f"net_inv ${net_usd:.2f} > cap ${settings.MAX_NET_INVENTORY_USD}"
 
         # Total gross — use the LARGER of base + overrides (audit fix)
         total_gross = self._total_gross_exposure()

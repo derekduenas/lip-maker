@@ -521,3 +521,33 @@ DISLOCATION_PRONG_ENABLED = os.getenv("DISLOCATION_ENABLED", "false").lower() ==
 # agnostic and catches any rapid-restart pattern via journalctl.
 EMPTY_UNIVERSE_SLEEP_SEC    = int(os.getenv("LIP_EMPTY_UNIVERSE_SLEEP_SEC",    "60"))
 EMPTY_UNIVERSE_MAX_WAIT_SEC = int(os.getenv("LIP_EMPTY_UNIVERSE_MAX_WAIT_SEC", "1800"))
+
+# ── 2026-09-30 in-loop adverse-selection guard (engine/adverse_selection.py) ──
+# Defaults ON: every switch here only REMOVES or WIDENS quotes, never adds
+# exposure, so ON is the safe default in paper and live alike. Thresholds are
+# conservative starting points to be refit from the as_markouts table.
+AS_GUARD_ENABLED = os.getenv("AS_GUARD_ENABLED", "true").lower() == "true"
+# The old volatility skip was TRANSIENT (stopped repricing, left the stale
+# quotes resting). When True, a volatile book PULLS our quotes and starts a
+# cooldown instead.
+PULL_ON_VOLATILITY = os.getenv("PULL_ON_VOLATILITY", "true").lower() == "true"
+# Side-aware inventory cap: at the net cap, stop quoting the side that ADDS
+# exposure but keep quoting the side that reduces it (previously the whole
+# target was refused and the heavy-side order stayed resting).
+INVENTORY_SIDE_CAP_ENABLED = os.getenv("INVENTORY_SIDE_CAP_ENABLED", "true").lower() == "true"
+INVENTORY_SOFT_FRACTION = float(os.getenv("INVENTORY_SOFT_FRACTION", "0.5"))
+AS_FILL_COOLDOWN_SEC = float(os.getenv("AS_FILL_COOLDOWN_SEC", "15"))
+AS_BURST_WINDOW_SEC = float(os.getenv("AS_BURST_WINDOW_SEC", "60"))
+AS_BURST_CONTRACTS = float(os.getenv("AS_BURST_CONTRACTS", "100"))
+AS_BURST_COOLDOWN_SEC = float(os.getenv("AS_BURST_COOLDOWN_SEC", "120"))
+AS_SCORE_HORIZON_SEC = float(os.getenv("AS_SCORE_HORIZON_SEC", "30"))
+AS_MIN_OBS = int(os.getenv("AS_MIN_OBS", "3"))
+AS_WIDEN_MARKOUT_CENTS = float(os.getenv("AS_WIDEN_MARKOUT_CENTS", "1.0"))
+AS_PULL_MARKOUT_CENTS = float(os.getenv("AS_PULL_MARKOUT_CENTS", "3.0"))
+AS_TOXIC_COOLDOWN_SEC = float(os.getenv("AS_TOXIC_COOLDOWN_SEC", "600"))
+AS_VOLATILITY_COOLDOWN_SEC = float(os.getenv("AS_VOLATILITY_COOLDOWN_SEC", "30"))
+AS_PERSIST_MARKOUTS = os.getenv("AS_PERSIST_MARKOUTS", "true").lower() == "true"
+# Per-series Kalshi maker-fee resolution (engine/series_fees.py). OFF by
+# default because it makes paper economics LESS conservative than the global
+# schedule; flip in paper and compare econ_rejects before relying on it.
+SERIES_FEES_ENABLED = os.getenv("SERIES_FEES_ENABLED", "false").lower() == "true"
