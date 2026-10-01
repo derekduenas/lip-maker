@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings
 from execution.kalshi_auth import KalshiClient, KalshiAuthError
+from mm.venues.kalshi import amend_response_killed_quote, resting_quote
 from execution.order_request import (
     LiveExecutionBlocked, MakerSafetyError, assert_maker_safe,
     build_limit_order, require_live_execution_allowed, to_event_order_v2,
@@ -223,26 +224,33 @@ class QuoteManager:
         from execution.kalshi_ws import KalshiWS as _KW
         if raw.get("status") != "resting":
             return None
-        side = str(raw.get("side", "")).lower()
-        if side not in ("yes", "no"):
-            return None
         ticker = raw.get("ticker") or raw.get("market_ticker") or ""
         order_id = raw.get("order_id") or ""
         if not ticker or not order_id:
             return None
-        p_raw = raw.get(f"{side}_price_dollars")
-        if p_raw is None:
-            p_raw = raw.get(f"{side}_price_fp", raw.get(f"{side}_price"))
-        if p_raw is None:
-            return None
-        price_cents = _KW._price_to_cents(p_raw)
         off_grid = False
-        if price_cents is None:
-            exact = _KW._price_to_cents_exact(p_raw)
-            if exact is None:
+        if raw.get("book_side") or raw.get("outcome_side"):
+            # V2 portfolio rows keep side="yes" for a NO ask. book_side wins.
+            routed = resting_quote(raw)
+            if routed is None:
                 return None
-            price_cents = int(round(exact))
-            off_grid = True
+            side, price_cents = routed
+        else:
+            side = str(raw.get("side", "")).lower()
+            if side not in ("yes", "no"):
+                return None
+            p_raw = raw.get(f"{side}_price_dollars")
+            if p_raw is None:
+                p_raw = raw.get(f"{side}_price_fp", raw.get(f"{side}_price"))
+            if p_raw is None:
+                return None
+            price_cents = _KW._price_to_cents(p_raw)
+            if price_cents is None:
+                exact = _KW._price_to_cents_exact(p_raw)
+                if exact is None:
+                    return None
+                price_cents = int(round(exact))
+                off_grid = True
         rem = raw.get("remaining_count_fp")
         if rem is None:
             rem = raw.get("remaining_count")
@@ -1056,7 +1064,8 @@ class QuoteManager:
             try:
                 self.client.post(
                     f"{V2_CREATE_PATH}/{order.order_id}/decrease",
-                    {"reduce_to": f"{new_size:.2f}"},
+                    {"reduce_to": f"{new_size:.2f}",
+                     "market_ticker": order.market_ticker},
                 )
             except Exception as e:
                 _log.warning(f"decrease failed {order.order_id}: {e}")
@@ -1065,11 +1074,13 @@ class QuoteManager:
         order.queue_preserved = True
         return True
 
-    def _amend_order(self, order: RestingOrder, new_price: int, new_size: float) -> bool:
+    def _amend_order(self, order: RestingOrder, new_price: int, new_size: float):
         """Price change or size-up. Kalshi amend forfeits queue position.
 
         One request, not cancel-then-place: a failed amend must not leave a
-        second order on the same side.
+        second order on the same side. A 200 whose remaining count is 0 and
+        fill count is 0 cancelled the quote (post_only on amend); that order
+        is removed. Return value is True, False, or ``"dead"``.
         """
         if not self.paper:
             try:
@@ -1086,7 +1097,7 @@ class QuoteManager:
                     enforce_non_crossing=False,
                 )
                 v2 = to_event_order_v2(legacy)
-                self.client.post(
+                resp = self.client.post(
                     f"{V2_CREATE_PATH}/{order.order_id}/amend",
                     {"ticker": order.market_ticker, "side": v2["side"],
                      "price": v2["price"], "count": f"{float(new_size):.2f}",
@@ -1095,10 +1106,30 @@ class QuoteManager:
             except Exception as e:
                 _log.warning(f"amend failed {order.order_id}: {e}")
                 return False
+            if amend_response_killed_quote(resp or {}):
+                self._retire_dead_quote(order, "amend_post_only_cancelled")
+                return "dead"
         order.price_cents = int(new_price)
         order.size_contracts = float(new_size)
         order.queue_preserved = False
         return True
+
+    def _retire_dead_quote(self, order: RestingOrder, notes: str) -> None:
+        """The venue no longer has this order. Drop it. Do not re-place."""
+        with self._state_lock:
+            self._state_generation += 1
+            lst = self.resting.get(order.market_ticker, [])
+            try:
+                lst.remove(order)
+            except ValueError:
+                pass
+            if not lst and order.market_ticker in self.resting:
+                # Keep the key if the other side is still there.
+                if not self.resting[order.market_ticker]:
+                    self.resting.pop(order.market_ticker, None)
+            self._tombstone(order.order_id)
+            self._release_capital(order.client_order_id)
+        self._update_quote_status(order.order_id, "cancelled", notes=notes)
 
     def _release_capital(self, client_order_id: str) -> None:
         """Return an order's reserved capital to the available pool.
@@ -1269,7 +1300,10 @@ class QuoteManager:
                     actions[f"pending_cancel_{label}"] = 1
                 return
             if plan.action == "amend":
-                if self._amend_order(o, plan.price_cents, plan.size):
+                amended = self._amend_order(o, plan.price_cents, plan.size)
+                if amended == "dead":
+                    actions["cancelled"] += 1
+                elif amended:
                     actions["amended"] += 1
                 else:
                     o.pending_cancel = True

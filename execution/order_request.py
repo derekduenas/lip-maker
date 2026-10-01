@@ -88,7 +88,18 @@ MAKER_ONLY_FIELD_VERIFIED = True
 # False until a live rejection is observed. Do not promote a conservative
 # assumption into a verified fact: the whole point of the flag is the case
 # the local preflight cannot cover (the book moving in transit).
+#
+# Kalshi demo evidence (2026-09-30) is recorded, but this global flag stays
+# False: it also gates venues that were not on that wire (Polymarket US,
+# the quote manager). Kalshi has its own switch below.
 MAKER_ONLY_ENFORCEMENT_VERIFIED = False
+
+# Kalshi-only. Default False, so KalshiAdapter live writes stay blocked.
+# Set only via enable_kalshi_maker_only_enforcement(). Does not flip the
+# global flag and does not allow the production host.
+KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED = False
+KALSHI_POST_ONLY_EVIDENCE = "docs/venue_evidence/kalshi_post_only_demo_20260930.md"
+KALSHI_POST_ONLY_ACK = "kalshi-demo-2026-09-30-post-only-cross"
 
 # The obsolete field venue/kalshi.py sent. Kept as a named constant so the
 # guard below can name it in the error rather than hard-coding a string.
@@ -215,20 +226,56 @@ class LiveExecutionBlocked(RuntimeError):
     """Live order transmission attempted while maker enforcement is unproven."""
 
 
-def require_live_execution_allowed() -> None:
+def enable_kalshi_maker_only_enforcement(acknowledgement: str) -> None:
+    """Mark Kalshi ``post_only`` enforced for this process. Default is off.
+
+    The demo wire on 2026-09-30 (``demo-api.kalshi.co``, market
+    ``KXRAIN-26SEP30-DTW``) rejected crossing V2 orders with HTTP 400
+    ``invalid_order`` / ``post only cross``, and an amend to a crossing
+    price returned HTTP 200 with ``remaining_count`` 0 and no fill. That
+    evidence is written up in ``KALSHI_POST_ONLY_EVIDENCE``.
+
+    Passing ``KALSHI_POST_ONLY_ACK`` sets ``KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED``
+    only. ``MAKER_ONLY_ENFORCEMENT_VERIFIED`` stays False, so the quote
+    manager and Polymarket US stay blocked. Production hosts stay blocked
+    until ``KalshiRestTransport(..., allow_production=True)``.
+    """
+    global KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED
+    if acknowledgement != KALSHI_POST_ONLY_ACK:
+        raise LiveExecutionBlocked(
+            "refusing to mark Kalshi post_only verified without the demo "
+            f"acknowledgement; evidence is {KALSHI_POST_ONLY_EVIDENCE}")
+    KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED = True
+
+
+def require_live_execution_allowed(*, venue: str = "") -> None:
     """Raise unless we may legitimately send a LIVE order.
 
     The directive is explicit: a local non-crossing check cannot guarantee
     maker execution, so exchange-enforced post_only must be verified before
-    live execution. The field is verified to exist; its enforcement is not.
-    Until a live rejection is observed, live transmission is refused here —
-    one chokepoint, so no adapter can quietly opt out.
+    live execution. The field is verified to exist. Enforcement is per venue.
+
+    ``venue="kalshi"`` consults ``KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED``,
+    which defaults False. Every other caller, including the quote manager,
+    consults ``MAKER_ONLY_ENFORCEMENT_VERIFIED``, which also defaults False.
+    Enabling the Kalshi switch does not unblock those callers.
 
     Paper mode never reaches this: it sends nothing.
     """
     if not MAKER_ONLY_FIELD_VERIFIED:
         raise LiveExecutionBlocked(
             f"{MAKER_ONLY_FIELD} is not verified against the venue schema")
+    if venue == "kalshi":
+        if not KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED:
+            raise LiveExecutionBlocked(
+                "LIVE EXECUTION BLOCKED for Kalshi: post_only was observed "
+                "on the demo exchange (2026-09-30, see "
+                f"{KALSHI_POST_ONLY_EVIDENCE}) but "
+                "KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED is still False. "
+                "Call enable_kalshi_maker_only_enforcement with "
+                f"{KALSHI_POST_ONLY_ACK!r} to acknowledge that evidence. "
+                "That call does not allow the production host.")
+        return
     if not MAKER_ONLY_ENFORCEMENT_VERIFIED:
         raise LiveExecutionBlocked(
             f"LIVE EXECUTION BLOCKED: `{MAKER_ONLY_FIELD}` exists in "

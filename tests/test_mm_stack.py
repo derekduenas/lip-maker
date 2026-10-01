@@ -110,9 +110,10 @@ class TestVenues:
 
     def test_kalshi_decrease_keeps_queue_flag(self):
         a = KalshiAdapter(paper=True)
-        resp = a.decrease("oid", 8)
+        resp = a.decrease("oid", 8, market="KXTEST-1")
         assert resp["queue_preserved"] is True
-        assert a.sent[0]["body"] == {"reduce_to": "8.00"}
+        assert a.sent[0]["body"]["reduce_to"] == "8.00"
+        assert a.sent[0]["body"]["market_ticker"] == "KXTEST-1"
         assert a.sent[0]["path"].endswith("/decrease")
 
     def test_kalshi_live_place_is_blocked(self):

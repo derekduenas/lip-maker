@@ -14,6 +14,22 @@ from typing import Optional, Protocol
 from mm.types import VenueOrderView
 
 
+class TransportHTTPError(Exception):
+    """A venue HTTP response that is not a success.
+
+    Adapters turn this into a typed result. Callers must not treat it as
+    ``ok`` with an empty order id.
+    """
+
+    def __init__(self, status: int, body=None, *, method: str = "", path: str = ""):
+        self.status = int(status)
+        self.body = body if isinstance(body, dict) else {}
+        self.raw_body = body
+        self.method = method
+        self.path = path
+        super().__init__(f"HTTP {self.status} {method} {path}")
+
+
 class Transport(Protocol):
     def request(self, method: str, path: str, *,
                 body: Optional[dict] = None,
