@@ -1096,6 +1096,7 @@ class QuoteManager:
             existing_lst.append(rest)
         self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                               order_id, "resting", notes=f"coid={coid}")
+        self._note_quote_write(market_ticker)
         return rest
 
     def _decrease_order(self, order: RestingOrder, new_size: float) -> bool:
@@ -1127,49 +1128,129 @@ class QuoteManager:
         order.queue_preserved = True
         return True
 
-    def _amend_order(self, order: RestingOrder, new_price: int, new_size: float):
+    def _note_quote_write(self, market_ticker: str) -> None:
+        """Count a place or amend toward the sentinel quote-rate caps."""
+        try:
+            from risk.sentinel import Sentinel
+            Sentinel.record_write(market_ticker)
+        except Exception as e:
+            _log.debug(f"quote-rate record failed for {market_ticker}: {e}")
+
+    def _rereserve(self, order: RestingOrder, price_cents: int, size: int) -> None:
+        allowance = 0
+        try:
+            allowance = fee_usd(price_cents, size, is_taker=False)
+        except Exception:
+            allowance = 0
+        self.account.reserve(
+            order.client_order_id, market=order.market_ticker,
+            program_id=order.program_id or order.market_ticker,
+            price_cents=price_cents, quantity=size,
+            fee_allowance_usd=allowance)
+
+    def _amend_order(self, order: RestingOrder, new_price: int, new_size: float,
+                     best_opposing_bid_cents: Optional[int] = None):
         """Price change or size-up. Kalshi amend forfeits queue position.
 
         One request, not cancel-then-place: a failed amend must not leave a
         second order on the same side. A 200 whose remaining count is 0 and
         fill count is 0 cancelled the quote (post_only on amend); that order
         is removed. Return value is True, False, or ``"dead"``.
+
+        The same gates as placement apply: 0/100 prices are refused, a
+        price change or size-up re-reserves capital before the order can
+        rest at the new terms, and the order must not cross.
         """
-        if not self.paper:
-            _reject_readonly_client(self.client)
+        new_price = int(new_price)
+        new_size_f = float(new_size)
+        if new_price <= 0 or new_price >= 100:
+            _log.debug(f"[SKIP] amend {order.market_ticker} {order.side}"
+                       f"@{new_price}c — edge price (Kalshi rejects)")
+            return False
+        size_i = int(round(new_size_f))
+        if size_i <= 0:
+            return False
+        prior_price = int(order.price_cents)
+        prior_size = float(order.size_contracts)
+        price_changed = new_price != prior_price
+        size_up = new_size_f > prior_size + 1e-9
+        reserved = False
+        if (self.account is not None and order.client_order_id
+                and (price_changed or size_up)):
             try:
-                require_live_execution_allowed(venue="kalshi")
-            except LiveExecutionBlocked as e:
-                _log.error(f"[LIVE] BLOCKED amend {order.order_id}: {e}")
+                self._rereserve(order, new_price, size_i)
+                reserved = True
+            except InsufficientCapital as e:
+                self.capital_refusals += 1
+                _log.warning(f"REFUSED amend {order.market_ticker} "
+                             f"{order.side}@{new_price}c x{size_i}: {e}")
                 return False
+
+        def _restore_reserve() -> None:
+            if not reserved or self.account is None or not order.client_order_id:
+                return
             try:
-                legacy = build_limit_order(
-                    ticker=order.market_ticker, side=order.side,
-                    price_cents=int(new_price),
-                    size_contracts=max(1, int(round(new_size))),
-                    client_order_id=order.client_order_id or "amend",
-                    enforce_non_crossing=False,
-                )
-                v2 = to_event_order_v2(legacy)
-                amend_body = {"ticker": order.market_ticker, "side": v2["side"],
-                              "price": v2["price"], "count": f"{float(new_size):.2f}",
-                              "client_order_id": order.client_order_id}
-                if order.exchange_index is not None:
-                    amend_body["exchange_index"] = int(order.exchange_index)
-                _reject_readonly_client(self.client)
-                resp = self.client.post(
-                    f"{V2_CREATE_PATH}/{order.order_id}/amend",
-                    amend_body,
-                )
+                self._rereserve(order, prior_price, max(1, int(round(prior_size))))
             except Exception as e:
-                _log.warning(f"amend failed {order.order_id}: {e}")
-                return False
-            if amend_response_killed_quote(resp or {}):
-                self._retire_dead_quote(order, "amend_post_only_cancelled")
-                return "dead"
-        order.price_cents = int(new_price)
-        order.size_contracts = float(new_size)
+                _log.warning(f"amend reserve restore failed {order.order_id}: {e}")
+
+        if self.paper:
+            if best_opposing_bid_cents is not None:
+                chk = would_cross(order.side, new_price,
+                                  best_opposing_bid_cents=best_opposing_bid_cents)
+                if not chk.safe:
+                    _log.warning(f"[PAPER] REFUSED amend {order.market_ticker} "
+                                 f"{order.side}@{new_price}c: {chk.reason}")
+                    _restore_reserve()
+                    return False
+            order.price_cents = new_price
+            order.size_contracts = new_size_f
+            order.queue_preserved = False
+            self._note_quote_write(order.market_ticker)
+            return True
+
+        _reject_readonly_client(self.client)
+        try:
+            require_live_execution_allowed(venue="kalshi")
+        except LiveExecutionBlocked as e:
+            _log.error(f"[LIVE] BLOCKED amend {order.order_id}: {e}")
+            _restore_reserve()
+            return False
+        try:
+            legacy = build_limit_order(
+                ticker=order.market_ticker, side=order.side,
+                price_cents=new_price,
+                size_contracts=size_i,
+                client_order_id=order.client_order_id or "amend",
+                best_opposing_bid_cents=best_opposing_bid_cents,
+            )
+            assert_maker_safe(legacy)
+            v2 = to_event_order_v2(legacy)
+            amend_body = {"ticker": order.market_ticker, "side": v2["side"],
+                          "price": v2["price"], "count": f"{new_size_f:.2f}",
+                          "client_order_id": order.client_order_id}
+            if order.exchange_index is not None:
+                amend_body["exchange_index"] = int(order.exchange_index)
+            _reject_readonly_client(self.client)
+            resp = self.client.post(
+                f"{V2_CREATE_PATH}/{order.order_id}/amend",
+                amend_body,
+            )
+        except MakerSafetyError as e:
+            _log.error(f"[LIVE] REFUSED amend {order.market_ticker} "
+                       f"{order.side}@{new_price}c: {e}")
+            _restore_reserve()
+            return False
+        except Exception as e:
+            _log.warning(f"amend failed {order.order_id}: {e}")
+            return False
+        if amend_response_killed_quote(resp or {}):
+            self._retire_dead_quote(order, "amend_post_only_cancelled")
+            return "dead"
+        order.price_cents = new_price
+        order.size_contracts = new_size_f
         order.queue_preserved = False
+        self._note_quote_write(order.market_ticker)
         return True
 
     def _retire_dead_quote(self, order: RestingOrder, notes: str) -> None:
@@ -1389,7 +1470,9 @@ class QuoteManager:
                     actions[f"pending_cancel_{label}"] = 1
                 return
             if plan.action == "amend":
-                amended = self._amend_order(o, plan.price_cents, plan.size)
+                amended = self._amend_order(
+                    o, plan.price_cents, plan.size,
+                    best_opposing_bid_cents=opposing)
                 if amended == "dead":
                     actions["cancelled"] += 1
                 elif amended:

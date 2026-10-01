@@ -99,8 +99,9 @@ class Sentinel:
             if not ok:
                 return False, reason
 
-            # Register this quote in the rate-limiter
-            self._record_quote(target)
+            # Approval is not a write. QuoteManager records a quote only
+            # after a place or amend actually hits the book. Counting this
+            # call would trip the per-minute caps on no-op reconciles.
             return True, "approved"
         except Exception as e:
             # Fail-CLOSED on Sentinel errors. Better to miss a quote than
@@ -217,11 +218,20 @@ class Sentinel:
 
     # ── Quote registration (rate-limiter bookkeeping) ───────────────────────
 
-    def _record_quote(self, target) -> None:
+    @classmethod
+    def record_write(cls, market_ticker: str) -> None:
+        """Count one real place or amend. Keep and decrease do not call this."""
         now = time.time()
-        Sentinel._quote_timestamps.append(now)
-        ticker = getattr(target, "market_ticker", "")
-        Sentinel._quote_timestamps_per_market[ticker].append(now)
+        cls._quote_timestamps.append(now)
+        cls._quote_timestamps_per_market[str(market_ticker or "")].append(now)
+
+    @classmethod
+    def reset_rate_clock(cls) -> None:
+        cls._quote_timestamps.clear()
+        cls._quote_timestamps_per_market.clear()
+
+    def _record_quote(self, target) -> None:
+        self.record_write(getattr(target, "market_ticker", ""))
 
     # ── State queries ───────────────────────────────────────────────────────
     # Cached for 1 second to keep approve() fast on quote-rate workloads.

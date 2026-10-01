@@ -232,6 +232,8 @@ class PaperRunner:
         self.exit_policy = ExitPolicy()
         # Set by the main loop to the live WS book map.
         self.books: dict = {}
+        # PaperFillSimulator, when this process is simulating fills.
+        self.fill_sim = None
         # Economic selection telemetry.
         self.econ_rejects: int = 0
         self._econ_last: dict[str, dict] = {}
@@ -742,6 +744,7 @@ class PaperRunner:
             return False
         self._skip_cancel_ts[ticker] = now
         self.qm.cancel_all(market_ticker=ticker, only_ours=True)
+        self._sync_fill_sim(ticker)
         # From this instant our share is known to be zero (conservative:
         # whatever was accrued between the last row and now is forfeited).
         self._note_flat(ticker)
@@ -929,10 +932,11 @@ class PaperRunner:
         self.qm.inventory.pop(ev.market_ticker, None)
         if settings.AS_GUARD_ENABLED and status == "applied" and ev.side in ("yes", "no"):
             try:
+                trade_ts = ev.exchange_ts if ev.exchange_ts is not None else ev.ts
                 self.as_guard.record_fill(
                     ev.market_ticker, ev.side,
                     ev.price_cents_exact if ev.price_cents_exact is not None else None,
-                    float(ev.count or 0), ts=time.time())
+                    float(ev.count or 0), ts=trade_ts)
             except Exception as e:      # the guard must never break fill handling
                 _log.warning(f"AS record_fill failed for {ev.market_ticker}: {e}")
         if not self.qm.paper and status == "applied":
@@ -1694,14 +1698,17 @@ class PaperRunner:
                      int(size * 1.5)}
             if shortfalls:
                 sizes.add(max(shortfalls))
-            sizes = sorted(n for n in sizes if n > 0)
+            ceiling = self._quote_size_ceiling(yes_bid_c, no_bid_c)
+            from config import constitution
+            floor = int(constitution.MIN_QUOTE_SIZE_CONTRACTS)
+            sizes = sorted(n for n in sizes if floor <= n <= ceiling)
             cands = [QuoteCandidate(n, yes_bid_c, no_bid_c) for n in sizes]
             cands.append(QuoteCandidate(0, None, None))
             avail = Decimal(str(self.account.available_usd()))
             return select(
                 cands,
                 available_capital_usd=avail,
-                max_market_capital_usd=self._max_market_capital(),
+                max_market_capital_usd=self._risk_market_capital(),
                 max_event_capital_usd=self._max_event_capital(),
                 event_capital_used_usd=self._event_capital_used(
                     book.market_ticker),
@@ -1737,6 +1744,106 @@ class PaperRunner:
             return cash * pct
         except Exception:
             return None
+
+    def _risk_market_capital(self):
+        """Dollars one market may rest, including Sentinel's concentration cap.
+
+        Sentinel prices a quote as size times the dearer side. The economics
+        layer prices both sides. The tighter of those dollar caps is what
+        select() is allowed to commit.
+        """
+        from config import constitution
+        caps = []
+        bankroll_share = self._max_market_capital()
+        if bankroll_share is not None:
+            caps.append(bankroll_share)
+        try:
+            bankroll = Decimal(str(getattr(settings, "BANKROLL_USD", 0) or 0))
+            if bankroll > 0:
+                caps.append(bankroll * Decimal(str(constitution.MAX_PER_MARKET_PCT)))
+                caps.append(bankroll * Decimal(str(constitution.MAX_PER_SERIES_PCT)))
+                caps.append(bankroll * Decimal(str(constitution.MAX_GROSS_EXPOSURE_PCT)))
+        except Exception:
+            pass
+        for name in ("MAX_GROSS_PER_MARKET_USD", "MAX_GROSS_PER_SERIES_USD",
+                     "MAX_TOTAL_GROSS_USD"):
+            try:
+                caps.append(Decimal(str(getattr(settings, name))))
+            except Exception:
+                continue
+        positive = [c for c in caps if c is not None and c > 0]
+        return min(positive) if positive else None
+
+    def _quote_size_ceiling(self, yes_c: int, no_c: int) -> int:
+        """Largest size that fits every risk cap at these prices.
+
+        Sentinel's per-market concentration is bankroll × MAX_PER_MARKET_PCT
+        ($500 at the $5,000 paper bankroll). A 1.5× candidate that ignores
+        it is vetoed and the resting orders are pulled.
+        """
+        from config import constitution
+        from mm.session_gates import max_contracts_for_fill, single_fill_cap_usd
+        hi = max(int(yes_c), int(no_c))
+        both = int(yes_c) + int(no_c)
+        limits: list[int] = []
+        bankroll = float(getattr(settings, "BANKROLL_USD", 0) or 0)
+        if hi > 0 and bankroll > 0:
+            for pct in (constitution.MAX_PER_MARKET_PCT,
+                        constitution.MAX_PER_SERIES_PCT,
+                        constitution.MAX_GROSS_EXPOSURE_PCT):
+                limits.append(int((bankroll * float(pct)) * 100 // hi))
+        if both > 0:
+            for name in ("MAX_GROSS_PER_MARKET_USD", "MAX_GROSS_PER_SERIES_USD",
+                         "MAX_TOTAL_GROSS_USD"):
+                dollars = float(getattr(settings, name, 0) or 0)
+                if dollars > 0:
+                    limits.append(int(dollars * 100 // both))
+        fill_cap = single_fill_cap_usd()
+        limits.append(max_contracts_for_fill(int(yes_c), fill_cap))
+        limits.append(max_contracts_for_fill(int(no_c), fill_cap))
+        if not limits:
+            return 0
+        return max(0, min(limits))
+
+    def _sync_fill_sim(self, ticker: str | None = None) -> None:
+        """Track resting paper orders and drop ones that were cancelled."""
+        sim = self.fill_sim
+        if sim is None:
+            return
+        if ticker is None:
+            scope = set(self.qm.resting) | {o.market_ticker for o in sim.orders.values()}
+        else:
+            scope = {ticker}
+        for tkr in scope:
+            live = {o.order_id: o for o in self.qm.resting.get(tkr, [])}
+            for oid, so in list(sim.orders.items()):
+                if so.market_ticker == tkr and oid not in live:
+                    sim.untrack(oid)
+            book = self.books.get(tkr)
+            for oid, o in live.items():
+                if oid in sim.orders:
+                    continue
+                sim.track(order_id=oid, market_ticker=o.market_ticker, side=o.side,
+                          price_cents=int(o.price_cents), size=float(o.size_contracts),
+                          book=book, program_id=getattr(o, "program_id", "") or "")
+
+    def _risk_veto_pulls(self, ticker: str, result) -> bool:
+        """Pull resting orders on a real risk veto.
+
+        A quote-rate refusal means we should not write again this minute.
+        The orders already resting stay. Concentration, blacklist, and a
+        full throttle still pull.
+        """
+        if not isinstance(result, dict) or result.get("action") != "skip":
+            return False
+        why = str(result.get("reason", ""))
+        if not why.startswith(("SENTINEL", "BLACKLIST", "THROTTLE: size_scale=0")):
+            return False
+        detail = why.split(":", 1)[1].strip() if ":" in why else ""
+        if detail.startswith("rate_limit"):
+            self.skip_counts["rate_limit_kept"] += 1
+            return False
+        return self._handle_skip(ticker, f"risk_veto:{why.split(':', 1)[0]}")
 
     @staticmethod
     def _event_key(ticker: str) -> str:
@@ -1971,17 +2078,17 @@ class PaperRunner:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, self.qm.reconcile, target)
         self.reconciles[ticker] += 1
+        self._sync_fill_sim(ticker)
         # 2026-09-20 audit #7: a risk veto inside reconcile (Sentinel,
         # blacklist, full throttle) used to return {"action": "skip"} and
         # leave whatever was resting untouched. Route it through the same
-        # exposure-pulling path as a skipped target. Capacity gates
+        # exposure-pulling path as a skipped target. A rate-limit refusal
+        # is not that path: the resting orders stay. Capacity gates
         # (gross/net/bankroll caps, spread, min size) are NOT vetoes —
         # they refuse to add, not to keep.
         try:
             if isinstance(result, dict) and result.get("action") == "skip":
-                why = str(result.get("reason", ""))
-                if why.startswith(("SENTINEL", "BLACKLIST", "THROTTLE: size_scale=0")):
-                    self._handle_skip(ticker, f"risk_veto:{why.split(':', 1)[0]}")
+                self._risk_veto_pulls(ticker, result)
             elif isinstance(result, dict) and (result.get("placed") or result.get("cancelled")):
                 # Resting state changed: the share credited FORWARD from
                 # here must be the post-reconcile one, not the pre-reconcile
@@ -2305,6 +2412,33 @@ def _compute_saturated_tickers(saturation_threshold: float = 0.80) -> set[str]:
     return saturated
 
 
+def attach_paper_fills(runner: "PaperRunner", ws) -> "PaperFillSimulator":
+    """Connect public trades to the paper fill simulator and the runner.
+
+    ``run_paper.main`` used to subscribe to books and never to trades, so
+    a paper order could not fill. Cancels drop the simulator's copy via
+    ``PaperRunner._sync_fill_sim``.
+    """
+    from execution.paper_fills import PaperFillSimulator
+    sim = PaperFillSimulator()
+    runner.fill_sim = sim
+
+    async def _on_trade(trade: dict) -> None:
+        for f in sim.apply_trades([trade]):
+            ev = FillEvent(
+                order_id=f["order_id"], market_ticker=f["market_ticker"],
+                side=f["side"], count=float(f["count"]),
+                price_cents_exact=float(f["price_cents"]),
+                is_taker=False, trade_id=str(f["trade_id"]),
+                ts=float(f["ts"]),
+                exchange_ts=float(f["ts"]) if f.get("ts") else None,
+            )
+            runner.on_fill(ev)
+
+    ws.on_trade(_on_trade)
+    return sim
+
+
 async def main(duration_sec: int = 300, top_n: int = 50):
     logging.basicConfig(
         level=logging.INFO,
@@ -2381,6 +2515,8 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     ws = KalshiWS()
     await ws.connect()
     ws.on_update(runner.on_book_update)
+    if runner.qm.paper:
+        attach_paper_fills(runner, ws)
 
     # 2026-09-20 review: the socket dropping means every book is stale and
     # every resting order is unmanaged. Pull exposure IMMEDIATELY (before
@@ -2414,7 +2550,9 @@ async def main(duration_sec: int = 300, top_n: int = 50):
     ws.on_fill(_on_fill)
 
     await ws.subscribe_orderbook([m["market_ticker"] for m in markets])
-    if not runner.qm.paper:
+    if runner.qm.paper:
+        await ws.subscribe_trades([m["market_ticker"] for m in markets])
+    else:
         await ws.subscribe_fills()
 
     # Run with periodic summaries
@@ -2509,6 +2647,8 @@ async def main(duration_sec: int = 300, top_n: int = 50):
                             )
                             runner.markets.append(m)
                     await ws.subscribe_orderbook(list(new_tickers))
+                    if runner.qm.paper:
+                        await ws.subscribe_trades(list(new_tickers))
                 else:
                     _log.debug("periodic_discover: no new markets")
             except Exception as e:

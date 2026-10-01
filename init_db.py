@@ -101,6 +101,52 @@ CREATE TABLE IF NOT EXISTS inventory (
     last_updated    TEXT NOT NULL
 );
 
+-- Fills. Same identity tools/fills_sync.py and QuoteManager use.
+CREATE TABLE IF NOT EXISTS fill_ledger (
+    trade_id          TEXT PRIMARY KEY,
+    order_id          TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    side              TEXT NOT NULL,
+    count             INTEGER NOT NULL,
+    yes_price_cents   INTEGER,
+    no_price_cents    INTEGER,
+    is_taker          INTEGER,
+    created_at        TEXT NOT NULL,
+    synced_at         TEXT NOT NULL,
+    count_real        REAL,
+    exchange_ts       REAL,
+    subaccount        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_fill_ledger_ticker ON fill_ledger(ticker);
+CREATE INDEX IF NOT EXISTS idx_fill_ledger_order  ON fill_ledger(order_id);
+
+-- Settlements. Base columns from tools/settlement_reconciler.py.
+-- Later provenance columns are added by engine.reward_provenance.
+CREATE TABLE IF NOT EXISTS settlement_log (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker               TEXT NOT NULL,
+    series_prefix        TEXT NOT NULL,
+    close_time           TEXT NOT NULL,
+    strike               REAL,
+    kalshi_settle_value  REAL,
+    kalshi_result        TEXT,
+    futures_fair         REAL,
+    futures_confidence   TEXT,
+    predicted_result     TEXT,
+    prediction_correct   INTEGER,
+    delta_kalshi_futures REAL,
+    our_position_yes     INTEGER,
+    our_position_no      INTEGER,
+    our_realized_usd     REAL,
+    rebate_earned_usd    REAL,
+    net_outcome_usd      REAL,
+    recorded_at          TEXT NOT NULL,
+    UNIQUE(ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_settle_prefix_time ON settlement_log(series_prefix, close_time);
+
 -- Reconciliation: end-of-period actual payout vs our simulation
 CREATE TABLE IF NOT EXISTS period_reconciliation (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

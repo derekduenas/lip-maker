@@ -174,6 +174,13 @@ def _eligible(programs: list[dict], top_n: int) -> list[dict]:
     return out[:top_n]
 
 
+def untrack_cancelled(sim, ticker: str, resting_ids: set[str]) -> None:
+    """Drop simulator orders that are no longer resting on this market."""
+    for oid, so in list(sim.orders.items()):
+        if so.market_ticker == ticker and oid not in resting_ids:
+            sim.untrack(oid)
+
+
 async def run_session(args) -> dict:
     prov = _provenance(args)
     cap_dir = Path(args.capture_dir)
@@ -201,6 +208,7 @@ async def run_session(args) -> dict:
     runner.qm.paper = True
     runner.last_complete_scan_ts = time.time() if disc.complete else None
     sim = PaperFillSimulator(latency_ms=args.latency_ms, capture_path=str(trade_cap))
+    runner.fill_sim = sim
     feed = RestBookFeed(poll_interval_sec=args.poll_sec, capture_path=str(book_cap))
     runner.books = feed.books
     tickers = [m["market_ticker"] for m in markets]
@@ -215,9 +223,14 @@ async def run_session(args) -> dict:
             await runner.on_book_update(book)
         except Exception as e:
             _log.debug(f"on_book_update {book.market_ticker}: {e}")
+        # A cancel removes the order from the quote manager. The simulator
+        # must drop it too, or a later print still fills a dead order.
+        resting_ids = {o.order_id for o in runner.qm.resting.get(book.market_ticker, [])}
+        untrack_cancelled(sim, book.market_ticker, resting_ids)
         # Track any newly-rested paper order for fill simulation.
         for o in runner.qm.resting.get(book.market_ticker, []):
-            if o.order_id in seen_orders:
+            if o.order_id in seen_orders or o.order_id in sim.orders:
+                seen_orders.add(o.order_id)
                 continue
             seen_orders.add(o.order_id)
             sim.track(order_id=o.order_id, market_ticker=o.market_ticker,

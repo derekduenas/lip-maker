@@ -69,9 +69,10 @@ def test_price_change_amends_in_place_and_does_not_restack(monkeypatch):
     """One order, new price: amend. The order id stays. No second place."""
     from execution.quote_manager import RestingOrder
     qm, target = _fresh_qm(monkeypatch)
+    target.no_bid_cents = 50
     qm.resting["TEST-MKT"].append(RestingOrder(
         order_id="OLD-NO-1", market_ticker="TEST-MKT", side="no",
-        price_cents=58, size_contracts=25, placed_at=time.time(), paper=True,
+        price_cents=50, size_contracts=25, placed_at=time.time(), paper=True,
     ))
     monkeypatch.setattr(qm, "_passes_safety", lambda t: (True, "ok"))
     monkeypatch.setattr(qm, "_refresh_inventory", lambda mkt: None)

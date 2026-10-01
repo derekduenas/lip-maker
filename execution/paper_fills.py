@@ -21,15 +21,19 @@ observed would have reached us:
    `activation_ts` (placement + latency). A trade that happened while our
    order was in flight is not ours.
 
-3. CONSUMPTION. A trade counts against our level only when it executed AT
-   our price and the taker was hitting our side of the book. Buying YES
-   rests as a YES bid, and it is consumed by a taker buying NO (equivalently,
-   selling YES) at the mirror price. Trades at other levels do not fill us,
-   even when they sweep past — a sweep that stops one cent away is not a
-   fill, and pretending otherwise is how a simulator invents P&L.
+3. CONSUMPTION. A trade counts against our bid when the taker was hitting
+   our side and the print is AT our price or THROUGH it (a lower price on
+   that side). Buying YES rests as a YES bid, and it is consumed by a
+   taker buying NO. A print that stops one cent short of our bid is not a
+   fill. A print through the bid means the level was swept: the queue
+   ahead of us is cleared, then the print's size fills us. Ignoring those
+   prints leaves the adverse-selection fills out of the paper result.
 
-4. ORDERING. Observed volume at our level first exhausts the queue ahead of
-   us; only the remainder fills us, and never more than our remaining size.
+4. ORDERING. At our price, observed volume first exhausts the queue ahead
+   of us; only the remainder fills us, and never more than our remaining
+   size. A through-print zeroes that queue first (the level could not
+   trade through while size was still ahead), then fills min(print, remaining).
+   A quantity smaller than 1e-9 is float residue and is dropped.
 
 Every fill carries the trade_id that caused it, so a fill can be traced back
 to a real, public, timestamped market event rather than to a coin flip.
@@ -37,9 +41,9 @@ to a real, public, timestamped market event rather than to a coin flip.
 What it still cannot know
 -------------------------
 Real queue position (cancellations ahead of us are invisible, so we
-overstate the queue and UNDER-fill), hidden/iceberg size, and whether our
-own order would have changed the taker's behaviour. Under-filling is the
-conservative direction for a strategy whose risk comes from being filled.
+overstate the queue and under-fill AT our price), hidden/iceberg size,
+and whether our own order would have changed the taker's behaviour.
+A through-print is not under-filled: the level was swept.
 """
 from __future__ import annotations
 
@@ -59,6 +63,8 @@ _log = logging.getLogger(__name__)
 # demo session is not stuck on the production host hardcoded here before.
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_LATENCY_MS = 250.0
+# Float residue from fixed-point counts. A 1e-15 "fill" is not a contract.
+DUST_QTY = 1e-9
 
 
 def api_base() -> str:
@@ -182,34 +188,44 @@ class PaperFillSimulator:
                 qty = float(tr.get("count_fp") or tr.get("count") or 0)
             except (TypeError, ValueError):
                 continue
-            if qty <= 0:
+            if qty < DUST_QTY:
                 continue
             yes_c = _cents(tr.get("yes_price_dollars") or 0)
             no_c = _cents(tr.get("no_price_dollars") or 0)
             taker = (tr.get("taker_side") or "").lower()
 
             for o in list(self.orders.values()):
-                if o.market_ticker != ticker or o.remaining <= 0:
+                if o.market_ticker != ticker or o.remaining < DUST_QTY:
                     continue
                 if t_ts < o.activation_ts:
                     continue        # in flight when this trade happened
-                # Our YES bid is hit by a taker buying NO, at the mirror
+                # Our YES bid is hit by a taker buying NO at or through our
                 # price; our NO bid is hit by a taker buying YES.
                 if o.side == "yes":
-                    if taker != "no" or yes_c != o.price_cents:
+                    if taker != "no" or yes_c <= 0 or yes_c > o.price_cents:
                         continue
+                    through = yes_c < o.price_cents
                 else:
-                    if taker != "yes" or no_c != o.price_cents:
+                    if taker != "yes" or no_c <= 0 or no_c > o.price_cents:
                         continue
+                    through = no_c < o.price_cents
+                if through:
+                    # The print is past our level, so the queue at our
+                    # price was cleared before this trade could happen.
+                    o.queue_ahead = 0.0
                 vol = qty
                 if o.queue_ahead > 0:
                     used = min(o.queue_ahead, vol)
                     o.queue_ahead -= used
                     vol -= used
-                if vol <= 0:
+                if vol < DUST_QTY:
                     continue
                 got = min(vol, o.remaining)
+                if got < DUST_QTY:
+                    continue
                 o.remaining -= got
+                if o.remaining < DUST_QTY:
+                    o.remaining = 0.0
                 o.filled += got
                 o.fill_trade_ids.append(tid)
                 self.fills_generated += 1

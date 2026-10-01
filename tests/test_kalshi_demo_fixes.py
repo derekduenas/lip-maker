@@ -357,10 +357,10 @@ class TestQuoteManagerAmendDeath:
             RestingOrder(order_id="OLD-YES-1", market_ticker="TEST-MKT", side="yes",
                          price_cents=40, size_contracts=25, placed_at=now, paper=False),
             RestingOrder(order_id="OLD-NO-1", market_ticker="TEST-MKT", side="no",
-                         price_cents=58, size_contracts=25, placed_at=now, paper=False),
+                         price_cents=50, size_contracts=25, placed_at=now, paper=False),
         ]
-        target = QuoteTarget(market_ticker="TEST-MKT", yes_bid_cents=42,
-                             no_bid_cents=58, size_contracts=25)
+        target = QuoteTarget(market_ticker="TEST-MKT", yes_bid_cents=38,
+                             no_bid_cents=50, size_contracts=25)
         actions = qm.reconcile(target)
         assert actions["cancelled"] == 1
         sides = [o.side for o in qm.resting.get("TEST-MKT", [])]

@@ -197,6 +197,7 @@ class KalshiWS:
         # Private `fill` channel: consumers keep resting sizes honest between
         # REST resyncs (partial fills).
         self._fill_callbacks: list[Callable[["FillEvent"], Awaitable[None]]] = []
+        self._trade_callbacks: list[Callable[[dict], Awaitable[None]]] = []
         self.connected: bool = False
         self._grid_warned: set[str] = set()
         self._load_key()
@@ -266,6 +267,23 @@ class KalshiWS:
 
     def on_fill(self, cb: Callable[["FillEvent"], Awaitable[None]]) -> None:
         self._fill_callbacks.append(cb)
+
+    def on_trade(self, cb: Callable[[dict], Awaitable[None]]) -> None:
+        """Public trade prints. Paper fills are driven from these."""
+        self._trade_callbacks.append(cb)
+
+    async def subscribe_trades(self, tickers: list[str]) -> int:
+        """Subscribe to the public `trade` channel for paper fill simulation."""
+        self._cmd_id += 1
+        cmd = {
+            "id": self._cmd_id,
+            "cmd": "subscribe",
+            "params": {"channels": ["trade"], "market_tickers": list(tickers)},
+        }
+        await self._ws.send(json.dumps(cmd))
+        self._pending_cmd_tickers[self._cmd_id] = list(tickers)
+        _log.info(f"subscribed trades (cmd_id={self._cmd_id}) n={len(tickers)}")
+        return self._cmd_id
 
     def on_disconnect(self, cb: Callable[[list[str]], Awaitable[None]]) -> None:
         """Register a hook fired immediately when the socket drops (before
@@ -603,9 +621,41 @@ class KalshiWS:
             if sid is not None and tickers is not None:
                 self._sid_to_tickers[sid] = list(tickers)
             _log.info(f"subscribed ack: sid={sid} cmd_id={cmd_id} n={len(tickers or [])}")
+        elif mtype == "trade":
+            trade = self._parse_public_trade(msg)
+            if trade is None:
+                return
+            for cb in self._trade_callbacks:
+                try:
+                    await cb(trade)
+                except Exception as e:
+                    _log.error(f"trade callback failed: {e}")
         elif mtype == "error":
             _log.error(f"WS error: {msg}")
-        # Other message types (trade, ticker, fill) ignored here
+        # Other message types (ticker) ignored here
+
+    @classmethod
+    def _parse_public_trade(cls, msg: dict) -> Optional[dict]:
+        """Public `trade` channel payload in the shape PaperFillSimulator reads."""
+        body = msg.get("msg") if isinstance(msg.get("msg"), dict) else msg
+        if not isinstance(body, dict):
+            return None
+        tid = body.get("trade_id")
+        if not tid:
+            return None
+        out = dict(body)
+        out["trade_id"] = str(tid)
+        out["ticker"] = body.get("ticker") or body.get("market_ticker") or ""
+        if not out.get("created_time"):
+            raw = body.get("ts") or body.get("created_time")
+            if isinstance(raw, (int, float)) or (isinstance(raw, str) and raw.replace(".", "", 1).isdigit()):
+                v = float(raw)
+                v = v / 1000.0 if v > 1e11 else v
+                out["created_time"] = datetime.fromtimestamp(v, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+            elif raw:
+                out["created_time"] = str(raw)
+        return out
 
     @classmethod
     def _parse_fill(cls, m: dict) -> Optional["FillEvent"]:

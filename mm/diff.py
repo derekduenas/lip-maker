@@ -23,6 +23,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+# A one-cent flicker is not worth forfeiting queue position. Size-up
+# below this fraction is the same order, not a new one.
+AMEND_PRICE_TICKS = 2
+AMEND_SIZE_UP_FRAC = 0.10
+
 
 @dataclass(frozen=True)
 class Diff:
@@ -41,8 +46,15 @@ def plan_resting(
     *,
     eps: float = 1e-6,
     fade: bool = False,
+    price_tick_threshold: int = AMEND_PRICE_TICKS,
+    size_up_frac: float = AMEND_SIZE_UP_FRAC,
 ) -> Diff:
-    """One resting order (or none) against one target."""
+    """One resting order (or none) against one target.
+
+    Price moves smaller than ``price_tick_threshold`` cents, and size-ups
+    smaller than ``size_up_frac``, stay resting. Those writes were the
+    churn that tripped the quote-rate caps.
+    """
     if target_price is None or target_size <= eps:
         if resting_price is None:
             return Diff("keep", None, 0.0, True, "nothing_to_do")
@@ -58,5 +70,13 @@ def plan_resting(
     if same_px and fade and float(target_size) > float(resting_size) + eps:
         return Diff("keep", int(resting_price), float(resting_size), True,
                     "fade_no_topup")
+    price_delta = 0 if same_px else abs(int(resting_price) - int(target_price))
+    size_up = float(target_size) > float(resting_size) * (1.0 + float(size_up_frac)) + eps
+    if price_delta < int(price_tick_threshold) and not size_up:
+        if float(target_size) < float(resting_size) - eps:
+            return Diff("decrease", int(resting_price), float(target_size), True,
+                        "size_down_keeps_queue")
+        return Diff("keep", int(resting_price), float(resting_size), True,
+                    "within_amend_threshold")
     return Diff("amend", int(target_price), float(target_size), False,
                 "price_or_size_up_loses_queue")
