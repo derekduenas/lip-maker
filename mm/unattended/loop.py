@@ -79,6 +79,8 @@ class DemoPoster:
     def __init__(self, host: str, sender: Callable[[dict], dict]) -> None:
         if host not in DEMO_HOSTS:
             raise UnattendedRefused(f"demo orders require a demo host, got {host}")
+        from mm.venues.readonly import reject_market_data_reader
+        reject_market_data_reader(sender)
         self.host = host
         self.sender = sender
 
@@ -527,6 +529,8 @@ class RunLoop:
         if rewards < 0:
             rewards = Decimal(0)
         day = datetime.fromtimestamp(self.now or 0, timezone.utc).date().isoformat()
+        from mm.venues.readonly import book_source
+        books = book_source(force_demo=self.mode != "paper")
         return {
             "paper": self.mode == "paper",
             "demo": self.mode == "demo",
@@ -557,6 +561,7 @@ class RunLoop:
             "pnl_usd": format(-premium, "f"),
             "rewards_usd": format(rewards, "f"),
             "day": day,
+            "data_source": books["flag"],
         }
 
 
@@ -642,7 +647,70 @@ async def drive_socket(ws_url: str, on_frame: Callable[[dict], None]) -> None:
         await ws.close()
 
 
+async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -> None:
+    """Production books and public trades. The reader cannot place an order."""
+    from mm.venues.readonly import (
+        PUBLIC_WS_CHANNELS, ReadOnlyKalshiTransport, ReadOnlyMarketSocket, load_private_key,
+    )
+    key = load_private_key(source["key_path"])
+    reader = ReadOnlyKalshiTransport(api_key=source["key_id"], private_key=key)
+    payload: dict = {}
+    try:
+        payload = reader.get(
+            "/incentive_programs", params={"status": "active", "type": "liquidity"},
+        )
+    except Exception:
+        payload = {}
+    for frame in _programs_from_incentive(payload):
+        on_frame(frame)
+    sock = ReadOnlyMarketSocket(api_key=source["key_id"], private_key=key, url=source["ws_url"])
+    await sock.connect()
+    try:
+        tickers = [frame["market"] for frame in _programs_from_incentive(payload)]
+        await sock.subscribe(sorted(PUBLIC_WS_CHANNELS), tickers)
+        async for raw in sock._ws:
+            msg = json.loads(raw)
+            msg.setdefault("ts", time.time())
+            kind = str(msg.get("type") or "")
+            if kind == "trade":
+                body = msg.get("msg") or msg
+                on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
+            elif kind in ("orderbook_snapshot", "orderbook_delta"):
+                on_frame(msg)
+    finally:
+        await sock.close()
+
+
+def _programs_from_incentive(payload: dict) -> list[dict]:
+    from engine.lip_discovery import _parse_program
+    frames = []
+    now = time.time()
+    for raw in payload.get("incentive_programs") or []:
+        parsed = _parse_program(raw)
+        if not parsed:
+            continue
+        start = datetime.fromisoformat(str(parsed["start_date"]).replace("Z", "+00:00")).timestamp()
+        end = datetime.fromisoformat(str(parsed["end_date"]).replace("Z", "+00:00")).timestamp()
+        frames.append({
+            "kind": "program",
+            "market": parsed["market_ticker"],
+            "series": parsed["series_ticker"],
+            "program_id": parsed.get("id") or parsed["market_ticker"],
+            "period_reward_usd": parsed["period_reward_usd"],
+            "period_seconds": parsed["period_seconds"],
+            "discount_factor": parsed["discount_factor"],
+            "target_size": parsed["target_size"],
+            "start_ts": start,
+            "end_ts": end,
+            "close_ts": end,
+            "days_to_settle": max(0.0, (end - now) / 86400.0),
+        })
+    return frames
+
+
 def waiting_report(ws_url: str) -> dict:
+    from mm.venues.readonly import book_source
+    books = book_source()
     return {
         "paper": True,
         "demo": False,
@@ -659,4 +727,5 @@ def waiting_report(ws_url: str) -> dict:
         "day": datetime.now(timezone.utc).date().isoformat(),
         "kill": None,
         "ws_url": ws_url,
+        "data_source": books["flag"],
     }

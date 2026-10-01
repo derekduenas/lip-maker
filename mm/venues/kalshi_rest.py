@@ -91,6 +91,8 @@ class KalshiRestTransport:
         self.allow_production = bool(allow_production)
         self._session = session
         self.last_signed_path = ""
+        self.writes_orders = True
+        self.read_only_market_data = False
 
     def _session_or_create(self):
         if self._session is None:

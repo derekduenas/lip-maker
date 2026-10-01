@@ -43,12 +43,18 @@ class SafeSender:
     """Place only with an order-group id. Trigger flattens those groups."""
 
     def __init__(self, adapter, book: Optional[OrderGroupBook] = None) -> None:
+        from mm.venues.readonly import reject_market_data_reader
+        reject_market_data_reader(adapter)
+        reject_market_data_reader(getattr(adapter, "transport", None))
         self.adapter = adapter
         self.book = book if book is not None else OrderGroupBook(adapter)
 
     def place(self, market: str, side: Side, price_cents: int, size: float, *,
               exchange_index: int, best_opposing_bid_cents: Optional[int],
               contracts_limit: int = 1000, now: float = 0.0) -> dict:
+        from mm.venues.readonly import reject_market_data_reader
+        reject_market_data_reader(self.adapter)
+        reject_market_data_reader(getattr(self.adapter, "transport", None))
         if exchange_index is None:
             return {"ok": False, "error": "shard_unknown", "order_id": ""}
         spec = self.book.group_for(

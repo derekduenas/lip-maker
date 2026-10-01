@@ -4,7 +4,7 @@ Paper and demo rails stay. Production stays disarmed. This file lists what was c
 
 ## Entrypoint
 
-`python -m mm.unattended --run` is the continuous paper process: demo websocket by default, then selector, sizer, quoter, per-second scorer, allocator, and risk on a 10-minute selection cadence. `--run --replay STREAM.jsonl` is that loop on a recorded websocket stream and does not open a socket. `--cycle` remains the one-shot book pass. The systemd unit runs `--run` with `LIP_PAPER=true` and the demo host. Droplet steps are in `docs/DROPLET.md`.
+`python -m mm.unattended --run` is the continuous paper process. With `KALSHI_PROD_READ_KEY_ID` and `KALSHI_PROD_READ_KEY_PATH` it reads production books through a read-only client. Without them the status flag is `demo-books: results not representative`. The loop then runs selector, sizer, quoter, per-second scorer, allocator, and risk on a 10-minute selection cadence. `--run --replay STREAM.jsonl` is that loop on a recorded websocket stream and does not open a socket. `--cycle` remains the one-shot book pass. The systemd unit runs `--run` with `LIP_PAPER=true` and the demo host. Droplet steps are in `docs/DROPLET.md`.
 
 ## Findings
 

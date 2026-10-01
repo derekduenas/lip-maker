@@ -207,6 +207,8 @@ class KalshiAdapter:
     name = VenueName.KALSHI
 
     def __init__(self, transport: Optional[object] = None, *, paper: bool = True) -> None:
+        from mm.venues.readonly import reject_market_data_reader
+        reject_market_data_reader(transport)
         self.transport = transport
         self.paper = paper
         self.budget = RateBudget(capacity=100.0, per_second=100.0)
@@ -239,6 +241,8 @@ class KalshiAdapter:
         require_live_execution_allowed(venue="kalshi")
         if self.transport is None:
             raise LiveExecutionBlocked("no transport")
+        from mm.venues.readonly import reject_market_data_reader
+        reject_market_data_reader(self.transport)
         return self.transport.request(method, path, body=body, params=params)
 
     def _call(self, method: str, path: str, body: Optional[dict] = None,

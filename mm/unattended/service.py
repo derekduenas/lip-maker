@@ -86,6 +86,7 @@ def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
             fills=int(report.get("fills_n") or 0),
             pnl_usd=float(report.get("pnl_usd") or 0),
             rewards_usd=float(report.get("rewards_usd") or 0),
+            data_source=str(report.get("data_source") or "") or None,
         ), encoding="utf-8")
     if args.report:
         dest = Path(args.report)
@@ -159,31 +160,40 @@ def main(argv: list[str] | None = None) -> int:
         from mm.unattended.loop import (
             resolve_mode, resolve_ws_url, run_recorded, socket_plan, waiting_report,
         )
+        from mm.venues.readonly import book_source
         mode = resolve_mode()
         url = resolve_ws_url(ws_url)
         if mode == "paper":
             assert_paper_demo(paper=True, ws_url=url)
+            books = book_source()
         else:
             from mm.unattended.loop import assert_demo_host
             assert_demo_host(url)
+            books = book_source(force_demo=True)
         started: list = []
         if args.replay:
             report = run_recorded(
                 args.replay, mode=mode, select_every=args.select_every,
             )
-            report["ws_url"] = url
+            report["ws_url"] = books["ws_url"] if books["reader"] else url
+            report["data_source"] = books["flag"]
             _write_run_outputs(args, report, started)
             return 0
         while True:
-            plan = socket_plan(url)
+            if books["reader"]:
+                plan = {"socket": True, "url": books["ws_url"], "stage": "connect", "reader": True}
+            else:
+                plan = socket_plan(url)
+                plan["reader"] = False
             report = waiting_report(plan["url"])
             report["stage"] = plan["stage"]
             report["mode"] = mode
             report["paper"] = mode == "paper"
             report["demo"] = mode == "demo"
+            report["data_source"] = books["flag"]
             _write_run_outputs(args, report, started)
             if plan["socket"]:
-                from mm.unattended.loop import RunLoop, drive_socket
+                from mm.unattended.loop import RunLoop, drive_readonly_books, drive_socket
                 loop = RunLoop(mode=mode, select_every=args.select_every)
                 loop.socket_opened = True
 
@@ -192,10 +202,14 @@ def main(argv: list[str] | None = None) -> int:
                     write_heartbeat(args.heartbeat)
 
                 import asyncio
-                asyncio.run(drive_socket(plan["url"], _on_frame))
+                if plan.get("reader"):
+                    asyncio.run(drive_readonly_books(books, _on_frame))
+                else:
+                    asyncio.run(drive_socket(plan["url"], _on_frame))
                 report = loop.finish()
                 report["socket_opened"] = True
                 report["ws_url"] = plan["url"]
+                report["data_source"] = books["flag"]
                 _write_run_outputs(args, report, started)
             if args.once:
                 return 0

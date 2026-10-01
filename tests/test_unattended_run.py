@@ -113,7 +113,9 @@ def test_modes_and_demo_poster():
     assert plan["stage"] == "waiting_for_demo_key"
 
 
-def test_run_loop_on_a_recorded_stream(tmp_path):
+def test_run_loop_on_a_recorded_stream(tmp_path, monkeypatch):
+    monkeypatch.delenv("KALSHI_PROD_READ_KEY_ID", raising=False)
+    monkeypatch.delenv("KALSHI_PROD_READ_KEY_PATH", raising=False)
     path = tmp_path / "stream.jsonl"
     path.write_text("\n".join(json.dumps(row) for row in _stream()) + "\n", encoding="utf-8")
     called = []
@@ -165,6 +167,8 @@ def test_run_loop_on_a_recorded_stream(tmp_path):
     assert "cancel_all" in (tmp_path / "cancel").read_text(encoding="utf-8")
     text = summary.read_text(encoding="utf-8")
     assert "fills 1" in text
+    assert "data_source demo-books: results not representative" in text
+    assert saved["status"]["data_source"] == "demo-books: results not representative"
     assert (tmp_path / "hb").exists()
 
 
@@ -191,6 +195,8 @@ def test_demo_mode_applies_the_series_gate(tmp_path):
 def test_run_without_a_key_does_not_open_a_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(tmp_path / "missing.pem"))
     monkeypatch.delenv("LIP_KALSHI_WS_URL", raising=False)
+    monkeypatch.delenv("KALSHI_PROD_READ_KEY_ID", raising=False)
+    monkeypatch.delenv("KALSHI_PROD_READ_KEY_PATH", raising=False)
     monkeypatch.setenv("LIP_PAPER", "true")
     out = tmp_path / "idle.json"
     code = main([
@@ -204,6 +210,8 @@ def test_run_without_a_key_does_not_open_a_socket(tmp_path, monkeypatch):
     assert saved["socket_opened"] is False
     assert saved["stage"] == "waiting_for_demo_key"
     assert saved["ws_url"].startswith("wss://demo-api.kalshi.co/")
+    assert saved["data_source"] == "demo-books: results not representative"
+    assert saved["status"]["data_source"] == "demo-books: results not representative"
 
 
 def test_unit_runs_the_paper_loop():

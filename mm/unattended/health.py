@@ -10,13 +10,17 @@ from mm.safety.supervisor import write_heartbeat
 WINDOW_SECONDS = 86400.0
 
 
-def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: float) -> str:
-    return (
+def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: float,
+                         data_source: str | None = None) -> str:
+    text = (
         f"daily summary {day}\n"
         f"fills {int(fills)}\n"
         f"pnl_usd {float(pnl_usd):.4f}\n"
         f"rewards_usd {float(rewards_usd):.4f}\n"
     )
+    if data_source:
+        text += f"data_source {data_source}\n"
+    return text
 
 
 class Health:

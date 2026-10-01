@@ -1,6 +1,6 @@
 # Unattended Kalshi loop (paper / demo)
 
-This process is for a small always-on VM in **us-east**, close to the venue, running the paper loop continuously. It does not talk to the production exchange. `LIP_PAPER` stays `true`. A production websocket host is refused.
+This process is for a small always-on VM in **us-east**, close to the venue, running the paper loop continuously. `LIP_PAPER` stays `true`. Orders are not sent to the production exchange. When `KALSHI_PROD_READ_KEY_ID` and `KALSHI_PROD_READ_KEY_PATH` are set, paper mode reads production books through the read-only client. Without them the status line is `demo-books: results not representative`.
 
 `python -m mm.unattended --run` is the long-running process: demo websocket by default (`wss://demo-api.kalshi.co/trade-api/ws/v2`), then selector, sizer, quoter, per-second scorer, allocator, and risk. Selection repeats every 10 minutes. Paper mode simulates fills on live trades. `--run --replay STREAM.jsonl` does the same loop on a recording and does not open a socket. `--cycle` remains the one-shot book pass. Droplet install, firewall, and the env file are in `docs/DROPLET.md`. The audit of this branch is `docs/AUDIT.md`.
 

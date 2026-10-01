@@ -99,6 +99,14 @@ def _exchange_index(raw: dict) -> Optional[int]:
         return None
 
 
+def _reject_readonly_client(client) -> None:
+    """The production book reader is not an order client."""
+    if client is None:
+        return
+    from mm.venues.readonly import reject_market_data_reader
+    reject_market_data_reader(client)
+
+
 @dataclass
 class RestingOrder:
     """A currently-open order we've placed.
@@ -1009,6 +1017,7 @@ class QuoteManager:
             # observation and the order's arrival. Live transmission is
             # therefore refused until exchange-enforced post_only is
             # verified. One chokepoint, before the body is even built.
+            _reject_readonly_client(self.client)
             try:
                 require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
@@ -1036,6 +1045,7 @@ class QuoteManager:
                 gid = ""
                 if self.order_group_for is not None:
                     gid = self.order_group_for(market_ticker) or ""
+                _reject_readonly_client(self.client)
                 resp = self.client.post(
                     V2_CREATE_PATH, to_event_order_v2(body, order_group_id=gid or None))
                 order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id", "")
@@ -1094,6 +1104,7 @@ class QuoteManager:
         if new_size <= 0 or new_size >= order.size_contracts:
             return False
         if not self.paper:
+            _reject_readonly_client(self.client)
             try:
                 require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
@@ -1104,6 +1115,7 @@ class QuoteManager:
                         "market_ticker": order.market_ticker}
                 if order.exchange_index is not None:
                     body["exchange_index"] = int(order.exchange_index)
+                _reject_readonly_client(self.client)
                 self.client.post(
                     f"{V2_CREATE_PATH}/{order.order_id}/decrease",
                     body,
@@ -1124,6 +1136,7 @@ class QuoteManager:
         is removed. Return value is True, False, or ``"dead"``.
         """
         if not self.paper:
+            _reject_readonly_client(self.client)
             try:
                 require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
@@ -1143,6 +1156,7 @@ class QuoteManager:
                               "client_order_id": order.client_order_id}
                 if order.exchange_index is not None:
                     amend_body["exchange_index"] = int(order.exchange_index)
+                _reject_readonly_client(self.client)
                 resp = self.client.post(
                     f"{V2_CREATE_PATH}/{order.order_id}/amend",
                     amend_body,
@@ -1201,6 +1215,7 @@ class QuoteManager:
         if self.paper:
             _log.info(f"[PAPER] CANCEL {order.market_ticker} {order.side}@{order.price_cents}c")
         else:
+            _reject_readonly_client(self.client)
             try:
                 from urllib.parse import urlencode
                 path = (f"{V2_CREATE_PATH}/{order.order_id}?"

@@ -7,6 +7,7 @@ from typing import Callable
 
 
 def status_payload(report: dict) -> dict:
+    from mm.venues.readonly import book_source
     return {
         "paper": True,
         "live_armed": False,
@@ -14,6 +15,7 @@ def status_payload(report: dict) -> dict:
         "markets": report.get("markets") or [],
         "estimated_usd": report.get("estimated_usd"),
         "kill": report.get("kill"),
+        "data_source": report.get("data_source") or book_source()["flag"],
     }
 
 

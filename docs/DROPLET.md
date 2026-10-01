@@ -14,7 +14,34 @@ The process is `python3 -m mm.unattended --run`. It cancels on startup, then con
 
 Heartbeat: `/var/lib/lip-maker/heartbeat`. Daily summary: `/var/lib/lip-maker/daily-summary`. Status JSON: `http://127.0.0.1:8765/status` (loopback only; ufw does not open it). Logs: `/var/lib/lip-maker/lip.log`, rotating at 1 MB, five files.
 
-`LIP_PAPER=true` simulates fills from public trades with the paper fill model (last in queue, 250 ms latency, only a trade at our price). A demo API key in `/etc/lip-maker/lip-maker.env` (`KALSHI_PRIVATE_KEY_PATH` and `KALSHI_KEY_ID`) lets the process open the demo websocket. Until that key exists the process stays up, writes the heartbeat, and does not open a socket and does not fall back to the production host.
+`LIP_PAPER=true` simulates fills from public trades with the paper fill model (last in queue, 250 ms latency, only a trade at our price). With `KALSHI_PROD_READ_KEY_ID` and `KALSHI_PROD_READ_KEY_PATH` set, those books and trades come from the production exchange through a read-only client. Without that key the process uses demo books and the status page and daily summary say `demo-books: results not representative`.
+
+The read-only client allows GET market data (markets, events, series, order books, trades, incentive programs, exchange status) and a websocket subscription to `orderbook_delta`, `ticker`, and `trade`. A POST, PUT, DELETE, PATCH, portfolio route, or order/fill/position channel logs and exits. The quote path, `SafeSender`, and the demo sender cannot take that client. `KALSHI_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` stay the demo order key and are separate.
+
+## Production read key
+
+1. In the Kalshi web UI create an API key. Kalshi shows the key id and gives you the private key file once.
+2. Copy the pem to the droplet and lock it down. From your own machine:
+
+```bash
+scp ./kalshi_prod_read.pem root@YOUR_DROPLET:/etc/lip-maker/kalshi-prod-read.pem
+ssh root@YOUR_DROPLET 'chown lip:lip /etc/lip-maker/kalshi-prod-read.pem && chmod 600 /etc/lip-maker/kalshi-prod-read.pem'
+```
+
+3. Put the id and the path in `/etc/lip-maker/lip-maker.env` (mode 600). Do not put the pem on the command line.
+
+```bash
+KALSHI_PROD_READ_KEY_ID=the-id-from-the-kalshi-ui
+KALSHI_PROD_READ_KEY_PATH=/etc/lip-maker/kalshi-prod-read.pem
+```
+
+4. Restart the paper service:
+
+```bash
+sudo systemctl restart lip-unattended.service
+```
+
+The status page at `http://127.0.0.1:8765/status` then shows `data_source` `production-books`. The daily summary at `/var/lib/lip-maker/daily-summary` includes the same line. Live arming flags stay off.
 
 Secrets stay in `/etc/lip-maker/lip-maker.env` or in files that variable points at. A private key on the command line is refused.
 

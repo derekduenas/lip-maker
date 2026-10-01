@@ -24,6 +24,10 @@ if [[ ! -f /etc/lip-maker/lip-maker.env ]]; then
 fi
 chown -R lip:lip /opt/lip-maker /var/lib/lip-maker /etc/lip-maker
 chmod 600 /etc/lip-maker/lip-maker.env
+if [[ -f /etc/lip-maker/kalshi-prod-read.pem ]]; then
+  chown lip:lip /etc/lip-maker/kalshi-prod-read.pem
+  chmod 600 /etc/lip-maker/kalshi-prod-read.pem
+fi
 
 cp /opt/lip-maker/deploy/lip-unattended.service /etc/systemd/system/lip-unattended.service
 systemctl daemon-reload
@@ -37,5 +41,7 @@ ufw --force enable
 systemctl enable --now lip-unattended.service
 
 echo "Paper unit is enabled and running (selector, sizer, quoter, scorer, allocator, risk)."
-echo "LIP_PAPER=true. Websocket default is the demo host. A missing demo key keeps the process up and does not open a socket."
+echo "LIP_PAPER=true. Orders stay simulated."
+echo "Production books: set KALSHI_PROD_READ_KEY_ID and KALSHI_PROD_READ_KEY_PATH in /etc/lip-maker/lip-maker.env, chmod 600 the pem, then systemctl restart lip-unattended.service."
+echo "Without that read key the status page shows: demo-books: results not representative"
 echo "Live trading stays off. Arming it later takes a separate acknowledgement, allow_production, and LIP_PAPER=false. This script does not do that."

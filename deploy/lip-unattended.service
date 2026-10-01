@@ -9,6 +9,9 @@ User=lip
 Group=lip
 WorkingDirectory=/opt/lip-maker
 EnvironmentFile=-/etc/lip-maker/lip-maker.env
+# Paper orders stay off. Production books are read-only and use
+# KALSHI_PROD_READ_KEY_ID plus KALSHI_PROD_READ_KEY_PATH from the env file.
+# Without that key the process reads demo books.
 Environment=LIP_PAPER=true
 Environment=LIP_KALSHI_WS_URL=wss://demo-api.kalshi.co/trade-api/ws/v2
 Environment=PYTHONUNBUFFERED=1
