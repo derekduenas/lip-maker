@@ -285,7 +285,7 @@ class TestPool:
                     has_reference=ref, has_observation=obs)
 
     def test_long_dated_event_excluded_reference_preferred_on_a_tie(self):
-        event = self._pool("KXGOV-1", "KXGOV", 40, "5", "0")
+        event = self._pool("KXGOV-1", "KXGOV", 100, "5", "0")
         near_event = self._pool("KXSHOW-1", "KXSHOW", 3, "2", "0")
         brent = self._pool("KXBRENTD-1", "KXBRENTD", 3, "2", "0", ref=True)
         chosen = select([event, near_event, brent])

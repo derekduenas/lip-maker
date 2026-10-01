@@ -77,7 +77,7 @@ class TestSelector:
     def test_commodity_weekly_beats_a_crowd_and_skips_the_long_event(self):
         thin = _market("KXBRENT-26OCT07", comp=10, pool=50)
         crowded = _market("KXBRENT-26OCT08", comp=5000, pool=50)
-        long_event = _market("KXPRES-26NOV01", comp=0, pool=500, days=30,
+        long_event = _market("KXPRES-26NOV01", comp=0, pool=500, days=100,
                              series="KXPRES")
         short_event = _market("KXPRES-26OCT04", comp=100, pool=2, days=10,
                               series="KXPRES")

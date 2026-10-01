@@ -1,5 +1,12 @@
 """Pre-trade gates from the 1 October 2026 paper sim.
 
+Durable-focus defaults (env-configurable): a market that closes in under
+24 hours is out, live sports and esports matches are out, and the long-dated
+window is 90 days for events and 120 days for anything. Those horizons are
+the market ``close_time``, not the incentive program end. A plan richer than
+$40/day per $100 of capital is flagged, not auto-traded past the other gates.
+
+
 Three hours, 7,035 fills. Quoting through the last hour before close lost
 about $924 a day per $1,000 of fills. Pulling quotes 15 minutes before
 close flipped that to about +$238. Eleven fills lost more than $100 on
@@ -11,10 +18,18 @@ so the quoter and the supervisor apply the same rule.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 DEFAULT_PULL_BEFORE_CLOSE_MIN = 15.0
 DEFAULT_SINGLE_FILL_CAP_USD = 100.0
+DEFAULT_MIN_HOURS_TO_CLOSE = 24.0
+DEFAULT_LONG_DATED_EVENT_DAYS = 90.0
+DEFAULT_LONG_DATED_ANY_DAYS = 120.0
+DEFAULT_SUSPECT_USD_PER_100_DAY = 40.0
+DEFAULT_SUBSCRIBE_LIMIT = 300
+DEFAULT_MATCH_SERIES_DENY = r"(?i)(?:MATCH|GAME|FIGHT|BOUT)$"
+DEFAULT_SPORTS_CATEGORIES = "sports,esports"
 
 
 def pull_before_close_s(minutes: float | None = None) -> float:
@@ -23,6 +38,86 @@ def pull_before_close_s(minutes: float | None = None) -> float:
         raw = os.environ.get("LIP_PULL_BEFORE_CLOSE_MIN", "")
         minutes = float(raw) if raw else DEFAULT_PULL_BEFORE_CLOSE_MIN
     return float(minutes) * 60.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return float(default)
+    return float(raw)
+
+
+def min_hours_to_close() -> float:
+    """Drop a market whose close is closer than this. ``0`` disables the gate."""
+    return _env_float("LIP_MIN_HOURS_TO_CLOSE", DEFAULT_MIN_HOURS_TO_CLOSE)
+
+
+def long_dated_event_days() -> float:
+    return _env_float("LIP_LONG_DATED_EVENT_DAYS", DEFAULT_LONG_DATED_EVENT_DAYS)
+
+
+def long_dated_any_days() -> float:
+    return _env_float("LIP_LONG_DATED_ANY_DAYS", DEFAULT_LONG_DATED_ANY_DAYS)
+
+
+def suspect_usd_per_100_day() -> float:
+    """Planned dollars per day per $100 of capital above which status says suspect."""
+    return _env_float("LIP_SUSPECT_USD_PER_100_DAY", DEFAULT_SUSPECT_USD_PER_100_DAY)
+
+
+def subscribe_limit() -> int:
+    return max(1, int(_env_float("LIP_SUBSCRIBE_LIMIT", DEFAULT_SUBSCRIBE_LIMIT)))
+
+
+def plan_per_hundred(planned_usd_per_day: float, capital_usd: float) -> float:
+    capital = float(capital_usd)
+    if capital <= 0:
+        return 0.0
+    return float(planned_usd_per_day) / capital * 100.0
+
+
+def plan_is_suspect(planned_usd_per_day: float, capital_usd: float) -> bool:
+    return plan_per_hundred(planned_usd_per_day, capital_usd) > suspect_usd_per_100_day()
+
+
+def match_series_reason(series: str, market: str = "", category: str = "") -> str:
+    """Live sports and esports matches. Category or a series-name pattern.
+
+    ``LIP_MATCH_SERIES_DENY`` is a regex on the series ticker. Unset uses
+    a suffix of MATCH, GAME, FIGHT, or BOUT. ``LIP_SPORTS_CATEGORIES`` is a
+    comma list. Set either variable to ``-`` to turn that check off.
+    """
+    pattern = os.environ.get("LIP_MATCH_SERIES_DENY")
+    if pattern is None:
+        pattern = DEFAULT_MATCH_SERIES_DENY
+    if pattern and pattern != "-":
+        rx = re.compile(pattern)
+        for raw in (series, market):
+            head = (raw or "").upper().split("-", 1)[0]
+            if head and rx.search(head):
+                return "match_series"
+    cats = os.environ.get("LIP_SPORTS_CATEGORIES")
+    if cats is None:
+        cats = DEFAULT_SPORTS_CATEGORIES
+    banned = {part.strip().lower() for part in cats.split(",") if part.strip() and part.strip() != "-"}
+    label = (category or "").strip().lower()
+    if label and label in banned:
+        return "sports_category"
+    return ""
+
+
+def close_horizon_reason(days_to_settle: float | None) -> str:
+    """Short close and the any-market long-dated cap, from days until close."""
+    if days_to_settle is None:
+        return "settlement_time_unknown"
+    days = float(days_to_settle)
+    hours = days * 24.0
+    minimum = min_hours_to_close()
+    if minimum > 0 and hours < minimum:
+        return "closes_within_24h"
+    if days > long_dated_any_days():
+        return f"long_dated_{days:.0f}d"
+    return ""
 
 
 def single_fill_cap_usd(cap: float | None = None) -> float:

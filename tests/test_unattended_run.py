@@ -429,12 +429,19 @@ def test_prod_read_programs_are_paged_sharded_and_selected(tmp_path, monkeypatch
     monkeypatch.delenv("LIP_KALSHI_WS_URL", raising=False)
     monkeypatch.setenv("KALSHI_PROD_READ_KEY_ID", "kid")
     monkeypatch.setenv("KALSHI_PROD_READ_KEY_PATH", str(pem))
+    monkeypatch.setenv("LIP_MARKET_CACHE", str(tmp_path / "market_meta.json"))
 
     now = datetime.now(timezone.utc)
     start = (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     end = (now + timedelta(days=1)).isoformat().replace("+00:00", "Z")
     hourly = "KXTEMPH-26OCT01-B50"
     brent = "KXBRENT-26OCT07"
+    match = "KXTTELITEMATCH-26OCT01A"
+    close_at = {
+        brent: now + timedelta(days=3),
+        hourly: now + timedelta(days=3),
+        match: now + timedelta(hours=6),
+    }
 
     def raw(ticker):
         return {
@@ -450,36 +457,36 @@ def test_prod_read_programs_are_paged_sharded_and_selected(tmp_path, monkeypatch
         }
 
     calls = []
+    events = []
+
+    def _resp(status, payload):
+        return type("R", (), {"status_code": status, "json": lambda self, payload=payload: payload})()
 
     class Books:
         def request(self, method, url, headers=None, data=None, timeout=10):
             calls.append((method, url))
+            events.append(("http", url))
             parts = urlsplit(url)
             query = parse_qs(parts.query)
             if parts.path.endswith("/incentive_programs"):
                 if "cursor" not in query:
-                    return type("R", (), {
-                        "status_code": 200,
-                        "json": lambda self: {
-                            "incentive_programs": [raw(hourly)],
-                            "next_cursor": "page-2",
-                        },
-                    })()
+                    return _resp(200, {"incentive_programs": [raw(hourly)], "next_cursor": "page-2"})
                 assert query["cursor"] == ["page-2"]
-                return type("R", (), {
-                    "status_code": 200,
-                    "json": lambda self: {
-                        "incentive_programs": [raw(brent)],
-                        "next_cursor": "",
-                    },
-                })()
-            ticker = parts.path.rstrip("/").rsplit("/", 1)[-1]
-            return type("R", (), {
-                "status_code": 200,
-                "json": lambda self, ticker=ticker: {
-                    "market": {"ticker": ticker, "exchange_index": 2},
-                },
-            })()
+                return _resp(200, {
+                    "incentive_programs": [raw(brent), raw(match)],
+                    "next_cursor": "",
+                })
+            assert parts.path.rstrip("/").endswith("/markets")
+            wanted = query["tickers"][0].split(",")
+            rows = []
+            for ticker in wanted:
+                rows.append({
+                    "ticker": ticker,
+                    "exchange_index": 2,
+                    "category": "Sports" if ticker == match else "",
+                    "close_time": close_at[ticker].isoformat().replace("+00:00", "Z"),
+                })
+            return _resp(200, {"markets": rows})
 
     monkeypatch.setattr("requests.Session", lambda: Books())
 
@@ -489,32 +496,40 @@ def test_prod_read_programs_are_paged_sharded_and_selected(tmp_path, monkeypatch
         def __init__(self, *, api_key, private_key, url):
             self.url = url
             self._ws = self
-            self._done = False
+            self._queue = None
             self.subscribed = None
             FakeSocket.last = self
 
         async def connect(self):
-            return None
+            import asyncio
+            self._queue = asyncio.Queue()
+            events.append(("connect",))
 
         async def subscribe(self, channels, tickers=None):
-            self.subscribed = (list(channels), list(tickers or []))
-            return {}
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if self._done:
-                raise StopAsyncIteration
-            self._done = True
-            return json.dumps({
+            names = list(tickers or [])
+            self.subscribed = (list(channels), names)
+            events.append(("subscribe", names))
+            await self._queue.put(json.dumps({
                 "type": "orderbook_snapshot", "sid": 1, "seq": 1, "ts": now.timestamp(),
                 "msg": {
                     "market_ticker": brent,
                     "yes_dollars_fp": [["0.5000", "100.00"]],
                     "no_dollars_fp": [["0.5000", "100.00"]],
                 },
-            })
+            }))
+            await self._queue.put(None)
+            return {}
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._queue is None:
+                raise StopAsyncIteration
+            item = await self._queue.get()
+            if item is None:
+                raise StopAsyncIteration
+            return item
 
         async def close(self):
             return None
@@ -534,18 +549,28 @@ def test_prod_read_programs_are_paged_sharded_and_selected(tmp_path, monkeypatch
     assert len(pages) == 2
     assert "cursor=" not in pages[0]
     assert "cursor=page-2" in pages[1]
-    assert sum(1 for url in urls if f"/markets/{brent}" in url) == 1
-    assert sum(1 for url in urls if f"/markets/{hourly}" in url) == 1
+    market_urls = [url for url in urls if "/markets" in url and "tickers=" in url]
+    assert len(market_urls) == 1
+    assert f"/markets/{brent}" not in market_urls[0]
+    batched = parse_qs(urlsplit(market_urls[0]).query)["tickers"][0].split(",")
+    assert set(batched) == {hourly, brent, match}
+    connect_at = next(i for i, event in enumerate(events) if event[0] == "connect")
+    batch_at = next(i for i, event in enumerate(events) if event[0] == "http" and "/markets" in event[1])
+    subscribe_at = next(i for i, event in enumerate(events) if event[0] == "subscribe")
+    assert connect_at < batch_at < subscribe_at
     assert FakeSocket.last is not None
-    assert brent in FakeSocket.last.subscribed[1]
-    assert hourly in FakeSocket.last.subscribed[1]
+    assert FakeSocket.last.subscribed[1] == [brent]
     saved = json.loads(out.read_text(encoding="utf-8"))
+    cached = json.loads((tmp_path / "market_meta.json").read_text(encoding="utf-8"))
+    assert cached[brent]["exchange_index"] == 2
     assert hourly in saved["markets"]
     assert brent in saved["markets"]
+    assert match in saved["markets"]
     selected = [row["market"] for row in saved["quotes"]]
     assert selected
     assert brent in selected
     assert hourly not in selected
+    assert match not in selected
     assert brent in saved["resting"]
     assert saved["paper"] is True
     assert saved["live_armed"] is False

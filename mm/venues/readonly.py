@@ -39,6 +39,8 @@ DEMO_BOOKS_FLAG = "demo-books: results not representative"
 PROD_BOOKS_FLAG = "production-books"
 
 PUBLIC_WS_CHANNELS = frozenset({"orderbook_delta", "ticker", "trade"})
+WS_PING_INTERVAL_S = 20
+WS_PING_TIMEOUT_S = 20
 
 _FORBIDDEN_SNIPPETS = (
     "/portfolio",
@@ -325,11 +327,13 @@ class ReadOnlyMarketSocket(MarketDataReader):
         headers = self.auth_headers()
         try:
             self._ws = await websockets.connect(
-                self.url, additional_headers=headers, ping_interval=20, ping_timeout=20,
+                self.url, additional_headers=headers,
+                ping_interval=WS_PING_INTERVAL_S, ping_timeout=WS_PING_TIMEOUT_S,
             )
         except TypeError:
             self._ws = await websockets.connect(
-                self.url, extra_headers=headers, ping_interval=20, ping_timeout=20,
+                self.url, extra_headers=headers,
+                ping_interval=WS_PING_INTERVAL_S, ping_timeout=WS_PING_TIMEOUT_S,
             )
 
     async def subscribe(self, channels: list[str], tickers: list[str] | None = None) -> dict:

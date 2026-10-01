@@ -60,6 +60,8 @@ def status_payload(report: dict) -> dict:
         "estimated_usd": report.get("estimated_usd"),
         "kill": report.get("kill"),
         "data_source": report.get("data_source") or book_source()["flag"],
+        "suspect": bool(report.get("suspect")),
+        "suspect_markets": list(report.get("suspect_markets") or []),
     }
 
 

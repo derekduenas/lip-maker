@@ -56,6 +56,8 @@ import os
 _load_dotenv_simple(str(Path(__file__).resolve().parent.parent / ".env"))
 
 _log = logging.getLogger(__name__)
+WS_PING_INTERVAL_S = 20
+WS_PING_TIMEOUT_S = 20
 
 
 @dataclass
@@ -236,16 +238,16 @@ class KalshiWS:
             self._ws = await websockets.connect(
                 self.url,
                 additional_headers=headers,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=WS_PING_INTERVAL_S,
+                ping_timeout=WS_PING_TIMEOUT_S,
                 max_size=2**20,
             )
         except TypeError:
             self._ws = await websockets.connect(
                 self.url,
                 extra_headers=headers,
-                ping_interval=20,
-                ping_timeout=20,
+                ping_interval=WS_PING_INTERVAL_S,
+                ping_timeout=WS_PING_TIMEOUT_S,
             )
         self.connected = True
         _log.info(f"WS connected to {self.url}")

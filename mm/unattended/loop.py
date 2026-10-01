@@ -32,9 +32,10 @@ from execution.paper_fills import PaperFillSimulator
 from mm.compound import MarketSample, reallocate
 from mm.ops import skew_is_excessive
 from mm.risk import FillClock, Limits, RiskEngine
-from mm.selector import KalshiMarket, allocate
+from mm.selector import KalshiMarket, allocate, reward_per_day
 from mm.session_gates import (
-    clamp_contracts, inside_close_window, pull_before_close_s, single_fill_cap_usd,
+    clamp_contracts, inside_close_window, plan_is_suspect, plan_per_hundred,
+    pull_before_close_s, single_fill_cap_usd, subscribe_limit,
 )
 from mm.unattended.feed import DEMO_WS_URL
 from mm.unattended.optimize import optimize_sizes
@@ -151,6 +152,7 @@ class _Program:
     days_to_settle: float | None
     exchange_index: int | None
     shard_cash_usd: float
+    category: str = ""
 
 
 class RunLoop:
@@ -196,6 +198,9 @@ class RunLoop:
         self.kill = None
         self.now = 0.0
         self.socket_opened = False
+        self.books_seen: set[str] = set()
+        self._books_at_last_select: set[str] = set()
+        self.suspect_markets: list[dict] = []
 
     def add_program(self, row: dict) -> None:
         market = str(row["market"])
@@ -205,6 +210,17 @@ class RunLoop:
         close = None if row.get("close_ts") is None else float(row["close_ts"])
         days = None if row.get("days_to_settle") is None else float(row["days_to_settle"])
         shard = row.get("exchange_index")
+        existing = self.programs.get(market)
+        if existing is not None:
+            if shard is not None:
+                existing.exchange_index = int(shard)
+            if close is not None:
+                existing.close_ts = close
+            if days is not None:
+                existing.days_to_settle = days
+            if row.get("category"):
+                existing.category = str(row["category"])
+            return
         prog = _Program(
             market=market,
             series=str(row.get("series") or market.split("-", 1)[0]),
@@ -218,6 +234,7 @@ class RunLoop:
             days_to_settle=days,
             exchange_index=None if shard is None else int(shard),
             shard_cash_usd=float(row.get("shard_cash_usd") or 1e9),
+            category=str(row.get("category") or ""),
         )
         self.programs[market] = prog
         params = ProgramParams(
@@ -287,6 +304,7 @@ class RunLoop:
             return
         accrual.on_message(row, ts)
         self.open_seconds[market] = int(ts)
+        self.books_seen.add(market)
 
     def _on_trade(self, row: dict, ts: float) -> None:
         trade = dict(row.get("trade") or row.get("msg") or row)
@@ -323,15 +341,20 @@ class RunLoop:
         return orders
 
     def _maybe_select(self, ts: float) -> None:
-        if not self.programs:
+        if not self.programs or not self.books_seen:
             return
+        fresh = self.books_seen - self._books_at_last_select
         if self.last_select_ts is not None and ts - self.last_select_ts < self.select_every:
-            return
+            if not fresh or ts - self.last_select_ts < 1.0:
+                return
         self._select(ts)
+        self._books_at_last_select = set(self.books_seen)
 
     def _markets(self) -> list[KalshiMarket]:
         rows = []
         for market, prog in self.programs.items():
+            if market not in self.books_seen:
+                continue
             book = self.accruals[market].book.book
             rows.append(KalshiMarket(
                 market=market,
@@ -346,6 +369,7 @@ class RunLoop:
                 days_to_settle=prog.days_to_settle,
                 exchange_index=prog.exchange_index,
                 shard_cash_usd=prog.shard_cash_usd,
+                category=prog.category,
             ))
         return rows
 
@@ -369,11 +393,29 @@ class RunLoop:
         )
         chosen = {row.market: row for row in sized.chosen}
         taken = {row.market for row in selection.taken}
+        by_market = {row.market: row for row in markets}
+        taken_rows = {row.market: row for row in selection.taken}
+        self.suspect_markets = []
         for market in self.programs:
+            if market not in self.books_seen:
+                continue
             row = chosen.get(market)
             if row is None or market not in taken or row.size <= 0:
                 self._cancel(market, "not_selected")
                 continue
+            picked = taken_rows.get(market)
+            km = by_market.get(market)
+            if picked is not None and km is not None:
+                planned = reward_per_day(picked.share, km)
+                if plan_is_suspect(planned, picked.capital_usd):
+                    self.suspect_markets.append({
+                        "market": market,
+                        "planned_usd_day": float(f"{planned:.4f}"),
+                        "capital_usd": float(f"{picked.capital_usd:.4f}"),
+                        "usd_per_100_day": float(
+                            f"{plan_per_hundred(planned, picked.capital_usd):.4f}"
+                        ),
+                    })
             self._quote(market, int(row.yes_cents), int(row.no_cents), float(row.size), ts)
 
     def _inside_close(self, market: str, ts: float) -> bool:
@@ -503,6 +545,8 @@ class RunLoop:
             "fills_n": len(self.fills),
             "estimated_usd": format(estimated, "f"),
             "kill": None if self.kill is None else dict(self.kill),
+            "suspect": bool(self.suspect_markets),
+            "suspect_markets": [dict(row) for row in self.suspect_markets],
             "pnl_usd": "0",
             "rewards_usd": "0",
             "day": day,
@@ -601,6 +645,8 @@ class RunLoop:
             "next_usd": next_usd,
             "risk": self.risk_rows,
             "kill": self.kill,
+            "suspect": bool(self.suspect_markets),
+            "suspect_markets": [dict(row) for row in self.suspect_markets],
             "pnl_usd": format(-premium, "f"),
             "rewards_usd": format(rewards, "f"),
             "day": day,
@@ -765,10 +811,196 @@ def _incentive_rows(reader) -> list[dict]:
 
 
 def load_readonly_programs(reader) -> list[dict]:
-    """Program frames for the production read path, each with its shard."""
-    return _programs_from_incentive(
-        {"incentive_programs": _incentive_rows(reader)}, reader=reader,
+    """Incentive frames only. Shard and close_time come from the market cache."""
+    return _programs_from_incentive({"incentive_programs": _incentive_rows(reader)})
+
+
+def market_cache_path() -> Path:
+    raw = os.environ.get("LIP_MARKET_CACHE", "").strip()
+    if raw:
+        return Path(raw)
+    return Path("/var/lib/lip-maker/market_meta.json")
+
+
+def load_market_cache(path: Path | None = None) -> dict:
+    dest = market_cache_path() if path is None else Path(path)
+    try:
+        payload = json.loads(dest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_market_cache(cache: dict, path: Path | None = None) -> None:
+    dest = market_cache_path() if path is None else Path(path)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        tmp.replace(dest)
+    except OSError as exc:
+        _log.warning("market cache not saved (%s)", exc)
+
+
+def _parse_close_ts(raw: dict) -> float | None:
+    text = raw.get("close_time") or raw.get("expected_expiration_time") or raw.get("expiration_time")
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def parse_market_row(raw: dict) -> dict | None:
+    from mm.venues.kalshi import exchange_index_from_market_payload
+    if not isinstance(raw, dict):
+        return None
+    ticker = str(raw.get("ticker") or raw.get("market_ticker") or "")
+    if not ticker:
+        return None
+    idx = exchange_index_from_market_payload({"market": raw})
+    return {
+        "ticker": ticker,
+        "exchange_index": None if idx is None else int(idx),
+        "close_ts": _parse_close_ts(raw),
+        "category": str(raw.get("category") or raw.get("event_category") or ""),
+    }
+
+
+def apply_market_meta(frame: dict, meta: dict | None, *, now: float | None = None) -> dict:
+    """Horizon follows the market close, not the incentive program end."""
+    out = dict(frame)
+    if not meta:
+        return out
+    now = time.time() if now is None else float(now)
+    if meta.get("exchange_index") is not None:
+        out["exchange_index"] = int(meta["exchange_index"])
+    if meta.get("category"):
+        out["category"] = str(meta["category"])
+    close = meta.get("close_ts")
+    if close is not None:
+        out["close_ts"] = float(close)
+        out["days_to_settle"] = max(0.0, (float(close) - now) / 86400.0)
+    return out
+
+
+def _market_rows(payload: dict) -> list[dict]:
+    if isinstance(payload.get("markets"), list):
+        return [row for row in payload["markets"] if isinstance(row, dict)]
+    if isinstance(payload.get("market"), dict):
+        return [payload["market"]]
+    return []
+
+
+MARKET_BATCH_TICKERS = 100
+
+
+def refresh_market_cache(reader, tickers: list[str], cache: dict | None = None) -> dict:
+    """GET /markets?tickers=... in batches. Writes the on-disk cache."""
+    from mm.venues.readonly import ReadOnlyDataError
+    store = dict(cache or {})
+    unique: list[str] = []
+    seen: set[str] = set()
+    for ticker in tickers:
+        key = str(ticker)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(key)
+    for start in range(0, len(unique), MARKET_BATCH_TICKERS):
+        chunk = unique[start:start + MARKET_BATCH_TICKERS]
+        _shards._acquire()
+        try:
+            payload = reader.get(
+                "/markets", params={"tickers": ",".join(chunk), "limit": str(len(chunk))},
+            )
+        except ReadOnlyDataError as exc:
+            _log.warning("read-only market batch failed (%s)", exc)
+            continue
+        for row in _market_rows(payload):
+            parsed = parse_market_row(row)
+            if parsed:
+                store[parsed["ticker"]] = parsed
+    save_market_cache(store)
+    return store
+
+
+def durable_frame_reason(frame: dict) -> str:
+    days = frame.get("days_to_settle")
+    market = KalshiMarket(
+        market=str(frame.get("market") or ""),
+        series=str(frame.get("series") or ""),
+        period_reward_usd=float(frame.get("period_reward_usd") or 0),
+        period_seconds=float(frame.get("period_seconds") or 86400),
+        seconds_left=float(frame.get("period_seconds") or 0),
+        discount_factor=float(frame.get("discount_factor") or 0.5),
+        target_size=float(frame.get("target_size") or 1),
+        days_to_settle=None if days is None else float(days),
+        exchange_index=0,
+        category=str(frame.get("category") or ""),
     )
+    from mm.selector import exclusion_reason
+    why = exclusion_reason(market)
+    if why == "shard_unknown":
+        return ""
+    return why
+
+
+def candidate_tickers(frames: list[dict], *, limit: int | None = None) -> list[str]:
+    """Highest reward-per-day names that pass the durable gates, capped."""
+    cap = subscribe_limit() if limit is None else int(limit)
+    ranked = []
+    for frame in frames:
+        if durable_frame_reason(frame):
+            continue
+        seconds = float(frame.get("period_seconds") or 0)
+        days = seconds / 86400.0 if seconds > 0 else 0.0
+        per_day = (float(frame.get("period_reward_usd") or 0) / days) if days > 0 else 0.0
+        market = str(frame.get("market") or "")
+        if market:
+            ranked.append((per_day, market))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    return [market for _rate, market in ranked[:cap]]
+
+
+def _frames_with_meta(frames: list[dict], cache: dict, *, now: float | None = None) -> list[dict]:
+    return [
+        apply_market_meta(frame, cache.get(str(frame.get("market") or "")), now=now)
+        for frame in frames
+    ]
+
+
+async def enrich_and_subscribe(sock, reader, frames, on_frame, *, channels) -> list[str]:
+    """Subscribe from the cache immediately, and refresh shards in the background.
+
+    The caller has already connected the websocket. This does not block that
+    connection on the market lookup: a warm cache subscribes first, then the
+    batch GET runs. A cold cache subscribes once the batch returns.
+    """
+    import asyncio
+    cache = load_market_cache()
+    primed = _frames_with_meta(frames, cache)
+    subscribed: list[str] = []
+
+    async def _subscribe(rows: list[dict]) -> None:
+        nonlocal subscribed
+        names = candidate_tickers(rows)
+        if names == subscribed:
+            return
+        await sock.subscribe(list(channels), names)
+        subscribed = list(names)
+
+    if any(frame.get("days_to_settle") is not None for frame in primed):
+        for frame in primed:
+            on_frame(frame)
+        await _subscribe(primed)
+    tickers = [str(frame.get("market") or "") for frame in frames]
+    refreshed = await asyncio.to_thread(refresh_market_cache, reader, tickers, cache)
+    updated = _frames_with_meta(frames, refreshed)
+    for frame in updated:
+        on_frame(frame)
+    await _subscribe(updated)
+    return subscribed
 
 
 async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -> None:
@@ -802,22 +1034,27 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
         )
         await asyncio.sleep(READONLY_DATA_BACKOFF_S)
         return
-    for frame in frames:
-        on_frame(frame)
     sock = ReadOnlyMarketSocket(api_key=source["key_id"], private_key=key, url=source["ws_url"])
     try:
         await sock.connect()
-        tickers = [frame["market"] for frame in frames]
-        await sock.subscribe(sorted(PUBLIC_WS_CHANNELS), tickers)
-        async for raw in sock._ws:
-            msg = json.loads(raw)
-            msg.setdefault("ts", time.time())
-            kind = str(msg.get("type") or "")
-            if kind == "trade":
-                body = msg.get("msg") or msg
-                on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
-            elif kind in ("orderbook_snapshot", "orderbook_delta"):
-                on_frame(msg)
+
+        async def _pump() -> None:
+            async for raw in sock._ws:
+                msg = json.loads(raw)
+                msg.setdefault("ts", time.time())
+                kind = str(msg.get("type") or "")
+                if kind == "trade":
+                    body = msg.get("msg") or msg
+                    on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
+                elif kind in ("orderbook_snapshot", "orderbook_delta"):
+                    on_frame(msg)
+
+        await asyncio.gather(
+            enrich_and_subscribe(
+                sock, reader, frames, on_frame, channels=sorted(PUBLIC_WS_CHANNELS),
+            ),
+            _pump(),
+        )
     except ReadOnlyViolation:
         raise
     except Exception as exc:
@@ -830,10 +1067,9 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
         await sock.close()
 
 
-def _programs_from_incentive(payload: dict, reader=None) -> list[dict]:
+def _programs_from_incentive(payload: dict) -> list[dict]:
     from engine.lip_discovery import _parse_program
     frames = []
-    now = time.time()
     for raw in payload.get("incentive_programs") or []:
         parsed = _parse_program(raw)
         if not parsed:
@@ -851,13 +1087,7 @@ def _programs_from_incentive(payload: dict, reader=None) -> list[dict]:
             "target_size": parsed["target_size"],
             "start_ts": start,
             "end_ts": end,
-            "close_ts": end,
-            "days_to_settle": max(0.0, (end - now) / 86400.0),
         }
-        if reader is not None and frame["market"]:
-            shard = _shards.exchange_index(reader, frame["market"])
-            if shard is not None:
-                frame["exchange_index"] = shard
         frames.append(frame)
     return frames
 

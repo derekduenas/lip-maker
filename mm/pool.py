@@ -19,10 +19,11 @@ from decimal import Decimal
 from typing import Optional
 
 from mm.fair_value import family_for_series
+from mm.session_gates import close_horizon_reason, long_dated_event_days
 
 ZERO = Decimal("0")
-LONG_DATED_EVENT_DAYS = 14
-LONG_DATED_ANY_DAYS = 45
+LONG_DATED_EVENT_DAYS = 90
+LONG_DATED_ANY_DAYS = 120
 
 
 @dataclass(frozen=True)
@@ -81,13 +82,12 @@ def ney(pool: Pool) -> Decimal:
 
 
 def exclusion_reason(pool: Pool) -> str:
-    if pool.days_to_settle is None:
-        return "settlement_time_unknown"
-    if pool.days_to_settle > LONG_DATED_ANY_DAYS:
-        return f"long_dated_{pool.days_to_settle:.0f}d"
+    horizon = close_horizon_reason(pool.days_to_settle)
+    if horizon:
+        return horizon
     referenced = pool.family in ("commodity", "crypto") or (
         pool.family == "weather" and pool.has_observation)
-    if pool.days_to_settle > LONG_DATED_EVENT_DAYS and not referenced:
+    if pool.days_to_settle > long_dated_event_days() and not referenced:
         return f"long_dated_event_{pool.days_to_settle:.0f}d"
     if pool.capital_usd <= 0:
         return "no_capital"

@@ -30,7 +30,8 @@ from engine.lip_scorer import (
 from mm.accounting import kalshi_fee_usd
 from mm.fair_value import family_for_series
 from mm.session_gates import (
-    SeriesGateConfig, SeriesStats, intraday_reason, max_contracts_for_fill,
+    SeriesGateConfig, SeriesStats, close_horizon_reason, intraday_reason,
+    long_dated_event_days, match_series_reason, max_contracts_for_fill,
     series_go,
 )
 from mm.unattended.feed import reference_cents
@@ -50,8 +51,8 @@ FILL_FRACTION_PER_DAY = {
     "weather": 0.04,
     "event": 0.15,
 }
-LONG_DATED_EVENT_DAYS = 14
-LONG_DATED_ANY_DAYS = 45
+LONG_DATED_EVENT_DAYS = 90
+LONG_DATED_ANY_DAYS = 120
 EMPIRICAL_BLEND = 0.7
 EMPIRICAL_MIN_N = 5
 
@@ -80,6 +81,7 @@ class KalshiMarket:
     entry_markout_cents: float | None = None
     empirical_markout_cents: float | None = None
     empirical_n: int = 0
+    category: str = ""
 
 
 @dataclass
@@ -162,7 +164,7 @@ def family_of(market: KalshiMarket) -> str:
 def markout_cents(market: KalshiMarket) -> float:
     family = family_of(market)
     prior = MARKOUT_PRIOR_CENTS.get(family, MARKOUT_PRIOR_CENTS["event"])
-    if (market.days_to_settle is not None and market.days_to_settle > LONG_DATED_EVENT_DAYS
+    if (market.days_to_settle is not None and market.days_to_settle > long_dated_event_days()
             and family not in ("commodity", "crypto")):
         prior -= 1.0
     if (market.empirical_n >= EMPIRICAL_MIN_N
@@ -257,14 +259,16 @@ def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> s
         short = intraday_reason(market.series, market.market)
         if short:
             return short
-    if market.days_to_settle is None:
-        return "settlement_time_unknown"
-    if market.days_to_settle > LONG_DATED_ANY_DAYS:
-        return f"long_dated_{market.days_to_settle:.0f}d"
+    sports = match_series_reason(market.series, market.market, market.category)
+    if sports:
+        return sports
+    horizon = close_horizon_reason(market.days_to_settle)
+    if horizon:
+        return horizon
     family = family_of(market)
     referenced = family in ("commodity", "crypto") or (
         family == "weather" and market.has_observation)
-    if market.days_to_settle > LONG_DATED_EVENT_DAYS and not referenced:
+    if market.days_to_settle > long_dated_event_days() and not referenced:
         return f"long_dated_event_{market.days_to_settle:.0f}d"
     if market.exchange_index is None:
         return "shard_unknown"
