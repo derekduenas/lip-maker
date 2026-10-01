@@ -80,6 +80,22 @@ class QuoteTarget:
         return self.no_size_override if self.no_size_override is not None else self.size_contracts
 
 
+def _exchange_index(raw: dict) -> Optional[int]:
+    """Shard on a portfolio row or a create response. Absent stays unknown."""
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("exchange_index")
+    nested = raw.get("order")
+    if value is None and isinstance(nested, dict):
+        value = nested.get("exchange_index")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class RestingOrder:
     """A currently-open order we've placed.
@@ -105,6 +121,9 @@ class RestingOrder:
     # Our client_order_id ("LIP-…") when we placed it; empty for orders
     # rehydrated from the venue that we cannot prove are ours.
     client_order_id: str = ""
+    # Shard the order was placed on. Live decrease/amend send it so the
+    # write is not defaulted to shard 0.
+    exchange_index: Optional[int] = None
     # Venue price was not on the whole-cent grid; price_cents is the nearest
     # cent for exposure math only — the order is never scored.
     price_off_grid: bool = False
@@ -266,6 +285,7 @@ class QuoteManager:
             return None
         if qty != qty or qty <= _QTY_EPS:
             return None
+        shard = _exchange_index(raw)
         placed = time.time()
         ct = raw.get("created_time")
         if isinstance(ct, str) and ct:
@@ -277,7 +297,7 @@ class QuoteManager:
             order_id=order_id, market_ticker=ticker, side=side,
             price_cents=price_cents, size_contracts=qty, placed_at=placed,
             paper=False, client_order_id=str(raw.get("client_order_id") or ""),
-            price_off_grid=off_grid,
+            price_off_grid=off_grid, exchange_index=shard,
         )
 
     def _fetch_live_orders(self) -> dict[str, RestingOrder]:
@@ -388,6 +408,8 @@ class QuoteManager:
                                   f"{' OFF-GRID' if o.price_off_grid else ''}")
                     if lo.client_order_id and not o.client_order_id:
                         o.client_order_id = lo.client_order_id
+                    if lo.exchange_index is not None:
+                        o.exchange_index = lo.exchange_index
                     kept.append(o)
                 if kept:
                     self.resting[ticker] = kept
@@ -1011,6 +1033,7 @@ class QuoteManager:
                 resp = self.client.post(
                     V2_CREATE_PATH, to_event_order_v2(body, order_group_id=gid or None))
                 order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id", "")
+                placed_shard = _exchange_index(resp if isinstance(resp, dict) else {})
                 _log.info(f"[LIVE] PLACED {market_ticker} {side}@{price_cents}c size={size_contracts} order_id={order_id}")
             except Exception as e:
                 # 2026-09-20 audit: an exception here does NOT prove the order
@@ -1037,6 +1060,7 @@ class QuoteManager:
             side=side, price_cents=price_cents, size_contracts=float(size_contracts),
             placed_at=time.time(), paper=self.paper, client_order_id=coid,
             program_id=program_id or "",
+            exchange_index=None if self.paper else placed_shard,
         )
         # #127 (2026-04-28) UPSERT semantics: drop any existing entry for
         # this (ticker, side) before appending. Prevents accumulation when
@@ -1070,10 +1094,13 @@ class QuoteManager:
                 _log.error(f"[LIVE] BLOCKED decrease {order.order_id}: {e}")
                 return False
             try:
+                body = {"reduce_to": f"{new_size:.2f}",
+                        "market_ticker": order.market_ticker}
+                if order.exchange_index is not None:
+                    body["exchange_index"] = int(order.exchange_index)
                 self.client.post(
                     f"{V2_CREATE_PATH}/{order.order_id}/decrease",
-                    {"reduce_to": f"{new_size:.2f}",
-                     "market_ticker": order.market_ticker},
+                    body,
                 )
             except Exception as e:
                 _log.warning(f"decrease failed {order.order_id}: {e}")
@@ -1105,11 +1132,14 @@ class QuoteManager:
                     enforce_non_crossing=False,
                 )
                 v2 = to_event_order_v2(legacy)
+                amend_body = {"ticker": order.market_ticker, "side": v2["side"],
+                              "price": v2["price"], "count": f"{float(new_size):.2f}",
+                              "client_order_id": order.client_order_id}
+                if order.exchange_index is not None:
+                    amend_body["exchange_index"] = int(order.exchange_index)
                 resp = self.client.post(
                     f"{V2_CREATE_PATH}/{order.order_id}/amend",
-                    {"ticker": order.market_ticker, "side": v2["side"],
-                     "price": v2["price"], "count": f"{float(new_size):.2f}",
-                     "client_order_id": order.client_order_id},
+                    amend_body,
                 )
             except Exception as e:
                 _log.warning(f"amend failed {order.order_id}: {e}")
@@ -1229,15 +1259,24 @@ class QuoteManager:
         """Drop all in-memory resting entries for a market (used on WS re-subscribe)."""
         lst = self.resting.pop(market_ticker, [])
         for o in lst:
+            self._release_capital(o.client_order_id)
             self._update_quote_status(o.order_id, "cancelled", notes="ws_resubscribe_reset")
         if lst:
             _log.info(f"reset_for_market {market_ticker}: dropped {len(lst)} in-memory orders")
 
     def reconcile(self, target: QuoteTarget) -> dict:
         with self._state_lock:
-            if self.uncertain_markets or self._fill_persistence_failed:
+            if self._market_uncertain(target.market_ticker):
                 return {"action": "skip", "reason": "ORDER_STATE_UNCERTAIN"}
             return self._reconcile_locked(target)
+
+    def _market_uncertain(self, market_ticker: str) -> bool:
+        """Startup failure blocks every market. A later failure blocks one."""
+        if "__startup__" in self.uncertain_markets:
+            return True
+        if market_ticker in self.uncertain_markets:
+            return True
+        return market_ticker in self._fill_persistence_failed.values()
 
     def _reconcile_locked(self, target: QuoteTarget) -> dict:
         """Bring resting orders in line with target for one market.

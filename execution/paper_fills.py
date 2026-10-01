@@ -55,8 +55,24 @@ from typing import Iterable, Optional
 
 _log = logging.getLogger(__name__)
 
+# Public trade history. Callers pass a base, or this reads settings so a
+# demo session is not stuck on the production host hardcoded here before.
 API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_LATENCY_MS = 250.0
+
+
+def api_base() -> str:
+    try:
+        from config import settings
+        configured = getattr(settings, "KALSHI_API_BASE", "") or API_BASE
+    except Exception:
+        configured = API_BASE
+    return str(configured).rstrip("/")
+
+
+def trades_url(query: str, base: str | None = None) -> str:
+    root = (base or api_base()).rstrip("/")
+    return f"{root}/markets/trades?{query}"
 
 
 def _ctx() -> ssl.SSLContext:
@@ -133,7 +149,7 @@ class PaperFillSimulator:
         for t in tickers:
             q = urllib.parse.urlencode({"ticker": t, "limit": limit})
             try:
-                req = urllib.request.Request(f"{API_BASE}/markets/trades?{q}",
+                req = urllib.request.Request(trades_url(q),
                                              headers={"Accept": "application/json"})
                 with urllib.request.urlopen(req, timeout=20, context=self._ctx) as r:
                     out.extend(json.loads(r.read()).get("trades", []))

@@ -74,3 +74,16 @@ def dollars_to_cents(value) -> int:
 
 def parse_fp(value) -> float:
     return float(value)
+
+
+def backoff_seconds(status: int, attempt: int, retry_after: str | None = None) -> float | None:
+    """Seconds to wait after an HTTP 429. Other statuses are not retried here."""
+    if int(status) != 429:
+        return None
+    if retry_after:
+        try:
+            return min(30.0, max(0.0, float(retry_after)))
+        except ValueError:
+            pass
+    step = max(0, int(attempt))
+    return min(30.0, 0.5 * (2 ** step))

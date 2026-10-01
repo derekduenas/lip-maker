@@ -496,6 +496,9 @@ Implemented, paper by default, live writes blocked:
 * Per-series multiplier (`engine/lip_calibration.py`) shrinks the mean of
   matched paid/estimate ratios toward 1 and is an input to the selector
   and the sizer. With no matched credits the multiplier is 1.
+* Paper cycle `python -m mm.unattended --cycle RECORDING.jsonl --once`
+  runs selector, sizer, paper quote, scorer, reconciler, allocator, and
+  risk on a recording. Findings and fixes are in `docs/AUDIT.md`.
 
 Not done, and required before any of the $500–$1,000 live checklist:
 

@@ -160,7 +160,19 @@ class KalshiClient:
         return r.json() if r.text else {}
 
     def get_balance(self) -> float:
-        """Portfolio balance in dollars (Kalshi reports cents)."""
-        data = self.get("/portfolio/balance")
-        cents = data.get("balance", 0) or 0
-        return float(cents) / 100.0
+        """Portfolio balance in dollars.
+
+        Get Balance returns ``balance`` in cents and, on current payloads,
+        ``balance_dollars``. A dollars field is the one to use when both
+        are present.
+        """
+        return parse_balance_usd(self.get("/portfolio/balance"))
+
+
+def parse_balance_usd(data: dict) -> float:
+    """Dollars from a Get Balance payload. Centi-cents are not this field."""
+    if not isinstance(data, dict):
+        return 0.0
+    if data.get("balance_dollars") is not None:
+        return float(data["balance_dollars"])
+    return float(data.get("balance") or 0) / 100.0

@@ -11,9 +11,10 @@ Polymarket US ranking waits. A caller that asks for it is told so and
 is not scored with the repeated reward-pool figure.
 
 Our size is merged into the book before the share is computed, and the
-same size is passed as our quotes. Joining the touch is the quote. A
-larger size earns a smaller marginal share because the book already
-contains everyone else.
+same size is passed as our quotes. The quote price is the LIP reference
+(cumulative target/5) when that level exists, and the touch when the book
+is still thinner than target/5. A larger size earns a smaller marginal
+share because the book already contains everyone else.
 
 Shard cash that cannot fund the quote excludes the market. Idle cash on
 another shard is reported. Nothing here moves collateral.
@@ -28,6 +29,7 @@ from engine.lip_scorer import (
 )
 from mm.accounting import kalshi_fee_usd
 from mm.fair_value import family_for_series
+from mm.unattended.feed import reference_cents
 
 # Negative markout is toxic. Commodity weeklies were the books that paid.
 # Long-dated events and adverse selection were the books that lost.
@@ -218,8 +220,13 @@ def _reward_factor(series: str, factors: dict[str, float] | None) -> float:
 def quote_economics(market: KalshiMarket, size: float, *,
                     reward_factor: float = 1.0) -> tuple[float, float, float, int, int]:
     """Return net $/day, capital, share, yes cents, no cents at ``size``."""
-    yes_cents = touch(market.yes_bids)
-    no_cents = touch(market.no_bids)
+    yes_ref = reference_cents(market.yes_bids, market.target_size)
+    no_ref = reference_cents(market.no_bids, market.target_size)
+    # A book that already reaches target/5 is quoted at that reference.
+    # A thinner book has no reference yet; the touch is the price that
+    # can create one once our size is added.
+    yes_cents = touch(market.yes_bids) if yes_ref is None else yes_ref
+    no_cents = touch(market.no_bids) if no_ref is None else no_ref
     share = kalshi_share(market, yes_cents, no_cents, size) if size > 0 else 0.0
     reward = reward_per_day(share, market, reward_factor=reward_factor)
     family = family_of(market)
@@ -543,6 +550,9 @@ class PMQuote:
     fill_contracts: float = 0.0
     fill_price_cents: int = 50
     capital_usd: float = 100.0
+    max_spread_usd: float | None = None
+    competing_bids: list[tuple[float, float]] = field(default_factory=list)
+    competing_asks: list[tuple[float, float]] = field(default_factory=list)
 
 
 def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, float]:
@@ -557,11 +567,13 @@ def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, floa
     )
     from mm.accounting import pm_us_maker_rebate_usd
 
-    bids = [Order(quote.our_bid, quote.our_size, ours=True)]
-    asks = [Order(quote.our_ask, quote.our_size, ours=True)]
+    bids = [Order(price, size, ours=False) for price, size in quote.competing_bids]
+    asks = [Order(price, size, ours=False) for price, size in quote.competing_asks]
+    bids.append(Order(quote.our_bid, quote.our_size, ours=True))
+    asks.append(Order(quote.our_ask, quote.our_size, ours=True))
     snap = score_snapshot(
         bids, asks, tick=quote.tick, discount_factor=quote.discount_factor,
-        target_size=quote.target_size,
+        target_size=quote.target_size, max_spread_usd=quote.max_spread_usd,
     )
     effective = effective_reward_pool_usd(quote.reward_pool_usd, quote.n_markets)
     days = quote.period_seconds / 86400.0

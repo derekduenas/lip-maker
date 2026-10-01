@@ -4,6 +4,8 @@ This process is for a small always-on VM in **us-east**, close to the venue, run
 
 The demo websocket path this client already signs is `/trade-api/ws/v2` on the demo host already allowed for REST: `wss://demo-api.kalshi.co/trade-api/ws/v2`. Set it with `LIP_KALSHI_WS_URL` only when a demo key is present. Leave the variable unset and the process stays on the local paper feed.
 
+A recording runs the whole paper path in one command. `python -m mm.unattended --cycle books.jsonl --once` selects, sizes, records a paper quote, scores, reconciles tagged credits, shrinks the series factor, allocates, and checks risk. Droplet install, firewall, and the env file are in `docs/DROPLET.md`. The audit of this branch is `docs/AUDIT.md`.
+
 ## What the process does on every start
 
 1. Append `cancel_all` and cancel every order it still knows about.

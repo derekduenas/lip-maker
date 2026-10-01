@@ -59,8 +59,23 @@ ACCOUNT_OPENING_CASH_USD = _CAPITAL_USD
 # Ramp-up phase: caps start SMALL and expand as daily PnL is positive.
 # Day 0 deploy: 10% of bankroll gross. Day 7+ clean: 40%.
 # Controlled by `RAMP_PHASE` env (1..4) → 10% / 20% / 30% / 40%.
-RAMP_PHASE = int(os.getenv("LIP_RAMP_PHASE", "4"))  # paper=full
-_ramp_fraction = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40}[max(1, min(4, RAMP_PHASE))]
+def _parse_ramp_phase(raw: str | None) -> int:
+    text = "4" if raw is None or raw == "" else str(raw)
+    try:
+        phase = int(text)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"LIP_RAMP_PHASE must be an integer from 1 to 4, got {text!r}"
+        ) from exc
+    if phase not in (1, 2, 3, 4):
+        raise RuntimeError(
+            f"LIP_RAMP_PHASE must be an integer from 1 to 4, got {phase}"
+        )
+    return phase
+
+
+RAMP_PHASE = _parse_ramp_phase(os.getenv("LIP_RAMP_PHASE"))
+_ramp_fraction = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40}[RAMP_PHASE]
 
 # 2026-05-02 PREDATOR: split per-market cap from total-budget multiplier.
 # Was: same _ramp_fraction served BOTH the per-market gate AND the total

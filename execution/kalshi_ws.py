@@ -567,9 +567,10 @@ class KalshiWS:
             if verdict == "gap":
                 await self._on_seq_gap(sid, ticker, seq)
                 return
-            if book.stale:
-                # Diverged and waiting for a snapshot; applying would only
-                # compound the divergence.
+            if book.stale or book.snapshot_count <= 0:
+                # A delta before the first snapshot, or after a gap, is not
+                # a book. Applying it would invent levels the venue has not
+                # confirmed.
                 return
             grid_ok_before = not book.unsupported_grid
             if self._apply_delta(book, m):

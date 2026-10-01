@@ -21,6 +21,7 @@ Cancel-all on disconnect is the protection this adapter exposes.
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from execution.order_request import LiveExecutionBlocked, require_live_execution_allowed
@@ -38,6 +39,10 @@ class PMUSAdapter:
         self.transport = transport
         self.paper = paper
         self.budget = RateBudget(capacity=20.0, per_second=20.0)
+        # Gateway incentives are documented at 5 requests/second, separate
+        # from the 20/s retail order budget.
+        self.incentive_budget = RateBudget(capacity=5.0, per_second=5.0)
+        self.incentive_limited = False
         self.incentives_cache = list(incentives or [])
         self.sent: list[dict] = []
         self._seq = 0
@@ -101,6 +106,8 @@ class PMUSAdapter:
         A transport attached for signed reads is not used. The body is the
         same maker order ``place`` builds, including ``participateDontInitiate``.
         """
+        # Latch paper on this instance. The key used for engine orders is
+        # read-only; a later place() on the same object must not go live.
         self.paper = True
         resp = self.place(market_slug, intent=intent, price_cents=price_cents,
                           quantity=quantity, now=now)
@@ -108,14 +115,20 @@ class PMUSAdapter:
         resp["paper"] = True
         return resp
 
-    def incentives(self) -> list:
+    def incentives(self, now: float | None = None) -> list:
         """Programs last supplied by the caller or a gateway fetch.
 
         Paper does not call the network. A live fetch is a GET and does not
-        go through the maker-only write interlock.
+        go through the maker-only write interlock. It does consume the
+        5/s incentive budget.
         """
         if self.incentives_cache or self.paper or self.transport is None:
             return list(self.incentives_cache)
+        ts = time.time() if now is None else float(now)
+        if not self.incentive_budget.allow(1.0, ts):
+            self.incentive_limited = True
+            return list(self.incentives_cache)
+        self.incentive_limited = False
         raw = self.transport.request("GET", "/v1/incentives")
         self.incentives_cache = list(raw.get("markets") or raw.get("incentives") or [])
         return list(self.incentives_cache)

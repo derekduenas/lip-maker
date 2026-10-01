@@ -29,6 +29,7 @@ collateral is per shard (``GET /portfolio/balance?exchange_index=``).
 """
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Optional
 from urllib.parse import urlencode
@@ -39,7 +40,7 @@ from execution.order_request import (
 )
 from mm.types import Side, VenueName, VenueOrderView
 from mm.venues.base import (
-    RateBudget, TransportHTTPError, dollars_to_cents, parse_fp,
+    RateBudget, TransportHTTPError, backoff_seconds, dollars_to_cents, parse_fp,
 )
 
 CREATE = "/portfolio/events/orders"
@@ -251,6 +252,10 @@ class KalshiAdapter:
             mapped = map_exchange_failure(e.body, operation=operation, status=e.status)
             if mapped is None:
                 mapped = {"ok": False, "error": f"http_{e.status}", "status": e.status, "order_id": ""}
+            wait = backoff_seconds(e.status, 0)
+            if wait is not None:
+                mapped["error"] = "rate_limited"
+                mapped["backoff_s"] = wait
             mapped["raw"] = e.body
             return mapped
         except LiveExecutionBlocked as e:
@@ -332,10 +337,8 @@ class KalshiAdapter:
         except TransportHTTPError as e:
             mapped = map_exchange_failure(e.body, operation="balance", status=e.status)
             return mapped or {"ok": False, "error": f"http_{e.status}", "status": e.status}
-        if payload.get("balance_dollars") is not None:
-            available = float(payload["balance_dollars"])
-        else:
-            available = float(payload.get("balance") or 0) / 100.0
+        from execution.kalshi_auth import parse_balance_usd
+        available = parse_balance_usd(payload)
         return {"ok": True, "available_usd": available, "exchange_index": int(exchange_index)}
 
     def place(self, market: str, side: Side, price_cents: int, size: float, *,
@@ -390,8 +393,13 @@ class KalshiAdapter:
         result["client_order_id"] = coid
         return result
 
+    def _budget_ok(self, cost: float, now: float | None) -> bool:
+        ts = time.time() if now is None else float(now)
+        return self.budget.allow(cost, ts)
+
     def decrease(self, order_id: str, reduce_to: float, *, market: str = "",
-                 exchange_index: Optional[int] = None) -> dict:
+                 exchange_index: Optional[int] = None,
+                 now: float | None = None) -> dict:
         """Size down. ``market_ticker`` is what routes off shard 0.
 
         Decrease Order V2 (fetched 2026-10-01) takes ``market_ticker`` and
@@ -399,6 +407,8 @@ class KalshiAdapter:
         """
         if not market:
             return {"ok": False, "error": "market_ticker_required", "order_id": ""}
+        if not self._budget_ok(CREATE_TOKENS, now):
+            return {"ok": False, "error": "rate_budget", "order_id": ""}
         body = {"reduce_to": f"{float(reduce_to):.2f}", "market_ticker": market}
         idx = exchange_index if exchange_index is not None else self._shards.get(market)
         if idx is not None:
@@ -407,7 +417,9 @@ class KalshiAdapter:
                           cost=CREATE_TOKENS, operation="decrease")
 
     def amend(self, order_id: str, *, market: str, side: Side, price_cents: int,
-              total_count: float, client_order_id: str = "") -> dict:
+              total_count: float, client_order_id: str = "",
+              exchange_index: Optional[int] = None,
+              now: float | None = None) -> dict:
         """Price change or size-up. Queue is NOT preserved (Kalshi docs).
 
         A 200 with remaining 0 and fill 0 is the exchange cancelling a
@@ -424,6 +436,8 @@ class KalshiAdapter:
             v2 = to_event_order_v2(legacy)
         except MakerSafetyError as e:
             return {"ok": False, "error": str(e)}
+        if not self._budget_ok(CREATE_TOKENS, now):
+            return {"ok": False, "error": "rate_budget", "order_id": ""}
         body = {
             "ticker": market,
             "side": v2["side"],
@@ -432,7 +446,7 @@ class KalshiAdapter:
         }
         if client_order_id:
             body["client_order_id"] = client_order_id
-        idx = self._shards.get(market)
+        idx = exchange_index if exchange_index is not None else self._shards.get(market)
         if idx is not None:
             body["exchange_index"] = int(idx)
         return self._call("POST", f"{CREATE}/{order_id}/amend", body,

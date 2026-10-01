@@ -8,11 +8,13 @@ acknowledgement.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from mm.ops import ConfigError, configure_logging, validate_config
 from mm.safety.supervisor import write_heartbeat
 from mm.venues.kalshi_rest import PRODUCTION_HOSTS
 
@@ -78,15 +80,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--heartbeat", default="/var/lib/lip-maker/heartbeat")
     parser.add_argument("--cancel-log", default="/var/lib/lip-maker/startup-cancel")
     parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--cycle", default="", help="JSONL recording to run one paper cycle")
+    parser.add_argument("--report", default="", help="where to write the cycle JSON")
+    parser.add_argument("--log-file", default="", help="rotating log file")
     args = parser.parse_args(argv)
     paper = os.environ.get("LIP_PAPER", "true").lower() == "true"
     ws_url = os.environ.get("LIP_KALSHI_WS_URL") or None
+    try:
+        validate_config(paper=paper, ws_url=ws_url, argv=list(argv or []))
+    except ConfigError as exc:
+        raise UnattendedRefused(str(exc)) from exc
     assert_paper_demo(paper=paper, ws_url=ws_url)
+    if args.log_file:
+        configure_logging(args.log_file)
     log = Path(args.cancel_log)
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write("cancel_all\n")
     write_heartbeat(args.heartbeat)
+    if args.cycle:
+        from mm.cycle import run_recording
+        report = run_recording(args.cycle)
+        dest = Path(args.report or str(Path(args.heartbeat).with_suffix(".json")))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(report, default=str), encoding="utf-8")
+        return 0
     if args.once:
         return 0
     while True:

@@ -73,17 +73,18 @@ class OrderbookFeed:
 
 
 class BookDriver:
-    """Turn a book update into a requote when the yes-side reference moves."""
+    """Requote when either side's LIP reference moves by one cent."""
 
     def __init__(self, targets: dict[str, float], on_requote) -> None:
         self.targets = dict(targets)
-        self.gate = RequoteGate(on_requote)
+        self.yes_gate = RequoteGate(on_requote)
+        self.no_gate = RequoteGate(on_requote)
 
     def on_book(self, market: str, *, yes_bids, no_bids, now: float) -> None:
         target = float(self.targets.get(market, 0))
         yes_ref = reference_cents(list(yes_bids), target)
         no_ref = reference_cents(list(no_bids), target)
-        moved = yes_ref if yes_ref is not None else no_ref
-        if moved is None:
-            return
-        self.gate.on_reference(market, moved, now)
+        if yes_ref is not None:
+            self.yes_gate.on_reference(market, yes_ref, now)
+        if no_ref is not None:
+            self.no_gate.on_reference(market, no_ref, now)

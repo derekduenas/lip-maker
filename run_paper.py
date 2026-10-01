@@ -73,6 +73,18 @@ from execution.quote_manager import QuoteManager, QuoteTarget
 _log = logging.getLogger("lip_maker")
 
 
+def record_fill_counts(status_counts: dict, ticker_counts: dict,
+                       status: str, ticker: str) -> None:
+    """Status totals stay in ``status_counts``. Realized fills are per ticker.
+
+    ``_expected_fills`` reads the ticker map. Writing the status string into
+    the ticker map made every market look like it had never filled.
+    """
+    status_counts[status] = int(status_counts.get(status, 0)) + 1
+    if status == "applied":
+        ticker_counts[ticker] = int(ticker_counts.get(ticker, 0)) + 1
+
+
 def _program_params_from_market(m: dict) -> ProgramParams:
     """Build ProgramParams in the right units (2026-09-20 audit #3).
 
@@ -186,6 +198,7 @@ class PaperRunner:
         self._skip_reason: dict[str, str] = {}
         self.skip_counts: dict[str, int] = defaultdict(int)
         self.fill_counts: dict[str, int] = defaultdict(int)
+        self.fill_counts_by_ticker: dict[str, int] = defaultdict(int)
         self._skip_cancel_ts: dict[str, float] = {}
         # 2026-09-20 review: per-market forward accrual chains.
         self._accrual: dict[str, AccrualState] = {}
@@ -918,7 +931,7 @@ class PaperRunner:
             subaccount=ev.subaccount,
         )
         status = self.qm.last_fill_status
-        self.fill_counts[status] += 1
+        record_fill_counts(self.fill_counts, self.fill_counts_by_ticker, status, ev.market_ticker)
         if status not in ("applied", "persistence_failed", "untracked"):
             return status        # duplicates change nothing, including accrual
         try:
@@ -1797,7 +1810,7 @@ class PaperRunner:
         conservative cases are available for sensitivity.
 
         None means UNKNOWN and the economics prices it as such."""
-        n = self.fill_counts.get(ticker, 0)
+        n = self.fill_counts_by_ticker.get(ticker, 0)
         elapsed = max(1.0, time.time() - self.start_time)
         if n > 0:
             return float(n) * horizon_sec / elapsed
