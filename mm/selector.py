@@ -3,8 +3,9 @@
 Scoring is ``engine.lip_scorer`` (30 July 2026 rules: reference at
 target/5, discount factor per tick, a second pays nothing if either side
 of the book is under target). The $1 market-period floor and the cent
-floor are ``kalshi_period_payout``. This module does not fit a factor to
-April or May 2026 payouts.
+floor are ``kalshi_period_payout``. A caller may pass a per-series
+multiplier from matched paid/estimate ratios. The default multiplier is 1.
+This module does not fit a factor to April or May 2026 payouts.
 
 Polymarket US ranking waits. A caller that asks for it is told so and
 is not scored with the repeated reward-pool figure.
@@ -190,22 +191,37 @@ def _uptime(market: KalshiMarket) -> float:
     return min(1.0, market.seconds_left / market.period_seconds)
 
 
-def reward_per_day(share: float, market: KalshiMarket) -> float:
-    """Period obligation under $1 pays nothing, including as a daily rate."""
+def reward_per_day(share: float, market: KalshiMarket, *,
+                   reward_factor: float = 1.0) -> float:
+    """Period obligation under $1 pays nothing, including as a daily rate.
+
+    ``reward_factor`` scales the payable estimate. 1 leaves the LIP formula
+    unchanged. The factor is a calibrated multiplier, applied after the
+    exchange floor.
+    """
     uptime = _uptime(market)
     paid = kalshi_period_payout(share, market.period_reward_usd, uptime=uptime)
     days = (market.period_seconds / 86400.0) * uptime
-    if paid <= 0 or days <= 0:
+    if paid <= 0 or days <= 0 or reward_factor <= 0:
         return 0.0
-    return paid / days
+    return (paid / days) * float(reward_factor)
 
 
-def quote_economics(market: KalshiMarket, size: float) -> tuple[float, float, float, int, int]:
+def _reward_factor(series: str, factors: dict[str, float] | None) -> float:
+    if not factors:
+        return 1.0
+    if series in factors:
+        return float(factors[series])
+    return float(factors.get(series.upper(), 1.0))
+
+
+def quote_economics(market: KalshiMarket, size: float, *,
+                    reward_factor: float = 1.0) -> tuple[float, float, float, int, int]:
     """Return net $/day, capital, share, yes cents, no cents at ``size``."""
     yes_cents = touch(market.yes_bids)
     no_cents = touch(market.no_bids)
     share = kalshi_share(market, yes_cents, no_cents, size) if size > 0 else 0.0
-    reward = reward_per_day(share, market)
+    reward = reward_per_day(share, market, reward_factor=reward_factor)
     family = family_of(market)
     fraction = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     fills_side = size * fraction
@@ -275,7 +291,8 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
              max_size: float = 200, hysteresis: float = 0.15,
              per_market_usd: float | None = None,
              per_series_usd: float | None = None,
-             per_category_usd: float | None = None) -> Selection:
+             per_category_usd: float | None = None,
+             series_factors: dict[str, float] | None = None) -> Selection:
     """Greedy marginal net $/day per dollar, with caps and hysteresis."""
     selection = Selection()
     cap_m, cap_s, cap_c = _caps(bankroll, per_market_usd, per_series_usd, per_category_usd)
@@ -305,7 +322,9 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
             nxt = size_of[market.market] + chunk
             if nxt > max_size + 1e-9:
                 continue
-            net, capital, share, yes_c, no_c = quote_economics(market, nxt)
+            factor = _reward_factor(market.series, series_factors)
+            net, capital, share, yes_c, no_c = quote_economics(
+                market, nxt, reward_factor=factor)
             d_net = net - net_of[market.market]
             d_cap = capital - capital_of[market.market]
             if d_cap <= 1e-12:
@@ -555,7 +574,8 @@ def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, floa
 
 
 def rank_cross_venue(kalshi: list[KalshiMarket], pm: list[PMQuote], *,
-                     kalshi_size: float = 100.0) -> list[tuple[str, str, float]]:
+                     kalshi_size: float = 100.0,
+                     series_factors: dict[str, float] | None = None) -> list[tuple[str, str, float]]:
     """Kalshi and PM US together, best net $/day per $ first.
 
     Kalshi uses ``quote_economics``. PM uses the shared pool and the
@@ -564,7 +584,9 @@ def rank_cross_venue(kalshi: list[KalshiMarket], pm: list[PMQuote], *,
     """
     rows: list[tuple[str, str, float]] = []
     for market in kalshi:
-        net, capital, _share, _yes, _no = quote_economics(market, kalshi_size)
+        factor = _reward_factor(market.series, series_factors)
+        net, capital, _share, _yes, _no = quote_economics(
+            market, kalshi_size, reward_factor=factor)
         per = net / capital if capital else -999.0
         rows.append(("kalshi", market.market, per))
     for quote in pm:

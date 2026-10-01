@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mm.selector import KalshiMarket, competition_ratio, kalshi_share, reward_per_day
+from mm.selector import (
+    KalshiMarket, _reward_factor, competition_ratio, kalshi_share, reward_per_day,
+)
 from mm.unattended.feed import reference_cents
 
 SHORT_POOL_SECONDS = 15 * 60
@@ -51,7 +53,8 @@ def _capital(yes_cents: int, no_cents: int, size: float) -> float:
 
 
 def _curve(market: KalshiMarket, sizes: tuple[float, ...],
-           markout_usd_per_contract: float) -> tuple[int, int, dict[float, float], float, float, float]:
+           markout_usd_per_contract: float, *,
+           reward_factor: float = 1.0) -> tuple[int, int, dict[float, float], float, float, float]:
     """Return reference prices, objective by size, and the best size's economics."""
     yes_cents = reference_cents(market.yes_bids, market.target_size)
     no_cents = reference_cents(market.no_bids, market.target_size)
@@ -63,7 +66,7 @@ def _curve(market: KalshiMarket, sizes: tuple[float, ...],
     best_share = 0.0
     for size in sizes:
         share = kalshi_share(market, yes_cents, no_cents, float(size))
-        reward = reward_per_day(share, market)
+        reward = reward_per_day(share, market, reward_factor=reward_factor)
         cost = float(markout_usd_per_contract) * float(size) * 2.0
         objective = reward - cost
         curve[float(size)] = objective
@@ -80,7 +83,8 @@ def optimize_sizes(markets: list[KalshiMarket], *, bankroll: float,
                    per_market_usd: float, per_event_usd: float, total_usd: float,
                    sizes: tuple[float, ...] = (10, 25, 50, 100),
                    markout_usd_per_contract: float = 0.0,
-                   enable_short_pools: bool = False) -> SizePlan:
+                   enable_short_pools: bool = False,
+                   series_factors: dict[str, float] | None = None) -> SizePlan:
     plan = SizePlan()
     eligible: list[KalshiMarket] = []
     for market in markets:
@@ -92,7 +96,8 @@ def optimize_sizes(markets: list[KalshiMarket], *, bankroll: float,
     scored = []
     for market in eligible:
         yes_c, no_c, curve, best_size, best_obj, best_share = _curve(
-            market, sizes, markout_usd_per_contract)
+            market, sizes, markout_usd_per_contract,
+            reward_factor=_reward_factor(market.series, series_factors))
         plan.objectives[market.market] = curve
         if best_size <= 0 or yes_c <= 0:
             continue

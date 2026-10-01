@@ -482,6 +482,20 @@ Implemented, paper by default, live writes blocked:
   $500→$10k ladder (`mm/compound.py`). PM US shared-pool divisor and paper
   `engine_place` (`docs/CROSS_VENUE.md`). One cross-venue capital cap, event
   net, and kill. The selector ranks Kalshi and PM US by net $/day per $.
+* Per-second Kalshi accrual (`engine/lip_accrual.py`) from the websocket
+  book (snapshot, delta, sequence gap marks the book stale until a snapshot)
+  and from resting size on our orders. Unknown and skipped seconds are
+  omitted. The $1 floor and the cent floor run once on the period sum.
+  Optional `max_reward_per_account` caps that sum. Programs that start
+  before 30 July 2026 are not scored with the current formula.
+* Reconciliation (`engine/lip_reconcile.py`) matches a tagged
+  `liquidity_reward` credit to that estimate. The Trade API catalog on
+  docs.kalshi.com as retrieved 1 October 2026 has no per-user incentive
+  payout route. `GET /incentive_programs` is the pool and a program-level
+  `paid_out` flag. Settlements, fills, and balance are not that credit.
+* Per-series multiplier (`engine/lip_calibration.py`) shrinks the mean of
+  matched paid/estimate ratios toward 1 and is an input to the selector
+  and the sizer. With no matched credits the multiplier is 1.
 
 Not done, and required before any of the $500–$1,000 live checklist:
 
