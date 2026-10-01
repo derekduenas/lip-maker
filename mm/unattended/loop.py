@@ -690,6 +690,87 @@ async def drive_socket(ws_url: str, on_frame: Callable[[dict], None]) -> None:
         await ws.close()
 
 
+# Ten market reads per second. The incentive list is one page of about
+# 100, and each ticker needs GET /markets/{ticker} for its shard. The
+# cache keeps a reconnect from repeating those reads.
+MARKET_READS_PER_SECOND = 10.0
+MAX_INCENTIVE_PAGES = 100
+
+
+class ShardLookup:
+    """Cached ``exchange_index`` from GET /markets/{ticker}.
+
+    A cache hit does not spend the read budget. A data error is not
+    cached, so the next pass can try that ticker again.
+    """
+
+    def __init__(self, *, per_second: float = MARKET_READS_PER_SECOND) -> None:
+        from mm.venues.base import RateBudget
+        self.per_second = float(per_second)
+        self.budget = RateBudget(capacity=self.per_second, per_second=self.per_second)
+        self.cache: dict[str, int] = {}
+
+    def exchange_index(self, reader, ticker: str) -> int | None:
+        from mm.venues.kalshi import exchange_index_from_market_payload
+        from mm.venues.readonly import ReadOnlyDataError
+        from urllib.parse import quote
+        key = str(ticker)
+        if key in self.cache:
+            return self.cache[key]
+        self._acquire()
+        try:
+            payload = reader.get("/markets/" + quote(key, safe=""))
+        except ReadOnlyDataError as exc:
+            _log.warning("read-only market %s shard lookup failed (%s)", key, exc)
+            return None
+        idx = exchange_index_from_market_payload(payload)
+        if idx is None:
+            return None
+        self.cache[key] = int(idx)
+        return self.cache[key]
+
+    def _acquire(self) -> None:
+        while True:
+            if self.budget.allow(1.0, time.monotonic()):
+                return
+            gap = 1.0 / self.per_second if self.per_second > 0 else 0.05
+            time.sleep(gap)
+
+
+_shards = ShardLookup()
+
+
+def reset_readonly_shard_cache() -> None:
+    global _shards
+    _shards = ShardLookup()
+
+
+def _incentive_rows(reader) -> list[dict]:
+    """Every active liquidity program, following ``next_cursor``."""
+    rows: list[dict] = []
+    cursor = ""
+    seen: set[str] = set()
+    for _page in range(MAX_INCENTIVE_PAGES):
+        params = {"status": "active", "type": "liquidity", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        payload = reader.get("/incentive_programs", params=params)
+        rows.extend(payload.get("incentive_programs") or [])
+        nxt = str(payload.get("next_cursor") or "")
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        cursor = nxt
+    return rows
+
+
+def load_readonly_programs(reader) -> list[dict]:
+    """Program frames for the production read path, each with its shard."""
+    return _programs_from_incentive(
+        {"incentive_programs": _incentive_rows(reader)}, reader=reader,
+    )
+
+
 async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -> None:
     """Production books and public trades. The reader cannot place an order.
 
@@ -709,11 +790,9 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
     reader = ReadOnlyKalshiTransport(
         api_key=source["key_id"], private_key=key, session=requests.Session(),
     )
-    payload: dict = {}
+    frames: list[dict] = []
     try:
-        payload = reader.get(
-            "/incentive_programs", params={"status": "active", "type": "liquidity"},
-        )
+        frames = load_readonly_programs(reader)
     except ReadOnlyViolation:
         raise
     except Exception as exc:
@@ -723,12 +802,12 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
         )
         await asyncio.sleep(READONLY_DATA_BACKOFF_S)
         return
-    for frame in _programs_from_incentive(payload):
+    for frame in frames:
         on_frame(frame)
     sock = ReadOnlyMarketSocket(api_key=source["key_id"], private_key=key, url=source["ws_url"])
     try:
         await sock.connect()
-        tickers = [frame["market"] for frame in _programs_from_incentive(payload)]
+        tickers = [frame["market"] for frame in frames]
         await sock.subscribe(sorted(PUBLIC_WS_CHANNELS), tickers)
         async for raw in sock._ws:
             msg = json.loads(raw)
@@ -751,7 +830,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
         await sock.close()
 
 
-def _programs_from_incentive(payload: dict) -> list[dict]:
+def _programs_from_incentive(payload: dict, reader=None) -> list[dict]:
     from engine.lip_discovery import _parse_program
     frames = []
     now = time.time()
@@ -761,7 +840,7 @@ def _programs_from_incentive(payload: dict) -> list[dict]:
             continue
         start = datetime.fromisoformat(str(parsed["start_date"]).replace("Z", "+00:00")).timestamp()
         end = datetime.fromisoformat(str(parsed["end_date"]).replace("Z", "+00:00")).timestamp()
-        frames.append({
+        frame = {
             "kind": "program",
             "market": parsed["market_ticker"],
             "series": parsed["series_ticker"],
@@ -774,7 +853,12 @@ def _programs_from_incentive(payload: dict) -> list[dict]:
             "end_ts": end,
             "close_ts": end,
             "days_to_settle": max(0.0, (end - now) / 86400.0),
-        })
+        }
+        if reader is not None and frame["market"]:
+            shard = _shards.exchange_index(reader, frame["market"])
+            if shard is not None:
+                frame["exchange_index"] = shard
+        frames.append(frame)
     return frames
 
 

@@ -24,14 +24,32 @@ def _count(report: dict, number_key: str, value_key: str) -> int:
     return 0
 
 
+def _mode_flags(report: dict) -> tuple[bool, bool, str | None]:
+    """Paper and live-armed as the report recorded them."""
+    if "paper" in report and report["paper"] is not None:
+        paper = bool(report["paper"])
+    else:
+        paper = str(report.get("mode") or "") == "paper"
+    if "live_armed" in report and report["live_armed"] is not None:
+        live_armed = bool(report["live_armed"])
+    else:
+        live_armed = False
+    mode = report.get("mode")
+    if mode is None and "paper" in report:
+        mode = "paper" if paper else "demo"
+    return paper, live_armed, None if mode is None else str(mode)
+
+
 def status_payload(report: dict) -> dict:
     from mm.venues.readonly import book_source
     fills = report.get("fills_n")
     if not isinstance(fills, (int, float)) or isinstance(fills, bool):
         fills = _count(report, "fills_n", "fills")
+    paper, live_armed, mode = _mode_flags(report)
     return {
-        "paper": True,
-        "live_armed": False,
+        "paper": paper,
+        "live_armed": live_armed,
+        "mode": mode,
         "stage": report.get("stage"),
         "markets": list(report.get("markets") or []),
         "programs_loaded": _count(report, "programs_loaded", "programs"),

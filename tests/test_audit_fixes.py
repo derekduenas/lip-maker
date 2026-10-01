@@ -240,8 +240,10 @@ def test_clock_skew_secret_redaction_and_log_rotation(tmp_path):
 
 
 def test_status_page_is_loopback_json():
-    page = StatusPage(lambda: {"stage": "risk", "estimated_usd": "1.00", "markets": ["M"], "kill": None},
-                      port=0)
+    page = StatusPage(lambda: {
+        "stage": "risk", "estimated_usd": "1.00", "markets": ["M"], "kill": None,
+        "paper": True, "mode": "paper", "live_armed": False,
+    }, port=0)
     try:
         import threading
         thread = threading.Thread(target=page.serve_one, daemon=True)
@@ -252,8 +254,14 @@ def test_status_page_is_loopback_json():
     finally:
         page.close()
     assert body["paper"] is True
+    assert body["mode"] == "paper"
     assert body["live_armed"] is False
     assert status_payload({})["live_armed"] is False
+    assert status_payload({})["paper"] is False
+    demo = status_payload({"paper": False, "mode": "demo", "live_armed": False})
+    assert demo["paper"] is False
+    assert demo["mode"] == "demo"
+    assert demo["live_armed"] is False
 
 
 def test_paper_cycle_on_a_recording(tmp_path):

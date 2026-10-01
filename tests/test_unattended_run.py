@@ -377,3 +377,178 @@ def test_long_lived_socket_refreshes_status_without_finish(tmp_path, monkeypatch
     assert "fills 1" in seen["summary"]
     assert "pnl_usd 0.0000" in seen["summary"]
     assert "rewards_usd 0.0000" in seen["summary"]
+
+
+def test_shard_lookup_caches_and_waits(monkeypatch):
+    from mm.unattended.loop import ShardLookup
+
+    clock = {"t": 100.0}
+    slept = []
+
+    def _sleep(seconds):
+        slept.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr("mm.unattended.loop.time.monotonic", lambda: clock["t"])
+    monkeypatch.setattr("mm.unattended.loop.time.sleep", _sleep)
+    lookup = ShardLookup(per_second=10)
+    lookup.budget.tokens = 0
+    calls = []
+
+    class Reader:
+        def get(self, path):
+            calls.append(path)
+            return {"market": {"exchange_index": 4, "ticker": path.rsplit("/", 1)[-1]}}
+
+    assert lookup.exchange_index(Reader(), "MKT-A") == 4
+    assert slept
+    assert lookup.exchange_index(Reader(), "MKT-A") == 4
+    assert calls == ["/markets/MKT-A"]
+
+
+def test_prod_read_programs_are_paged_sharded_and_selected(tmp_path, monkeypatch):
+    """A second incentive page with a real shard is quoted. Page one alone is not."""
+    from datetime import timedelta
+    from urllib.parse import parse_qs, urlsplit
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from mm.unattended.loop import reset_readonly_shard_cache
+
+    reset_readonly_shard_cache()
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = tmp_path / "read.pem"
+    pem.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    monkeypatch.setenv("LIP_PAPER", "true")
+    monkeypatch.delenv("LIP_DEMO", raising=False)
+    monkeypatch.delenv("LIP_KALSHI_WS_URL", raising=False)
+    monkeypatch.setenv("KALSHI_PROD_READ_KEY_ID", "kid")
+    monkeypatch.setenv("KALSHI_PROD_READ_KEY_PATH", str(pem))
+
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    end = (now + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    hourly = "KXTEMPH-26OCT01-B50"
+    brent = "KXBRENT-26OCT07"
+
+    def raw(ticker):
+        return {
+            "id": ticker,
+            "market_ticker": ticker,
+            "incentive_type": "liquidity",
+            "period_reward": 864_000_000,
+            "discount_factor_bps": 5000,
+            "target_size_fp": "100.00",
+            "start_date": start,
+            "end_date": end,
+            "paid_out": False,
+        }
+
+    calls = []
+
+    class Books:
+        def request(self, method, url, headers=None, data=None, timeout=10):
+            calls.append((method, url))
+            parts = urlsplit(url)
+            query = parse_qs(parts.query)
+            if parts.path.endswith("/incentive_programs"):
+                if "cursor" not in query:
+                    return type("R", (), {
+                        "status_code": 200,
+                        "json": lambda self: {
+                            "incentive_programs": [raw(hourly)],
+                            "next_cursor": "page-2",
+                        },
+                    })()
+                assert query["cursor"] == ["page-2"]
+                return type("R", (), {
+                    "status_code": 200,
+                    "json": lambda self: {
+                        "incentive_programs": [raw(brent)],
+                        "next_cursor": "",
+                    },
+                })()
+            ticker = parts.path.rstrip("/").rsplit("/", 1)[-1]
+            return type("R", (), {
+                "status_code": 200,
+                "json": lambda self, ticker=ticker: {
+                    "market": {"ticker": ticker, "exchange_index": 2},
+                },
+            })()
+
+    monkeypatch.setattr("requests.Session", lambda: Books())
+
+    class FakeSocket:
+        last = None
+
+        def __init__(self, *, api_key, private_key, url):
+            self.url = url
+            self._ws = self
+            self._done = False
+            self.subscribed = None
+            FakeSocket.last = self
+
+        async def connect(self):
+            return None
+
+        async def subscribe(self, channels, tickers=None):
+            self.subscribed = (list(channels), list(tickers or []))
+            return {}
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return json.dumps({
+                "type": "orderbook_snapshot", "sid": 1, "seq": 1, "ts": now.timestamp(),
+                "msg": {
+                    "market_ticker": brent,
+                    "yes_dollars_fp": [["0.5000", "100.00"]],
+                    "no_dollars_fp": [["0.5000", "100.00"]],
+                },
+            })
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("mm.venues.readonly.ReadOnlyMarketSocket", FakeSocket)
+    out = tmp_path / "run.json"
+    code = main([
+        "--run", "--once",
+        "--report", str(out),
+        "--heartbeat", str(tmp_path / "hb"),
+        "--cancel-log", str(tmp_path / "cancel"),
+        "--summary", str(tmp_path / "summary"),
+    ])
+    assert code == 0
+    urls = [url for method, url in calls if method == "GET"]
+    pages = [url for url in urls if "incentive_programs" in url]
+    assert len(pages) == 2
+    assert "cursor=" not in pages[0]
+    assert "cursor=page-2" in pages[1]
+    assert sum(1 for url in urls if f"/markets/{brent}" in url) == 1
+    assert sum(1 for url in urls if f"/markets/{hourly}" in url) == 1
+    assert FakeSocket.last is not None
+    assert brent in FakeSocket.last.subscribed[1]
+    assert hourly in FakeSocket.last.subscribed[1]
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert hourly in saved["markets"]
+    assert brent in saved["markets"]
+    selected = [row["market"] for row in saved["quotes"]]
+    assert selected
+    assert brent in selected
+    assert hourly not in selected
+    assert brent in saved["resting"]
+    assert saved["paper"] is True
+    assert saved["live_armed"] is False
+    assert saved["status"]["paper"] is True
+    assert saved["status"]["mode"] == "paper"
+    assert saved["status"]["live_armed"] is False
