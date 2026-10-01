@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from mm.selector import (
     KalshiMarket, _reward_factor, competition_ratio, kalshi_share, reward_per_day,
 )
+from mm.session_gates import max_contracts_for_fill
 from mm.unattended.feed import reference_cents
 
 SHORT_POOL_SECONDS = 15 * 60
@@ -84,7 +85,8 @@ def optimize_sizes(markets: list[KalshiMarket], *, bankroll: float,
                    sizes: tuple[float, ...] = (10, 25, 50, 100),
                    markout_usd_per_contract: float = 0.0,
                    enable_short_pools: bool = False,
-                   series_factors: dict[str, float] | None = None) -> SizePlan:
+                   series_factors: dict[str, float] | None = None,
+                   single_fill_cap_usd: float = 100.0) -> SizePlan:
     plan = SizePlan()
     eligible: list[KalshiMarket] = []
     for market in markets:
@@ -114,6 +116,14 @@ def optimize_sizes(markets: list[KalshiMarket], *, bankroll: float,
     spent_total = 0.0
     budget = min(float(bankroll), float(total_usd))
     for market, yes_c, no_c, size, objective, capital, share in scored:
+        legal = min(float(size),
+                    max_contracts_for_fill(yes_c, single_fill_cap_usd),
+                    max_contracts_for_fill(no_c, single_fill_cap_usd))
+        if legal <= 0:
+            continue
+        if legal + 1e-9 < float(size):
+            size = legal
+            capital = _capital(yes_c, no_c, size)
         event = market.series.upper()
         if capital > per_market_usd + 1e-9:
             continue

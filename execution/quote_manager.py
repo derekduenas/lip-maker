@@ -72,6 +72,9 @@ class QuoteTarget:
     # physical order set serves every program on the ticker, so this is an
     # attribution label on ledger events, not a second reservation.
     program_id:        str = ""
+    # Unix close time. Inside the pull window the manager cancels and
+    # does not place. None leaves the quote alone.
+    close_ts:          Optional[float] = None
 
     def yes_size(self) -> int:
         return self.yes_size_override if self.yes_size_override is not None else self.size_contracts
@@ -200,6 +203,9 @@ class QuoteManager:
         # that id so a dead process can still be flattened by triggering the
         # group. None leaves the body unchanged (existing callers).
         self.order_group_for = None
+        from mm.session_gates import pull_before_close_s, single_fill_cap_usd
+        self.pull_before_close_s = pull_before_close_s()
+        self.single_fill_cap_usd = single_fill_cap_usd()
         self.capital_refusals: int = 0
         # Live placements refused because maker enforcement is unverified.
         self.live_blocked: int = 0
@@ -1268,7 +1274,28 @@ class QuoteManager:
         with self._state_lock:
             if self._market_uncertain(target.market_ticker):
                 return {"action": "skip", "reason": "ORDER_STATE_UNCERTAIN"}
-            return self._reconcile_locked(target)
+            if self._inside_close(target):
+                n = self.cancel_all(target.market_ticker)
+                return {"action": "cancel", "reason": "close_cutoff", "cancelled": n}
+            return self._reconcile_locked(self._cap_target(target))
+
+    def _inside_close(self, target: QuoteTarget) -> bool:
+        close_ts = getattr(target, "close_ts", None)
+        if close_ts is None:
+            return False
+        from mm.session_gates import inside_close_window
+        return inside_close_window(
+            float(close_ts), time.time(), pull_before_s=self.pull_before_close_s,
+        )
+
+    def _cap_target(self, target: QuoteTarget) -> QuoteTarget:
+        """Shrink each side so one fill's premium stays inside the cap."""
+        from dataclasses import replace
+        from mm.session_gates import clamp_contracts
+        cap = self.single_fill_cap_usd
+        yes = clamp_contracts(target.yes_bid_cents, target.yes_size(), cap)
+        no = clamp_contracts(target.no_bid_cents, target.no_size(), cap)
+        return replace(target, yes_size_override=yes, no_size_override=no)
 
     def _market_uncertain(self, market_ticker: str) -> bool:
         """Startup failure blocks every market. A later failure blocks one."""

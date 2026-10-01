@@ -29,6 +29,10 @@ from engine.lip_scorer import (
 )
 from mm.accounting import kalshi_fee_usd
 from mm.fair_value import family_for_series
+from mm.session_gates import (
+    SeriesGateConfig, SeriesStats, intraday_reason, max_contracts_for_fill,
+    series_go,
+)
 from mm.unattended.feed import reference_cents
 
 # Negative markout is toxic. Commodity weeklies were the books that paid.
@@ -248,7 +252,11 @@ def quote_economics(market: KalshiMarket, size: float, *,
     return net, capital, share, yes_cents, no_cents
 
 
-def exclusion_reason(market: KalshiMarket) -> str:
+def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> str:
+    if not allow_intraday:
+        short = intraday_reason(market.series, market.market)
+        if short:
+            return short
     if market.days_to_settle is None:
         return "settlement_time_unknown"
     if market.days_to_settle > LONG_DATED_ANY_DAYS:
@@ -299,16 +307,35 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
              per_market_usd: float | None = None,
              per_series_usd: float | None = None,
              per_category_usd: float | None = None,
-             series_factors: dict[str, float] | None = None) -> Selection:
-    """Greedy marginal net $/day per dollar, with caps and hysteresis."""
+             series_factors: dict[str, float] | None = None,
+             allow_intraday: bool = False,
+             live: bool = False,
+             series_stats: dict[str, SeriesStats] | None = None,
+             series_gate: SeriesGateConfig | None = None,
+             single_fill_cap_usd: float = 100.0) -> Selection:
+    """Greedy marginal net $/day per dollar, with caps and hysteresis.
+
+    ``live=True`` trades a series only when ``series_go`` says so. Paper
+    leaves that gate off. Hourly temperature and 15-minute names stay out
+    unless ``allow_intraday`` is set. A chunk that would put one fill's
+    premium over ``single_fill_cap_usd`` is not taken.
+    """
     selection = Selection()
     cap_m, cap_s, cap_c = _caps(bankroll, per_market_usd, per_series_usd, per_category_usd)
+    gate = series_gate or SeriesGateConfig()
+    stats = series_stats or {}
     eligible: list[KalshiMarket] = []
     for market in markets:
-        why = exclusion_reason(market)
+        why = exclusion_reason(market, allow_intraday=allow_intraday)
         if why:
             selection.excluded.append((market.market, why))
             continue
+        if live:
+            record = stats.get(market.series.upper()) or stats.get(market.series)
+            ok, gate_why = series_go(record, gate)
+            if not ok:
+                selection.excluded.append((market.market, f"series_gate:{gate_why}"))
+                continue
         leaving = exit_reason(market)
         if leaving:
             selection.exits.append((market.market, leaving))
@@ -332,6 +359,9 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
             factor = _reward_factor(market.series, series_factors)
             net, capital, share, yes_c, no_c = quote_economics(
                 market, nxt, reward_factor=factor)
+            if (nxt > max_contracts_for_fill(yes_c, single_fill_cap_usd)
+                    or nxt > max_contracts_for_fill(no_c, single_fill_cap_usd)):
+                continue
             d_net = net - net_of[market.market]
             d_cap = capital - capital_of[market.market]
             if d_cap <= 1e-12:
