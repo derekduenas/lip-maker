@@ -58,6 +58,9 @@ from engine.lip_scorer import (
     interval_payout_usd, snapshot_share, _find_cutoff_price,
 )
 from engine.adaptive_sizer import AdaptiveSizer
+from engine.adverse_selection import (
+    AdverseSelectionGuard, ASConfig, inventory_side_controls, yes_mid_cents,
+)
 from engine.microprice import microprice_yes  # A.1: imbalance-weighted fair value
 from engine.reservation_price import (        # A.2: inventory-aware fair value
     reservation_price, realized_sigma_cents, suggest_quote_skew,
@@ -114,6 +117,11 @@ def _program_params_from_market(m: dict) -> ProgramParams:
 # stale_book, no_params, unknown) means our resting orders are exposure
 # without a thesis and must be cancelled (2026-09-20 audit #7).
 TRANSIENT_SKIP_REASONS = frozenset({"volatility", "no_best"})
+# 2026-09-30: adverse-selection pulls must cancel NOW, not after the 30s
+# skip-cancel throttle — the throttle exists to stop gate flapping from
+# spamming the API, and a fast market is exactly when waiting is the loss.
+FORCE_PULL_REASONS = frozenset({"as_pull", "volatility_pull"})
+_SERIES_FEES = None   # lazily built engine.series_fees.SeriesFeeResolver
 
 
 @dataclass
@@ -269,6 +277,24 @@ class PaperRunner:
         # VOLATILITY_WINDOW_SEC, we're in a hot market — back off.
         from collections import deque
         self._best_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
+        # 2026-09-30: in-loop adverse-selection guard (fill fade, burst,
+        # markout toxicity, volatility pull). See engine/adverse_selection.py.
+        self.as_guard = AdverseSelectionGuard(
+            ASConfig(
+                fill_cooldown_sec=settings.AS_FILL_COOLDOWN_SEC,
+                burst_window_sec=settings.AS_BURST_WINDOW_SEC,
+                burst_contracts=settings.AS_BURST_CONTRACTS,
+                burst_cooldown_sec=settings.AS_BURST_COOLDOWN_SEC,
+                score_horizon_sec=settings.AS_SCORE_HORIZON_SEC,
+                min_obs=settings.AS_MIN_OBS,
+                widen_markout_cents=settings.AS_WIDEN_MARKOUT_CENTS,
+                pull_markout_cents=settings.AS_PULL_MARKOUT_CENTS,
+                toxic_cooldown_sec=settings.AS_TOXIC_COOLDOWN_SEC,
+                volatility_cooldown_sec=settings.AS_VOLATILITY_COOLDOWN_SEC,
+            ),
+            db_path=(settings.DB_PATH if settings.AS_PERSIST_MARKOUTS else None),
+        )
+        self.as_decisions: dict[str, str] = {}
         self._blacklist_last_action: dict[str, float] = {}   # ticker → last-cancel ts
         # A.1 (2026-05-14): microprice cache. Updated on every book in
         # _quote_target_for. Consumed by A.2 (reservation price) and A.4
@@ -708,6 +734,8 @@ class PaperRunner:
         base = reason.split(":", 1)[0]
         if base in TRANSIENT_SKIP_REASONS:
             return False
+        if base in FORCE_PULL_REASONS:
+            force = True
         if not [o for o in self._live_resting(ticker) if o.is_ours]:
             return False
         now = time.time()
@@ -895,6 +923,14 @@ class PaperRunner:
             return status        # duplicates change nothing, including accrual
         self._break_accrual(ev.market_ticker, "fill")
         self.qm.inventory.pop(ev.market_ticker, None)
+        if settings.AS_GUARD_ENABLED and status == "applied" and ev.side in ("yes", "no"):
+            try:
+                self.as_guard.record_fill(
+                    ev.market_ticker, ev.side,
+                    ev.price_cents_exact if ev.price_cents_exact is not None else None,
+                    float(ev.count or 0), ts=time.time())
+            except Exception as e:      # the guard must never break fill handling
+                _log.warning(f"AS record_fill failed for {ev.market_ticker}: {e}")
         if not self.qm.paper and status == "applied":
             self.qm.periodic_resync()
         if ev.trade_id and status == "applied":
@@ -979,7 +1015,7 @@ class PaperRunner:
             best_no = book.no_bids[0].price_cents if (book and book.no_bids) else None
             decision = self.exit_policy.evaluate(
                 pos, now=now, best_yes_bid_cents=best_yes,
-                best_no_bid_cents=best_no, fee_schedule=self._fee_schedule())
+                best_no_bid_cents=best_no, fee_schedule=self._fee_schedule(tkr))
             if not decision.should_exit:
                 out["skipped"] += 1
                 self._exit_reasons[tkr] = decision.reason
@@ -1032,12 +1068,24 @@ class PaperRunner:
         return out
 
     @staticmethod
-    def _fee_schedule():
+    def _fee_schedule(ticker: str | None = None):
         try:
             from engine import fees
-            return fees.active_schedule()
+            base = fees.active_schedule()
         except Exception:
             return None
+        if ticker and settings.SERIES_FEES_ENABLED:
+            # 2026-09-30: per-series maker-fee truth; unknown series fall
+            # back to the conservative global schedule.
+            global _SERIES_FEES
+            try:
+                if _SERIES_FEES is None:
+                    from engine.series_fees import SeriesFeeResolver, http_series_fetcher
+                    _SERIES_FEES = SeriesFeeResolver(http_series_fetcher(), base)
+                return _SERIES_FEES.for_ticker(ticker)
+            except Exception:
+                return base
+        return base
 
     def _entry_cutoff_min(self, ticker: str, mins_until: float) -> float:
         """Minutes before CLOSE at which new reward-driven entries stop.
@@ -1319,6 +1367,10 @@ class PaperRunner:
         best_no  = book.best_no_bid()
         if best_yes is None or best_no is None:
             return self._skip(tkr, "no_best")
+        now_as = time.time()
+        if settings.AS_GUARD_ENABLED:
+            self.as_guard.record_mid(
+                tkr, yes_mid_cents(best_yes.price_cents, best_no.price_cents), now_as)
 
         # A.1 (2026-05-14): cache microprice for downstream consumers
         # (A.2 reservation price, A.4 markout). Best-effort — None when
@@ -1345,6 +1397,16 @@ class PaperRunner:
         # chase a flickering market — protects against being the slow
         # replacement quote that informed flow picks off. Throttle log so
         # we can tell volatility-skips apart from other skip-reasons.
+        as_dec = None
+        if settings.AS_GUARD_ENABLED:
+            as_dec = self.as_guard.decide(tkr, now_as)
+            if as_dec.reason:
+                self.as_decisions[tkr] = as_dec.reason
+            if as_dec.pull_market:
+                tag = ":".join(seg for seg in as_dec.reason.split(":")
+                               if not any(ch.isdigit() for ch in seg))
+                return self._skip(tkr, f"as_pull:{tag}")
+
         if self._is_volatile(book.market_ticker, best_yes.price_cents,
                              best_no.price_cents):
             now_ts = time.time()
@@ -1354,6 +1416,11 @@ class PaperRunner:
                           f"best moved >{settings.VOLATILITY_BACKOFF_TICKS}c "
                           f"in last {settings.VOLATILITY_WINDOW_SEC}s")
                 self._fv_skip_log_ts[f"vol:{book.market_ticker}"] = now_ts
+            if settings.PULL_ON_VOLATILITY:
+                # 2026-09-30: pull, don't just freeze. A frozen quote in a
+                # fast book is the stale order informed flow hits.
+                self.as_guard.note_volatility(tkr, now_as)
+                return self._skip(tkr, "volatility_pull")
             return self._skip(tkr, "volatility")
 
         # Quant audit: futures fair-value adverse-selection gate. Skip
@@ -1460,13 +1527,53 @@ class PaperRunner:
                               f"yes_off={skew.yes_tick_offset} no_off={skew.no_tick_offset} "
                               f"reason={skew.reason}")
 
+        # 2026-09-30: adverse-selection widen + side-aware inventory control.
+        # Both only move quotes AWAY from the touch or remove a side.
+        suppress_sides: set[str] = set()
+        heavy_restore = None
+        heavy_back = 0
+        if as_dec is not None:
+            if as_dec.tick_back:
+                yes_bid_c = max(1, yes_bid_c - as_dec.tick_back)
+                no_bid_c = max(1, no_bid_c - as_dec.tick_back)
+            suppress_sides |= set(as_dec.suppress)
+        if settings.INVENTORY_SIDE_CAP_ENABLED and inv and inv.net_yes_contracts:
+            max_net = float(settings.MAX_NET_INVENTORY_USD) / 0.50   # same basis as QM cap
+            inv_suppress, heavy_back, inv_reason = inventory_side_controls(
+                inv.net_yes_contracts, max_net_contracts=max_net,
+                soft_fraction=settings.INVENTORY_SOFT_FRACTION)
+            heavy = "yes" if inv.net_yes_contracts > 0 else "no"
+            heavy_restore = (heavy, yes_bid_c if heavy == "yes" else no_bid_c)
+            if heavy_back:
+                if heavy == "yes":
+                    yes_bid_c = max(1, yes_bid_c - heavy_back)
+                else:
+                    no_bid_c = max(1, no_bid_c - heavy_back)
+            if inv_suppress:
+                suppress_sides.add(inv_suppress)
+            if inv_reason:
+                self.as_decisions[tkr] = inv_reason
+
         # 2026-09-20 review (qualification-aware placement): a quote that
         # cannot qualify earns nothing and is pure adverse-selection
         # exposure. Top a side up to the qualify cliff when the cap allows;
         # otherwise do not quote (and pull what is resting).
+        yes_ov_in, no_ov_in = yes_size_override, no_size_override
         q_reason, yes_size_override, no_size_override = self._qualification_adjust(
-            book, p, yes_bid_c, no_bid_c, size, yes_size_override, no_size_override,
+            book, p, yes_bid_c, no_bid_c, size, yes_ov_in, no_ov_in,
         )
+        if (q_reason and heavy_back and heavy_restore is not None
+                and q_reason == f"unqualifiable:{heavy_restore[0]}_beyond_cutoff"):
+            # The inventory tick-back pushed the heavy side past the reward
+            # cutoff (deep book at the touch). A non-scoring order is pure
+            # risk, so fall back to size skew alone at the original price.
+            if heavy_restore[0] == "yes":
+                yes_bid_c = heavy_restore[1]
+            else:
+                no_bid_c = heavy_restore[1]
+            q_reason, yes_size_override, no_size_override = self._qualification_adjust(
+                book, p, yes_bid_c, no_bid_c, size, yes_ov_in, no_ov_in,
+            )
         if q_reason:
             now_ts = time.time()
             last = self._fv_skip_log_ts.get(f"qual:{tkr}", 0)
@@ -1502,10 +1609,12 @@ class PaperRunner:
                     no_size_override = min(no_size_override, chosen)
                 size = chosen
 
+        if suppress_sides >= {"yes", "no"}:
+            return self._skip(tkr, "as_pull:both_sides_suppressed")
         return QuoteTarget(
             market_ticker=book.market_ticker,
-            yes_bid_cents=yes_bid_c,
-            no_bid_cents=no_bid_c,
+            yes_bid_cents=(None if "yes" in suppress_sides else yes_bid_c),
+            no_bid_cents=(None if "no" in suppress_sides else no_bid_c),
             size_contracts=size,
             yes_size_override=yes_size_override,
             no_size_override=no_size_override,
@@ -1582,7 +1691,7 @@ class PaperRunner:
                 expected_fills_per_horizon=self._expected_fills(
                     book.market_ticker, size, horizon, queue_depth=top,
                     side="yes", price_cents=yes_bid_c),
-                fee_schedule=self._fee_schedule(),
+                fee_schedule=self._fee_schedule(book.market_ticker),
                 book=book,
                 # We do not hold to settlement: the exit policy unwinds.
                 adverse_holding_hours=float(
