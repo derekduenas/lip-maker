@@ -11,7 +11,7 @@ WINDOW_SECONDS = 86400.0
 
 
 def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: float,
-                         data_source: str | None = None) -> str:
+                         data_source: str | None = None, buckets: dict | None = None) -> str:
     text = (
         f"daily summary {day}\n"
         f"fills {int(fills)}\n"
@@ -20,6 +20,13 @@ def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: f
     )
     if data_source:
         text += f"data_source {data_source}\n"
+    for name, b in sorted((buckets or {}).items()):
+        text += (f"bucket {name} selected {int(b.get('selected_n', 0))} "
+                 f"capital_usd {float(b.get('capital_usd', 0)):.2f} "
+                 f"raw_est_rewards_usd {float(b.get('raw_est_usd', 0)):.4f} "
+                 f"fills {int(b.get('fills_n', 0))} "
+                 f"markout_usd {float(b.get('markout_usd', 0)):.4f} "
+                 f"pnl_usd {float(b.get('pnl_usd', 0)):.4f}\n")
     return text
 
 

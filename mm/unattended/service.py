@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import threading
 import time
@@ -25,6 +26,21 @@ from mm.venues.kalshi_rest import PRODUCTION_HOSTS
 class UnattendedRefused(RuntimeError):
     """This process will not start against production or with paper off."""
 
+
+
+def _honor_kill_file(loop, path) -> bool:
+    """Patch 17: external kill flag (written by lip-watchdog). Fail closed."""
+    try:
+        if not path or not os.path.exists(path):
+            return False
+    except Exception:
+        return False
+    try:
+        reason = str(json.loads(Path(path).read_text(encoding="utf-8")).get("reason") or "kill_file")
+    except Exception:
+        reason = "kill_file"
+    loop.external_kill(reason[:200])
+    return True
 
 def assert_paper_demo(*, paper: bool, ws_url: str | None) -> None:
     if not paper:
@@ -71,6 +87,59 @@ class CrashWatchdog:
                     raise
 
 
+class LiveStatusRefresher:
+    """Push a read-only RunLoop snapshot to the status page and daily summary.
+
+    Counts refresh every ``every_s`` seconds (default 10). Per-market USD
+    estimates are heavier (they walk scored seconds), so they refresh every
+    ``estimate_every_s`` (default 60) and only for markets that were quoted.
+    Never calls ``loop.finish()``. A failure here logs and is swallowed so
+    the feed keeps running.
+    """
+
+    def __init__(self, loop, write, *, data_source: str, ws_url: str,
+                 every_s: float = 10.0, estimate_every_s: float = 60.0,
+                 clock=time.monotonic) -> None:
+        self.loop = loop
+        self.write = write
+        self.data_source = data_source
+        self.ws_url = ws_url
+        self.every_s = float(every_s)
+        self.estimate_every_s = float(estimate_every_s)
+        self.clock = clock
+        self._last = None
+        self._last_est = None
+        self._estimates = None
+        self._session_start = None
+        self.refreshes = 0
+
+    def maybe_refresh(self) -> bool:
+        now = self.clock()
+        if self._session_start is None and self.loop.now:
+            self._session_start = float(self.loop.now)
+        if self._last is not None and now - self._last < self.every_s:
+            return False
+        self._last = now
+        try:
+            if self._last_est is None or now - self._last_est >= self.estimate_every_s:
+                quoted = {q["market"] for q in self.loop.quotes} | set(self.loop.resting)
+                self._estimates = self.loop.live_estimates(quoted)
+                self._accrual = self.loop.live_accrual(quoted)
+                self._last_est = now
+            report = self.loop.live_snapshot(
+                estimates=self._estimates, session_start_ts=self._session_start,
+                accrual=getattr(self, "_accrual", None),
+            )
+            report["data_source"] = self.data_source
+            report["ws_url"] = self.ws_url
+            self.write(report)
+            self.refreshes += 1
+            return True
+        except Exception:
+            logging.getLogger("lip.status").exception("live status refresh failed")
+            return False
+
+
 def _paper_env() -> bool:
     return os.environ.get("LIP_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
 
@@ -87,6 +156,7 @@ def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
             pnl_usd=float(report.get("pnl_usd") or 0),
             rewards_usd=float(report.get("rewards_usd") or 0),
             data_source=str(report.get("data_source") or "") or None,
+            buckets=report.get("buckets"),
         ), encoding="utf-8")
     if args.report:
         dest = Path(args.report)
@@ -194,12 +264,35 @@ def main(argv: list[str] | None = None) -> int:
             _write_run_outputs(args, report, started)
             if plan["socket"]:
                 from mm.unattended.loop import RunLoop, drive_readonly_books, drive_socket
-                loop = RunLoop(mode=mode, select_every=args.select_every)
+                from mm.bankroll import capital_usd
+                loop = RunLoop(
+                    mode=mode, select_every=args.select_every,
+                    bankroll=float(capital_usd()),
+                    first_select_warmup_s=float(os.environ.get("LIP_FIRST_SELECT_WARMUP_S", "60")),
+                    carry_forward=True,
+                )
                 loop.socket_opened = True
+                from mm.unattended.fairvalue import FairValueCache, enabled as _fv_enabled
+                if _fv_enabled():  # Patch 16: external fair value, background refresh only
+                    loop.fv = FairValueCache()
+                    loop.fv.start(lambda loop=loop: set(list(loop.resting)) | set(loop._fv_wanted))
 
-                def _on_frame(msg, loop=loop):
+                refresher = LiveStatusRefresher(
+                    loop, lambda rep: _write_run_outputs(args, rep, started),
+                    data_source=books["flag"], ws_url=plan["url"],
+                )
+
+                _hb = {"sec": None}
+                _kill_path = os.environ.get("LIP_KILL_FILE", "/var/lib/lip-maker/KILL")
+
+                def _on_frame(msg, loop=loop, refresher=refresher):
                     loop.on_frame(msg)
-                    write_heartbeat(args.heartbeat)
+                    sec = int(time.time())
+                    if _hb["sec"] != sec:  # heartbeat file write once per second
+                        _hb["sec"] = sec
+                        write_heartbeat(args.heartbeat)
+                        _honor_kill_file(loop, _kill_path)
+                    refresher.maybe_refresh()
 
                 import asyncio
                 if plan.get("reader"):

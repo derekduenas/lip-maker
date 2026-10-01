@@ -1,0 +1,23 @@
+[Unit]
+Description=lip-maker independent watchdog / kill switch (patch 17)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lip
+Group=lip
+WorkingDirectory=/opt/lip-maker
+EnvironmentFile=-/etc/lip-maker/lip-maker.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/lip-maker/.venv/bin/python -m mm.safety.lip_watchdog
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lip-maker
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -74,7 +74,9 @@ class TestKalshiPeriodFloor:
 
 
 class TestSelector:
+    @__import__("unittest.mock").mock.patch.dict("os.environ", {"LIP_LONG_DATED_EVENT_DAYS": "14", "LIP_LONG_DATED_ANY_DAYS": "45"})
     def test_commodity_weekly_beats_a_crowd_and_skips_the_long_event(self):
+        # Pinned to the pre-2026-10-01 14/45-day policy; the durable 90/120 defaults are in test_durable_policy.py.
         thin = _market("KXBRENT-26OCT07", comp=10, pool=50)
         crowded = _market("KXBRENT-26OCT08", comp=5000, pool=50)
         long_event = _market("KXPRES-26NOV01", comp=0, pool=500, days=30,

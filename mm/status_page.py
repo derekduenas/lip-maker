@@ -6,11 +6,62 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 
+LIVE_STATUS_FIELDS = (
+    "programs_loaded", "selection_count", "selected_n", "selected_top",
+    "resting_n", "quotes_n", "cancels_n", "fills_n", "excluded_n",
+    "estimates_partial", "session_elapsed_s", "last_frame_ts", "pnl_usd",
+    "excluded_reasons", "programs_shard_unknown",
+    "programs_fed", "screen", "suspect_n",
+    "paper_capital_usd", "alloc_budget_usd", "bankroll_usd", "risk_limits",
+    "cap_skips_n", "cap_skips", "rank_skips_n",
+    "estimated_raw_usd", "estimated_usd_note", "accrual_seconds",
+    "buckets", "durable_reserve",
+    "fills_detail", "markouts", "policy_skips", "pulls", "repegs_n", "fair_value", "select_ms", "size_ladder",
+)
+
+
 def status_payload(report: dict) -> dict:
+    out = _base_status(report)
+    for field in LIVE_STATUS_FIELDS:
+        if field in report:
+            out[field] = report[field]
+    return out
+
+
+def actual_mode(environ: dict | None = None) -> dict:
+    """Mode from the real config, not a constant.
+
+    ``live_armed`` follows ``config.settings``' rule: LIP_PAPER false AND
+    LIP_LIVE_ACK equal to the acknowledgement phrase.
+    """
+    import os
+    env = os.environ if environ is None else environ
+
+    def _on(name: str, default: str) -> bool:
+        return str(env.get(name, default)).strip().lower() in ("1", "true", "yes", "on")
+
+    try:
+        from config.settings import LIVE_ACK_PHRASE
+    except Exception:
+        LIVE_ACK_PHRASE = "I_ACCEPT_LIVE_RISK"
+    paper = _on("LIP_PAPER", "true")
+    demo = (not paper) and _on("LIP_DEMO", "false")
+    live_armed = (not paper) and str(env.get("LIP_LIVE_ACK", "")) == LIVE_ACK_PHRASE
+    mode = "paper" if paper else ("demo" if demo else ("live" if live_armed else "refused"))
+    return {"paper": paper, "demo": demo, "live_armed": live_armed, "mode": mode}
+
+
+def _base_status(report: dict) -> dict:
     from mm.venues.readonly import book_source
+    real = actual_mode()
+    # A report that claims paper while config says otherwise reports the config.
+    paper = bool(real["paper"]) and report.get("paper", True) is not False
+    live_armed = bool(real["live_armed"]) or report.get("live_armed") is True
     return {
-        "paper": True,
-        "live_armed": False,
+        "paper": paper,
+        "demo": bool(real["demo"]) or report.get("demo") is True,
+        "live_armed": live_armed,
+        "mode": report.get("mode") or real["mode"],
         "stage": report.get("stage"),
         "markets": report.get("markets") or [],
         "estimated_usd": report.get("estimated_usd"),

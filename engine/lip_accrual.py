@@ -291,7 +291,7 @@ class SecondAccrual:
     def set_resting(self, orders: list[RestingOrder]) -> None:
         self.resting = list(orders)
 
-    def omit_until(self, second: int) -> None:
+    def omit_until(self, second: int, status: str = "missed") -> None:
         """Mark unscored seconds before ``second`` as missed.
 
         The second itself stays open. A missed second adds no dollars and
@@ -304,7 +304,7 @@ class SecondAccrual:
             self._next = second
             return
         while self._next < second:
-            self._mark(self._next, "missed", counted=False)
+            self._mark(self._next, status, counted=False)
             self._next += 1
 
     def on_message(self, msg: dict, ts: float) -> str:
@@ -359,12 +359,48 @@ class SecondAccrual:
             snapshot_score=snap.our_total_score, intra=intra,
         )
 
+    def _agg(self) -> dict:
+        agg = self.__dict__.get("_compacted")
+        if agg is None:
+            agg = {"status": {}, "counted": 0, "intra": 0,
+                   "score": Decimal(0), "share": Decimal(0), "n": 0}
+            self.__dict__["_compacted"] = agg
+        return agg
+
+    def compact(self, keep: int = 300) -> int:
+        """Fold all but the last ``keep`` marks into running totals.
+
+        ``raw_usd``/``payable_usd``/``estimate`` give the same result before
+        and after. Used by the long-running live loop so memory and estimate
+        cost stay bounded.
+        """
+        keep = max(0, int(keep))
+        if len(self.marks) <= keep:
+            return 0
+        cut = len(self.marks) - keep
+        old, self.marks = self.marks[:cut], self.marks[cut:]
+        agg = self._agg()
+        for mark in old:
+            agg["status"][mark.status] = agg["status"].get(mark.status, 0) + 1
+            agg["n"] += 1
+            if mark.intra_second:
+                agg["intra"] += 1
+            if mark.counted:
+                agg["counted"] += 1
+                agg["score"] += Decimal(str(mark.snapshot_score))
+                if mark.share is not None:
+                    agg["share"] += Decimal(str(mark.share))
+        return len(old)
+
     def raw_usd(self) -> Decimal:
         pool = Decimal(str(self.params.period_reward_usd))
         length = Decimal(str(self.params.period_seconds))
         if length <= 0:
             return Decimal(0)
         raw = Decimal(0)
+        agg = self.__dict__.get("_compacted")
+        if agg is not None and agg["share"]:
+            raw += agg["share"] * pool / length
         for mark in self.marks:
             if not mark.counted or mark.share is None:
                 continue
@@ -375,13 +411,18 @@ class SecondAccrual:
         return period_payout(self.raw_usd(), self.max_reward_usd)
 
     def estimate(self) -> PeriodEstimate:
-        def n(status: str) -> int:
-            return sum(1 for mark in self.marks if mark.status == status)
+        agg = self.__dict__.get("_compacted") or {"status": {}, "counted": 0, "intra": 0,
+                                                  "score": Decimal(0)}
 
-        known = sum(1 for mark in self.marks if mark.counted)
-        unknown = sum(1 for mark in self.marks if mark.status in ("unknown", "missed"))
+        def n(status: str) -> int:
+            return (sum(1 for mark in self.marks if mark.status == status)
+                    + int(agg["status"].get(status, 0)))
+
+        known = sum(1 for mark in self.marks if mark.counted) + int(agg["counted"])
+        unknown = (sum(1 for mark in self.marks if mark.status in ("unknown", "missed"))
+                   + int(agg["status"].get("unknown", 0)) + int(agg["status"].get("missed", 0)))
         score = sum((Decimal(str(mark.snapshot_score)) for mark in self.marks if mark.counted),
-                    Decimal(0))
+                    Decimal(0)) + agg["score"]
         raw = self.raw_usd()
         payable = self.payable_usd()
         return PeriodEstimate(
@@ -395,7 +436,7 @@ class SecondAccrual:
             out_of_program_seconds=n("out_of_program"),
             boundary_seconds=n("boundary"),
             unsupported_rule_seconds=n("unsupported_rule"),
-            intra_second_seconds=sum(1 for mark in self.marks if mark.intra_second),
+            intra_second_seconds=sum(1 for mark in self.marks if mark.intra_second) + int(agg["intra"]),
             sum_snapshot_score=format(score, "f"),
             raw_usd=format(raw, "f"),
             estimated_usd=format(payable, "f"),

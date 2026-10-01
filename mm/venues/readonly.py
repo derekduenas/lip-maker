@@ -59,6 +59,30 @@ class ReadOnlyViolation(SystemExit):
         super().__init__(3)
 
 
+def _ws_ping() -> tuple[float, float]:
+    """Websocket keepalive (LIP_WS_PING_INTERVAL / LIP_WS_PING_TIMEOUT, default 20/20)."""
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+    return _f("LIP_WS_PING_INTERVAL", 20.0), _f("LIP_WS_PING_TIMEOUT", 20.0)
+
+
+class ReadOnlyHTTPError(ReadOnlyViolation):
+    """An allowed public GET came back HTTP 4xx/5xx.
+
+    Still a ``ReadOnlyViolation`` (exit code 3) for callers that do not
+    handle it. The read-only book driver catches this subclass, backs off,
+    and retries. Route and verb refusals stay plain ``ReadOnlyViolation``
+    and still end the process.
+    """
+
+    def __init__(self, reason: str, status: int) -> None:
+        self.status = int(status)
+        super().__init__(reason)
+
+
 class MarketDataReader:
     """Nominal type for production book reads. Order code is not this class."""
 
@@ -219,7 +243,8 @@ class ReadOnlyKalshiTransport(MarketDataReader):
             except Exception:
                 payload = {}
         if status >= 400:
-            _refuse(f"GET {path} HTTP {status}")
+            _log.warning("read-only Kalshi GET %s HTTP %s", path, status)
+            raise ReadOnlyHTTPError(f"GET {path} HTTP {status}", status)
         return payload if isinstance(payload, dict) else {}
 
     def get(self, path: str, *, params: Optional[dict] = None) -> dict:
@@ -306,11 +331,11 @@ class ReadOnlyMarketSocket(MarketDataReader):
         headers = self.auth_headers()
         try:
             self._ws = await websockets.connect(
-                self.url, additional_headers=headers, ping_interval=20, ping_timeout=20,
+                self.url, additional_headers=headers, ping_interval=_ws_ping()[0], ping_timeout=_ws_ping()[1],
             )
         except TypeError:
             self._ws = await websockets.connect(
-                self.url, extra_headers=headers, ping_interval=20, ping_timeout=20,
+                self.url, extra_headers=headers, ping_interval=_ws_ping()[0], ping_timeout=_ws_ping()[1],
             )
 
     async def subscribe(self, channels: list[str], tickers: list[str] | None = None) -> dict:

@@ -50,8 +50,64 @@ FILL_FRACTION_PER_DAY = {
     "weather": 0.04,
     "event": 0.15,
 }
-LONG_DATED_EVENT_DAYS = 14
-LONG_DATED_ANY_DAYS = 45
+# Durable-focus policy (2026-10-01). Env-configurable; read at call time.
+#   LIP_LONG_DATED_EVENT_DAYS (90), LIP_LONG_DATED_ANY_DAYS (120): days to the
+#     market's effective close (min of close_time and occurrence_datetime).
+#   LIP_MIN_CLOSE_HOURS (24): exclude markets closing sooner than this.
+#   LIP_SPORTS_DENYLIST (regex on series ticker), LIP_SPORTS_CATEGORIES
+#     (comma list, from GET /series category), LIP_SPORTS_MAX_DAYS (14):
+#     live/same-day sports and esports matches are excluded.
+# The markout prior keeps its original 14-day long-dated penalty.
+import os as _os
+import re as _re
+
+MARKOUT_LONG_DATED_DAYS = 14
+# Single-game / single-match series. League futures (MVP, champion, season
+# totals) are not denylisted; short-dated ones fall to the Sports category rule.
+DEFAULT_SPORTS_DENYLIST = (
+    r"(MATCH|GAME|MAP|FIGHT|BOUT|SPREAD|TOTALS?)$"
+    r"|^KX(ATP|WTA|ITF|TT|LOL|CS2|CSGO|DOTA|VALORANT|ESPORT)"
+)
+DEFAULT_SPORTS_CATEGORIES = "Sports,Esports,eSports"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def long_dated_event_days() -> float:
+    return _env_float("LIP_LONG_DATED_EVENT_DAYS", 90)
+
+
+def long_dated_any_days() -> float:
+    return _env_float("LIP_LONG_DATED_ANY_DAYS", 120)
+
+
+def min_close_hours() -> float:
+    if _os.environ.get("LIP_MIN_HOURS_TO_CLOSE"):
+        return _env_float("LIP_MIN_HOURS_TO_CLOSE", 24)
+    return _env_float("LIP_MIN_CLOSE_HOURS", 24)
+
+
+def sports_max_days() -> float:
+    return _env_float("LIP_SPORTS_MAX_DAYS", 14)
+
+
+def sports_denylist() -> str:
+    return _os.environ.get("LIP_SPORTS_DENYLIST") or DEFAULT_SPORTS_DENYLIST
+
+
+def sports_categories() -> set[str]:
+    raw = _os.environ.get("LIP_SPORTS_CATEGORIES") or DEFAULT_SPORTS_CATEGORIES
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+# Import-time values kept for callers that read the names.
+LONG_DATED_EVENT_DAYS = long_dated_event_days()
+LONG_DATED_ANY_DAYS = long_dated_any_days()
 EMPIRICAL_BLEND = 0.7
 EMPIRICAL_MIN_N = 5
 
@@ -80,6 +136,7 @@ class KalshiMarket:
     entry_markout_cents: float | None = None
     empirical_markout_cents: float | None = None
     empirical_n: int = 0
+    category: str | None = None
 
 
 @dataclass
@@ -162,7 +219,7 @@ def family_of(market: KalshiMarket) -> str:
 def markout_cents(market: KalshiMarket) -> float:
     family = family_of(market)
     prior = MARKOUT_PRIOR_CENTS.get(family, MARKOUT_PRIOR_CENTS["event"])
-    if (market.days_to_settle is not None and market.days_to_settle > LONG_DATED_EVENT_DAYS
+    if (market.days_to_settle is not None and market.days_to_settle > MARKOUT_LONG_DATED_DAYS
             and family not in ("commodity", "crypto")):
         prior -= 1.0
     if (market.empirical_n >= EMPIRICAL_MIN_N
@@ -186,6 +243,27 @@ def kalshi_share(market: KalshiMarket, yes_cents: int, no_cents: int,
         target_size=market.target_size,
         discount_factor=market.discount_factor,
         period_reward_usd=market.period_reward_usd,
+        period_seconds=market.period_seconds,
+    )
+    return snapshot_share(score_snapshot(book, ours, params))
+
+
+def kalshi_one_sided_share(market: KalshiMarket, side: str, price_cents: int,
+                           size: float) -> float:
+    """Snapshot share when we rest on one side only (the other side's book
+    must still reach target for the snapshot to count)."""
+    yes_book = _levels(market.yes_bids)
+    no_book = _levels(market.no_bids)
+    if side == "yes":
+        yes_book = _merge(yes_book, price_cents, size)
+        ours = OurQuotes(yes_bids=[BookLevel(price_cents, size)], no_bids=[])
+    else:
+        no_book = _merge(no_book, price_cents, size)
+        ours = OurQuotes(yes_bids=[], no_bids=[BookLevel(price_cents, size)])
+    book = BookState(market_ticker=market.market, yes_bids=yes_book, no_bids=no_book)
+    params = ProgramParams(
+        market_ticker=market.market, target_size=market.target_size,
+        discount_factor=market.discount_factor, period_reward_usd=market.period_reward_usd,
         period_seconds=market.period_seconds,
     )
     return snapshot_share(score_snapshot(book, ours, params))
@@ -221,6 +299,18 @@ def _reward_factor(series: str, factors: dict[str, float] | None) -> float:
     return float(factors.get(series.upper(), 1.0))
 
 
+def holding_model() -> str:
+    """LIP_HOLDING_MODEL: 'legacy' (default; $0.01/contract/day to close) or 'carry'."""
+    return (_os.environ.get("LIP_HOLDING_MODEL") or "legacy").strip().lower()
+
+
+def carry_apr() -> float:
+    try:
+        return float(_os.environ.get("LIP_CARRY_APR", 0.10))
+    except (TypeError, ValueError):
+        return 0.10
+
+
 def quote_economics(market: KalshiMarket, size: float, *,
                     reward_factor: float = 1.0) -> tuple[float, float, float, int, int]:
     """Return net $/day, capital, share, yes cents, no cents at ``size``."""
@@ -245,11 +335,31 @@ def quote_economics(market: KalshiMarket, size: float, *,
         family == "weather" and market.has_observation)
     holding = 0.0
     if days > 1:
-        rate = 0.002 if cheap else 0.01
-        holding = rate * (days - 1.0) * (fills_side * 2.0)
+        if holding_model() == "carry":
+            # Capital carry: each day's fills lock their premium until close,
+            # charged at LIP_CARRY_APR. Markout/adverse selection is the
+            # separate as_cost term (and the screen's days-shrinking penalty).
+            locked = fills_side * (yes_cents + no_cents) / 100.0
+            holding = carry_apr() / 365.0 * (days - 1.0) * locked
+        else:
+            rate = 0.002 if cheap else 0.01
+            holding = rate * (days - 1.0) * (fills_side * 2.0)
     net = reward - as_cost - fee - holding
     capital = (yes_cents / 100.0) * size + (no_cents / 100.0) * size
     return net, capital, share, yes_cents, no_cents
+
+
+def sports_reason(market: KalshiMarket) -> str:
+    """Live/same-day sports and esports match markets."""
+    series = (market.series or market.market.split("-", 1)[0]).upper()
+    if _re.search(sports_denylist(), series):
+        return "sports_match"
+    category = (market.category or "").strip().lower()
+    if (category and category in sports_categories()
+            and market.days_to_settle is not None
+            and market.days_to_settle <= sports_max_days()):
+        return "sports_short_dated"
+    return ""
 
 
 def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> str:
@@ -259,12 +369,17 @@ def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> s
             return short
     if market.days_to_settle is None:
         return "settlement_time_unknown"
-    if market.days_to_settle > LONG_DATED_ANY_DAYS:
+    if market.days_to_settle * 24.0 < min_close_hours():
+        return f"closes_within_{min_close_hours():g}h"
+    sport = sports_reason(market)
+    if sport:
+        return sport
+    if market.days_to_settle > long_dated_any_days():
         return f"long_dated_{market.days_to_settle:.0f}d"
     family = family_of(market)
     referenced = family in ("commodity", "crypto") or (
         family == "weather" and market.has_observation)
-    if market.days_to_settle > LONG_DATED_EVENT_DAYS and not referenced:
+    if market.days_to_settle > long_dated_event_days() and not referenced:
         return f"long_dated_event_{market.days_to_settle:.0f}d"
     if market.exchange_index is None:
         return "shard_unknown"
@@ -415,6 +530,45 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
             marginal_net_per_day=d_net, marginal_capital=d_cap,
             marginal_per_dollar=per, net_per_day=net, capital_usd=capital,
             share=share, yes_cents=yes_c, no_cents=no_c,
+        ))
+    return selection
+
+
+def fast_allocate(markets: list[KalshiMarket], *, per_market_usd: float, chunk: float = 100.0,
+                  single_fill_cap_usd: float = 100.0,
+                  allow_intraday: bool = False) -> Selection:
+    """Paper-loop eligibility + economics at one size, one evaluation per market.
+
+    Same exclusions, exits, fill-cap, per-market and shard checks as
+    ``allocate`` with ``chunk == max_size`` and a non-binding cash pool. The
+    per-series cap is not applied here; the loop's budget pass enforces it.
+    """
+    selection = Selection()
+    for market in markets:
+        why = exclusion_reason(market, allow_intraday=allow_intraday)
+        if why:
+            selection.excluded.append((market.market, why))
+            continue
+        leaving = exit_reason(market)
+        if leaving:
+            selection.exits.append((market.market, leaving))
+            continue
+        net, capital, share, yes_c, no_c = quote_economics(market, chunk)
+        if (chunk > max_contracts_for_fill(yes_c, single_fill_cap_usd)
+                or chunk > max_contracts_for_fill(no_c, single_fill_cap_usd)):
+            continue
+        if capital <= 1e-12 or capital > per_market_usd + 1e-9:
+            continue
+        if capital > market.shard_cash_usd + 1e-9:
+            selection.excluded.append((market.market, "unfunded_shard"))
+            continue
+        per = net / capital
+        if per <= 0:
+            continue
+        selection.taken.append(Taken(
+            market=market.market, size=chunk, marginal_net_per_day=net,
+            marginal_capital=capital, marginal_per_dollar=per, net_per_day=net,
+            capital_usd=capital, share=share, yes_cents=yes_c, no_cents=no_c,
         ))
     return selection
 
