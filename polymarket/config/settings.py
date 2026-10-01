@@ -99,8 +99,10 @@ DEFAULT_QUOTE_SIZE_CONTRACTS = 20
 # Reprice when best moves by this many ticks
 REPRICE_TICK_THRESHOLD    = 1
 
-# Cancel on stale data: pull quotes if no WS update for this many seconds
-STALE_DATA_PULL_SECONDS   = 10
+# Pull quotes when the websocket book is older than this. The signed
+# REST book on api.polymarket.us is a ~30s Cloudflare cache (HIT, age
+# 15–16s on 1 October 2026) and is not a fallback. See pm_book_gate.
+STALE_DATA_PULL_SECONDS   = 1.0
 
 # Max acceptable spread on a quoted market. Wider books = adverse selection
 # trap (one fill at our quote, the other side moves and we eat MTM loss).

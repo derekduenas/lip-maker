@@ -1,8 +1,10 @@
 """Polymarket US WebSocket client — real-time book stream.
 
-Replaces 30s REST polling with sub-second push notifications. Critical
-for fast-moving markets (sports/crypto live) where 30s = miss every
-material price move.
+The signed REST order book on api.polymarket.us is served from
+Cloudflare's cache (about 30s; a live check on 1 October 2026 saw HIT
+with age 15–16s) even when the request is authenticated. This channel
+pushes the full book about ten times a second. Quotes use it, and a
+book older than one second is a pull. See ``pm_book_gate``.
 
 USAGE:
   from execution.pm_ws import PMBookStream

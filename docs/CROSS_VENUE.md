@@ -10,6 +10,8 @@ The published "$1 is not paid" check is `payable`. Whether that minimum is per p
 
 Maker rebates stay `0.0125 × contracts × p × (1−p)`, banker's-rounded to the cent on each fill (`mm.accounting.pm_us_maker_rebate_usd`).
 
+The maker quotes from the signed websocket book only. A live check on 1 October 2026 found the signed REST order book on `api.polymarket.us` served from Cloudflare's cache (HIT, age 15–16s, about 30s) even when authenticated. The websocket market channel pushed the full book about 10 times a second, median age 0.16s. A REST book is not a quote. A websocket book older than 1s pulls the quote.
+
 ## Compounding
 
 `BankrollLedger` adds realized rewards and fill P&L by venue, market, and series. `reallocate` shrinks the observed net $/day per $ toward a prior (`posterior`). Size cannot rise until `min_sample` observations (default 5). Each market is capped at `fraction × equity` (default 1/4). Equity 5% under the peak cuts every size in half. Equity 10% under the peak flattens.
