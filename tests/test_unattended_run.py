@@ -282,3 +282,98 @@ def test_prod_read_key_starts_and_survives_a_503(tmp_path, monkeypatch, caplog):
     assert (tmp_path / "hb").exists()
     paper = (ROOT / "run_paper.py").read_text(encoding="utf-8")
     assert 'unattended_main(["--run"])' in paper
+
+
+def test_dev_requirements_include_pytest_asyncio():
+    runtime = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    dev = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    script = (ROOT / "deploy" / "droplet" / "setup.sh").read_text(encoding="utf-8")
+    assert "pytest-asyncio" not in runtime
+    assert "pytest-asyncio" in dev
+    assert "-r requirements.txt" in dev
+    assert "requirements-dev.txt" not in script
+
+
+def test_long_lived_socket_refreshes_status_without_finish(tmp_path, monkeypatch):
+    """Frames on an open socket rewrite /status. finish() stays at session end."""
+    monkeypatch.setenv("LIP_PAPER", "true")
+    monkeypatch.delenv("LIP_DEMO", raising=False)
+    monkeypatch.delenv("LIP_KALSHI_WS_URL", raising=False)
+    monkeypatch.delenv("KALSHI_PROD_READ_KEY_ID", raising=False)
+    monkeypatch.delenv("KALSHI_PROD_READ_KEY_PATH", raising=False)
+    key = tmp_path / "demo.pem"
+    key.write_text("not-a-key\n", encoding="utf-8")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(key))
+    clock = {"t": 0.0}
+    monkeypatch.setattr("mm.unattended.service.time.monotonic", lambda: clock["t"])
+
+    from mm.unattended import loop as loop_mod
+    finish_calls = {"n": 0}
+    real_finish = loop_mod.RunLoop.finish
+
+    def counting_finish(self):
+        finish_calls["n"] += 1
+        return real_finish(self)
+
+    monkeypatch.setattr(loop_mod.RunLoop, "finish", counting_finish)
+    report = tmp_path / "report.json"
+    summary = tmp_path / "summary.txt"
+    seen = {}
+
+    async def fake_drive(url, on_frame):
+        waiting = json.loads(report.read_text(encoding="utf-8"))
+        assert waiting["stage"] == "connect"
+        assert waiting["markets"] == []
+        assert waiting["status"]["stage"] == "connect"
+        assert waiting["status"]["markets"] == []
+        # Program, two books, a clock, and the at-price trade. Still before T-15.
+        for row in _stream()[:5]:
+            on_frame(row)
+        clock["t"] = 10.0
+        on_frame({"type": "clock", "ts": AUG + 3.0})
+        assert finish_calls["n"] == 0
+        seen["mid"] = json.loads(report.read_text(encoding="utf-8"))
+        seen["summary"] = summary.read_text(encoding="utf-8")
+        frozen = report.read_text(encoding="utf-8")
+        clock["t"] = 15.0
+        on_frame({"type": "clock", "ts": AUG + 4.0})
+        assert report.read_text(encoding="utf-8") == frozen
+        assert finish_calls["n"] == 0
+
+    monkeypatch.setattr(loop_mod, "drive_socket", fake_drive)
+    code = main([
+        "--run", "--once",
+        "--report", str(report),
+        "--summary", str(summary),
+        "--heartbeat", str(tmp_path / "hb"),
+        "--cancel-log", str(tmp_path / "cancel"),
+    ])
+    assert code == 0
+    assert finish_calls["n"] == 1
+    mid = seen["mid"]
+    assert mid["stage"] == "running"
+    assert "inferred" not in mid
+    assert "next_usd" not in mid
+    assert mid["programs_loaded"] >= 1
+    assert mid["selection_count"] >= 1
+    assert MARKET in mid["markets"]
+    assert mid["quotes"] and mid["quotes"][0]["paper"] is True
+    assert MARKET in mid["resting"]
+    assert mid["fills_n"] >= 1
+    assert Decimal(mid["estimated_usd"]) >= 0
+    assert mid["paper"] is True
+    assert mid["live_armed"] is False
+    status = mid["status"]
+    assert status["stage"] == "running"
+    assert status["paper"] is True
+    assert status["live_armed"] is False
+    assert status["programs_loaded"] >= 1
+    assert status["selection_count"] >= 1
+    assert MARKET in status["markets"]
+    assert status["quotes"] >= 1
+    assert status["resting"] >= 1
+    assert status["fills"] >= 1
+    assert Decimal(status["estimated_usd"]) >= 0
+    assert "fills 1" in seen["summary"]
+    assert "pnl_usd 0.0000" in seen["summary"]
+    assert "rewards_usd 0.0000" in seen["summary"]

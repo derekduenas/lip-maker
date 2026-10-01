@@ -75,6 +75,22 @@ def _paper_env() -> bool:
     return os.environ.get("LIP_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
+STATUS_REFRESH_S = 10.0
+
+
+def maybe_refresh_status(loop, args, started, *, books, plan, now: float, last: list) -> bool:
+    """Rewrite the status page from a read-only snapshot. Does not call finish."""
+    if last[0] is not None and now - last[0] < STATUS_REFRESH_S:
+        return False
+    last[0] = now
+    report = loop.live_status()
+    report["socket_opened"] = True
+    report["ws_url"] = plan["url"]
+    report["data_source"] = books["flag"]
+    _write_run_outputs(args, report, started)
+    return True
+
+
 def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
     from mm.status_page import status_payload
     write_heartbeat(args.heartbeat)
@@ -197,9 +213,15 @@ def main(argv: list[str] | None = None) -> int:
                 loop = RunLoop(mode=mode, select_every=args.select_every)
                 loop.socket_opened = True
 
+                last_status = [None]
+
                 def _on_frame(msg, loop=loop):
                     loop.on_frame(msg)
                     write_heartbeat(args.heartbeat)
+                    maybe_refresh_status(
+                        loop, args, started, books=books, plan=plan,
+                        now=time.monotonic(), last=last_status,
+                    )
 
                 import asyncio
                 if plan.get("reader"):

@@ -471,6 +471,44 @@ class RunLoop:
         self.risk.market_usd[market] = Decimal(str(self.risk.market_usd.get(market, 0))) - prev
         self.risk.venue_usd["kalshi"] = Decimal(str(self.risk.venue_usd.get("kalshi", 0))) - prev
 
+    def live_status(self) -> dict:
+        """Read-only counts for a socket that is still open.
+
+        This does not score the open second, reconcile rewards, or
+        reallocate. Those run only in ``finish``.
+        """
+        estimates = {}
+        for market, accrual in self.accruals.items():
+            est = accrual.estimate()
+            estimates[market] = Decimal(est.estimated_usd)
+        estimated = sum(estimates.values(), Decimal(0))
+        day = datetime.fromtimestamp(self.now or 0, timezone.utc).date().isoformat()
+        from mm.venues.readonly import book_source
+        books = book_source(force_demo=self.mode != "paper")
+        selected = list(self.resting)
+        return {
+            "paper": self.mode == "paper",
+            "demo": self.mode == "demo",
+            "mode": self.mode,
+            "live_armed": False,
+            "socket_opened": self.socket_opened,
+            "stage": "running",
+            "programs_loaded": len(self.programs),
+            "selection_count": self.selection_count,
+            "markets": selected,
+            "quotes": [dict(row) for row in self.quotes],
+            "quotes_n": len(self.quotes),
+            "resting": {market: dict(quote) for market, quote in self.resting.items()},
+            "resting_n": len(self.resting),
+            "fills_n": len(self.fills),
+            "estimated_usd": format(estimated, "f"),
+            "kill": None if self.kill is None else dict(self.kill),
+            "pnl_usd": "0",
+            "rewards_usd": "0",
+            "day": day,
+            "data_source": books["flag"],
+        }
+
     def finish(self) -> dict:
         for market, accrual in self.accruals.items():
             open_s = self.open_seconds.get(market)
