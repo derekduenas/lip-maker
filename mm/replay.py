@@ -132,3 +132,17 @@ def _mark(result: ReplayResult) -> None:
                 no_mark = Decimal(100) - Decimal(str(yes_mark))
                 pnl = Decimal(str(count)) * (no_mark - Decimal(px)) / Decimal(100)
             book.realized_usd += pnl
+
+
+def _cli(argv=None) -> int:
+    """``python -m mm.replay bench ...`` -> Patch 19 replay bench (mm.replay_bench)."""
+    import sys
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "bench":
+        argv = argv[1:]
+    from mm.replay_bench import main
+    return main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

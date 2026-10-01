@@ -277,6 +277,23 @@ def main(argv: list[str] | None = None) -> int:
                     loop.fv = FairValueCache()
                     loop.fv.start(lambda loop=loop: set(list(loop.resting)) | set(loop._fv_wanted))
 
+                from mm.unattended import bookrec as _bookrec
+                _rec = None
+                if _bookrec.enabled():  # Patch 19: bounded compressed frame recorder
+                    try:
+                        _rec = _bookrec.FrameRecorder().start()
+                        loop.recorder = _rec
+                    except Exception:
+                        logging.getLogger("lip.recorder").exception("recorder start failed")
+                        _rec = None
+                if getattr(loop, "pmus", None) is None:  # Patch 20: PM US paper venue
+                    try:
+                        from mm.unattended import pmus_paper as _pmp
+                        if _pmp.enabled():
+                            loop.pmus = _pmp.PMUSPaperVenue(kalshi_loop=loop).start()
+                    except Exception:
+                        logging.getLogger("lip.pmus").exception("pmus paper start failed")
+
                 refresher = LiveStatusRefresher(
                     loop, lambda rep: _write_run_outputs(args, rep, started),
                     data_source=books["flag"], ws_url=plan["url"],
@@ -285,7 +302,9 @@ def main(argv: list[str] | None = None) -> int:
                 _hb = {"sec": None}
                 _kill_path = os.environ.get("LIP_KILL_FILE", "/var/lib/lip-maker/KILL")
 
-                def _on_frame(msg, loop=loop, refresher=refresher):
+                def _on_frame(msg, loop=loop, refresher=refresher, rec=_rec):
+                    if rec is not None:
+                        rec.record(msg)
                     loop.on_frame(msg)
                     sec = int(time.time())
                     if _hb["sec"] != sec:  # heartbeat file write once per second

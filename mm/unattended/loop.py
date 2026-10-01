@@ -236,6 +236,8 @@ class RunLoop:
         self._fv_wanted: set = set()
         self._fv_state: dict = {}
         self.fv_blocks: dict = {}
+        # Patch 18: inventory skew counters.
+        self.skew_stats: dict = {}
 
     def add_program(self, row: dict) -> None:
         market = str(row["market"])
@@ -403,12 +405,72 @@ class RunLoop:
             "paper fill %s %s %.0f@%.0fc mid %s unpaired_yes %.0f",
             market, side, count, price, None if mid is None else round(mid, 1),
             pos["yes"] - pos["no"])
+        from mm.unattended import skew as _skew
+        if _skew.enabled() and side in ("yes", "no"):
+            # Patch 18: no cooldown; re-quote both sides skewed by inventory.
+            self._skew_requote(market, ts)
+            return
         cool = _env_num("LIP_FILL_COOLDOWN_S", 0.0)
         if cool > 0 and side in ("yes", "no"):
             self.cooldown[(market, side)] = max(self.cooldown.get((market, side), 0.0), ts + cool)
             # Stop buying more of what was just hit. The opposite side stays:
             # if it fills it pairs the inventory into a $1 settlement.
             self._drop_side(market, side, "fill_cooldown")
+
+    # ------------------------------------------------------------ patch 18
+    def _inv_frac(self, market: str) -> float:
+        """Inventory as a fraction of the unpaired-$ caps (max of market, event)."""
+        cap_m = _env_num("LIP_MARKET_INV_CAP_USD", 0.0) or _env_num("LIP_SKEW_REF_USD", 25.0)
+        cap_e = _env_num("LIP_EVENT_INV_CAP_USD", 0.0)
+        frac = self._unpaired_usd(market) / cap_m if cap_m > 0 else 0.0
+        if cap_e > 0:
+            ev = self._event_of(market)
+            held = sum(self._unpaired_usd(m) for m in self.position if self._event_of(m) == ev)
+            frac = max(frac, held / cap_e) if self._unpaired_usd(market) > 0 else frac
+        return frac
+
+    def _skew_target(self, market: str, yes_cents: int, no_cents: int) -> tuple:
+        from mm.unattended import skew as _skew
+        pos = self.position.get(market)
+        net = 0.0 if not pos else float(pos["yes"]) - float(pos["no"])
+        if not net or market not in self.accruals:
+            return int(yes_cents), int(no_cents), None
+        yb, nb = self._best(market)
+        try:
+            yr, nr = self._refs(market)
+        except Exception:
+            yr, nr = None, None
+        info = _skew.skew_prices(int(yes_cents), int(no_cents), net_yes=net,
+                                 frac=self._inv_frac(market), best_yes=yb, best_no=nb,
+                                 df=self.programs[market].discount_factor,
+                                 yes_ref=yr, no_ref=nr)
+        return info["yes_cents"], info["no_cents"], info
+
+    def _skew_status(self) -> dict:
+        from mm.unattended import skew as _skew
+        if not _skew.enabled():
+            return {"enabled": False}
+        out = dict(self.skew_stats, enabled=True)
+        out["skewed_now"] = sum(1 for q in self.resting.values()
+                                if (q.get("skew") or {}).get("agg") or (q.get("skew") or {}).get("back"))
+        return out
+
+    def _skew_requote(self, market: str, ts: float) -> None:
+        quote = self.resting.get(market)
+        if quote is None or market not in self.accruals:
+            return
+        yr, nr = self._refs(market)
+        y = int(yr) if yr is not None else int(quote["yes_cents"])
+        n = int(nr) if nr is not None else int(quote["no_cents"])
+        size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
+        sides = tuple(sd for sd in ("yes", "no") if not self._side_blocked(market, sd, ts))
+        if size <= 0 or not sides:
+            self._cancel(market, "skew_no_side")
+            return
+        best0 = quote.get("best0")
+        self.skew_stats["requotes"] = self.skew_stats.get("requotes", 0) + 1
+        if self._quote(market, y, n, size, ts, sides=sides) and best0 is not None and market in self.resting:
+            self.resting[market]["best0"] = best0
 
     def _drop_side(self, market: str, side: str, reason: str) -> None:
         quote = self.resting.get(market)
@@ -549,7 +611,7 @@ class RunLoop:
                     self.pulls["fv_disagree"] = self.pulls.get("fv_disagree", 0) + 1
                     size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
                     self._quote(market, int(quote["yes_cents"]), int(quote["no_cents"]), size, ts,
-                                sides=keep)
+                                sides=keep, skewed=True)
                 else:
                     self._pull_one(market, "fv_disagree", ts, 0.0)
                 continue
@@ -565,12 +627,17 @@ class RunLoop:
                 yr, nr = self._refs(market)
                 new_y = int(quote["yes_cents"]) if (yr is None or not on["yes"]) else int(yr)
                 new_n = int(quote["no_cents"]) if (nr is None or not on["no"]) else int(nr)
+                from mm.unattended import skew as _skew
+                if _skew.enabled():
+                    sy, sn, _info = self._skew_target(market, new_y, new_n)
+                    new_y = sy if on["yes"] else new_y
+                    new_n = sn if on["no"] else new_n
                 if (new_y, new_n) != (int(quote["yes_cents"]), int(quote["no_cents"])):
                     self._repeg_at[market] = ts
                     size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
                     sides = tuple(sd for sd in ("yes", "no") if on[sd])
                     best0 = quote.get("best0")
-                    if self._quote(market, new_y, new_n, size, ts, sides=sides):
+                    if self._quote(market, new_y, new_n, size, ts, sides=sides, skewed=True):
                         self.repegs_n += 1
                         # keep the fast-move anchor from the original placement
                         if best0 is not None and market in self.resting:
@@ -968,7 +1035,15 @@ class RunLoop:
         return inside_close_window(close_ts, ts, pull_before_s=self.pull_before_s)
 
     def _quote(self, market: str, yes_cents: int, no_cents: int, size: float, ts: float,
-               sides: tuple = ("yes", "no")) -> bool:
+               sides: tuple = ("yes", "no"), skewed: bool = False) -> bool:
+        skew_info = None
+        if not skewed:
+            from mm.unattended import skew as _skew
+            if _skew.enabled():
+                yes_cents, no_cents, skew_info = self._skew_target(market, yes_cents, no_cents)
+                if skew_info and (skew_info["agg"] or skew_info["back"]):
+                    self.skew_stats["skewed_quotes"] = self.skew_stats.get("skewed_quotes", 0) + 1
+                    self.skew_stats["last"] = {"market": market, **skew_info}
         if self.kill is not None:
             self._cancel(market, self.kill["reason"])
             return False
@@ -1049,6 +1124,10 @@ class RunLoop:
                 )
         quote = {"yes": size if "yes" in sides else 0.0, "no": size if "no" in sides else 0.0,
                  "yes_cents": yes_cents, "no_cents": no_cents, "ts": ts}
+        if skew_info is not None:
+            quote["skew"] = skew_info
+        elif skewed and market in self.resting and self.resting[market].get("skew"):
+            quote["skew"] = self.resting[market]["skew"]
         try:
             quote["best0"] = self._best(market)
         except Exception:
@@ -1238,6 +1317,11 @@ class RunLoop:
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),
             "repegs_n": self.repegs_n,
+            "skew": self._skew_status(),
+            "recorder": (self.recorder.summary() if getattr(self, "recorder", None) is not None
+                         else {"enabled": False}),
+            "pmus": (self.pmus.summary() if getattr(self, "pmus", None) is not None
+                     else {"enabled": False}),
             "fair_value": (dict(self.fv.summary(), blocks=dict(self.fv_blocks),
                                 withheld=sorted(k for k, v in self._fv_state.items() if v))
                            if self.fv is not None else {"enabled": False}),
