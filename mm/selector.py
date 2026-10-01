@@ -51,7 +51,7 @@ FILL_FRACTION_PER_DAY = {
     "weather": 0.04,
     "event": 0.15,
 }
-LONG_DATED_EVENT_DAYS = 90
+LONG_DATED_EVENT_DAYS = 95
 LONG_DATED_ANY_DAYS = 120
 EMPIRICAL_BLEND = 0.7
 EMPIRICAL_MIN_N = 5
@@ -223,6 +223,41 @@ def _reward_factor(series: str, factors: dict[str, float] | None) -> float:
     return float(factors.get(series.upper(), 1.0))
 
 
+# News-driven books pick up flow when a headline hits. The penalty below
+# is a prior, not a fit to any payout statement.
+_NEWS_MARKERS = ("news", "politic", "election", "entertainment", "world")
+
+
+def news_driven(category: str) -> bool:
+    label = (category or "").strip().lower()
+    return any(marker in label for marker in _NEWS_MARKERS)
+
+
+def adverse_selection_penalty(days_to_settle: float | None, category: str = "") -> float:
+    """Extra cost in net dollars per day, per dollar of capital.
+
+    The term is ``1/sqrt(days)``. A market one day from close pays 1.
+    A market 16 days out pays 0.25. A news-driven category doubles it.
+    Days under a quarter-day are treated as a quarter-day so the term
+    stays finite. Unknown days use one day.
+    """
+    if days_to_settle is None:
+        days = 1.0
+    else:
+        days = max(float(days_to_settle), 0.25)
+    penalty = 1.0 / (days ** 0.5)
+    if news_driven(category):
+        penalty *= 2.0
+    return penalty
+
+
+def expected_net_per_dollar(market: KalshiMarket, size: float) -> float:
+    """Net $/day per $ of capital at ``size``, after the close/news penalty."""
+    net, capital, _share, _yes, _no = quote_economics(market, size)
+    per = (net / capital) if capital > 0 else 0.0
+    return per - adverse_selection_penalty(market.days_to_settle, market.category)
+
+
 def quote_economics(market: KalshiMarket, size: float, *,
                     reward_factor: float = 1.0) -> tuple[float, float, float, int, int]:
     """Return net $/day, capital, share, yes cents, no cents at ``size``."""
@@ -311,6 +346,7 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
              per_market_usd: float | None = None,
              per_series_usd: float | None = None,
              per_category_usd: float | None = None,
+             per_venue_usd: float | None = None,
              series_factors: dict[str, float] | None = None,
              allow_intraday: bool = False,
              live: bool = False,
@@ -352,6 +388,8 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
     series_cap: dict[str, float] = {}
     category_cap: dict[str, float] = {}
     cash = float(bankroll)
+    spent_venue = 0.0
+    venue_cap = None if per_venue_usd is None else float(per_venue_usd)
 
     while eligible and cash > 1e-9:
         best = None
@@ -379,6 +417,8 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
             if series_cap.get(series, 0.0) + d_cap > cap_s + 1e-9:
                 continue
             if category_cap.get(family, 0.0) + d_cap > cap_c + 1e-9:
+                continue
+            if venue_cap is not None and spent_venue + d_cap > venue_cap + 1e-9:
                 continue
             if capital > market.shard_cash_usd + 1e-9:
                 if not any(name == market.market and why == "unfunded_shard"
@@ -413,6 +453,7 @@ def allocate(markets: list[KalshiMarket], *, bankroll: float, chunk: float = 10,
         series_cap[market.series.upper()] = series_cap.get(market.series.upper(), 0.0) + d_cap
         family = family_of(market)
         category_cap[family] = category_cap.get(family, 0.0) + d_cap
+        spent_venue += d_cap
         cash -= d_cap
         selection.taken.append(Taken(
             market=market.market, size=nxt,

@@ -141,7 +141,11 @@ def test_run_loop_on_a_recorded_stream(tmp_path, monkeypatch):
     assert report["fills"][0]["count"] == 50
     assert any(row["reason"] == "close_cutoff" for row in report["cancelled"])
     assert report["resting"] == []
-    assert Decimal(report["estimated_usd"]) == Decimal("1")
+    # Two observed seconds at share 0.5 pay $1. The live clock also scores
+    # the second the quote was still resting when the stream jumped ahead,
+    # after the through-print had cut the size, which brings the period to $1.41.
+    # The 598 seconds with no book tick stay missed.
+    assert Decimal(report["estimated_usd"]) == Decimal("1.41")
     assert report["risk"][0]["allowed"] is True
     assert report["kill"] is None
     assert report["inferred"]["inferred"] is True
@@ -149,7 +153,10 @@ def test_run_loop_on_a_recorded_stream(tmp_path, monkeypatch):
     assert report["inferred"]["credits"][0]["inferred"] is True
     assert Decimal(report["inferred"]["credits"][0]["amount_usd"]) == Decimal("2")
     assert report["calibration_inferred"] is True
-    assert report["factors"]["KXBRENT"] == pytest.approx((2.0 + PRIOR_STRENGTH * 1.0) / (1 + PRIOR_STRENGTH))
+    ratio = float(Decimal("2") / Decimal(report["estimated_usd"]))
+    assert report["factors"]["KXBRENT"] == pytest.approx(
+        (ratio + PRIOR_STRENGTH * 1.0) / (1 + PRIOR_STRENGTH)
+    )
     assert MARKET in report["next_usd"]
     out = tmp_path / "run.json"
     summary = tmp_path / "summary.txt"

@@ -1,10 +1,12 @@
 """Pre-trade gates from the 1 October 2026 paper sim.
 
 Durable-focus defaults (env-configurable): a market that closes in under
-24 hours is out, live sports and esports matches are out, and the long-dated
-window is 90 days for events and 120 days for anything. Those horizons are
-the market ``close_time``, not the incentive program end. A plan richer than
-$40/day per $100 of capital is flagged, not auto-traded past the other gates.
+48 hours is out, live sports and esports matches are out, and the long-dated
+window is 95 days for events and 120 days for anything. The short-close
+horizon is the earlier of market ``close_time`` and ``occurrence_datetime``,
+not the incentive program end. A plan richer than $40/day per $100 of
+capital is flagged, not auto-traded past the other gates. The subscribe
+list keeps the top ``LIP_CANDIDATE_TOP`` names (default 1000).
 
 
 Three hours, 7,035 fills. Quoting through the last hour before close lost
@@ -23,11 +25,12 @@ from dataclasses import dataclass
 
 DEFAULT_PULL_BEFORE_CLOSE_MIN = 15.0
 DEFAULT_SINGLE_FILL_CAP_USD = 100.0
-DEFAULT_MIN_HOURS_TO_CLOSE = 24.0
-DEFAULT_LONG_DATED_EVENT_DAYS = 90.0
+DEFAULT_MIN_HOURS_TO_CLOSE = 48.0
+DEFAULT_LONG_DATED_EVENT_DAYS = 95.0
 DEFAULT_LONG_DATED_ANY_DAYS = 120.0
 DEFAULT_SUSPECT_USD_PER_100_DAY = 40.0
-DEFAULT_SUBSCRIBE_LIMIT = 300
+DEFAULT_CANDIDATE_TOP = 1000
+DEFAULT_SUBSCRIBE_LIMIT = DEFAULT_CANDIDATE_TOP
 DEFAULT_MATCH_SERIES_DENY = r"(?i)(?:MATCH|GAME|FIGHT|BOUT)$"
 DEFAULT_SPORTS_CATEGORIES = "sports,esports"
 
@@ -65,8 +68,21 @@ def suspect_usd_per_100_day() -> float:
     return _env_float("LIP_SUSPECT_USD_PER_100_DAY", DEFAULT_SUSPECT_USD_PER_100_DAY)
 
 
+def candidate_top() -> int:
+    """How many durable names to subscribe. ``LIP_CANDIDATE_TOP`` wins.
+
+    ``LIP_SUBSCRIBE_LIMIT`` still applies when the new name is unset, so an
+    existing operator override is kept. Unset both and the cap is 1000.
+    """
+    for name in ("LIP_CANDIDATE_TOP", "LIP_SUBSCRIBE_LIMIT"):
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() != "":
+            return max(1, int(float(raw)))
+    return int(DEFAULT_CANDIDATE_TOP)
+
+
 def subscribe_limit() -> int:
-    return max(1, int(_env_float("LIP_SUBSCRIBE_LIMIT", DEFAULT_SUBSCRIBE_LIMIT)))
+    return candidate_top()
 
 
 def plan_per_hundred(planned_usd_per_day: float, capital_usd: float) -> float:

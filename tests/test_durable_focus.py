@@ -31,9 +31,13 @@ def _frame(market, series, *, reward=10.0, days=3.0, category=""):
 
 
 def test_close_under_24h_is_excluded_and_the_window_is_configurable(monkeypatch):
+    from mm.session_gates import min_hours_to_close
+    assert min_hours_to_close() == 48
     soon = _market("KXBRENT-SOON", days=0.5)
+    day = _market("KXBRENT-DAY", days=1)
     later = _market("KXBRENT-LATER", days=2)
     assert exclusion_reason(soon) == "closes_within_24h"
+    assert exclusion_reason(day) == "closes_within_24h"
     assert exclusion_reason(later) == ""
     monkeypatch.setenv("LIP_MIN_HOURS_TO_CLOSE", "0")
     assert exclusion_reason(soon) == ""
@@ -51,6 +55,8 @@ def test_sports_and_esports_matches_are_excluded_by_category_and_pattern(monkeyp
 
 
 def test_long_dated_window_is_90_and_120_from_market_close(monkeypatch):
+    from mm.session_gates import long_dated_event_days
+    assert long_dated_event_days() == 95
     now = datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp()
     frame = {
         "market": "KXPRES-1", "series": "KXPRES",

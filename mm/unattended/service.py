@@ -209,8 +209,12 @@ def main(argv: list[str] | None = None) -> int:
             report["data_source"] = books["flag"]
             _write_run_outputs(args, report, started)
             if plan["socket"]:
+                from mm.bankroll import capital_usd
                 from mm.unattended.loop import RunLoop, drive_readonly_books, drive_socket
-                loop = RunLoop(mode=mode, select_every=args.select_every)
+                loop = RunLoop(
+                    mode=mode, select_every=args.select_every,
+                    bankroll=float(capital_usd()),
+                )
                 loop.socket_opened = True
 
                 last_status = [None]

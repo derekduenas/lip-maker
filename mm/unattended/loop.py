@@ -29,13 +29,14 @@ from engine.lip_reconcile import (
 )
 from engine.lip_scorer import ProgramParams
 from execution.paper_fills import PaperFillSimulator
+from mm.bankroll import capital_usd
 from mm.compound import MarketSample, reallocate
 from mm.ops import skew_is_excessive
 from mm.risk import FillClock, Limits, RiskEngine
-from mm.selector import KalshiMarket, allocate, reward_per_day
+from mm.selector import KalshiMarket, allocate, expected_net_per_dollar, reward_per_day
 from mm.session_gates import (
-    clamp_contracts, inside_close_window, plan_is_suspect, plan_per_hundred,
-    pull_before_close_s, single_fill_cap_usd, subscribe_limit,
+    candidate_top, clamp_contracts, inside_close_window, plan_is_suspect,
+    plan_per_hundred, pull_before_close_s, single_fill_cap_usd,
 )
 from mm.unattended.feed import DEMO_WS_URL
 from mm.unattended.optimize import optimize_sizes
@@ -47,6 +48,13 @@ READONLY_DATA_BACKOFF_S = 5.0
 from mm.venues.kalshi_rest import DEMO_HOSTS, PRODUCTION_HOSTS
 
 SELECT_EVERY_S = 600.0
+# Size up to this fraction of the risk per-venue cap. The last 5% is slack
+# so a tick of rounding does not trip the hard cap.
+VENUE_HEADROOM = 0.95
+# Share used when ranking names that do not have a book yet.
+CANDIDATE_SIZE = 100.0
+# Live loop scores one completed second per tick while quotes rest.
+CLOCK_INTERVAL_S = 1.0
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -158,7 +166,7 @@ class _Program:
 class RunLoop:
     """One pass over recorded or live frames. The constructor opens nothing."""
 
-    def __init__(self, *, mode: str = "paper", bankroll: float = 10_000.0,
+    def __init__(self, *, mode: str = "paper", bankroll: float | None = None,
                  select_every: float = SELECT_EVERY_S,
                  chunk: float = 100.0,
                  poster: DemoPoster | None = None,
@@ -169,7 +177,9 @@ class RunLoop:
         if mode not in ("paper", "demo"):
             raise UnattendedRefused("live trading is not armed")
         self.mode = mode
-        self.bankroll = float(bankroll)
+        # None follows LIP_BANKROLL (then LIP_ACCOUNT_USD, then $5,000).
+        # A caller that passes a number is sizing a fixture, not the account.
+        self.bankroll = float(capital_usd() if bankroll is None else bankroll)
         self.select_every = float(select_every)
         self.chunk = float(chunk)
         self.poster = poster
@@ -285,12 +295,22 @@ class RunLoop:
             self._pull(ts)
 
     def _close_elapsed(self, second: int) -> None:
+        """Score the open second once the clock moves past it.
+
+        A one-second step leaves the new second open, so a resting quote
+        keeps accruing on the live clock. A jump marks the interior
+        missed: those seconds were not observed, and they are not filled
+        in from the last book. The current second stays unscored.
+        """
         for market, accrual in self.accruals.items():
             open_s = self.open_seconds.get(market)
             if open_s is not None and open_s < second:
                 accrual.score_second(open_s)
-                self.open_seconds[market] = None
             accrual.omit_until(second)
+            if market in self.books_seen and (open_s is None or second <= open_s + 1):
+                self.open_seconds[market] = second
+            elif open_s is not None and open_s < second:
+                self.open_seconds[market] = None
 
     def _on_book(self, row: dict, ts: float) -> None:
         body = row.get("msg") or {}
@@ -373,21 +393,31 @@ class RunLoop:
             ))
         return rows
 
+    def _venue_budget(self) -> float:
+        return float(self.risk.limits.per_venue_usd) * VENUE_HEADROOM
+
     def _select(self, ts: float) -> None:
         self.selection_count += 1
         self.last_select_ts = ts
         markets = self._markets()
         live = self.mode != "paper"
+        limits = self.risk.limits
+        venue_budget = self._venue_budget()
         selection = allocate(
             markets, bankroll=self.bankroll, chunk=self.chunk, max_size=self.chunk,
-            per_market_usd=self.bankroll, per_series_usd=self.bankroll,
-            per_category_usd=self.bankroll, live=live, series_stats=self.series_stats,
+            per_market_usd=float(limits.per_market_usd),
+            per_series_usd=float(limits.per_series_usd),
+            per_category_usd=float(limits.per_venue_usd),
+            per_venue_usd=venue_budget,
+            live=live, series_stats=self.series_stats,
             single_fill_cap_usd=self.fill_cap,
         )
         self.excluded = list(selection.excluded)
         sized = optimize_sizes(
-            markets, bankroll=self.bankroll, per_market_usd=self.bankroll,
-            per_event_usd=self.bankroll, total_usd=self.bankroll,
+            markets, bankroll=self.bankroll,
+            per_market_usd=float(limits.per_market_usd),
+            per_event_usd=float(limits.per_series_usd),
+            total_usd=venue_budget,
             sizes=(self.chunk,), markout_usd_per_contract=0.0,
             single_fill_cap_usd=self.fill_cap,
         )
@@ -446,11 +476,20 @@ class RunLoop:
             "reason": decision.reason, "cancel_all": decision.cancel_all,
         })
         if not decision.allowed:
-            self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
-                         "paper": self.mode == "paper"}
-            self._cancel(market, decision.reason)
-            if decision.cancel_all:
+            # A cap (per-market, per-series, per-venue, gross) is a skip.
+            # It does not latch. A kill (cancel_all) still pulls every
+            # resting quote. The latch lives on this process only; a new
+            # RunLoop starts clear.
+            if decision.cancel_all or self.risk.killed:
+                self.kill = {
+                    "reason": decision.reason, "cancel_all": True,
+                    "paper": self.mode == "paper",
+                }
+                self._cancel(market, decision.reason)
                 self._cancel_all(decision.reason)
+                return
+            _log.warning("skip quote %s: %s", market, decision.reason)
+            self._cancel(market, decision.reason)
             return
         book = self.accruals[market].book.book
         if self.mode == "demo":
@@ -514,16 +553,20 @@ class RunLoop:
         self.risk.venue_usd["kalshi"] = Decimal(str(self.risk.venue_usd.get("kalshi", 0))) - prev
 
     def live_status(self) -> dict:
-        """Read-only counts for a socket that is still open.
+        """Counts for a socket that is still open.
 
-        This does not score the open second, reconcile rewards, or
-        reallocate. Those run only in ``finish``.
+        Completed seconds are scored through ``self.now``. The open
+        second is not scored. ``estimated_usd`` is the raw accrual
+        (share × pool / period), so a partial period under the $1
+        settlement floor is still visible. ``finish`` is what applies
+        that floor, reconciles, and reallocates.
         """
-        estimates = {}
-        for market, accrual in self.accruals.items():
-            est = accrual.estimate()
-            estimates[market] = Decimal(est.estimated_usd)
-        estimated = sum(estimates.values(), Decimal(0))
+        if self.now:
+            self._close_elapsed(int(self.now))
+        estimated = sum(
+            (accrual.raw_usd() for accrual in self.accruals.values()),
+            Decimal(0),
+        )
         day = datetime.fromtimestamp(self.now or 0, timezone.utc).date().isoformat()
         from mm.venues.readonly import book_source
         books = book_source(force_demo=self.mode != "paper")
@@ -707,6 +750,17 @@ def fetch_demo_programs(host: str) -> list[dict]:
     return frames
 
 
+async def _emit_clock(on_frame: Callable[[dict], None]) -> None:
+    """One clock frame a second so a quiet book still accrues and refreshes."""
+    import asyncio
+    try:
+        while True:
+            await asyncio.sleep(CLOCK_INTERVAL_S)
+            on_frame({"type": "clock", "ts": time.time()})
+    except asyncio.CancelledError:
+        return
+
+
 async def drive_socket(ws_url: str, on_frame: Callable[[dict], None]) -> None:
     """Open the demo websocket and feed frames into ``on_frame``."""
     from execution.kalshi_ws import KalshiWS
@@ -719,6 +773,8 @@ async def drive_socket(ws_url: str, on_frame: Callable[[dict], None]) -> None:
     if (urlsplit(ws.url).hostname or "").lower() in PRODUCTION_HOSTS:
         raise UnattendedRefused("production host refused")
     await ws.connect()
+    import asyncio
+    clock = asyncio.create_task(_emit_clock(on_frame))
     try:
         tickers = [frame["market"] for frame in programs]
         if tickers:
@@ -733,6 +789,8 @@ async def drive_socket(ws_url: str, on_frame: Callable[[dict], None]) -> None:
             msg.setdefault("ts", time.time())
             on_frame(msg)
     finally:
+        clock.cancel()
+        await clock
         await ws.close()
 
 
@@ -842,14 +900,34 @@ def save_market_cache(cache: dict, path: Path | None = None) -> None:
         _log.warning("market cache not saved (%s)", exc)
 
 
-def _parse_close_ts(raw: dict) -> float | None:
-    text = raw.get("close_time") or raw.get("expected_expiration_time") or raw.get("expiration_time")
+def _parse_ts(text) -> float | None:
     if not text:
         return None
     try:
         return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def horizon_close_ts(raw: dict) -> float | None:
+    """Earlier of close_time and occurrence_datetime.
+
+    A same-day match can list a close_time days out and an
+    occurrence_datetime tonight. The short-close gate uses the earlier
+    one. A missing side is ignored. Program end is not a fallback.
+    """
+    close = _parse_ts(
+        raw.get("close_time") or raw.get("expected_expiration_time") or raw.get("expiration_time")
+    )
+    occurrence = _parse_ts(raw.get("occurrence_datetime"))
+    stamps = [ts for ts in (close, occurrence) if ts is not None]
+    if not stamps:
+        return None
+    return min(stamps)
+
+
+def _parse_close_ts(raw: dict) -> float | None:
+    return horizon_close_ts(raw)
 
 
 def parse_market_row(raw: dict) -> dict | None:
@@ -946,21 +1024,44 @@ def durable_frame_reason(frame: dict) -> str:
     return why
 
 
+def _frame_market(frame: dict) -> KalshiMarket:
+    days = frame.get("days_to_settle")
+    return KalshiMarket(
+        market=str(frame.get("market") or ""),
+        series=str(frame.get("series") or ""),
+        period_reward_usd=float(frame.get("period_reward_usd") or 0),
+        period_seconds=float(frame.get("period_seconds") or 86400),
+        seconds_left=float(frame.get("period_seconds") or 86400),
+        discount_factor=float(frame.get("discount_factor") or 0.5),
+        target_size=float(frame.get("target_size") or CANDIDATE_SIZE),
+        yes_bids=list(frame.get("yes_bids") or []),
+        no_bids=list(frame.get("no_bids") or []),
+        days_to_settle=None if days is None else float(days),
+        exchange_index=0,
+        category=str(frame.get("category") or ""),
+    )
+
+
 def candidate_tickers(frames: list[dict], *, limit: int | None = None) -> list[str]:
-    """Highest reward-per-day names that pass the durable gates, capped."""
-    cap = subscribe_limit() if limit is None else int(limit)
+    """Durable names ranked by expected net $/day per $ of capital.
+
+    The score is the share at ``CANDIDATE_SIZE`` minus the adverse-selection
+    penalty (larger as days-to-close shrinks, and larger for news-driven
+    categories). It is not the raw pool per day. The list is capped at
+    ``LIP_CANDIDATE_TOP`` (default 1000).
+    """
+    cap = candidate_top() if limit is None else int(limit)
     ranked = []
     for frame in frames:
         if durable_frame_reason(frame):
             continue
-        seconds = float(frame.get("period_seconds") or 0)
-        days = seconds / 86400.0 if seconds > 0 else 0.0
-        per_day = (float(frame.get("period_reward_usd") or 0) / days) if days > 0 else 0.0
         market = str(frame.get("market") or "")
-        if market:
-            ranked.append((per_day, market))
+        if not market:
+            continue
+        score = expected_net_per_dollar(_frame_market(frame), CANDIDATE_SIZE)
+        ranked.append((score, market))
     ranked.sort(key=lambda row: (-row[0], row[1]))
-    return [market for _rate, market in ranked[:cap]]
+    return [market for _score, market in ranked[:cap]]
 
 
 def _frames_with_meta(frames: list[dict], cache: dict, *, now: float | None = None) -> list[dict]:
@@ -1049,12 +1150,17 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
                 elif kind in ("orderbook_snapshot", "orderbook_delta"):
                     on_frame(msg)
 
-        await asyncio.gather(
-            enrich_and_subscribe(
-                sock, reader, frames, on_frame, channels=sorted(PUBLIC_WS_CHANNELS),
-            ),
-            _pump(),
-        )
+        clock = asyncio.create_task(_emit_clock(on_frame))
+        try:
+            await asyncio.gather(
+                enrich_and_subscribe(
+                    sock, reader, frames, on_frame, channels=sorted(PUBLIC_WS_CHANNELS),
+                ),
+                _pump(),
+            )
+        finally:
+            clock.cancel()
+            await clock
     except ReadOnlyViolation:
         raise
     except Exception as exc:

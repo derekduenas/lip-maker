@@ -22,7 +22,7 @@ from mm.fair_value import family_for_series
 from mm.session_gates import close_horizon_reason, long_dated_event_days
 
 ZERO = Decimal("0")
-LONG_DATED_EVENT_DAYS = 90
+LONG_DATED_EVENT_DAYS = 95
 LONG_DATED_ANY_DAYS = 120
 
 
