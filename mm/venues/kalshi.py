@@ -295,6 +295,9 @@ class KalshiAdapter:
                 "raw": resp,
                 "contracts_limit": limit_echo,
             }
+        if operation == "trigger":
+            return {"ok": True, "order_group_id": str(resp.get("order_group_id") or ""),
+                    "raw": resp}
         return {"ok": True, "raw": resp}
 
     def resolve_shard(self, market: str) -> Optional[int]:
@@ -486,6 +489,20 @@ class KalshiAdapter:
         if result.get("ok") and not result.get("order_group_id"):
             result["order_group_id"] = f"PAPER-OG-{limit}"
         return result
+
+    def trigger_order_group(self, order_group_id: str, *,
+                            exchange_index: Optional[int] = None) -> dict:
+        """Cancel every resting order in the group.
+
+        ``PUT /portfolio/order_groups/{id}/trigger`` (fetched 2026-10-01).
+        Groups do not cross shards, so the shard is sent when it is known.
+        """
+        params = None
+        if exchange_index is not None:
+            params = {"exchange_index": int(exchange_index)}
+        path = f"/portfolio/order_groups/{order_group_id}/trigger"
+        return self._call("PUT", path, params=params, cost=CANCEL_TOKENS,
+                          operation="trigger")
 
     def queue_position(self, order_id: str, *, market: str = "") -> Optional[float]:
         """Contracts ahead of this order.

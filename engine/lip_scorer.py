@@ -20,6 +20,7 @@ views of the opposite side.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
 from typing import Optional
 
 from execution.kalshi_ws import BookLevel, BookState
@@ -198,6 +199,27 @@ def interval_payout_usd(share: float, params: ProgramParams, elapsed_sec: float)
         return 0.0
     est = share * params.pool_rate_usd_per_sec * elapsed_sec
     return max(0.0, min(params.period_reward_usd, est))
+
+
+def kalshi_period_payout(share: float, period_reward_usd: float, *,
+                         uptime: float = 1.0) -> float:
+    """Market-period dollars under the 30 July 2026 LIP terms.
+
+    ``share`` is already 0 when either side of the book is under target
+    (that second is forfeited, not redistributed). The $1 minimum applies
+    to the period total, not to each second. The exchange rounds the
+    payout down to the cent. There is no calibration against April or May
+    2026 statements: those were paid under the 28 February 2026 rules.
+    """
+    if share <= 0.0 or period_reward_usd <= 0.0 or uptime <= 0.0:
+        return 0.0
+    raw = (Decimal(str(share)) * Decimal(str(period_reward_usd))
+           * Decimal(str(uptime)))
+    cents = (raw * 100).to_integral_value(rounding=ROUND_FLOOR)
+    floored = cents / Decimal(100)
+    if floored < 1:
+        return 0.0
+    return float(floored)
 
 
 def estimated_period_payout(

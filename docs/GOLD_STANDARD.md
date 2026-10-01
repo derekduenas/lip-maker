@@ -421,9 +421,12 @@ V2 shape, which `execution.order_request.to_event_order_v2` produces:
   `good_till_canceled` plus `expiration_time`.
 * `self_trade_prevention_type` is required. We send `taker_at_cross`
   (cancel our incoming order rather than pull the resting quote).
-* `post_only: true` is still set. Its enforcement on an order, as opposed
-  to the documented quote behaviour, is still not something this repo has
-  observed live. That is why the interlock stays shut.
+* `post_only: true` is still set. A Kalshi demo wire on 30 September 2026
+  returned `post only cross` for a crossing order
+  (`docs/venue_evidence/kalshi_post_only_demo_20260930.md`). Acknowledging
+  that evidence sets only `KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED`, and
+  only when the caller passes the demo phrase. The flag defaults False,
+  and it does not leave paper mode.
 * cancel is `DELETE /portfolio/events/orders/{order_id}` and needs
   `market_ticker` in the query so the exchange can route the shard
   (<https://docs.kalshi.com/api-reference/orders/cancel-order-v2>)
@@ -459,21 +462,33 @@ Implemented, paper by default, live writes blocked:
 * estimated vs paid rewards, Kalshi per-series maker coefficients including
   combo, PM US rebate and taker fee with the published rounding example
 * JSONL recorder, replay through `PaperFillSimulator`, daily report
+* Kalshi selector (`mm/selector.py`): July 30 2026 snapshot score, $1
+  market-period floor rounded down to the cent, greedy marginal $/day per
+  dollar, hysteresis, competition and toxicity exits, shard-funding report
+  with no collateral transfer. `tools/pool_report.py --demo` prints the table.
+  April and May 2026 payouts are not a calibration input.
+* Quote manager live place checks `require_live_execution_allowed(venue="kalshi")`.
+  `enable_kalshi_maker_only_enforcement` arms that check only.
+* Disconnect path: FIX logon tag 8013 behind a default-off flag (no socket),
+  `SafeSender` order groups on the market's shard, `DeadMan`, and
+  `python -m mm.safety.supervisor` which logs `cancel_all` and does not send.
 
 Not done, and required before any of the $500–$1,000 live checklist:
 
-* a recorded `post_only` / `participateDontInitiate` rejection from the
-  venue, then `MAKER_ONLY_ENFORCEMENT_VERIFIED = True`
+* `KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED` and `MAKER_ONLY_ENFORCEMENT_VERIFIED`
+  both default False. `LIVE_ARMED` is still required to construct a live
+  quote manager. Production hosts still need `allow_production`.
 * a cached `GET /series` table so `SERIES_FEES_ENABLED` can default on
   without an HTTP fetch inside the quote loop (the resolver still defaults
   off for that reason)
-* paid-reward calibration: estimates vs a statement, not vs themselves
-* a markout model trained on `as_markouts`, not the hand-set expectation
-  the selector accepts today
+* a markout model trained on recorded fills. The selector uses category
+  priors until `empirical_n` is at least 5.
 * an equivalence table filled from rule text, per pair
-* order-group create actually sent (it is blocked with every other live write)
-* a systemd `ExecStopPost` that calls cancel-all with credentials this
-  process does not keep in the unit file here
+* the supervisor does not hold keys. Pointing it at `SafeSender.trigger_all`
+  is a deployment step, not the default.
+* collateral is not moved between shards. The selector only reports the move.
+* Polymarket US pool selection, including the shared reward-pool divisor.
+  `harness/run_mm_paper.py` is not in this repo. Existing PM scoring is unchanged.
 * ForecastEx, after member access and the retainer exhibit
 * full-period replay against a Kalshi payout export. The replay reproduces
   the paper fill model. It does not reproduce a historical account.

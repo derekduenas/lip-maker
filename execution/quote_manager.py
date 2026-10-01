@@ -177,6 +177,10 @@ class QuoteManager:
         # so two markets cannot each pass their own cap while jointly
         # exceeding the cash that exists.
         self.account = account
+        # Optional ``market -> order_group_id``. When set, live places carry
+        # that id so a dead process can still be flattened by triggering the
+        # group. None leaves the body unchanged (existing callers).
+        self.order_group_for = None
         self.capital_refusals: int = 0
         # Live placements refused because maker enforcement is unverified.
         self.live_blocked: int = 0
@@ -978,7 +982,7 @@ class QuoteManager:
             # therefore refused until exchange-enforced post_only is
             # verified. One chokepoint, before the body is even built.
             try:
-                require_live_execution_allowed()
+                require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
                 self.live_blocked += 1
                 _log.error(f"[LIVE] BLOCKED {market_ticker} "
@@ -1001,7 +1005,11 @@ class QuoteManager:
                 self._release_capital(coid)
                 return None
             try:
-                resp = self.client.post(V2_CREATE_PATH, to_event_order_v2(body))
+                gid = ""
+                if self.order_group_for is not None:
+                    gid = self.order_group_for(market_ticker) or ""
+                resp = self.client.post(
+                    V2_CREATE_PATH, to_event_order_v2(body, order_group_id=gid or None))
                 order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id", "")
                 _log.info(f"[LIVE] PLACED {market_ticker} {side}@{price_cents}c size={size_contracts} order_id={order_id}")
             except Exception as e:
@@ -1057,7 +1065,7 @@ class QuoteManager:
             return False
         if not self.paper:
             try:
-                require_live_execution_allowed()
+                require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
                 _log.error(f"[LIVE] BLOCKED decrease {order.order_id}: {e}")
                 return False
@@ -1084,7 +1092,7 @@ class QuoteManager:
         """
         if not self.paper:
             try:
-                require_live_execution_allowed()
+                require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
                 _log.error(f"[LIVE] BLOCKED amend {order.order_id}: {e}")
                 return False

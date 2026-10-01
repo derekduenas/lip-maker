@@ -236,9 +236,12 @@ def enable_kalshi_maker_only_enforcement(acknowledgement: str) -> None:
     evidence is written up in ``KALSHI_POST_ONLY_EVIDENCE``.
 
     Passing ``KALSHI_POST_ONLY_ACK`` sets ``KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED``
-    only. ``MAKER_ONLY_ENFORCEMENT_VERIFIED`` stays False, so the quote
-    manager and Polymarket US stay blocked. Production hosts stay blocked
-    until ``KalshiRestTransport(..., allow_production=True)``.
+    only. ``MAKER_ONLY_ENFORCEMENT_VERIFIED`` stays False, so Polymarket US
+    stays blocked. The Kalshi quote manager calls
+    ``require_live_execution_allowed(venue="kalshi")``, so this switch is
+    what arms Kalshi quoting. It does not by itself leave paper mode
+    (``LIVE_ARMED`` is still required) and it does not allow production
+    hosts (``KalshiRestTransport(..., allow_production=True)``).
     """
     global KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED
     if acknowledgement != KALSHI_POST_ONLY_ACK:
@@ -256,8 +259,9 @@ def require_live_execution_allowed(*, venue: str = "") -> None:
     live execution. The field is verified to exist. Enforcement is per venue.
 
     ``venue="kalshi"`` consults ``KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED``,
-    which defaults False. Every other caller, including the quote manager,
-    consults ``MAKER_ONLY_ENFORCEMENT_VERIFIED``, which also defaults False.
+    which defaults False. The Kalshi quote manager passes that venue.
+    Every other caller, including Polymarket US, consults
+    ``MAKER_ONLY_ENFORCEMENT_VERIFIED``, which also defaults False.
     Enabling the Kalshi switch does not unblock those callers.
 
     Paper mode never reaches this: it sends nothing.

@@ -339,7 +339,8 @@ class TestQuoteManagerAmendDeath:
         from execution.quote_manager import QuoteManager, QuoteTarget, RestingOrder
         import time
         monkeypatch.setattr(
-            "execution.quote_manager.require_live_execution_allowed", lambda: None)
+            "execution.quote_manager.require_live_execution_allowed",
+            lambda *args, **kwargs: None)
         qm = QuoteManager(paper=True)
         qm.paper = False
         qm.client = type("C", (), {

@@ -42,6 +42,7 @@ def acct():
 def allow_live(monkeypatch):
     import execution.order_request as orq
     monkeypatch.setattr(orq, "MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
+    monkeypatch.setattr(orq, "KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
 
 
 def _live_qm(tmp_path, acct):

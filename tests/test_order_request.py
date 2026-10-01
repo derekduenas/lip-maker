@@ -35,6 +35,8 @@ def allow_live(monkeypatch):
     without this fixture those tests would pass for the wrong reason."""
     import execution.order_request as orq
     monkeypatch.setattr(orq, "MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
+    # The quote manager and the Kalshi adapter pass venue="kalshi".
+    monkeypatch.setattr(orq, "KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
     return True
 
 
