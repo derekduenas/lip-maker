@@ -94,6 +94,20 @@ class PMUSAdapter:
         body = {"slugs": list(slugs or [])}
         return self._write("POST", "/v1/orders/open/cancel", body, now=now)
 
+    def engine_place(self, market_slug: str, *, intent: str, price_cents: int,
+                     quantity: float, now: float = 0.0) -> dict:
+        """MM-engine entry. The PM US key is read-only, so this stays paper.
+
+        A transport attached for signed reads is not used. The body is the
+        same maker order ``place`` builds, including ``participateDontInitiate``.
+        """
+        self.paper = True
+        resp = self.place(market_slug, intent=intent, price_cents=price_cents,
+                          quantity=quantity, now=now)
+        resp["read_only"] = True
+        resp["paper"] = True
+        return resp
+
     def incentives(self) -> list:
         """Programs last supplied by the caller or a gateway fetch.
 

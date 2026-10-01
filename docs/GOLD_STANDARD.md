@@ -478,6 +478,10 @@ Implemented, paper by default, live writes blocked:
   `optimize_sizes` sizes at the LIP reference. 15-minute programs stay in a
   bucket that is off unless asked. A 24h reward-to-markout ratio under 1
   cancels and latches.
+* Compounding ledger, fractional-Kelly cap, drawdown throttle, and the
+  $500→$10k ladder (`mm/compound.py`). PM US shared-pool divisor and paper
+  `engine_place` (`docs/CROSS_VENUE.md`). One cross-venue capital cap, event
+  net, and kill. The selector ranks Kalshi and PM US by net $/day per $.
 
 Not done, and required before any of the $500–$1,000 live checklist:
 

@@ -500,3 +500,75 @@ def demo_selection() -> Selection:
     )
     return allocate([market], bankroll=500, chunk=100, max_size=100,
                     per_market_usd=100, per_series_usd=200, per_category_usd=300)
+
+
+@dataclass
+class PMQuote:
+    """One PM US market scored with the shared program pool.
+
+    ``reward_pool_usd`` is the figure the gateway repeats. ``n_markets`` is
+    the member count that figure is divided by. Fills are expected contracts
+    per day at ``fill_price_cents``; the rebate is rounded per fill.
+    """
+    slug: str
+    reward_pool_usd: float
+    n_markets: int
+    period_seconds: float
+    discount_factor: float = 0.5
+    target_size: float = 100.0
+    tick: float = 0.01
+    our_bid: float = 0.49
+    our_ask: float = 0.51
+    our_size: float = 100.0
+    markout_usd_per_day: float = 0.0
+    fill_contracts: float = 0.0
+    fill_price_cents: int = 50
+    capital_usd: float = 100.0
+
+
+def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, float]:
+    """Return net $/day, capital, $/day per $, reward $/day, rebate $/day.
+
+    Presence is the whole period at the current snapshot share. The pool
+    is the effective (shared) pool. ``payable`` is not applied: the $1
+    unit on PM US is not verified.
+    """
+    from polymarket.engine.pm_us_lip_scorer import (
+        Order, effective_reward_pool_usd, score_snapshot,
+    )
+    from mm.accounting import pm_us_maker_rebate_usd
+
+    bids = [Order(quote.our_bid, quote.our_size, ours=True)]
+    asks = [Order(quote.our_ask, quote.our_size, ours=True)]
+    snap = score_snapshot(
+        bids, asks, tick=quote.tick, discount_factor=quote.discount_factor,
+        target_size=quote.target_size,
+    )
+    effective = effective_reward_pool_usd(quote.reward_pool_usd, quote.n_markets)
+    days = quote.period_seconds / 86400.0
+    reward = (effective * snap.our_share / days) if days > 0 else 0.0
+    rebate = float(pm_us_maker_rebate_usd(quote.fill_price_cents, quote.fill_contracts))
+    net = reward + rebate - float(quote.markout_usd_per_day)
+    capital = float(quote.capital_usd)
+    per = net / capital if capital > 0 else 0.0
+    return net, capital, per, reward, rebate
+
+
+def rank_cross_venue(kalshi: list[KalshiMarket], pm: list[PMQuote], *,
+                     kalshi_size: float = 100.0) -> list[tuple[str, str, float]]:
+    """Kalshi and PM US together, best net $/day per $ first.
+
+    Kalshi uses ``quote_economics``. PM uses the shared pool and the
+    per-fill maker rebate. Fees on Kalshi come from the series fee type
+    inside ``quote_economics``.
+    """
+    rows: list[tuple[str, str, float]] = []
+    for market in kalshi:
+        net, capital, _share, _yes, _no = quote_economics(market, kalshi_size)
+        per = net / capital if capital else -999.0
+        rows.append(("kalshi", market.market, per))
+    for quote in pm:
+        _net, _capital, per, _reward, _rebate = pm_quote_economics(quote)
+        rows.append(("pmus", quote.slug, per))
+    rows.sort(key=lambda row: -row[2])
+    return rows
