@@ -47,24 +47,35 @@ PAPER_MODE  = not LIVE_ARMED
 SHADOW_MODE = os.getenv("LIP_SHADOW", "true").lower() == "true"
 
 # ── Bankroll / risk ───────────────────────────────────────────────────────
-# BANKROLL_USD drives all risk caps. Read from LIP_BANKROLL env if set,
-# else fall back to a floor of $80 (current starting point). After a
-# deposit, set env: LIP_BANKROLL=5000 in lip-maker.service.
-BANKROLL_USD = float(os.getenv("LIP_BANKROLL", "80"))
-
-# 2026-09-21: the one account this system evaluates against. Previously three
-# different figures coexisted — BANKROLL_USD ($80 default), a hardcoded
-# $10,000 in QuoteManager._get_balance's paper branch, and the $5,000 the
-# project actually intends — which made MAX_BANKROLL_SHARE_PCT enforce 50% of
-# a fiction. engine/account_ledger.AccountLedger holds cash and reservations
-# against this number.
-ACCOUNT_OPENING_CASH_USD = float(os.getenv("LIP_ACCOUNT_USD", "5000"))
+# One number. mm.bankroll.capital_usd is the source: LIP_BANKROLL if set,
+# else LIP_ACCOUNT_USD, else $5,000 (the paper ledger). BANKROLL_USD and
+# ACCOUNT_OPENING_CASH_USD are that same number. The old $80 default was a
+# second account and produced zero-quote runs against the $5,000 ledger.
+from mm.bankroll import capital_usd as _capital_usd
+_CAPITAL_USD = float(_capital_usd())
+BANKROLL_USD = _CAPITAL_USD
+ACCOUNT_OPENING_CASH_USD = _CAPITAL_USD
 
 # Ramp-up phase: caps start SMALL and expand as daily PnL is positive.
 # Day 0 deploy: 10% of bankroll gross. Day 7+ clean: 40%.
 # Controlled by `RAMP_PHASE` env (1..4) → 10% / 20% / 30% / 40%.
-RAMP_PHASE = int(os.getenv("LIP_RAMP_PHASE", "4"))  # paper=full
-_ramp_fraction = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40}[max(1, min(4, RAMP_PHASE))]
+def _parse_ramp_phase(raw: str | None) -> int:
+    text = "4" if raw is None or raw == "" else str(raw)
+    try:
+        phase = int(text)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"LIP_RAMP_PHASE must be an integer from 1 to 4, got {text!r}"
+        ) from exc
+    if phase not in (1, 2, 3, 4):
+        raise RuntimeError(
+            f"LIP_RAMP_PHASE must be an integer from 1 to 4, got {phase}"
+        )
+    return phase
+
+
+RAMP_PHASE = _parse_ramp_phase(os.getenv("LIP_RAMP_PHASE"))
+_ramp_fraction = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.40}[RAMP_PHASE]
 
 # 2026-05-02 PREDATOR: split per-market cap from total-budget multiplier.
 # Was: same _ramp_fraction served BOTH the per-market gate AND the total
@@ -97,8 +108,15 @@ else:
     MAX_TOTAL_NET_USD         = _total_gross_budget * 0.25
 
 # ── HARD circuit breakers (live mode only) ────────────────────────────
-# Daily loss cap: if realized P&L drops below this, halt all new quotes.
-MAX_DAILY_LOSS_USD        = BANKROLL_USD * 0.05  # 5% of bankroll per day
+# Daily loss cap: the tighter of 5% of capital and the ramp-tier constitution
+# cap. At the $5,000 default and ramp 4 that is $250. At $500–$1,000 the
+# mm.risk small-live profile is tighter still ($40); this line is the
+# quote-manager backstop.
+from config import constitution as _constitution
+MAX_DAILY_LOSS_USD        = min(
+    BANKROLL_USD * 0.05,
+    float(_constitution.MAX_DAILY_LOSS_BY_RAMP.get(RAMP_PHASE, 250.0)),
+)
 # Session loss cap: if lifetime session loss exceeds this, halt.
 MAX_SESSION_LOSS_USD      = BANKROLL_USD * 0.10  # 10% of bankroll total
 # Single-fill cap: if one fill alone loses > this, halt and alert.

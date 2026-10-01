@@ -37,7 +37,13 @@ from engine.fees import FeeSchedule
 _log = logging.getLogger(__name__)
 
 TAKER_BASE = Decimal("0.07")
+# Fee schedule PDF, July 2026 (7.7.26), https://kalshi.com/docs/kalshi-fee-schedule.pdf
+# maker = M × 0.0175 × C × P × (1−P) where maker fees apply.
+# Series schema (docs.kalshi.com Get Series, fetched 2026-10-01): combo maker
+# multiplier is 0.5 of the taker coefficient, standard maker is 0.25.
+# 0.07 × 0.25 = 0.0175; 0.07 × 0.50 = 0.035.
 MAKER_BASE = Decimal("0.0175")
+MAKER_COMBO_BASE = Decimal("0.035")
 MAKER_FEE_TYPES = frozenset({"quadratic_with_maker_fees", "quadratic_with_combo_maker_fees"})
 KNOWN_FEE_TYPES = MAKER_FEE_TYPES | {"quadratic"}
 
@@ -64,8 +70,15 @@ class SeriesFeeSchedule:
     def maker_charged(self) -> bool:
         return self.fee_type in MAKER_FEE_TYPES
 
+    def _maker_base(self) -> Decimal:
+        if self.fee_type == "quadratic_with_combo_maker_fees":
+            return MAKER_COMBO_BASE
+        if self.fee_type == "quadratic_with_maker_fees":
+            return MAKER_BASE
+        return Decimal("0")
+
     def _schedule(self, is_taker: bool) -> FeeSchedule:
-        rate = (TAKER_BASE if is_taker else MAKER_BASE) * self.multiplier
+        rate = (TAKER_BASE if is_taker else self._maker_base()) * self.multiplier
         return FeeSchedule(name=self.name, rate=rate, source=self.source,
                            verified=False, rounding="ceil_6dp",
                            charge_maker=self.maker_charged)

@@ -31,7 +31,12 @@ def test_maker_fee_series_charges_quarter_rate_times_multiplier():
     assert s.verified is False
 
 
-def test_unknown_fee_type_returns_none():
+def test_combo_maker_fee_is_half_the_taker_coefficient():
+    s = schedule_from_series({"ticker": "KXCOMBO", "fee_type": "quadratic_with_combo_maker_fees",
+                              "fee_multiplier": 1})
+    # 0.035 × 100 × 0.25 = $0.875
+    assert s.fee_usd(50, 100, is_taker=False) == Decimal("0.875")
+    assert s.fee_usd(50, 100, is_taker=True) == Decimal("1.75")
     assert schedule_from_series({"fee_type": "flat_new_thing"}) is None
     assert schedule_from_series({"fee_type": "quadratic", "fee_multiplier": "x"}) is None
 

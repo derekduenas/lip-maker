@@ -38,7 +38,8 @@ Prices are handled in integer ticks to avoid float drift (tick 0.01 or
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Iterable, Optional, Sequence
 
@@ -54,6 +55,9 @@ class PMProgram:
     max_spread_usd: Optional[float]
     start: Optional[str]
     status: str
+    # Gateway repeats rewardPool on every market in the program window.
+    # n_markets is how many members share that one pool. 1 keeps a lone market.
+    n_markets: int = 1
 
 
 def parse_incentives(record: dict) -> list[PMProgram]:
@@ -171,13 +175,53 @@ def score_snapshot(bids: Sequence[Order], asks: Sequence[Order], *, tick: float,
     return SnapshotResult(True, b, a)
 
 
-def expected_payout_usd(shares: Iterable[float], *, reward_pool_usd: float,
-                        period_seconds: float) -> float:
-    """Pool × (Σ per-second share) / seconds-in-period. Unobserved seconds
-    must be passed as 0 — they still count toward the period."""
-    if period_seconds <= 0 or reward_pool_usd <= 0:
+def effective_reward_pool_usd(reward_pool_usd: float, n_markets: int) -> float:
+    """One program window has one pool. The API repeats it on every market.
+
+    Divide by the member count. That count is the conservative split: a
+    market with no qualifying book does not take a cut, so the true divisor
+    is at most about 1.25× smaller. ``n_markets`` below 1 is rejected.
+    """
+    n = int(n_markets)
+    if n < 1:
+        raise ValueError("n_markets must be >= 1")
+    if reward_pool_usd <= 0:
         return 0.0
-    return reward_pool_usd * sum(shares) / period_seconds
+    return float(reward_pool_usd) / n
+
+
+def expected_payout_usd(shares: Iterable[float], *, reward_pool_usd: float,
+                        period_seconds: float, n_markets: int = 1) -> float:
+    """Effective pool × (Σ per-second share) / seconds-in-period.
+
+    Unobserved seconds must be passed as 0 — they still count toward the
+    period. ``n_markets`` defaults to 1 so a single-market call is unchanged.
+    ``payable`` is a separate $1 check whose unit (program-period versus
+    user-per-day) is not verified against a payout statement, so callers
+    that are estimating a slice should use this function and not payable().
+    """
+    effective = effective_reward_pool_usd(reward_pool_usd, n_markets)
+    if period_seconds <= 0 or effective <= 0:
+        return 0.0
+    return effective * sum(shares) / period_seconds
+
+
+def effective_pool_from_market(market: dict) -> float:
+    """Prefer an explicit ``pool_eff``. Otherwise divide the repeated pool."""
+    if market.get("pool_eff") is not None:
+        return float(market["pool_eff"])
+    raw = market.get("reward_pool_usd", market.get("rewardPool", 0))
+    n = market.get("n_window", market.get("n_markets", 1))
+    return effective_reward_pool_usd(float(raw or 0), int(n or 1))
+
+
+def with_shared_pools(programs: list[PMProgram]) -> list[PMProgram]:
+    """Mark every market with how many siblings share its program window."""
+    counts = Counter((p.program_id, p.period) for p in programs)
+    return [
+        replace(p, n_markets=counts[(p.program_id, p.period)])
+        for p in programs
+    ]
 
 
 def payable(amount_usd: float) -> float:

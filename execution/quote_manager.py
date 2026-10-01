@@ -44,9 +44,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import settings
 from execution.kalshi_auth import KalshiClient, KalshiAuthError
+from mm.venues.kalshi import amend_response_killed_quote, resting_quote
 from execution.order_request import (
     LiveExecutionBlocked, MakerSafetyError, assert_maker_safe,
-    build_limit_order, require_live_execution_allowed, would_cross,
+    build_limit_order, require_live_execution_allowed, to_event_order_v2,
+    would_cross, V2_CREATE_PATH,
 )
 from engine.account_ledger import AccountLedger, InsufficientCapital
 from engine.fees import fee_usd
@@ -70,12 +72,39 @@ class QuoteTarget:
     # physical order set serves every program on the ticker, so this is an
     # attribution label on ledger events, not a second reservation.
     program_id:        str = ""
+    # Unix close time. Inside the pull window the manager cancels and
+    # does not place. None leaves the quote alone.
+    close_ts:          Optional[float] = None
 
     def yes_size(self) -> int:
         return self.yes_size_override if self.yes_size_override is not None else self.size_contracts
 
     def no_size(self) -> int:
         return self.no_size_override if self.no_size_override is not None else self.size_contracts
+
+
+def _exchange_index(raw: dict) -> Optional[int]:
+    """Shard on a portfolio row or a create response. Absent stays unknown."""
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("exchange_index")
+    nested = raw.get("order")
+    if value is None and isinstance(nested, dict):
+        value = nested.get("exchange_index")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reject_readonly_client(client) -> None:
+    """The production book reader is not an order client."""
+    if client is None:
+        return
+    from mm.venues.readonly import reject_market_data_reader
+    reject_market_data_reader(client)
 
 
 @dataclass
@@ -97,9 +126,15 @@ class RestingOrder:
     # Flag prevents placing a duplicate same-side order until next reconcile
     # cycle clears the in-memory state via periodic_resync.
     pending_cancel: bool = False
+    # False after a price change or a size increase (Kalshi amend drops
+    # queue priority). A decrease leaves this True.
+    queue_preserved: bool = True
     # Our client_order_id ("LIP-…") when we placed it; empty for orders
     # rehydrated from the venue that we cannot prove are ours.
     client_order_id: str = ""
+    # Shard the order was placed on. Live decrease/amend send it so the
+    # write is not defaulted to shard 0.
+    exchange_index: Optional[int] = None
     # Venue price was not on the whole-cent grid; price_cents is the nearest
     # cent for exposure math only — the order is never scored.
     price_off_grid: bool = False
@@ -172,6 +207,13 @@ class QuoteManager:
         # so two markets cannot each pass their own cap while jointly
         # exceeding the cash that exists.
         self.account = account
+        # Optional ``market -> order_group_id``. When set, live places carry
+        # that id so a dead process can still be flattened by triggering the
+        # group. None leaves the body unchanged (existing callers).
+        self.order_group_for = None
+        from mm.session_gates import pull_before_close_s, single_fill_cap_usd
+        self.pull_before_close_s = pull_before_close_s()
+        self.single_fill_cap_usd = single_fill_cap_usd()
         self.capital_refusals: int = 0
         # Live placements refused because maker enforcement is unverified.
         self.live_blocked: int = 0
@@ -219,26 +261,33 @@ class QuoteManager:
         from execution.kalshi_ws import KalshiWS as _KW
         if raw.get("status") != "resting":
             return None
-        side = str(raw.get("side", "")).lower()
-        if side not in ("yes", "no"):
-            return None
         ticker = raw.get("ticker") or raw.get("market_ticker") or ""
         order_id = raw.get("order_id") or ""
         if not ticker or not order_id:
             return None
-        p_raw = raw.get(f"{side}_price_dollars")
-        if p_raw is None:
-            p_raw = raw.get(f"{side}_price_fp", raw.get(f"{side}_price"))
-        if p_raw is None:
-            return None
-        price_cents = _KW._price_to_cents(p_raw)
         off_grid = False
-        if price_cents is None:
-            exact = _KW._price_to_cents_exact(p_raw)
-            if exact is None:
+        if raw.get("book_side") or raw.get("outcome_side"):
+            # V2 portfolio rows keep side="yes" for a NO ask. book_side wins.
+            routed = resting_quote(raw)
+            if routed is None:
                 return None
-            price_cents = int(round(exact))
-            off_grid = True
+            side, price_cents = routed
+        else:
+            side = str(raw.get("side", "")).lower()
+            if side not in ("yes", "no"):
+                return None
+            p_raw = raw.get(f"{side}_price_dollars")
+            if p_raw is None:
+                p_raw = raw.get(f"{side}_price_fp", raw.get(f"{side}_price"))
+            if p_raw is None:
+                return None
+            price_cents = _KW._price_to_cents(p_raw)
+            if price_cents is None:
+                exact = _KW._price_to_cents_exact(p_raw)
+                if exact is None:
+                    return None
+                price_cents = int(round(exact))
+                off_grid = True
         rem = raw.get("remaining_count_fp")
         if rem is None:
             rem = raw.get("remaining_count")
@@ -250,6 +299,7 @@ class QuoteManager:
             return None
         if qty != qty or qty <= _QTY_EPS:
             return None
+        shard = _exchange_index(raw)
         placed = time.time()
         ct = raw.get("created_time")
         if isinstance(ct, str) and ct:
@@ -261,7 +311,7 @@ class QuoteManager:
             order_id=order_id, market_ticker=ticker, side=side,
             price_cents=price_cents, size_contracts=qty, placed_at=placed,
             paper=False, client_order_id=str(raw.get("client_order_id") or ""),
-            price_off_grid=off_grid,
+            price_off_grid=off_grid, exchange_index=shard,
         )
 
     def _fetch_live_orders(self) -> dict[str, RestingOrder]:
@@ -372,6 +422,8 @@ class QuoteManager:
                                   f"{' OFF-GRID' if o.price_off_grid else ''}")
                     if lo.client_order_id and not o.client_order_id:
                         o.client_order_id = lo.client_order_id
+                    if lo.exchange_index is not None:
+                        o.exchange_index = lo.exchange_index
                     kept.append(o)
                 if kept:
                     self.resting[ticker] = kept
@@ -965,8 +1017,9 @@ class QuoteManager:
             # observation and the order's arrival. Live transmission is
             # therefore refused until exchange-enforced post_only is
             # verified. One chokepoint, before the body is even built.
+            _reject_readonly_client(self.client)
             try:
-                require_live_execution_allowed()
+                require_live_execution_allowed(venue="kalshi")
             except LiveExecutionBlocked as e:
                 self.live_blocked += 1
                 _log.error(f"[LIVE] BLOCKED {market_ticker} "
@@ -989,8 +1042,14 @@ class QuoteManager:
                 self._release_capital(coid)
                 return None
             try:
-                resp = self.client.post("/portfolio/orders", body)
-                order_id = resp.get("order", {}).get("order_id", "")
+                gid = ""
+                if self.order_group_for is not None:
+                    gid = self.order_group_for(market_ticker) or ""
+                _reject_readonly_client(self.client)
+                resp = self.client.post(
+                    V2_CREATE_PATH, to_event_order_v2(body, order_group_id=gid or None))
+                order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id", "")
+                placed_shard = _exchange_index(resp if isinstance(resp, dict) else {})
                 _log.info(f"[LIVE] PLACED {market_ticker} {side}@{price_cents}c size={size_contracts} order_id={order_id}")
             except Exception as e:
                 # 2026-09-20 audit: an exception here does NOT prove the order
@@ -1017,6 +1076,7 @@ class QuoteManager:
             side=side, price_cents=price_cents, size_contracts=float(size_contracts),
             placed_at=time.time(), paper=self.paper, client_order_id=coid,
             program_id=program_id or "",
+            exchange_index=None if self.paper else placed_shard,
         )
         # #127 (2026-04-28) UPSERT semantics: drop any existing entry for
         # this (ticker, side) before appending. Prevents accumulation when
@@ -1036,7 +1096,179 @@ class QuoteManager:
             existing_lst.append(rest)
         self._log_quote_row(market_ticker, side, price_cents, size_contracts,
                               order_id, "resting", notes=f"coid={coid}")
+        self._note_quote_write(market_ticker)
         return rest
+
+    def _decrease_order(self, order: RestingOrder, new_size: float) -> bool:
+        """Same price, smaller size. Kalshi decrease keeps queue position."""
+        new_size = float(new_size)
+        if new_size <= 0 or new_size >= order.size_contracts:
+            return False
+        if not self.paper:
+            _reject_readonly_client(self.client)
+            try:
+                require_live_execution_allowed(venue="kalshi")
+            except LiveExecutionBlocked as e:
+                _log.error(f"[LIVE] BLOCKED decrease {order.order_id}: {e}")
+                return False
+            try:
+                body = {"reduce_to": f"{new_size:.2f}",
+                        "market_ticker": order.market_ticker}
+                if order.exchange_index is not None:
+                    body["exchange_index"] = int(order.exchange_index)
+                _reject_readonly_client(self.client)
+                self.client.post(
+                    f"{V2_CREATE_PATH}/{order.order_id}/decrease",
+                    body,
+                )
+            except Exception as e:
+                _log.warning(f"decrease failed {order.order_id}: {e}")
+                return False
+        order.size_contracts = new_size
+        order.queue_preserved = True
+        return True
+
+    def _note_quote_write(self, market_ticker: str) -> None:
+        """Count a place or amend toward the sentinel quote-rate caps."""
+        try:
+            from risk.sentinel import Sentinel
+            Sentinel.record_write(market_ticker)
+        except Exception as e:
+            _log.debug(f"quote-rate record failed for {market_ticker}: {e}")
+
+    def _rereserve(self, order: RestingOrder, price_cents: int, size: int) -> None:
+        allowance = 0
+        try:
+            allowance = fee_usd(price_cents, size, is_taker=False)
+        except Exception:
+            allowance = 0
+        self.account.reserve(
+            order.client_order_id, market=order.market_ticker,
+            program_id=order.program_id or order.market_ticker,
+            price_cents=price_cents, quantity=size,
+            fee_allowance_usd=allowance)
+
+    def _amend_order(self, order: RestingOrder, new_price: int, new_size: float,
+                     best_opposing_bid_cents: Optional[int] = None):
+        """Price change or size-up. Kalshi amend forfeits queue position.
+
+        One request, not cancel-then-place: a failed amend must not leave a
+        second order on the same side. A 200 whose remaining count is 0 and
+        fill count is 0 cancelled the quote (post_only on amend); that order
+        is removed. Return value is True, False, or ``"dead"``.
+
+        The same gates as placement apply: 0/100 prices are refused, a
+        price change or size-up re-reserves capital before the order can
+        rest at the new terms, and the order must not cross.
+        """
+        new_price = int(new_price)
+        new_size_f = float(new_size)
+        if new_price <= 0 or new_price >= 100:
+            _log.debug(f"[SKIP] amend {order.market_ticker} {order.side}"
+                       f"@{new_price}c — edge price (Kalshi rejects)")
+            return False
+        size_i = int(round(new_size_f))
+        if size_i <= 0:
+            return False
+        prior_price = int(order.price_cents)
+        prior_size = float(order.size_contracts)
+        price_changed = new_price != prior_price
+        size_up = new_size_f > prior_size + 1e-9
+        reserved = False
+        if (self.account is not None and order.client_order_id
+                and (price_changed or size_up)):
+            try:
+                self._rereserve(order, new_price, size_i)
+                reserved = True
+            except InsufficientCapital as e:
+                self.capital_refusals += 1
+                _log.warning(f"REFUSED amend {order.market_ticker} "
+                             f"{order.side}@{new_price}c x{size_i}: {e}")
+                return False
+
+        def _restore_reserve() -> None:
+            if not reserved or self.account is None or not order.client_order_id:
+                return
+            try:
+                self._rereserve(order, prior_price, max(1, int(round(prior_size))))
+            except Exception as e:
+                _log.warning(f"amend reserve restore failed {order.order_id}: {e}")
+
+        if self.paper:
+            if best_opposing_bid_cents is not None:
+                chk = would_cross(order.side, new_price,
+                                  best_opposing_bid_cents=best_opposing_bid_cents)
+                if not chk.safe:
+                    _log.warning(f"[PAPER] REFUSED amend {order.market_ticker} "
+                                 f"{order.side}@{new_price}c: {chk.reason}")
+                    _restore_reserve()
+                    return False
+            order.price_cents = new_price
+            order.size_contracts = new_size_f
+            order.queue_preserved = False
+            self._note_quote_write(order.market_ticker)
+            return True
+
+        _reject_readonly_client(self.client)
+        try:
+            require_live_execution_allowed(venue="kalshi")
+        except LiveExecutionBlocked as e:
+            _log.error(f"[LIVE] BLOCKED amend {order.order_id}: {e}")
+            _restore_reserve()
+            return False
+        try:
+            legacy = build_limit_order(
+                ticker=order.market_ticker, side=order.side,
+                price_cents=new_price,
+                size_contracts=size_i,
+                client_order_id=order.client_order_id or "amend",
+                best_opposing_bid_cents=best_opposing_bid_cents,
+            )
+            assert_maker_safe(legacy)
+            v2 = to_event_order_v2(legacy)
+            amend_body = {"ticker": order.market_ticker, "side": v2["side"],
+                          "price": v2["price"], "count": f"{new_size_f:.2f}",
+                          "client_order_id": order.client_order_id}
+            if order.exchange_index is not None:
+                amend_body["exchange_index"] = int(order.exchange_index)
+            _reject_readonly_client(self.client)
+            resp = self.client.post(
+                f"{V2_CREATE_PATH}/{order.order_id}/amend",
+                amend_body,
+            )
+        except MakerSafetyError as e:
+            _log.error(f"[LIVE] REFUSED amend {order.market_ticker} "
+                       f"{order.side}@{new_price}c: {e}")
+            _restore_reserve()
+            return False
+        except Exception as e:
+            _log.warning(f"amend failed {order.order_id}: {e}")
+            return False
+        if amend_response_killed_quote(resp or {}):
+            self._retire_dead_quote(order, "amend_post_only_cancelled")
+            return "dead"
+        order.price_cents = new_price
+        order.size_contracts = new_size_f
+        order.queue_preserved = False
+        self._note_quote_write(order.market_ticker)
+        return True
+
+    def _retire_dead_quote(self, order: RestingOrder, notes: str) -> None:
+        """The venue no longer has this order. Drop it. Do not re-place."""
+        with self._state_lock:
+            self._state_generation += 1
+            lst = self.resting.get(order.market_ticker, [])
+            try:
+                lst.remove(order)
+            except ValueError:
+                pass
+            if not lst and order.market_ticker in self.resting:
+                # Keep the key if the other side is still there.
+                if not self.resting[order.market_ticker]:
+                    self.resting.pop(order.market_ticker, None)
+            self._tombstone(order.order_id)
+            self._release_capital(order.client_order_id)
+        self._update_quote_status(order.order_id, "cancelled", notes=notes)
 
     def _release_capital(self, client_order_id: str) -> None:
         """Return an order's reserved capital to the available pool.
@@ -1064,8 +1296,12 @@ class QuoteManager:
         if self.paper:
             _log.info(f"[PAPER] CANCEL {order.market_ticker} {order.side}@{order.price_cents}c")
         else:
+            _reject_readonly_client(self.client)
             try:
-                self.client.delete(f"/portfolio/orders/{order.order_id}")
+                from urllib.parse import urlencode
+                path = (f"{V2_CREATE_PATH}/{order.order_id}?"
+                        + urlencode({"market_ticker": order.market_ticker}))
+                self.client.delete(path)
                 _log.info(f"[LIVE] CANCELLED {order.market_ticker} {order.side}@{order.price_cents}c order_id={order.order_id}")
             except Exception as e:
                 if "404" in str(e) or "Not Found" in str(e):
@@ -1125,15 +1361,45 @@ class QuoteManager:
         """Drop all in-memory resting entries for a market (used on WS re-subscribe)."""
         lst = self.resting.pop(market_ticker, [])
         for o in lst:
+            self._release_capital(o.client_order_id)
             self._update_quote_status(o.order_id, "cancelled", notes="ws_resubscribe_reset")
         if lst:
             _log.info(f"reset_for_market {market_ticker}: dropped {len(lst)} in-memory orders")
 
     def reconcile(self, target: QuoteTarget) -> dict:
         with self._state_lock:
-            if self.uncertain_markets or self._fill_persistence_failed:
+            if self._market_uncertain(target.market_ticker):
                 return {"action": "skip", "reason": "ORDER_STATE_UNCERTAIN"}
-            return self._reconcile_locked(target)
+            if self._inside_close(target):
+                n = self.cancel_all(target.market_ticker)
+                return {"action": "cancel", "reason": "close_cutoff", "cancelled": n}
+            return self._reconcile_locked(self._cap_target(target))
+
+    def _inside_close(self, target: QuoteTarget) -> bool:
+        close_ts = getattr(target, "close_ts", None)
+        if close_ts is None:
+            return False
+        from mm.session_gates import inside_close_window
+        return inside_close_window(
+            float(close_ts), time.time(), pull_before_s=self.pull_before_close_s,
+        )
+
+    def _cap_target(self, target: QuoteTarget) -> QuoteTarget:
+        """Shrink each side so one fill's premium stays inside the cap."""
+        from dataclasses import replace
+        from mm.session_gates import clamp_contracts
+        cap = self.single_fill_cap_usd
+        yes = clamp_contracts(target.yes_bid_cents, target.yes_size(), cap)
+        no = clamp_contracts(target.no_bid_cents, target.no_size(), cap)
+        return replace(target, yes_size_override=yes, no_size_override=no)
+
+    def _market_uncertain(self, market_ticker: str) -> bool:
+        """Startup failure blocks every market. A later failure blocks one."""
+        if "__startup__" in self.uncertain_markets:
+            return True
+        if market_ticker in self.uncertain_markets:
+            return True
+        return market_ticker in self._fill_persistence_failed.values()
 
     def _reconcile_locked(self, target: QuoteTarget) -> dict:
         """Bring resting orders in line with target for one market.
@@ -1158,95 +1424,83 @@ class QuoteManager:
         current = self.resting.get(target.market_ticker, [])
         current_yes = [o for o in current if o.side == "yes"]
         current_no  = [o for o in current if o.side == "no"]
-
-        actions = {"cancelled": 0, "placed": 0, "kept": 0, "reason": reason}
-
-        # Yes side (#97: respects yes_size_override for inventory skew)
         yes_size = target.yes_size()
-        if target.yes_bid_cents is None:
-            for o in current_yes:
-                if self._cancel_order(o):
-                    actions["cancelled"] += 1
-        else:
-            need_replace = False
-            if len(current_yes) != 1:
-                need_replace = True
-            elif (current_yes[0].price_cents != target.yes_bid_cents
-                  or abs(current_yes[0].size_contracts - yes_size) > _QTY_EPS):
-                # Includes the partial-fill case: remaining < target ⇒ top up.
-                need_replace = True
-            if need_replace:
-                # 2026-05-02 PREDATOR C2: place ONLY if all cancels succeeded.
-                # Was: cancel returns False → we still place → two same-side
-                # orders co-exist → safety caps drift, double exposure. Now:
-                # any cancel failure marks the order pending_cancel and skips
-                # placement until next reconcile cycle (periodic_resync clears).
-                all_cancelled = True
-                for o in current_yes:
-                    if self._cancel_order(o):
-                        actions["cancelled"] += 1
-                    else:
-                        o.pending_cancel = True
-                        all_cancelled = False
-                        _log.warning(f"C2 cancel-failed yes {target.market_ticker} "
-                                     f"oid={o.order_id[:12]} — marking pending_cancel, "
-                                     f"skipping placement to avoid duplicate")
-                if all_cancelled:
-                    # The opposing bid is the other leg of our own two-sided
-                    # target: a YES buy crosses iff yes_bid + no_bid >= 100.
-                    r = self._place_order(target.market_ticker, "yes",
-                                           target.yes_bid_cents, yes_size,
-                                           best_opposing_bid_cents=target.no_bid_cents,
-                                           program_id=target.program_id)
-                    if r:
-                        actions["placed"] += 1
-                else:
-                    actions["pending_cancel_yes"] = sum(
-                        1 for o in current_yes if o.pending_cancel
-                    )
-            else:
-                actions["kept"] += 1
-
-        # No side (#97: respects no_size_override for inventory skew)
         no_size = target.no_size()
-        if target.no_bid_cents is None:
-            for o in current_no:
+
+        actions = {"cancelled": 0, "placed": 0, "kept": 0, "decreased": 0,
+                   "amended": 0, "reason": reason}
+
+        self._reconcile_side(
+            target, "yes", current_yes, target.yes_bid_cents, yes_size,
+            target.no_bid_cents, actions)
+        self._reconcile_side(
+            target, "no", current_no, target.no_bid_cents, no_size,
+            target.yes_bid_cents, actions)
+        return actions
+
+    def _reconcile_side(self, target, side: str, current: list, target_price,
+                        target_size: float, opposing, actions: dict) -> None:
+        """One side. A single resting order is decreased or amended in place.
+
+        Cancel-then-place remains for the zero-order and many-order cases,
+        and it still refuses to place when a cancel fails.
+        """
+        from mm.diff import plan_resting
+
+        label = "yes" if side == "yes" else "no"
+        if target_price is None:
+            for o in current:
                 if self._cancel_order(o):
                     actions["cancelled"] += 1
-        else:
-            need_replace = False
-            if len(current_no) != 1:
-                need_replace = True
-            elif (current_no[0].price_cents != target.no_bid_cents
-                  or abs(current_no[0].size_contracts - no_size) > _QTY_EPS):
-                need_replace = True
-            if need_replace:
-                # 2026-05-02 PREDATOR C2: same race fix as yes side above.
-                all_cancelled = True
-                for o in current_no:
-                    if self._cancel_order(o):
-                        actions["cancelled"] += 1
-                    else:
-                        o.pending_cancel = True
-                        all_cancelled = False
-                        _log.warning(f"C2 cancel-failed no {target.market_ticker} "
-                                     f"oid={o.order_id[:12]} — marking pending_cancel, "
-                                     f"skipping placement to avoid duplicate")
-                if all_cancelled:
-                    r = self._place_order(target.market_ticker, "no",
-                                           target.no_bid_cents, no_size,
-                                           best_opposing_bid_cents=target.yes_bid_cents,
-                                           program_id=target.program_id)
-                    if r:
-                        actions["placed"] += 1
-                else:
-                    actions["pending_cancel_no"] = sum(
-                        1 for o in current_no if o.pending_cancel
-                    )
-            else:
+            return
+        if len(current) == 1 and not current[0].pending_cancel:
+            o = current[0]
+            plan = plan_resting(
+                o.price_cents, o.size_contracts, target_price, target_size,
+                fade=bool(getattr(target, "fade_topup", False)),
+            )
+            if plan.action == "keep":
                 actions["kept"] += 1
-
-        return actions
+                return
+            if plan.action == "decrease":
+                if self._decrease_order(o, plan.size):
+                    actions["decreased"] += 1
+                else:
+                    o.pending_cancel = True
+                    actions[f"pending_cancel_{label}"] = 1
+                return
+            if plan.action == "amend":
+                amended = self._amend_order(
+                    o, plan.price_cents, plan.size,
+                    best_opposing_bid_cents=opposing)
+                if amended == "dead":
+                    actions["cancelled"] += 1
+                elif amended:
+                    actions["amended"] += 1
+                else:
+                    o.pending_cancel = True
+                    actions[f"pending_cancel_{label}"] = 1
+                return
+        # 2026-05-02 PREDATOR C2: place ONLY if every cancel succeeded.
+        all_cancelled = True
+        for o in current:
+            if self._cancel_order(o):
+                actions["cancelled"] += 1
+            else:
+                o.pending_cancel = True
+                all_cancelled = False
+                _log.warning(f"C2 cancel-failed {label} {target.market_ticker} "
+                             f"oid={o.order_id[:12]} — marking pending_cancel, "
+                             f"skipping placement to avoid duplicate")
+        if all_cancelled:
+            if self._place_order(target.market_ticker, side, target_price,
+                                 int(round(target_size)),
+                                 best_opposing_bid_cents=opposing,
+                                 program_id=target.program_id):
+                actions["placed"] += 1
+        else:
+            actions[f"pending_cancel_{label}"] = sum(
+                1 for o in current if o.pending_cancel)
 
     def cancel_all(self, market_ticker: Optional[str] = None, *, only_ours: bool = False) -> int:
         """Cancel every resting order, optionally scoped to one market.

@@ -83,10 +83,30 @@ def test_a_trade_before_activation_is_not_ours():
 
 
 def test_a_trade_at_another_price_does_not_fill_us():
-    """A sweep that stops one cent away is not a fill."""
+    """A sweep that stops one cent short of our bid is not a fill."""
     sim = _sim()
     _track(sim, price=45, queue=0.0)
     assert sim.apply_trades([_trade("t1", yes_c=46)]) == []
+
+
+def test_a_print_through_our_bid_fills_us_after_clearing_the_queue():
+    """Trading through the bid swept the level. Queue-ahead does not block it."""
+    sim = _sim()
+    _track(sim, price=50, size=10.0, queue=100.0)
+    fills = sim.apply_trades([_trade("t-through", yes_c=48, no_c=52, qty=4.0)])
+    assert len(fills) == 1
+    assert fills[0]["count"] == 4.0
+    assert fills[0]["price_cents"] == 50
+    assert sim.orders["o1"].queue_ahead == 0.0
+    assert sim.orders["o1"].remaining == 6.0
+
+
+def test_float_residue_does_not_fill():
+    sim = _sim()
+    _track(sim, price=45, size=10.0, queue=0.0)
+    assert sim.apply_trades([_trade("t-dust", qty=1e-15)]) == []
+    assert sim.orders["o1"].remaining == 10.0
+    assert sim.fills_generated == 0
 
 
 def test_a_taker_on_our_own_side_does_not_fill_us():

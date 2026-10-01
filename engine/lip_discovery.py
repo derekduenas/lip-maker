@@ -85,6 +85,19 @@ def _finite_float(v) -> float | None:
     return f
 
 
+def _max_reward_usd(raw) -> float | None:
+    """max_reward_per_account is centi-cents. Absent means no account cap."""
+    if raw is None or raw == "":
+        return None
+    try:
+        cents = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if cents < 0:
+        return None
+    return cents / 10_000.0
+
+
 def _parse_program(raw: dict) -> dict | None:
     """Normalize raw incentive program fields.
 
@@ -140,6 +153,9 @@ def _parse_program(raw: dict) -> dict | None:
         "target_size":        target_size,
         "paid_out":           int(bool(raw.get("paid_out", False))),
         "reward_per_day_usd": reward_per_day,        # pool / (window in days)
+        # Optional per-account cap. Centi-cents on the wire, dollars here.
+        # None means the program row did not set one.
+        "max_reward_usd":     _max_reward_usd(raw.get("max_reward_per_account")),
     }
 
 

@@ -19,7 +19,7 @@ from venue.base import (
 from execution.kalshi_auth import KalshiClient
 from execution.order_request import (
     LiveExecutionBlocked, MakerSafetyError, assert_maker_safe,
-    build_limit_order, require_live_execution_allowed,
+    build_limit_order, require_live_execution_allowed, to_event_order_v2,
 )
 
 _log = logging.getLogger(__name__)
@@ -148,8 +148,8 @@ class KalshiVenue(Venue):
         except MakerSafetyError as e:
             return OrderResult(success=False, error=f"maker safety: {e}")
         try:
-            resp = self._client.post("/portfolio/orders", body)
-            order_id = (resp.get("order") or {}).get("order_id")
+            resp = self._client.post("/portfolio/events/orders", to_event_order_v2(body))
+            order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id")
             if order_id:
                 return OrderResult(success=True, order_id=order_id, raw=resp)
             return OrderResult(success=False, error="no order_id in response", raw=resp)
@@ -158,7 +158,7 @@ class KalshiVenue(Venue):
 
     def cancel_order(self, order_id: str) -> bool:
         try:
-            self._client.delete(f"/portfolio/orders/{order_id}")
+            self._client.delete(f"/portfolio/events/orders/{order_id}")
             return True
         except Exception as e:
             # 404 = already cancelled/filled = effectively success for our purposes

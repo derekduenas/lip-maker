@@ -1,0 +1,25 @@
+[Unit]
+Description=Kalshi paper/demo unattended quote loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lip
+Group=lip
+WorkingDirectory=/opt/lip-maker
+EnvironmentFile=-/etc/lip-maker/lip-maker.env
+# Paper orders stay off. Production books are read-only and use
+# KALSHI_PROD_READ_KEY_ID plus KALSHI_PROD_READ_KEY_PATH from the env file.
+# Without that key the process reads demo books.
+Environment=LIP_PAPER=true
+Environment=LIP_KALSHI_WS_URL=wss://demo-api.kalshi.co/trade-api/ws/v2
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/lip-maker/.venv/bin/python -m mm.unattended --run --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel --status-port 8765 --log-file /var/lib/lip-maker/lip.log --summary /var/lib/lip-maker/daily-summary
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

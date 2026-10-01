@@ -35,6 +35,8 @@ def allow_live(monkeypatch):
     without this fixture those tests would pass for the wrong reason."""
     import execution.order_request as orq
     monkeypatch.setattr(orq, "MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
+    # The quote manager and the Kalshi adapter pass venue="kalshi".
+    monkeypatch.setattr(orq, "KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
     return True
 
 
@@ -217,8 +219,9 @@ class TestQuoteManagerUsesSharedContract:
         r = qm._place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
         assert r is not None
         body = qm.client.post.call_args[0][1]
-        assert body[MAKER_ONLY_FIELD] is True and "no_self_trade" not in body
-        assert body["yes_price"] == 49
+        assert body["post_only"] is True and "no_self_trade" not in body
+        assert body["side"] == "bid" and body["price"] == "0.4900"
+        assert qm.client.post.call_args[0][0] == "/portfolio/events/orders"
 
     def test_live_crossing_order_is_refused_before_transmission(self, tmp_path,
                                                                 allow_live):

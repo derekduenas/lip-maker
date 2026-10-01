@@ -88,7 +88,18 @@ MAKER_ONLY_FIELD_VERIFIED = True
 # False until a live rejection is observed. Do not promote a conservative
 # assumption into a verified fact: the whole point of the flag is the case
 # the local preflight cannot cover (the book moving in transit).
+#
+# Kalshi demo evidence (2026-09-30) is recorded, but this global flag stays
+# False: it also gates venues that were not on that wire (Polymarket US,
+# the quote manager). Kalshi has its own switch below.
 MAKER_ONLY_ENFORCEMENT_VERIFIED = False
+
+# Kalshi-only. Default False, so KalshiAdapter live writes stay blocked.
+# Set only via enable_kalshi_maker_only_enforcement(). Does not flip the
+# global flag and does not allow the production host.
+KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED = False
+KALSHI_POST_ONLY_EVIDENCE = "docs/venue_evidence/kalshi_post_only_demo_20260930.md"
+KALSHI_POST_ONLY_ACK = "kalshi-demo-2026-09-30-post-only-cross"
 
 # The obsolete field venue/kalshi.py sent. Kept as a named constant so the
 # guard below can name it in the error rather than hard-coding a string.
@@ -215,20 +226,60 @@ class LiveExecutionBlocked(RuntimeError):
     """Live order transmission attempted while maker enforcement is unproven."""
 
 
-def require_live_execution_allowed() -> None:
+def enable_kalshi_maker_only_enforcement(acknowledgement: str) -> None:
+    """Mark Kalshi ``post_only`` enforced for this process. Default is off.
+
+    The demo wire on 2026-09-30 (``demo-api.kalshi.co``, market
+    ``KXRAIN-26SEP30-DTW``) rejected crossing V2 orders with HTTP 400
+    ``invalid_order`` / ``post only cross``, and an amend to a crossing
+    price returned HTTP 200 with ``remaining_count`` 0 and no fill. That
+    evidence is written up in ``KALSHI_POST_ONLY_EVIDENCE``.
+
+    Passing ``KALSHI_POST_ONLY_ACK`` sets ``KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED``
+    only. ``MAKER_ONLY_ENFORCEMENT_VERIFIED`` stays False, so Polymarket US
+    stays blocked. The Kalshi quote manager calls
+    ``require_live_execution_allowed(venue="kalshi")``, so this switch is
+    what arms Kalshi quoting. It does not by itself leave paper mode
+    (``LIVE_ARMED`` is still required) and it does not allow production
+    hosts (``KalshiRestTransport(..., allow_production=True)``).
+    """
+    global KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED
+    if acknowledgement != KALSHI_POST_ONLY_ACK:
+        raise LiveExecutionBlocked(
+            "refusing to mark Kalshi post_only verified without the demo "
+            f"acknowledgement; evidence is {KALSHI_POST_ONLY_EVIDENCE}")
+    KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED = True
+
+
+def require_live_execution_allowed(*, venue: str = "") -> None:
     """Raise unless we may legitimately send a LIVE order.
 
     The directive is explicit: a local non-crossing check cannot guarantee
     maker execution, so exchange-enforced post_only must be verified before
-    live execution. The field is verified to exist; its enforcement is not.
-    Until a live rejection is observed, live transmission is refused here —
-    one chokepoint, so no adapter can quietly opt out.
+    live execution. The field is verified to exist. Enforcement is per venue.
+
+    ``venue="kalshi"`` consults ``KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED``,
+    which defaults False. The Kalshi quote manager passes that venue.
+    Every other caller, including Polymarket US, consults
+    ``MAKER_ONLY_ENFORCEMENT_VERIFIED``, which also defaults False.
+    Enabling the Kalshi switch does not unblock those callers.
 
     Paper mode never reaches this: it sends nothing.
     """
     if not MAKER_ONLY_FIELD_VERIFIED:
         raise LiveExecutionBlocked(
             f"{MAKER_ONLY_FIELD} is not verified against the venue schema")
+    if venue == "kalshi":
+        if not KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED:
+            raise LiveExecutionBlocked(
+                "LIVE EXECUTION BLOCKED for Kalshi: post_only was observed "
+                "on the demo exchange (2026-09-30, see "
+                f"{KALSHI_POST_ONLY_EVIDENCE}) but "
+                "KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED is still False. "
+                "Call enable_kalshi_maker_only_enforcement with "
+                f"{KALSHI_POST_ONLY_ACK!r} to acknowledge that evidence. "
+                "That call does not allow the production host.")
+        return
     if not MAKER_ONLY_ENFORCEMENT_VERIFIED:
         raise LiveExecutionBlocked(
             f"LIVE EXECUTION BLOCKED: `{MAKER_ONLY_FIELD}` exists in "
@@ -239,6 +290,50 @@ def require_live_execution_allowed() -> None:
             "transit. Observe a real post_only rejection, record it in "
             f"{MAKER_ONLY_SPEC_EVIDENCE}, then set "
             "MAKER_ONLY_ENFORCEMENT_VERIFIED = True.")
+
+
+# Create Order (V2). Legacy POST /portfolio/orders is deprecated no earlier
+# than 6 May 2026 (OpenAPI 3.32.0, fetched 2026-10-01).
+V2_CREATE_PATH = "/portfolio/events/orders"
+
+
+def to_event_order_v2(body: dict, *, order_group_id: Optional[str] = None) -> dict:
+    """Translate a maker-safe legacy body into a Create Order (V2) body.
+
+    V2 quotes the YES book only (docs: BookSide). A YES buy at p cents is
+    ``side=bid``, ``price=p/100``. A NO buy at q cents is economically a YES
+    sell at ``1 - q/100``, so ``side=ask``. ``count`` and ``price`` are
+    fixed-point strings. ``time_in_force`` and ``self_trade_prevention_type``
+    are required. ``post_only`` stays set. ``taker_at_cross`` cancels our
+    incoming order if it would trade against our own resting order, which is
+    the STP mode that does not pull the quote we are trying to keep.
+    """
+    assert_maker_safe(body)
+    side = body["side"]
+    if side == "yes":
+        book_side = "bid"
+        dollars = int(body["yes_price"]) / CONTRACT_CENTS
+    elif side == "no":
+        book_side = "ask"
+        dollars = (CONTRACT_CENTS - int(body["no_price"])) / CONTRACT_CENTS
+    else:
+        raise MakerSafetyError(f"invalid side {side!r}")
+    tif = body.get("time_in_force") or "good_till_canceled"
+    if tif not in TIME_IN_FORCE_VALUES:
+        raise MakerSafetyError(f"time_in_force {tif!r} is not a V2 value")
+    out = {
+        "ticker": body["ticker"],
+        "client_order_id": body["client_order_id"],
+        "side": book_side,
+        "count": f"{float(body['count']):.2f}",
+        "price": f"{dollars:.4f}",
+        "time_in_force": tif,
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": True,
+    }
+    if order_group_id:
+        out["order_group_id"] = order_group_id
+    return out
 
 
 def assert_maker_safe(body: dict) -> None:

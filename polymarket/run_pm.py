@@ -42,8 +42,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 _load_dotenv_simple(str(PROJECT_ROOT / ".env"))
 
 from polymarket_us import PolymarketUS
+from execution.pm_book_gate import quote_book
 from execution.pm_quote_manager import PMQuoteManager, QuoteTarget
-from execution.pm_ws import PMBookStream, book_age_sec
+from execution.pm_ws import PMBookStream
 from engine.rewards_schedule import expected_daily_reward
 from config import settings
 
@@ -184,20 +185,27 @@ class Runner:
         scored.sort(key=lambda x: -x[2]["expected_usd"])
         return scored[:self.top_n]
 
-    def _ws_overlay(self, slug: str, rest_book: dict) -> tuple[dict, str]:
-        """Prefer fresh WS book, fall back to REST. Returns (book, source)."""
-        ws_book = self.ws_stream.books.get(slug)
-        if ws_book and book_age_sec(ws_book) <= settings.STALE_DATA_PULL_SECONDS:
-            ws_bid = ws_book.best_yes_bid()
-            ws_ask = ws_book.best_yes_ask()
-            if ws_bid is not None and ws_ask is not None:
-                merged = dict(rest_book)
-                merged["best_bid"] = ws_bid
-                merged["best_ask"] = ws_ask
-                merged["top_bid_size"] = ws_book.top_bid_size()
-                merged["top_ask_size"] = ws_book.top_ask_size()
-                return merged, f"ws({book_age_sec(ws_book):.1f}s)"
-        return rest_book, "rest"
+    def _ws_overlay(self, slug: str, rest_book: dict) -> tuple[dict | None, str]:
+        """Quote from the websocket book only. A REST book is a pull."""
+        ws = self.ws_stream.books.get(slug)
+        ws_view = None
+        updated = None
+        if ws is not None:
+            updated = ws.last_update or None
+            bid, ask = ws.best_yes_bid(), ws.best_yes_ask()
+            if bid is not None and ask is not None:
+                ws_view = {
+                    "best_bid": bid,
+                    "best_ask": ask,
+                    "top_bid_size": ws.top_bid_size(),
+                    "top_ask_size": ws.top_ask_size(),
+                }
+        book, decision = quote_book(
+            ws_book=ws_view, ws_updated_at=updated, rest_book=rest_book, now=time.time(),
+        )
+        if decision != "quote" or book is None:
+            return None, "pull"
+        return book, f"ws({book['age_s']:.2f}s)"
 
     def build_target(self, market: dict, book: dict) -> tuple[QuoteTarget | None, str]:
         """Build at-best two-sided quote target.
@@ -210,8 +218,11 @@ class Runner:
         Returns (target_or_None, reason). reason is "ok" or rejection cause.
         """
         slug = market["slug"]
-        # WS-first pricing with REST fallback (audit fix #1: stale-book guard)
+        # Websocket only. The signed REST book is a Cloudflare cache
+        # (live check 2026-10-01) and is not a quote.
         book, src = self._ws_overlay(slug, book)
+        if book is None:
+            return None, src
         yes_bid = book.get("best_bid")
         yes_ask = book.get("best_ask")
         if yes_bid is None or yes_ask is None:
@@ -275,6 +286,9 @@ class Runner:
             quantity=qty,
             yes_qty_override=yes_qty_override,
             no_qty_override=no_qty_override,
+            ws_bid=float(yes_bid),
+            ws_ask=float(yes_ask),
+            ws_age_s=float(book.get("age_s") or 0.0),
         ), f"ok({src})"
 
     def _check_circuit_breaker(self) -> bool:

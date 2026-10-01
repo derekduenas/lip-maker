@@ -36,6 +36,11 @@ class QuoteTarget:
     # and yes_qty_override < qty to absorb shorts and bleed off the long.
     yes_qty_override: Optional[int] = None
     no_qty_override:  Optional[int] = None
+    # Websocket book this target was priced from. Live placement refuses
+    # a target that does not carry a fresh one.
+    ws_bid:   Optional[float] = None
+    ws_ask:   Optional[float] = None
+    ws_age_s: Optional[float] = None
 
 
 @dataclass
@@ -130,46 +135,41 @@ class PMQuoteManager:
             return {"error": str(e)}
 
     def _virtual_post_only_check(self, slug: str, intent: str,
-                                  price: float) -> tuple[bool, str]:
-        """NEXUS-OMNI V4 D1: pre-flight book check ('Virtual Post-Only').
-        PM US SDK doesn't expose post_only flag. We approximate by fetching
-        live BBO and aborting if our quote would cross. Returns (ok, reason).
+                                  price: float, *,
+                                  ws_bid: float | None = None,
+                                  ws_ask: float | None = None,
+                                  ws_age_s: float | None = None) -> tuple[bool, str]:
+        """Abort a live place that would cross the websocket book.
 
-        Logic:
-          BUY_LONG (buy YES) at $X — abort if best YES ask <= $X (we'd cross
-            into the ask = pay taker fee, no rebate).
-          BUY_SHORT (buy NO) at $Y on PM = sell YES at (1-Y).
-            sell YES at (1-Y) — abort if best YES bid >= (1-Y) (we'd cross).
+        The signed REST book is a Cloudflare cache and is not consulted.
+        A missing or old websocket book is a pull, not a permission to send.
         """
-        try:
-            r = self.client.markets.bbo(slug)
-            md = r.get("marketData", {}) if isinstance(r, dict) else {}
-            best_bid = md.get("bestBid", {}).get("value")
-            best_ask = md.get("bestAsk", {}).get("value")
-            if best_bid is None or best_ask is None:
-                return True, "no bbo (allow)"
-            best_bid = float(best_bid)
-            best_ask = float(best_ask)
-            if "BUY_LONG" in intent:
-                # Buying YES: abort if our bid >= best ask (would cross)
-                if price >= best_ask:
-                    return False, f"shielded: BUY_LONG ${price:.3f} >= best_ask ${best_ask:.3f}"
-            elif "BUY_SHORT" in intent:
-                # Selling YES at (1-our_no_price): abort if best_bid >= our YES sell price
-                yes_sell_price = 1.0 - price
-                if best_bid >= yes_sell_price:
-                    return False, f"shielded: BUY_SHORT yes_sell ${yes_sell_price:.3f} <= best_bid ${best_bid:.3f}"
-            return True, "ok"
-        except Exception as e:
-            # Don't block on infra issue; trust the cycle's already-fetched book
-            return True, f"shield-skip ({str(e)[:40]})"
+        from execution.pm_book_gate import ws_book_is_quotable
+
+        if ws_bid is None or ws_ask is None or not ws_book_is_quotable(ws_age_s):
+            return False, "pull: no fresh websocket book"
+        if "BUY_LONG" in intent and price >= float(ws_ask):
+            return False, f"shielded: BUY_LONG ${price:.3f} >= best_ask ${float(ws_ask):.3f}"
+        if "BUY_SHORT" in intent:
+            yes_sell_price = 1.0 - price
+            if float(ws_bid) >= yes_sell_price:
+                return False, (
+                    f"shielded: BUY_SHORT yes_sell ${yes_sell_price:.3f} "
+                    f"<= best_bid ${float(ws_bid):.3f}"
+                )
+        return True, "ok"
 
     def _place_order(self, slug: str, intent: str,
-                     price: float, quantity: int) -> Optional[RestingOrder]:
+                     price: float, quantity: int, *,
+                     ws_bid: float | None = None,
+                     ws_ask: float | None = None,
+                     ws_age_s: float | None = None) -> Optional[RestingOrder]:
         """Place one order. Paper mode → preview. Live mode → create."""
-        # NEXUS-OMNI V4 D1: virtual post-only — abort if would cross
+        # A live place needs the websocket book. REST is not a substitute.
         if not self.paper:
-            ok, reason = self._virtual_post_only_check(slug, intent, price)
+            ok, reason = self._virtual_post_only_check(
+                slug, intent, price, ws_bid=ws_bid, ws_ask=ws_ask, ws_age_s=ws_age_s,
+            )
             if not ok:
                 _log.info(f"[SHIELD] {slug[:40]} {intent} @${price:.3f} → {reason}")
                 return None
@@ -281,7 +281,9 @@ class PMQuoteManager:
                     if self._cancel_order(existing_yes):
                         actions["cancelled"] += 1
                 if self._place_order(target.slug, "ORDER_INTENT_BUY_LONG",
-                                     target.yes_price, yes_qty):
+                                     target.yes_price, yes_qty,
+                                     ws_bid=target.ws_bid, ws_ask=target.ws_ask,
+                                     ws_age_s=target.ws_age_s):
                     actions["placed"] += 1
             else:
                 actions["kept"] += 1
@@ -302,7 +304,9 @@ class PMQuoteManager:
                     if self._cancel_order(existing_no):
                         actions["cancelled"] += 1
                 if self._place_order(target.slug, "ORDER_INTENT_BUY_SHORT",
-                                     target.no_price, no_qty):
+                                     target.no_price, no_qty,
+                                     ws_bid=target.ws_bid, ws_ask=target.ws_ask,
+                                     ws_age_s=target.ws_age_s):
                     actions["placed"] += 1
             else:
                 actions["kept"] += 1
