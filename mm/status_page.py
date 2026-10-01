@@ -16,7 +16,7 @@ LIVE_STATUS_FIELDS = (
     "cap_skips_n", "cap_skips", "rank_skips_n",
     "estimated_raw_usd", "estimated_usd_note", "accrual_seconds",
     "buckets", "durable_reserve",
-    "fills_detail", "markouts", "policy_skips", "pulls", "repegs_n", "skew", "recorder", "pmus", "fair_value", "select_ms", "size_ladder",
+    "fills_detail", "markouts", "policy_skips", "pulls", "repegs_n", "skew", "recorder", "pmus", "venues", "fair_value", "select_ms", "size_ladder",
 )
 
 

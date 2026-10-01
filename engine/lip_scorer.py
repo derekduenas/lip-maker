@@ -51,6 +51,15 @@ class ProgramParams:
     # to [start_ts, end_ts): nothing is earned outside the window.
     start_ts: Optional[float] = None
     end_ts:   Optional[float] = None
+    # Patch 21: venue rule set. "kalshi" (default) = Help Center article
+    # 13823851 (reference at Target/5, both sides must reach Target).
+    # "pmus" = Polymarket US LIP, https://docs.polymarket.us/incentives/liquidity
+    # (ticks from each side's BEST price, sides independent unless maxSpread).
+    rules: str = "kalshi"
+    # PM US only: timePeriods[].maxSpread, a HALF-width in dollars (0.035 =
+    # 3.5c from the mid of the two size-adjusted prices); None = no Max Spread.
+    # https://docs.polymarket.us/api-reference/incentives/overview ("Reading maxSpread")
+    max_spread_usd: Optional[float] = None
 
     @property
     def pool_rate_usd_per_sec(self) -> float:
@@ -131,6 +140,8 @@ def score_snapshot(
     Returns SnapshotScore with our normalized shares per side + total.
     If the snapshot is invalid (either side fails TargetSize), our_total_score = 0.
     """
+    if getattr(params, "rules", "kalshi") == "pmus":
+        return score_snapshot_pmus(book, ours, params)
     target = params.target_size
     df = params.discount_factor
 
@@ -171,6 +182,61 @@ def score_snapshot(
         result.our_no_normalized = our_no / total_no
     result.no_total_qualifying_score = total_no
 
+    result.our_total_score = result.our_yes_normalized + result.our_no_normalized
+    return result
+
+
+def score_snapshot_pmus(book: BookState, ours: OurQuotes, params: ProgramParams) -> SnapshotScore:
+    """Polymarket US LIP snapshot (Patch 21), on a Kalshi-shaped book.
+
+    The PM US book is one instrument with bids and offers. It is mapped to
+    yes_bids = PM bids and no_bids = 100 - PM offers (cents), so "ticks from
+    the best offer" == "ticks from the best NO bid" on a 1c grid.
+    Rules (https://docs.polymarket.us/incentives/liquidity, retrieved 2026-10-01):
+    - Score = DF ** (ticks from that side's BEST price) x size ("How does
+      scoring work?"). Reference is the best price, NOT Target/5 (Kalshi).
+    - Walk from the best price outward one whole level at a time until raw
+      cumulative size reaches Target Size; orders through that level score,
+      deeper orders do not ("How does Target Size work?").
+    - Each side normalised to 1.0 per snapshot if Target is met on that side
+      ("How are snapshots weighted?").
+    - No Max Spread: sides are scored independently; a side that reaches
+      Target pays even if the other side does not.
+    - Max Spread (half-width, dollars): both sides must reach Target and the
+      two size-adjusted prices may be at most 2 x maxSpread apart (equality
+      passes), else nobody is paid ("What is Max Spread?").
+    ASSUMPTION (docs silent, conservative): a second's pool (rewardPool /
+    period seconds) is split 50/50 between the bid side and the ask side;
+    a side that does not qualify forfeits its half (not re-allocated).
+    snapshot_share() = (our_yes_norm + our_no_norm) / 2 encodes this.
+    """
+    target = params.target_size
+    df = params.discount_factor
+    yes_cut = _find_cutoff_price(book.yes_bids, target)
+    no_cut = _find_cutoff_price(book.no_bids, target)
+    yq, nq = yes_cut is not None, no_cut is not None
+    ms = getattr(params, "max_spread_usd", None)
+    if ms is not None:
+        ok = yq and nq and ((100 - no_cut) - yes_cut) <= 2.0 * float(ms) * 100.0 + 1e-9
+        pay_yes = pay_no = ok
+    else:
+        pay_yes, pay_no = yq, nq
+    result = SnapshotScore(
+        market_ticker=book.market_ticker, snapshot_valid=bool(pay_yes or pay_no),
+        yes_qualified=bool(pay_yes), no_qualified=bool(pay_no),
+        our_yes_normalized=0.0, our_no_normalized=0.0, our_total_score=0.0,
+        yes_cutoff_price=yes_cut, no_cutoff_price=no_cut,
+    )
+    if pay_yes and book.yes_bids:
+        ref = max(level.price_cents for level in book.yes_bids)
+        o, t = _score_bids(book.yes_bids, ours.yes_bids, ref, df, yes_cut)
+        result.our_yes_normalized = o / t if t > 0 else 0.0
+        result.yes_total_qualifying_score = t
+    if pay_no and book.no_bids:
+        ref = max(level.price_cents for level in book.no_bids)
+        o, t = _score_bids(book.no_bids, ours.no_bids, ref, df, no_cut)
+        result.our_no_normalized = o / t if t > 0 else 0.0
+        result.no_total_qualifying_score = t
     result.our_total_score = result.our_yes_normalized + result.our_no_normalized
     return result
 

@@ -283,7 +283,10 @@ class SecondAccrual:
         self.book = ScoringBook(params.market_ticker)
         self.resting: list[RestingOrder] = []
         self.marks: list[SecondMark] = []
-        self.rule = rule_version(params.start_ts)
+        # Patch 21: PM US programs use the PM US rule set (docs retrieved
+        # 2026-10-01); the Kalshi 30-July-2026 dating does not apply.
+        self.rule = (RULE_CURRENT if getattr(params, "rules", "kalshi") == "pmus"
+                     else rule_version(params.start_ts))
         self._next: Optional[int] = None
         self._gens: list[int] = []
         self.late_messages = 0

@@ -1,35 +1,77 @@
-"""Patch 20: Polymarket US paper maker venue (read-only data, PAPER ONLY).
+"""Patch 21: Polymarket US on the SAME engine as Kalshi (PAPER ONLY).
 
-What it does (background thread ``lip-pmus``, off unless LIP_PMUS_PAPER_ENABLE=1):
-1. Every LIP_PMUS_REFRESH_S (900 s) pulls active liquidity programs from the
-   PUBLIC gateway ``GET https://gateway.polymarket.us/v1/incentives`` (no key),
-   paged up to LIP_PMUS_MAX_PAGES (20 x 100 markets).
-2. Per market: effective pool = rewardPool / members of the same programId
-   (the gateway repeats one pool on every member; conservative split), rate =
-   effective pool / period seconds. Periods allowed: LIP_PMUS_PERIODS
-   (default ``daily_event,early,pre_day``; ``day_of``/``live`` single-game
-   sports are excluded by default for the same adverse-selection reason the
-   Kalshi side drops single-game sports).
-3. Top LIP_PMUS_CANDIDATES (30) by rate get a public book
-   ``GET /v1/markets/{slug}/book``. A paper quote joins the best bid (buy YES)
-   and the best offer (buy NO at 1 - offer), never crossing. Size is picked
-   from LIP_PMUS_SIZES to maximise expected (reward + maker rebate) per $ under
-   the caps; scoring uses polymarket.engine.pm_us_lip_scorer (official LIP
-   formula: DF^ticks from best x size, walk to Target Size, optional Max Spread).
-4. Unified risk: PM capital <= min(LIP_PMUS_BUDGET_USD (300),
-   gross_cap x alloc fraction - the full Kalshi allocation budget), so Kalshi +
-   PM can never exceed the shared gross cap; per-market LIP_PMUS_MARKET_CAP_USD
-   (100); unpaired inventory caps reuse LIP_MARKET_INV_CAP_USD ($25) and
-   LIP_EVENT_INV_CAP_USD ($75) and block the side that adds.
-5. Fills (pessimistic, book polling only, no trade tape): a side is filled in
-   full at our price only when the book trades THROUGH it between polls (best
-   offer <= our bid, or best bid >= our offer). Maker rebate 0.0125*C*p*(1-p).
-   Markout = MTM vs current mid. Rewards accrue left-Riemann between polls
-   (gaps > 120 s are not credited).
+Patch 20 ran PM US as a separate, simpler side module. Patch 21 replaces it
+with a *feed* for the production ``RunLoop``: PM US programs and books are
+translated into the loop's frames, so PM US markets go through the same
+selector (net $/day per $ capital, competition-aware share, durable/short
+buckets, 48 h min-to-close, event window, sports policy), size ladder
+allocator, re-peg, fast-move pull, cross guard, inventory skew, unpaired
+caps, fill log + markouts, status, recorder, and the RiskEngine's unified
+cross-venue caps. Only the reward rules differ (``ProgramParams.rules ==
+"pmus"`` in engine/lip_scorer.py, reward-optimal rung in
+mm/selector.pmus_side_rung).
 
-Order endpoints are HARD-DISABLED: the only HTTP client here is GET-only with
-a path allowlist (incentives, market book/bbo, market by slug). There is no
-code path to POST/DELETE anything, and no API key is loaded or needed.
+Venue mapping. A PM US market is one instrument with bids and offers
+(https://docs.polymarket.us/learn/trading/basics/buying-yes-vs-selling-no).
+It is mapped onto the Kalshi-shaped book as yes_bids = PM bids and
+no_bids = 100c - PM offers. Resting a "NO bid" at n cents == resting a PM
+offer (sell) at 100 - n; its collateral is n cents per contract, as for a
+Kalshi NO bid. Ticker = "PMUS:<marketSlug>".
+
+Data (public gateway, no key; https://docs.polymarket.us/api-reference/introduction):
+- GET /v1/incentives (paged with page_size/page_token, ALL pages, snake_case
+  params; https://docs.polymarket.us/api-reference/incentives/overview). The
+  documented host is api.polymarket.us (auth); the public gateway serves the
+  same payload without a key (verified live 2026-10-01).
+- GET /v1/market/slug/{slug} (endDate, orderPriceMinTickSize, marketType,
+  gameStartTime, category).
+- GET /v1/markets/{slug}/book (bids/offers + stats.sharesTraded/lastTradePx).
+Streaming: the Markets WebSocket (wss://api.polymarket.us/v1/ws/markets)
+requires API-key auth in the handshake
+(https://docs.polymarket.us/api-reference/websocket/markets); there is no
+public stream. So books are POLLED: quoted markets every LIP_PMUS_POLL_QUOTED_S
+(3 s), other candidates round-robin, all GETs through one limiter at
+LIP_PMUS_MAX_RPS (8/s; the public limit is 20 req/s per IP,
+https://docs.polymarket.us/api-reference/rate-limits).
+
+Reward rules used (https://docs.polymarket.us/incentives/liquidity):
+- Periods (FAQ "What do the time periods mean?"): early/pre-game until 6 h
+  before the event; day_of from 6 h before until start; live from start to
+  settlement; daily_event midnight-to-midnight ET.
+- rewardPool = "Total reward pool for this period in USD" on each market's
+  TimePeriod (https://docs.polymarket.us/api-reference/incentives/overview).
+  ASSUMPTION (docs do not say whether a programId's pool is shared across
+  the markets carrying it): the pool is PER MARKET. Evidence: the API groups
+  periods by market; one programId (e.g. nfl_team_props_day_of_20261001)
+  repeats the same rewardPool ($140) on 3,063 markets, which would be
+  $0.05/market if shared; the docs' earnings example pays $1,828.62 for one
+  market-day. LIP_PMUS_POOL_SPLIT=members restores the Patch 20 split.
+- daily_event with no `end` ("Ongoing programs omit end"): window = the
+  current ET day clipped to `start`; ASSUMPTION (conservative): the pool is
+  spread over the FULL ET day (rate = pool / 86400 s) even if the period
+  started mid-day.
+- Missing `end` on other periods: early -> eventStartTime - 6 h, day_of ->
+  eventStartTime, live -> market endDate (longer window = lower rate).
+Policy (same as Kalshi): day_of/live periods are single-event windows; they
+are excluded (sports_match for sports/uncategorised, event_window otherwise:
+the Kalshi engine pulls 6 h before an event and never quotes in-play).
+Other periods are screened with the Kalshi exclusion_reason (48 h min to
+close, sports short-dated, long-dated). Sub-cent tick markets are excluded
+(the engine's book/scorer is a 1c grid).
+
+Fills (no public trade tape): from book polls only.
+- A polled book that crosses our paper price (best offer <= our bid, or
+  best bid >= our offer) is filled by RunLoop's paper cross-fill (the same
+  rule now applies to Kalshi books, see RunLoop._paper_cross_fill).
+- An increase in stats.sharesTraded is one print of that many contracts at
+  stats.lastTradePx; the taker side is inferred from the previous poll's
+  best bid/offer (at/below best bid = seller, at/above best offer = buyer),
+  else skipped. The production PaperFillSimulator queue model applies.
+
+ORDER ENDPOINTS ARE HARD-DISABLED: the only HTTP client here is GET-only
+with a path allowlist (incentives, market book/bbo, market by slug) and any
+path containing "order" is refused (PMUSOrderBlocked). No API key is loaded.
+RunLoop additionally refuses any non-paper action on a pmus market.
 """
 from __future__ import annotations
 
@@ -40,17 +82,18 @@ import re
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 _log = logging.getLogger("lip.pmus")
 GATEWAY = "https://gateway.polymarket.us"
+PREFIX = "PMUS:"
 _ALLOWED = (
     re.compile(r"^/v1/incentives(\?[A-Za-z0-9_=&.\-%]*)?$"),
     re.compile(r"^/v1/markets/[A-Za-z0-9_.\-]+/(book|bbo)$"),
     re.compile(r"^/v1/market/slug/[A-Za-z0-9_.\-]+$"),
 )
-PERIOD_DEFAULT_S = {"live": 4 * 3600.0, "day_of": 6 * 3600.0, "daily_event": 86400.0,
-                    "early": 86400.0, "pre_day": 86400.0}
+DAY_OF_S = 6 * 3600.0
+SPORTS_CATEGORIES = {"spr", "sports", "sport", "esports"}
 
 
 class PMUSOrderBlocked(RuntimeError):
@@ -87,6 +130,10 @@ def _ts(s) -> float | None:
     if not s:
         return None
     txt = str(s).strip().replace("Z", "+00:00")
+    m = re.match(r"^(.*T\d\d:\d\d:\d\d)(\.\d+)?(.*)$", txt)
+    if m:  # nanosecond fractions -> microseconds (fromisoformat limit)
+        frac = (m.group(2) or "")[:7]
+        txt = m.group(1) + frac + m.group(3)
     if re.search(r"[+-]\d\d$", txt):
         txt += ":00"
     try:
@@ -94,37 +141,55 @@ def _ts(s) -> float | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        from datetime import timezone
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
 
 
-DAY_OF_S = 6 * 3600.0
+def et_day_bounds(now: float) -> tuple[float, float]:
+    """[midnight, next midnight) America/New_York containing ``now`` (DST-aware)."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("America/New_York")
+    d = datetime.fromtimestamp(now, tz).date()
+    start = datetime(d.year, d.month, d.day, tzinfo=tz)
+    nxt = d + timedelta(days=1)
+    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=tz)
+    return start.timestamp(), end.timestamp()
 
 
-def period_open(period: str, now: float, start: float | None, end: float | None,
-                event_ts: float | None) -> bool:
-    """Is this LIP time period paying right now? (docs: early/pre-game until
-    6 h before the event, day-of from 6 h before until start, live from start
-    until settlement, daily_event midnight-to-midnight ET)."""
-    if start is not None and now < start:
-        return False
-    if end is not None and now >= end:
-        return False
-    if event_ts is None or period == "daily_event":
-        return True
-    if period == "live":
-        return now >= event_ts
-    if period == "day_of":
-        return event_ts - DAY_OF_S <= now < event_ts
-    if period in ("early", "pre_day"):
-        return now < event_ts - DAY_OF_S
-    return True
+def program_window(tp: dict, event_ts: float | None, close_ts: float | None,
+                   now: float) -> tuple[float, float, float] | None:
+    """(window start, window end, pool seconds) for the period paying at ``now``, else None."""
+    period = str(tp.get("period") or "")
+    start, end = _ts(tp.get("start")), _ts(tp.get("end"))
+    if period == "daily_event":
+        d0, d1 = et_day_bounds(now)
+        ws = max(d0, start) if start is not None else d0
+        we = min(d1, end) if end is not None else d1
+        pool_s = d1 - d0
+    else:
+        if period in ("early", "pre_day", "pre_game"):
+            ws = start
+            we = end if end is not None else (event_ts - DAY_OF_S if event_ts else close_ts)
+        elif period == "day_of":
+            ws = start if start is not None else (event_ts - DAY_OF_S if event_ts else None)
+            we = end if end is not None else event_ts
+        elif period == "live":
+            ws = start if start is not None else event_ts
+            we = end if end is not None else close_ts
+        else:
+            ws, we = start, (end if end is not None else close_ts)
+        if ws is None or we is None:
+            return None
+        pool_s = we - ws
+    if ws is None or we is None or we <= ws or pool_s <= 0 or not (ws <= now < we):
+        return None
+    return ws, we, pool_s
 
 
 def infer_tick(book: dict) -> float:
     """Tick from displayed prices (0.01, 0.005 or 0.001)."""
     pxs = [p for p, _s in book.get("bids", [])] + [p for p, _s in book.get("offers", [])]
+
     def on(t):
         return all(abs(p / t - round(p / t)) < 1e-6 for p in pxs)
     for t in (0.01, 0.005):
@@ -135,6 +200,7 @@ def infer_tick(book: dict) -> float:
 
 def parse_book(payload: dict) -> dict:
     md = payload.get("marketData") or payload
+
     def lv(rows):
         out = []
         for r in rows or []:
@@ -145,268 +211,331 @@ def parse_book(payload: dict) -> dict:
         return out
     bids = sorted(lv(md.get("bids")), key=lambda x: -x[0])
     offers = sorted(lv(md.get("offers")), key=lambda x: x[0])
-    return {"bids": bids, "offers": offers, "state": md.get("state")}
+    stats = md.get("stats") or {}
+    last = (stats.get("lastTradePx") or {}).get("value")
+    try:
+        traded = float(stats.get("sharesTraded")) if stats.get("sharesTraded") is not None else None
+    except (TypeError, ValueError):
+        traded = None
+    try:
+        last = float(last) if last is not None else None
+    except (TypeError, ValueError):
+        last = None
+    return {"bids": bids, "offers": offers, "state": md.get("state"),
+            "shares_traded": traded, "last_px": last}
 
 
-def programs_from_incentives(records: list, *, now: float, periods: set) -> list:
-    """Flatten gateway records -> one row per (market, active liquidity period)."""
-    rows, members = [], {}
+def book_frame(slug: str, book: dict, ts: float) -> dict:
+    """PM US book -> Kalshi-shaped orderbook_snapshot frame for RunLoop."""
+    yes = [[f"{p:.4f}", f"{q:.4f}"] for p, q in book["bids"] if q > 0]
+    no = [[f"{1.0 - p:.4f}", f"{q:.4f}"] for p, q in book["offers"] if q > 0]
+    return {"type": "orderbook_snapshot", "ts": ts, "sid": None, "seq": None, "venue": "pmus",
+            "msg": {"market_ticker": PREFIX + slug, "yes_dollars_fp": yes, "no_dollars_fp": no}}
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def synth_trades(slug: str, prev: dict | None, book: dict, ts: float) -> list[dict]:
+    """Trade-print frames from one poll: an increase in stats.sharesTraded is
+    one print of that size at stats.lastTradePx, taker side inferred from the
+    previous poll's touch (else skipped). A book that crosses our paper quote
+    is filled by RunLoop's paper cross-fill (venue-neutral), not here."""
+    out = []
+    ticker = PREFIX + slug
+    if prev and prev.get("shares_traded") is not None and book.get("shares_traded") is not None \
+            and book["shares_traded"] > prev["shares_traded"] + 1e-9 and book.get("last_px") is not None:
+        qty = book["shares_traded"] - prev["shares_traded"]
+        px = book["last_px"]
+        taker = None
+        if prev.get("bb") is not None and px <= prev["bb"] + 1e-9:
+            taker = "no"   # seller hit the bids  (our YES bid side)
+        elif prev.get("bo") is not None and px >= prev["bo"] - 1e-9:
+            taker = "yes"  # buyer lifted offers (our NO side == PM offer)
+        if taker:
+            out.append({"trade_id": f"pmus:{slug}:{book['shares_traded']:.4f}", "ticker": ticker,
+                        "count": qty, "yes_price_dollars": f"{px:.4f}", "no_price_dollars": f"{1 - px:.4f}",
+                        "taker_side": taker, "created_time": _iso(ts)})
+    return [{"type": "trade", "ts": ts, "trade": t, "venue": "pmus"} for t in out]
+
+
+def _event_slug(slug: str) -> str:
+    return slug.rsplit("-", 1)[0] if "-" in slug else slug
+
+
+def records_to_programs(records: list, meta: dict, *, now: float) -> tuple[list, dict, list]:
+    """Gateway records -> (program frames, stats, slugs needing metadata).
+
+    Same policy as the Kalshi screen (mm/unattended/screen.py): the
+    KalshiMarket probe goes through selector.exclusion_reason.
+    """
+    from mm.selector import KalshiMarket, exclusion_reason
+    from mm.unattended.screen import rank_score
+    reasons: dict = {}
+    frames, need = [], []
+    members: dict = {}
+    split = os.environ.get("LIP_PMUS_POOL_SPLIT", "market").strip().lower()
+    if split == "members":
+        for rec in records:
+            for tp in rec.get("timePeriods") or []:
+                if tp.get("programType", "liquidityProgram") == "liquidityProgram" and tp.get("status") == "active":
+                    members[tp.get("programId")] = members.get(tp.get("programId"), 0) + 1
+
+    def bump(why):
+        reasons[why] = reasons.get(why, 0) + 1
+
+    seen = set()
     for rec in records:
-        for tp in rec.get("timePeriods") or []:
-            if tp.get("programType", "liquidityProgram") != "liquidityProgram" or tp.get("status") != "active":
-                continue
-            members[tp.get("programId")] = members.get(tp.get("programId"), 0) + 1
-    for rec in records:
-        slug = rec.get("marketSlug") or ""
-        if rec.get("instrumentState") not in (None, "INSTRUMENT_STATE_OPEN"):
+        slug = str(rec.get("marketSlug") or "")
+        if not slug or slug in seen:
             continue
-        for tp in rec.get("timePeriods") or []:
+        seen.add(slug)
+        if rec.get("instrumentState") not in (None, "INSTRUMENT_STATE_OPEN"):
+            bump("instrument_not_open")
+            continue
+        m = meta.get(slug)
+        close_ts = None if m is None else m.get("close_ts")
+        event_ts = _ts(rec.get("eventStartTime"))
+        cat = str(rec.get("category") or (m or {}).get("category") or "").strip().lower()
+        active = [tp for tp in rec.get("timePeriods") or []
+                  if tp.get("programType", "liquidityProgram") == "liquidityProgram" and tp.get("status") == "active"]
+        if not active:
+            bump("no_program")
+            continue
+        if all(str(tp.get("period")) in ("day_of", "live") for tp in active):
+            # single-event windows (6 h pre-start / in-play): same policy as Kalshi
+            bump("sports_match" if (cat in SPORTS_CATEGORIES or not cat) else "event_window")
+            continue
+        best = None
+        for tp in active:
             if tp.get("programType", "liquidityProgram") != "liquidityProgram" or tp.get("status") != "active":
-                continue
-            period = str(tp.get("period") or "")
-            if periods and period not in periods:
                 continue
             try:
-                pool = float(tp["rewardPool"])
-                df = float(tp["discountFactor"])
-                target = float(tp["targetSize"])
+                pool, df, target = float(tp["rewardPool"]), float(tp["discountFactor"]), float(tp["targetSize"])
             except (KeyError, TypeError, ValueError):
                 continue
-            start, end = _ts(tp.get("start")), _ts(tp.get("end"))
-            if not period_open(period, now, start, end, _ts(rec.get("eventStartTime"))):
+            win = program_window(tp, event_ts, close_ts, now)
+            if win is None:
                 continue
-            secs = (end - start) if (start and end and end > start) else PERIOD_DEFAULT_S.get(period, 86400.0)
-            n = max(1, members.get(tp.get("programId"), 1))
-            rows.append({
-                "slug": slug, "program_id": tp.get("programId"), "period": period,
-                "pool_usd": pool, "n_markets": n, "pool_eff_usd": pool / n,
-                "period_s": secs, "rate_per_s": pool / n / secs, "df": df, "target": target,
-                "max_spread": None if tp.get("maxSpread") is None else float(tp["maxSpread"]),
-                "category": rec.get("category"), "event": slug.rsplit("-", 1)[0],
-            })
-    best = {}
-    for r in rows:  # one row per market: highest rate
-        if r["slug"] not in best or r["rate_per_s"] > best[r["slug"]]["rate_per_s"]:
-            best[r["slug"]] = r
-    return sorted(best.values(), key=lambda r: -r["rate_per_s"])
+            if split == "members":
+                pool = pool / max(1, members.get(tp.get("programId"), 1))
+            rate = pool / win[2]
+            if best is None or rate > best[0]:
+                best = (rate, tp, win, pool, df, target)
+        if best is None:
+            if m is None and any(str(tp.get("period")) not in ("daily_event",) for tp in active):
+                need.append(slug)  # window may depend on endDate
+                bump("pending_meta")
+            else:
+                bump("no_open_period")
+            continue
+        _rate, tp, (ws, we, pool_s), pool, df, target = best
+        period = str(tp.get("period"))
+        if period in ("day_of", "live"):
+            bump("sports_match" if (cat in SPORTS_CATEGORIES or not cat) else "event_window")
+            continue
+        if m is None:
+            need.append(slug)
+            bump("pending_meta")
+            continue
+        if m.get("tick") is not None and abs(float(m["tick"]) - 0.01) > 1e-9:
+            bump("subcent_tick")
+            continue
+        if not m.get("active", True) or m.get("closed"):
+            bump("market_not_active")
+            continue
+        occ = m.get("occurrence_ts")
+        eff = min(x for x in (close_ts, occ) if x is not None) if (close_ts or occ) else None
+        days = None if eff is None else max(0.0, (eff - now) / 86400.0)
+        sports = cat in SPORTS_CATEGORIES
+        single = sports and str(m.get("market_type") or "").lower() not in ("futures", "future")
+        series = PREFIX + "-".join(slug.split("-")[:2])
+        probe = KalshiMarket(
+            market=PREFIX + slug, series=series, period_reward_usd=pool, period_seconds=pool_s,
+            seconds_left=max(0.0, we - now), discount_factor=df, target_size=target,
+            days_to_settle=days, exchange_index=0, category="Sports" if sports else (cat or None),
+            venue="pmus", max_spread_usd=None if tp.get("maxSpread") is None else float(tp["maxSpread"]),
+            sports_single=single,
+        )
+        why = exclusion_reason(probe)
+        if why:
+            bump(re.sub(r"_[0-9.]+d$", "", why.split(":", 1)[0]))
+            continue
+        frame = {
+            "kind": "program", "venue": "pmus", "market": PREFIX + slug, "series": series,
+            "program_id": f"{tp.get('programId')}@{int(ws)}", "period_reward_usd": pool,
+            "period_seconds": pool_s, "discount_factor": df, "target_size": target,
+            "start_ts": ws, "end_ts": we, "close_ts": eff, "days_to_settle": days,
+            "exchange_index": 0, "category": probe.category, "days_from_close": True,
+            "occurrence_ts": occ, "event_ticker": PREFIX + _event_slug(slug),
+            "max_spread_usd": probe.max_spread_usd, "sports_single": single,
+            "fee_type": "pmus_maker_rebate", "pm_period": period,
+        }
+        rk = rank_score(frame, {"yes_bid": m.get("best_bid"), "yes_ask": m.get("best_ask")},
+                        category=probe.category, days=days)
+        frame["rank_score"] = round(rk["score"], 6)
+        frame["rank_penalty_per_day"] = round(rk["penalty"], 6)
+        frames.append(frame)
+    frames.sort(key=lambda f: -f["rank_score"])
+    top = int(_num("LIP_PMUS_CANDIDATES", 200))
+    if len(frames) > top:
+        reasons["below_candidate_top"] = len(frames) - top
+        frames = frames[:top]
+    stats = {"records": len(records), "markets": len(seen), "eligible": len(frames),
+             "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])), "ts": now,
+             "pool_split": split}
+    return frames, stats, need
 
 
-def evaluate(prog: dict, book: dict, size: float, tick: float | None = None,
-             sides: tuple = ("yes", "no")) -> dict | None:
-    """Our paper quote joining best bid / best offer at ``size``; share & $/s."""
-    from polymarket.engine.pm_us_lip_scorer import Order, score_snapshot
-    if not book["bids"] or not book["offers"]:
-        return None
-    tick = tick or infer_tick(book)
-    bb, bo = book["bids"][0][0], book["offers"][0][0]
-    if bo - bb < tick - 1e-9:
-        return None  # locked/crossed: joining would take
-    bid_px, ask_px = bb, bo
-    bids = [Order(p, s) for p, s in book["bids"]] + ([Order(bid_px, size, ours=True)] if "yes" in sides else [])
-    asks = [Order(p, s) for p, s in book["offers"]] + ([Order(ask_px, size, ours=True)] if "no" in sides else [])
-    snap = score_snapshot(bids, asks, tick=tick, discount_factor=prog["df"],
-                          target_size=prog["target"], max_spread_usd=prog["max_spread"])
-    share = snap.our_share
-    capital = (size * bid_px if "yes" in sides else 0.0) + (size * (1.0 - ask_px) if "no" in sides else 0.0)
-    return {"bid_px": bid_px, "ask_px": ask_px, "size": size, "share": share,
-            "paid": snap.paid, "reason": snap.reason, "capital": capital,
-            "usd_per_s": share * prog["rate_per_s"],
-            "mid": (bb + bo) / 2.0}
+def market_meta(payload: dict, now: float) -> dict:
+    mk = payload.get("market") or payload
+    game = _ts(mk.get("gameStartTime"))
+    mtype = str(mk.get("marketType") or mk.get("sportsMarketType") or "")
+    try:
+        tick = float(mk.get("orderPriceMinTickSize")) if mk.get("orderPriceMinTickSize") is not None else None
+    except (TypeError, ValueError):
+        tick = None
+
+    def q(name):
+        try:
+            return float((mk.get(name) or {}).get("value"))
+        except (TypeError, ValueError, AttributeError):
+            return None
+    return {"close_ts": _ts(mk.get("endDate")), "tick": tick, "market_type": mtype,
+            "category": mk.get("category"), "active": bool(mk.get("active", True)),
+            "closed": bool(mk.get("closed", False)),
+            # futures have no fixed start (docs: daily_event "an event without a fixed start")
+            "occurrence_ts": None if mtype.lower() in ("futures", "future") else game,
+            "best_bid": q("bestBidQuote"), "best_ask": q("bestAskQuote"), "fetched": now}
 
 
-class PMUSPaperVenue:
-    def __init__(self, *, kalshi_loop=None, fetch=None, clock=time.time) -> None:
-        self.kalshi_loop = kalshi_loop
+class PMUSFeed:
+    """Background poller (thread ``lip-pmus``) that feeds PM US frames to RunLoop.ext_queue."""
+
+    def __init__(self, loop, *, fetch=None, clock=time.time, sleep=None) -> None:
+        self.loop = loop
         self.fetch = fetch or http_get
         self.clock = clock
-        self.programs: list = []
-        self.quotes: dict = {}     # slug -> quote dict
-        self.position: dict = {}   # slug -> {"yes","no","yes_cost","no_cost","event"}
-        self.fills: list = []
-        self.reward_usd = 0.0
-        self.rebate_usd = 0.0
-        self.stats = {"refreshes": 0, "gets": 0, "errors": 0, "polls": 0, "last_refresh": None,
-                      "records": 0, "blocked_writes": 0, "last_error": None}
-        self.started_ts = clock()
-        self._books: dict = {}
-        self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._thread = None
+        self._sleep = sleep or (lambda s: self._stop.wait(s))
+        self.meta: dict = {}
+        self.fed: dict = {}       # market -> program_id fed
+        self.cands: list = []     # slugs being polled
+        self.prev: dict = {}      # slug -> last poll state
+        self._next_poll: dict = {}
+        self._last_get = 0.0
+        self._rr = 0
+        self.stats = {"refreshes": 0, "pages": 0, "records": 0, "gets": 0, "errors": 0, "http_429": 0,
+                      "book_polls": 0, "trades_synth": 0, "blocked_writes": 0, "last_error": None,
+                      "last_refresh": None, "last_book_ts": None, "refresh_s": None, "eligible": 0}
+        self.screen: dict = {}
+        self.started_ts = clock()
 
-    # ---------------------------------------------------------------- caps
-    def headroom_usd(self) -> float:
-        budget = _num("LIP_PMUS_BUDGET_USD", 300.0)
-        loop = self.kalshi_loop
-        if loop is not None:
-            try:
-                from mm.unattended.loop import alloc_cap_fraction
-                lim = loop.risk.limits
-                gross = float(lim.gross_usd) * alloc_cap_fraction()
-                kal = max(float(loop.alloc_budget_usd or 0.0),
-                          float(sum(float(v) for v in list(loop.committed.values()))))
-                budget = min(budget, max(0.0, gross - kal))
-            except Exception:
-                pass
-        return budget
-
-    def _unpaired_usd(self, slug: str) -> float:
-        p = self.position.get(slug)
-        if not p:
-            return 0.0
-        out = 0.0
-        for side, other in (("yes", "no"), ("no", "yes")):
-            extra = p[side] - p[other]
-            if extra > 0 and p[side] > 0:
-                out += extra * p[f"{side}_cost"] / p[side]
-        return out
-
-    def side_blocked(self, slug: str, side: str, event: str) -> str:
-        p = self.position.get(slug) or {"yes": 0.0, "no": 0.0}
-        other = "no" if side == "yes" else "yes"
-        adds = p.get(side, 0.0) - p.get(other, 0.0) >= 0
-        cap_m = _num("LIP_MARKET_INV_CAP_USD", 25.0)
-        if adds and p.get(side, 0.0) > p.get(other, 0.0) and self._unpaired_usd(slug) >= cap_m:
-            return "market_inventory"
-        cap_e = _num("LIP_EVENT_INV_CAP_USD", 75.0)
-        held = sum(self._unpaired_usd(s) for s, q in self.position.items() if q.get("event") == event)
-        if adds and held >= cap_e:
-            return "event_inventory"
-        return ""
-
-    # ------------------------------------------------------------- network
+    # ---------------------------------------------------------------- http
     def _get(self, path: str) -> dict:
+        gap = 1.0 / max(0.5, _num("LIP_PMUS_MAX_RPS", 8.0))
+        wait = self._last_get + gap - self.clock()
+        if wait > 0:
+            self._sleep(wait)
+        self._last_get = self.clock()
         self.stats["gets"] += 1
-        return self.fetch(path)
+        try:
+            return self.fetch(path)
+        except PMUSOrderBlocked:
+            self.stats["blocked_writes"] += 1
+            raise
+        except Exception as exc:
+            if getattr(exc, "code", None) == 429:
+                self.stats["http_429"] += 1
+                self._sleep(2.0)  # docs: stop, wait >= 1 s, back off
+            raise
 
-    def refresh_programs(self) -> None:
-        periods = {p.strip() for p in os.environ.get(
-            "LIP_PMUS_PERIODS", "daily_event,early,pre_day").split(",") if p.strip()}
+    def _put(self, frame: dict) -> None:
+        self.loop.ext_queue.put(frame)
+
+    # ------------------------------------------------------------ programs
+    def refresh(self) -> None:
+        t0 = self.clock()
         recs, tok = [], None
-        for _ in range(int(_num("LIP_PMUS_MAX_PAGES", 20))):
+        for _ in range(int(_num("LIP_PMUS_MAX_PAGES", 1000))):
             q = "/v1/incentives?page_size=100&statuses=active&program_type=liquidityProgram"
             if tok:
                 q += "&page_token=" + urllib.request.quote(str(tok), safe="")
             d = self._get(q)
+            self.stats["pages"] += 1
             recs.extend(d.get("programs") or [])
             tok = d.get("nextPageToken")
-            if not tok:
+            if not tok or self._stop.is_set():
                 break
-            if self._stop.wait(0.3):
-                break
-        self.stats["records"] = len(recs)
-        self.programs = programs_from_incentives(recs, now=self.clock(), periods=periods)
-        self.stats["refreshes"] += 1
-        self.stats["last_refresh"] = self.clock()
-
-    def select(self) -> None:
-        """Pick paper quotes for the top candidates under the caps."""
-        sizes = [float(x) for x in os.environ.get("LIP_PMUS_SIZES", "50,100,200,500").split(",") if x.strip()]
-        cap_m = _num("LIP_PMUS_MARKET_CAP_USD", 100.0)
-        cands = []
-        for prog in self.programs[: int(_num("LIP_PMUS_CANDIDATES", 30))]:
+            self.poll_due()  # keep quoted books fresh while paging
+        now = self.clock()
+        frames, stats, need = records_to_programs(recs, self.meta, now=now)
+        ttl = _num("LIP_PMUS_META_TTL_S", 6 * 3600.0)
+        stale = [s for s, m in self.meta.items() if now - float(m.get("fetched") or 0) > ttl]
+        for slug in (need + stale)[: int(_num("LIP_PMUS_META_MAX", 300))]:
             try:
-                book = parse_book(self._get(f"/v1/markets/{prog['slug']}/book"))
-            except Exception as e:
+                self.meta[slug] = market_meta(self._get(f"/v1/market/slug/{slug}"), self.clock())
+            except PMUSOrderBlocked:
+                raise
+            except Exception as exc:
                 self.stats["errors"] += 1
-                self.stats["last_error"] = type(e).__name__
-                continue
-            self._books[prog["slug"]] = book
-            best = None
-            for s in sizes:
-                ev = evaluate(prog, book, s)
-                if ev is None or ev["capital"] > cap_m or ev["capital"] <= 0 or ev["usd_per_s"] <= 0:
-                    continue
-                ratio = ev["usd_per_s"] / ev["capital"]
-                if best is None or ratio > best[0] + 1e-15 or (abs(ratio - best[0]) < 1e-15 and s > best[1]["size"]):
-                    best = (ratio, ev)
-            if best is not None:
-                cands.append((best[0], prog, best[1]))
-            if self._stop.wait(0.4):
-                return
-        cands.sort(key=lambda x: -x[0])
-        room = self.headroom_usd()
-        new = {}
-        for ratio, prog, ev in cands:
-            if ev["capital"] > room:
-                continue
-            sides = tuple(sd for sd in ("yes", "no") if not self.side_blocked(prog["slug"], sd, prog["event"]))
-            if not sides:
-                continue
-            if sides != ("yes", "no"):
-                ev = evaluate(prog, self._books[prog["slug"]], ev["size"], sides=sides)
-                if ev is None or ev["capital"] > room:
-                    continue
-            room -= ev["capital"]
-            new[prog["slug"]] = dict(ev, prog=prog, sides=sides, ts=self.clock(), score_ts=self.clock())
-        with self._lock:
-            self.quotes = new
+                self.stats["last_error"] = f"meta:{type(exc).__name__}"
+            self.poll_due()
+        if need:
+            frames, stats, _need = records_to_programs(recs, self.meta, now=self.clock())
+        for f in frames:
+            if self.fed.get(f["market"]) != f["program_id"]:
+                self._put(f)
+                self.fed[f["market"]] = f["program_id"]
+        self.cands = [f["market"][len(PREFIX):] for f in frames]
+        self.stats.update(records=len(recs), refreshes=self.stats["refreshes"] + 1,
+                          last_refresh=self.clock(), refresh_s=round(self.clock() - t0, 1),
+                          eligible=len(frames))
+        self.screen = stats
+        self._put({"kind": "screen_pmus", "stats": stats})
+        _log.info("pmus refresh: %d records, %d eligible, reasons %s", len(recs), len(frames), stats["reasons"])
 
-    def poll_once(self) -> None:
-        """Refresh each quoted book: accrue reward, detect trade-through fills."""
-        from mm.accounting import pm_us_maker_rebate_usd
-        for slug in list(self.quotes):
-            q = self.quotes.get(slug)
-            if q is None:
-                continue
+    # --------------------------------------------------------------- books
+    def poll_due(self) -> int:
+        if not self.cands:
+            return 0
+        now = self.clock()
+        quoted = {m[len(PREFIX):] for m in getattr(self.loop, "resting_view", frozenset()) if m.startswith(PREFIX)}
+        fast, slow = _num("LIP_PMUS_POLL_QUOTED_S", 3.0), _num("LIP_PMUS_POLL_S", 30.0)
+        due = [s for s in self.cands if now >= self._next_poll.get(s, 0.0)]
+        due.sort(key=lambda s: (s not in quoted, self._next_poll.get(s, 0.0)))
+        n = 0
+        for slug in due[: int(_num("LIP_PMUS_POLL_BATCH", 8))]:
+            self._next_poll[slug] = self.clock() + (fast if slug in quoted else slow)
             try:
-                book = parse_book(self._get(f"/v1/markets/{slug}/book"))
-            except Exception as e:
+                self.poll_book(slug)
+                n += 1
+            except PMUSOrderBlocked:
+                raise
+            except Exception as exc:
                 self.stats["errors"] += 1
-                self.stats["last_error"] = type(e).__name__
-                continue
-            now = self.clock()
-            dt = min(120.0, max(0.0, now - q["score_ts"]))
-            self.reward_usd += dt * q["usd_per_s"]
-            q["score_ts"] = now
-            self._books[slug] = book
-            bb = book["bids"][0][0] if book["bids"] else None
-            bo = book["offers"][0][0] if book["offers"] else None
-            filled = []
-            if "yes" in q["sides"] and bo is not None and bo <= q["bid_px"] + 1e-9:
-                filled.append(("yes", q["bid_px"]))
-            if "no" in q["sides"] and bb is not None and bb >= q["ask_px"] - 1e-9:
-                filled.append(("no", 1.0 - q["ask_px"]))
-            for side, px in filled:
-                p = self.position.setdefault(slug, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0,
-                                                    "no_cost": 0.0, "event": q["prog"]["event"]})
-                p[side] += q["size"]
-                p[f"{side}_cost"] += q["size"] * px
-                cents = int(round(px * 100))
-                reb = float(pm_us_maker_rebate_usd(cents, q["size"]))
-                self.rebate_usd += reb
-                self.fills.append({"slug": slug, "side": side, "px": px, "size": q["size"],
-                                   "ts": now, "rebate_usd": reb})
-                _log.info("pmus paper fill %s %s %.0f@%.3f rebate %.2f", slug, side, q["size"], px, reb)
-            if filled:
-                sides = tuple(sd for sd in q["sides"] if sd not in [f[0] for f in filled]
-                              and not self.side_blocked(slug, sd, q["prog"]["event"]))
-                # re-join at the new touch for sides still allowed
-                ev = evaluate(q["prog"], book, q["size"], sides=sides) if sides else None
-                if ev is None:
-                    self.quotes.pop(slug, None)
-                else:
-                    self.quotes[slug] = dict(ev, prog=q["prog"], sides=sides, ts=now, score_ts=now)
-            else:
-                ev = evaluate(q["prog"], book, q["size"], sides=q["sides"])
-                if ev is not None:  # follow the touch (paper re-join; queue reset)
-                    self.quotes[slug] = dict(ev, prog=q["prog"], sides=q["sides"], ts=q["ts"], score_ts=now)
-            if self._stop.wait(0.4):
-                return
-        self.stats["polls"] += 1
+                self.stats["last_error"] = f"book:{type(exc).__name__}"
+        return n
 
-    def markout_usd(self) -> float:
-        out = 0.0
-        for f in self.fills:
-            book = self._books.get(f["slug"])
-            if not book or not book["bids"] or not book["offers"]:
-                continue
-            mid = (book["bids"][0][0] + book["offers"][0][0]) / 2.0
-            side_mid = mid if f["side"] == "yes" else 1.0 - mid
-            out += f["size"] * (side_mid - f["px"])
-        return out
+    def poll_book(self, slug: str) -> None:
+        book = parse_book(self._get(f"/v1/markets/{slug}/book"))
+        ts = self.clock()
+        self.stats["book_polls"] += 1
+        if book.get("state") not in (None, "MARKET_STATE_OPEN"):
+            return  # not open: no snapshot -> the loop pulls on a stale book
+        # prints first (they happened before this book state), then the book
+        for tr in synth_trades(slug, self.prev.get(slug), book, ts):
+            self.stats["trades_synth"] += 1
+            self._put(tr)
+        self._put(book_frame(slug, book, ts))
+        self.prev[slug] = {"shares_traded": book.get("shares_traded"),
+                           "bb": book["bids"][0][0] if book["bids"] else None,
+                           "bo": book["offers"][0][0] if book["offers"] else None}
+        self.stats["last_book_ts"] = ts
 
     # -------------------------------------------------------------- thread
-    def start(self) -> "PMUSPaperVenue":
+    def start(self) -> "PMUSFeed":
         self._thread = threading.Thread(target=self._run, name="lip-pmus", daemon=True)
         self._thread.start()
         return self
@@ -416,46 +545,27 @@ class PMUSPaperVenue:
 
     def _run(self) -> None:
         refresh_s = max(120.0, _num("LIP_PMUS_REFRESH_S", 900.0))
-        poll_s = max(10.0, _num("LIP_PMUS_POLL_S", 30.0))
         next_refresh = 0.0
         while not self._stop.is_set():
             try:
                 if self.clock() >= next_refresh:
-                    self.refresh_programs()
-                    self.select()
                     next_refresh = self.clock() + refresh_s
-                else:
-                    self.poll_once()
+                    self.refresh()
+                elif not self.poll_due():
+                    self._sleep(0.25)
             except PMUSOrderBlocked:
-                self.stats["blocked_writes"] += 1
-                _log.exception("pmus blocked request")
-            except Exception as e:
+                _log.error("pmus blocked a non-allowlisted request (bug); feed continues read-only")
+                self._sleep(5.0)
+            except Exception as exc:
                 self.stats["errors"] += 1
-                self.stats["last_error"] = type(e).__name__
-                _log.warning("pmus paper cycle failed: %s", type(e).__name__)
-            self._stop.wait(poll_s)
+                self.stats["last_error"] = type(exc).__name__
+                _log.warning("pmus feed cycle failed: %s", type(exc).__name__)
+                self._sleep(5.0)
 
     def summary(self) -> dict:
-        el = max(1.0, self.clock() - self.started_ts)
-        quotes = list(self.quotes.items())
-        cap = sum(q["capital"] for _s, q in quotes)
-        rate_day = sum(q["usd_per_s"] for _s, q in quotes) * 86400.0
-        mk = self.markout_usd()
-        return {
-            "enabled": True, "paper": True, "order_endpoints": "hard-disabled (GET allowlist)",
-            "programs_eligible": len(self.programs), "quoted_n": len(quotes),
-            "capital_usd": round(cap, 2), "headroom_usd": round(self.headroom_usd(), 2),
-            "est_reward_raw_usd": round(self.reward_usd, 4),
-            "est_reward_rate_per_day_now": round(rate_day, 2),
-            "fills_n": len(self.fills), "rebates_usd": round(self.rebate_usd, 4),
-            "markout_usd": round(mk, 4),
-            "unpaired_usd": round(sum(self._unpaired_usd(s) for s in self.position), 4),
-            "net_usd": round(self.reward_usd + self.rebate_usd + mk, 4),
-            "session_s": round(el, 0),
-            "top": [{"slug": s, "period": q["prog"]["period"], "size": q["size"], "bid": q["bid_px"],
-                     "ask": q["ask_px"], "share": round(q["share"], 4),
-                     "usd_day": round(q["usd_per_s"] * 86400.0, 2), "paid": q["paid"],
-                     "sides": list(q["sides"])}
-                    for s, q in sorted(quotes, key=lambda kv: -kv[1]["usd_per_s"])[:8]],
-            **{k: v for k, v in self.stats.items()},
-        }
+        now = self.clock()
+        last = self.stats.get("last_book_ts")
+        return {"enabled": True, "paper": True, "engine": "shared RunLoop (patch 21)",
+                "order_endpoints": "hard-disabled (GET allowlist)", "feed": "poll (WS requires auth)",
+                "candidates": len(self.cands), "book_age_s": None if last is None else round(now - last, 1),
+                "screen": self.screen, **self.stats}

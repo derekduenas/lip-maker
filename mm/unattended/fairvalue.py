@@ -288,20 +288,27 @@ class FairValueCache:
             log.info("fv match %s fv=%.1fc conf=%.2f pm=%r", k, v["fv_cents"], v["conf"],
                      v["pm_question"][:80])
 
+    def stop(self) -> None:
+        ev = getattr(self, "_stop_ev", None)
+        if ev is not None:
+            ev.set()
+
     def start(self, targets_fn) -> None:
+        self._stop_ev = threading.Event()
+
         def run():
-            while True:
+            while not self._stop_ev.is_set():
                 try:
                     targets = targets_fn()
                     if not targets:
-                        time.sleep(15)
+                        self._stop_ev.wait(15)
                         continue
                     self.refresh(targets)
                 except Exception as exc:  # never kill the engine
                     self.stats["errors"] += 1
                     self.stats["last_error"] = type(exc).__name__
                     log.warning("fair value refresh failed: %s", type(exc).__name__)
-                time.sleep(max(60.0, _env("LIP_FV_REFRESH_S", 300)))
+                self._stop_ev.wait(max(60.0, _env("LIP_FV_REFRESH_S", 300)))
         self._thread = threading.Thread(target=run, name="lip-fairvalue", daemon=True)
         self._thread.start()
 

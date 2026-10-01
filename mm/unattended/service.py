@@ -122,7 +122,8 @@ class LiveStatusRefresher:
         self._last = now
         try:
             if self._last_est is None or now - self._last_est >= self.estimate_every_s:
-                quoted = {q["market"] for q in self.loop.quotes} | set(self.loop.resting)
+                quoted = (set(getattr(self.loop, "quoted_ever", ()) or ())
+                          | {q["market"] for q in self.loop.quotes} | set(self.loop.resting))
                 self._estimates = self.loop.live_estimates(quoted)
                 self._accrual = self.loop.live_accrual(quoted)
                 self._last_est = now
@@ -275,7 +276,8 @@ def main(argv: list[str] | None = None) -> int:
                 from mm.unattended.fairvalue import FairValueCache, enabled as _fv_enabled
                 if _fv_enabled():  # Patch 16: external fair value, background refresh only
                     loop.fv = FairValueCache()
-                    loop.fv.start(lambda loop=loop: set(list(loop.resting)) | set(loop._fv_wanted))
+                    loop.fv.start(lambda loop=loop: {m for m in (set(loop.resting.copy()) | loop._fv_wanted.copy())
+                                                     if not m.startswith("PMUS:")})
 
                 from mm.unattended import bookrec as _bookrec
                 _rec = None
@@ -286,13 +288,13 @@ def main(argv: list[str] | None = None) -> int:
                     except Exception:
                         logging.getLogger("lip.recorder").exception("recorder start failed")
                         _rec = None
-                if getattr(loop, "pmus", None) is None:  # Patch 20: PM US paper venue
+                if getattr(loop, "pmus", None) is None:  # Patch 21: PM US feed into this RunLoop
                     try:
                         from mm.unattended import pmus_paper as _pmp
-                        if _pmp.enabled():
-                            loop.pmus = _pmp.PMUSPaperVenue(kalshi_loop=loop).start()
+                        if _pmp.enabled() and mode == "paper":
+                            loop.pmus = _pmp.PMUSFeed(loop).start()
                     except Exception:
-                        logging.getLogger("lip.pmus").exception("pmus paper start failed")
+                        logging.getLogger("lip.pmus").exception("pmus feed start failed")
 
                 refresher = LiveStatusRefresher(
                     loop, lambda rep: _write_run_outputs(args, rep, started),
@@ -306,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
                     if rec is not None:
                         rec.record(msg)
                     loop.on_frame(msg)
+                    if getattr(loop, "pmus", None) is not None:
+                        loop.drain_external()  # Patch 21: PM US frames, same thread
                     sec = int(time.time())
                     if _hb["sec"] != sec:  # heartbeat file write once per second
                         _hb["sec"] = sec
@@ -314,10 +318,20 @@ def main(argv: list[str] | None = None) -> int:
                     refresher.maybe_refresh()
 
                 import asyncio
-                if plan.get("reader"):
-                    asyncio.run(drive_readonly_books(books, _on_frame))
-                else:
-                    asyncio.run(drive_socket(plan["url"], _on_frame))
+                try:
+                    if plan.get("reader"):
+                        asyncio.run(drive_readonly_books(books, _on_frame))
+                    else:
+                        asyncio.run(drive_socket(plan["url"], _on_frame))
+                finally:
+                    # Patch 21 (audit): background threads of this session must
+                    # not outlive it (a new RunLoop starts its own).
+                    for _bg in (getattr(loop, "pmus", None), getattr(loop, "fv", None), _rec):
+                        try:
+                            if _bg is not None and hasattr(_bg, "stop"):
+                                _bg.stop()
+                        except Exception:
+                            logging.getLogger("lip.status").exception("background stop failed")
                 report = loop.finish()
                 report["socket_opened"] = True
                 report["ws_url"] = plan["url"]

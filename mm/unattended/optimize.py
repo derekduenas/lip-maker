@@ -57,8 +57,9 @@ def _curve(market: KalshiMarket, sizes: tuple[float, ...],
            markout_usd_per_contract: float, *,
            reward_factor: float = 1.0) -> tuple[int, int, dict[float, float], float, float, float]:
     """Return reference prices, objective by size, and the best size's economics."""
-    yes_cents = reference_cents(market.yes_bids, market.target_size)
-    no_cents = reference_cents(market.no_bids, market.target_size)
+    from mm.selector import side_rungs
+    probe = max((float(x) for x in sizes), default=100.0)
+    yes_cents, no_cents = side_rungs(market, probe, fallback_touch=False)
     curve: dict[float, float] = {}
     if yes_cents is None or no_cents is None:
         return 0, 0, curve, 0.0, -1e18, 0.0

@@ -156,6 +156,18 @@ class _Program:
     rank_penalty_per_day: float = 0.0
     occurrence_ts: float | None = None
     event_ticker: str | None = None
+    # Patch 21: venue abstraction (kalshi | pmus) and per-venue rule inputs.
+    venue: str = "kalshi"
+    max_spread_usd: float | None = None
+    sports_single: bool = False
+    fee_type: str = "quadratic"
+    fee_multiplier: float = 1.0
+    program_id: str = ""
+
+
+VENUES = ("kalshi", "pmus")
+# Bounded history for the long-running live loop (counts stay exact).
+LIST_CAP = 20000
 
 
 def rank_live_score(net_per_day: float, penalty_per_day: float, capital_usd: float) -> float:
@@ -238,9 +250,25 @@ class RunLoop:
         self.fv_blocks: dict = {}
         # Patch 18: inventory skew counters.
         self.skew_stats: dict = {}
+        # Patch 21: external venue frames (PM US poller thread -> this loop).
+        # Only the loop's own thread mutates loop state: the poller only
+        # put()s frames; drain_external() runs on the frame thread.
+        import queue as _queue
+        self.ext_queue = _queue.SimpleQueue()
+        self.ext_frames_n = 0
+        self._book_ts: dict[str, float] = {}
+        self.resting_view: frozenset = frozenset()
+        self.quoted_ever: set = set()
+        self.quotes_total = 0
+        self.cancels_total = 0
+        self.pm_rebate_usd = 0.0
+        self.closed_periods: dict[str, float] = {}
+        self.refeeds_n = 0
 
     def add_program(self, row: dict) -> None:
         market = str(row["market"])
+        old_prog = self.programs.get(market)
+        old_acc = self.accruals.get(market)
         start = float(row.get("start_ts") or 0)
         period = float(row.get("period_seconds") or 86400)
         end = float(row["end_ts"]) if row.get("end_ts") is not None else start + period
@@ -266,19 +294,50 @@ class RunLoop:
             rank_penalty_per_day=float(row.get("rank_penalty_per_day") or 0.0),
             occurrence_ts=None if row.get("occurrence_ts") is None else float(row["occurrence_ts"]),
             event_ticker=row.get("event_ticker") or None,
+            venue=str(row.get("venue") or "kalshi"),
+            max_spread_usd=None if row.get("max_spread_usd") is None else float(row["max_spread_usd"]),
+            sports_single=bool(row.get("sports_single")),
+            fee_type=str(row.get("fee_type") or "quadratic"),
+            fee_multiplier=float(row.get("fee_multiplier") if row.get("fee_multiplier") is not None else 1.0),
+            program_id=str(row.get("program_id") or market),
         )
+        if prog.venue not in VENUES:
+            raise ValueError(f"unknown venue {prog.venue!r}")
+        if old_prog is not None and old_acc is not None and (
+                old_prog.program_id, old_prog.start_ts, old_prog.end_ts, old_prog.period_reward_usd,
+                old_prog.target_size, old_prog.discount_factor, old_prog.max_spread_usd) == (
+                prog.program_id, prog.start_ts, prog.end_ts, prog.period_reward_usd,
+                prog.target_size, prog.discount_factor, prog.max_spread_usd):
+            # Same program window re-fed (e.g. refreshed metadata): keep the
+            # accrual and book, update the descriptive fields only.
+            self.programs[market] = prog
+            return
         self.programs[market] = prog
         params = ProgramParams(
             market_ticker=market,
             target_size=prog.target_size,
             discount_factor=prog.discount_factor,
             period_reward_usd=prog.period_reward_usd,
-            program_id=str(row.get("program_id") or market),
+            program_id=prog.program_id,
             period_seconds=prog.period_seconds,
             start_ts=prog.start_ts,
             end_ts=prog.end_ts,
+            rules="pmus" if prog.venue == "pmus" else "kalshi",
+            max_spread_usd=prog.max_spread_usd if prog.venue == "pmus" else None,
         )
-        self.accruals[market] = SecondAccrual(params, series=prog.series)
+        acc = SecondAccrual(params, series=prog.series)
+        if old_acc is not None:
+            # Patch 21: a new program window for a known market (period
+            # roll-over). Keep the live book (the WS sends a snapshot only on
+            # subscribe) and our resting orders; archive the old raw accrual.
+            acc.book = old_acc.book
+            acc.resting = list(old_acc.resting)
+            try:
+                self.closed_periods[market] = self.closed_periods.get(market, 0.0) + float(old_acc.raw_usd())
+            except Exception:
+                pass
+            self.refeeds_n += 1
+        self.accruals[market] = acc
         self.open_seconds.setdefault(market, None)
 
     def on_frame(self, row: dict) -> None:
@@ -344,7 +403,7 @@ class RunLoop:
                 self.open_seconds[market] = None
             if (self.carry_forward and market in self.resting and accrual._next is not None
                     and 0 < second - accrual._next <= CARRY_FORWARD_MAX_S
-                    and accrual.book.book.is_usable()):
+                    and accrual.book.book.is_usable() and self._book_fresh(market, second)):
                 while accrual._next < second:
                     accrual.score_second(accrual._next)
             accrual.omit_until(second, status="idle" if idle else "missed")
@@ -365,6 +424,53 @@ class RunLoop:
             return
         accrual.on_message(row, ts)
         self.open_seconds[market] = int(ts)
+        self._book_ts[market] = ts
+
+    # ------------------------------------------------------------ patch 21
+    def _venue(self, market: str) -> str:
+        prog = self.programs.get(market)
+        return prog.venue if prog is not None else "kalshi"
+
+    def _book_fresh(self, market: str, ts: float) -> bool:
+        """Kalshi books are WS-maintained (quiet = unchanged). PM US books are
+        polled snapshots: a book older than LIP_PMUS_STALE_S (30 s) is not
+        carried forward or quoted against."""
+        if self._venue(market) != "pmus":
+            return True
+        seen = self._book_ts.get(market)
+        return seen is not None and ts - seen <= _env_num("LIP_PMUS_STALE_S", 30.0)
+
+    def drain_external(self, max_n: int = 2000) -> int:
+        """Feed queued external-venue frames (PM US poller) through on_frame.
+        Runs on the frame thread. Timestamps never move the loop clock back."""
+        n = 0
+        while n < max_n:
+            try:
+                frame = self.ext_queue.get_nowait()
+            except Exception:
+                break
+            if frame.get("kind") not in ("program", "screen_pmus") and "ts" in frame:
+                frame["ts"] = max(float(frame["ts"]), float(self.now or 0.0))
+            if frame.get("kind") == "screen_pmus":
+                self.pmus_screen = dict(frame.get("stats") or {})
+            else:
+                rec = getattr(self, "recorder", None)
+                if rec is not None:
+                    try:
+                        rec.record(frame)
+                    except Exception:
+                        pass
+                self.on_frame(frame)
+            n += 1
+        self.ext_frames_n += n
+        self.resting_view = frozenset(self.resting)
+        return n
+
+    def _trim_history(self) -> None:
+        for name in ("quotes", "cancels", "risk_rows"):
+            lst = getattr(self, name)
+            if len(lst) > LIST_CAP:
+                del lst[: len(lst) - LIST_CAP // 2]
 
     def _on_trade(self, row: dict, ts: float) -> None:
         trade = dict(row.get("trade") or row.get("msg") or row)
@@ -394,9 +500,14 @@ class RunLoop:
             pos[side] += count
             pos[f"{side}_cost"] += count * price / 100.0
         mid = self._side_mid_cents(market, side)
+        if self._venue(market) == "pmus" and count > 0:
+            # PM US maker rebate 0.0125 x C x p x (1-p), per fill, banker's
+            # rounded to the cent (https://docs.polymarket.us/fees).
+            from mm.accounting import pm_us_maker_rebate_usd
+            self.pm_rebate_usd += float(pm_us_maker_rebate_usd(int(round(price)), count))
         self.fill_marks.append({
             "market": market, "side": side, "price_cents": price, "count": count, "ts": ts,
-            "mid0": mid, "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
+            "mid0": mid, "venue": self._venue(market), "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
             "markout_60s": None, "markout_300s": None, "markout_1800s": None,
         })
         if len(self.fill_marks) > 2000:
@@ -485,9 +596,10 @@ class RunLoop:
         self.accruals[market].set_resting(self._orders(market, quote))
         add = Decimal(int(quote[f"{other}_cents"])) / Decimal(100) * Decimal(str(quote[other]))
         self._release(market)
-        self.risk.commit(market, "kalshi", add)
+        self.risk.commit(market, self._venue(market), add)
         self.committed[market] = add
         self.cancels.append({"market": market, "reason": f"{reason}:{side}", "ts": self.now})
+        self.cancels_total += 1
 
     def _unpaired(self, market: str, side: str) -> float:
         pos = self.position.get(market)
@@ -542,10 +654,19 @@ class RunLoop:
         anchor = event_anchor_ts(market, prog.occurrence_ts)
         return anchor is not None and ts >= anchor - hours * 3600.0
 
-    def _refs(self, market: str):
+    def _refs(self, market: str, size: float | None = None):
+        """Quote rungs from the live book under the market's venue rules."""
         from mm.unattended.feed import reference_cents
         prog = self.programs[market]
         book = self.accruals[market].book.book
+        if prog.venue == "pmus":
+            from mm.selector import pmus_side_rung
+            if size is None:
+                q = self.resting.get(market) or {}
+                size = max(float(q.get("yes") or 0), float(q.get("no") or 0)) or self.chunk
+            yb, nb = _bids(book.yes_bids), _bids(book.no_bids)
+            return (pmus_side_rung(yb, nb, size, prog.target_size, prog.discount_factor),
+                    pmus_side_rung(nb, yb, size, prog.target_size, prog.discount_factor))
         return (reference_cents(_bids(book.yes_bids), prog.target_size),
                 reference_cents(_bids(book.no_bids), prog.target_size))
 
@@ -557,7 +678,7 @@ class RunLoop:
     def _fv_drop(self, market: str, ts: float) -> tuple:
         """Patch 16: sides to withhold because external fair value disagrees with Kalshi mid."""
         from mm.unattended.fairvalue import enabled, fv_drop_sides
-        if self.fv is None or not enabled():
+        if self.fv is None or not enabled() or self._venue(market) != "kalshi":
             return ()
         self._fv_wanted.add(market)
         row = self.fv.get(market, now=time.time())
@@ -596,12 +717,17 @@ class RunLoop:
                 continue
             if not self.accruals[market].book.book.is_usable():
                 continue
+            if not self._book_fresh(market, ts):
+                self._pull_one(market, "pmus_stale_book", ts, 0.0)
+                continue
             yb, nb = self._best(market)
             on = {sd: float(quote.get(sd) or 0) > 0 for sd in ("yes", "no")}
             if _env_num("LIP_CROSS_GUARD", 0.0) > 0:
                 crossed = ((on["yes"] and nb is not None and int(quote["yes_cents"]) + nb >= 100)
                            or (on["no"] and yb is not None and int(quote["no_cents"]) + yb >= 100))
                 if crossed:
+                    if self.mode == "paper":
+                        self._paper_cross_fill(market, quote, yb, nb, ts)
                     self._pull_one(market, "trade_through", ts, cool)
                     continue
             fv_drop = self._fv_drop(market, ts)
@@ -644,6 +770,36 @@ class RunLoop:
                             self.resting[market]["best0"] = best0
         if self.fill_marks:
             self._update_markouts(ts)
+
+    def _paper_cross_fill(self, market: str, quote: dict, yb, nb, ts: float) -> None:
+        """Patch 21 (audit): a book that crosses our resting paper bid means a
+        real order would have traded with us. Paper used to only pull here,
+        which silently dropped exactly the adverse fills. Fill our crossed
+        side(s) at our price for min(our size, crossing depth), then the
+        caller pulls as before. Orders still in flight (latency) do not fill."""
+        book = self.accruals[market].book.book
+        for side, opp_levels in (("yes", book.no_bids), ("no", book.yes_bids)):
+            size = float(quote.get(side) or 0)
+            if size <= 0:
+                continue
+            price = int(quote[f"{side}_cents"])
+            depth = sum(float(l.size) for l in opp_levels if int(l.price_cents) + price >= 100)
+            order = self.sim.orders.get(f"{market}:{side}")
+            if depth <= 0 or order is None or ts < float(getattr(order, "activation_ts", 0.0)):
+                continue
+            count = min(size, depth)
+            fill = {"market_ticker": market, "side": side, "price_cents": price, "count": count,
+                    "ts": ts, "source": "paper_cross", "trade_id": f"cross:{market}:{side}:{ts:.3f}"}
+            self.fills.append(fill)
+            self._reduce_resting(fill)
+            self._note_fill(fill, ts)
+            decision = self.risk.record_fill(1, now=ts)
+            if not decision.allowed:
+                self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
+                             "paper": self.mode == "paper"}
+                self._cancel_all(decision.reason)
+                return
+            quote = self.resting.get(market) or quote
 
     def _update_markouts(self, ts: float) -> None:
         for mark in self.fill_marks[-500:]:
@@ -751,6 +907,11 @@ class RunLoop:
                 exchange_index=prog.exchange_index,
                 shard_cash_usd=prog.shard_cash_usd,
                 category=prog.category,
+                venue=prog.venue,
+                max_spread_usd=prog.max_spread_usd,
+                sports_single=prog.sports_single,
+                fee_type=prog.fee_type,
+                fee_multiplier=prog.fee_multiplier,
             ))
         return rows
 
@@ -764,8 +925,10 @@ class RunLoop:
         frac = alloc_cap_fraction()
         per_market = float(lim.per_market_usd) * frac
         per_series = float(lim.per_series_usd) * frac
-        budget = min(float(lim.per_venue_usd), float(lim.gross_usd)) * frac
+        venue_budget = self.venue_budgets()
+        budget = sum(venue_budget.values())
         self.alloc_budget_usd = budget
+        self.venue_budget = venue_budget
         # allocate/optimize_sizes are economics + eligibility passes here. Their
         # own cash pool must not bind, or their raw (unpenalized) $/day greedy
         # truncates the list before the markout-penalized rank pass below,
@@ -892,7 +1055,7 @@ class RunLoop:
                 curves[market] = curve
         min_rank = rank_min_score()
         spent_bucket = {"durable": 0.0, "short": 0.0}
-        spent = {"series": {}, "under": {}, "event": {}, "total": 0.0}
+        spent = {"series": {}, "under": {}, "event": {}, "venue": {}, "total": 0.0}
         event_frac = _env_num("LIP_EVENT_CAP_FRAC", 0.0)
         state = {m: -1 for m in curves}
         why_stop: dict[str, str] = {}
@@ -924,6 +1087,9 @@ class RunLoop:
             ev = self._event_of(market)
             if spent["total"] + dc > budget + 1e-9:
                 return f"alloc_budget {spent['total'] + dc:.0f} > {budget:.0f}"
+            vn = self._venue(market)
+            if spent["venue"].get(vn, 0.0) + dc > venue_budget.get(vn, 0.0) + 1e-9:
+                return f"alloc_venue_{vn} {spent['venue'].get(vn, 0.0) + dc:.0f} > {venue_budget.get(vn, 0.0):.0f}"
             if use_buckets and spent_bucket[bkt] + dc > bucket_budget[bkt] + 1e-9:
                 return f"alloc_bucket_{bkt} {spent_bucket[bkt] + dc:.0f} > {bucket_budget[bkt]:.0f}"
             if spent["series"].get(series, 0.0) + dc > per_series:
@@ -960,6 +1126,7 @@ class RunLoop:
                 state[market] = j
                 series = self.programs[market].series
                 spent["total"] += dc
+                spent["venue"][self._venue(market)] = spent["venue"].get(self._venue(market), 0.0) + dc
                 spent_bucket[bucket_now[market]] += dc
                 spent["series"][series] = spent["series"].get(series, 0.0) + dc
                 fam = family_for_series(series)
@@ -993,6 +1160,25 @@ class RunLoop:
             logging.getLogger("lip.risk").info(
                 "selection %d: %d quoted, %d skipped at caps (budget $%.0f)",
                 self.selection_count, len(self.resting), len(self.cap_skips), budget)
+
+    def venue_budgets(self) -> dict:
+        """Patch 21: unified cross-venue allocation budgets.
+
+        kalshi = alloc fraction x min(per-venue cap, gross cap) (unchanged).
+        pmus   = min(LIP_PMUS_BUDGET_USD (300), alloc fraction x gross - kalshi)
+                 when any PM US program is loaded, else 0.
+        Sum <= alloc fraction x gross cap, so both venues together can never
+        breach the shared gross cap; the RiskEngine also checks per-venue and
+        gross caps on every quote."""
+        lim = self.risk.limits
+        frac = alloc_cap_fraction()
+        kalshi = min(float(lim.per_venue_usd), float(lim.gross_usd)) * frac
+        out = {"kalshi": kalshi, "pmus": 0.0}
+        if any(p.venue == "pmus" for p in self.programs.values()):
+            room = max(0.0, float(lim.gross_usd) * frac - kalshi)
+            out["pmus"] = max(0.0, min(_env_num("LIP_PMUS_BUDGET_USD", 300.0), room,
+                                       float(lim.per_venue_usd) * frac))
+        return out
 
     def _dump_selection(self, chosen, taken, plan, budget) -> None:
         path = os.environ.get("LIP_SELECTION_DUMP", "/var/lib/lip-maker/last_selection.json")
@@ -1079,7 +1265,7 @@ class RunLoop:
         self._release(market)
         add = (Decimal(yes_cents if "yes" in sides else 0) + Decimal(no_cents if "no" in sides else 0)) \
             / Decimal(100) * Decimal(str(size))
-        decision = self.risk.check_quote(market=market, venue="kalshi", add_usd=add, now=ts)
+        decision = self.risk.check_quote(market=market, venue=self._venue(market), add_usd=add, now=ts)
         self.risk_rows.append({
             "market": market, "allowed": decision.allowed,
             "reason": decision.reason, "cancel_all": decision.cancel_all,
@@ -1096,6 +1282,10 @@ class RunLoop:
                 self._cancel_all(decision.reason)
             return False
         book = self.accruals[market].book.book
+        if self.mode != "paper" and self._venue(market) != "kalshi":
+            # Patch 21: PM US is PAPER ONLY. No order path exists for it here.
+            self._cancel(market, "pmus_paper_only")
+            return False
         if self.mode == "demo":
             if self.poster is None:
                 raise UnattendedRefused("demo mode would send without a sender")
@@ -1134,12 +1324,16 @@ class RunLoop:
             quote["best0"] = (None, None)
         self.resting[market] = quote
         self.accruals[market].set_resting(self._orders(market, quote))
-        self.risk.commit(market, "kalshi", add)
+        self.risk.commit(market, self._venue(market), add)
         self.committed[market] = add
         self.quotes.append({
             "market": market, "size": size, "yes_cents": yes_cents, "no_cents": no_cents,
             "paper": self.mode == "paper", "ts": ts, "sides": list(sides),
         })
+        self.quotes_total += 1
+        self.quoted_ever.add(market)
+        if self.carry_forward:
+            self._trim_history()
         return True
 
     def _pull(self, ts: float) -> None:
@@ -1165,6 +1359,7 @@ class RunLoop:
         self._release(market)
         if had:
             self.cancels.append({"market": market, "reason": reason, "ts": self.now})
+            self.cancels_total += 1
 
     def external_kill(self, reason: str) -> None:
         """Patch 17: latch an external (watchdog) kill; cancel all once. Idempotent."""
@@ -1183,8 +1378,9 @@ class RunLoop:
         prev = self.committed.pop(market, Decimal(0))
         if prev == 0:
             return
+        venue = self._venue(market)
         self.risk.market_usd[market] = Decimal(str(self.risk.market_usd.get(market, 0))) - prev
-        self.risk.venue_usd["kalshi"] = Decimal(str(self.risk.venue_usd.get("kalshi", 0))) - prev
+        self.risk.venue_usd[venue] = Decimal(str(self.risk.venue_usd.get(venue, 0))) - prev
 
     def live_snapshot(self, *, estimates: dict | None = None,
                       session_start_ts: float | None = None, top_n: int | None = None,
@@ -1297,8 +1493,9 @@ class RunLoop:
             "selected_n": len(self.resting),
             "selected_top": selected[:top_n],
             "resting_n": len(self.resting),
-            "quotes_n": len(self.quotes),
-            "cancels_n": len(self.cancels),
+            "quotes_n": self.quotes_total or len(self.quotes),
+            "cancels_n": self.cancels_total or len(self.cancels),
+            "venues": self.venue_report(est, accrual),
             "fills_n": len(self.fills),
             "excluded_n": len(self.excluded),
             "excluded_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
@@ -1335,6 +1532,31 @@ class RunLoop:
             "rewards_usd": "0",
             "day": day,
         }
+
+    def venue_report(self, est: dict | None = None, accrual: dict | None = None) -> dict:
+        """Patch 21: per-venue programs, resting, capital, est rewards, fills. Read-only."""
+        budgets = getattr(self, "venue_budget", None) or {}
+        out = {}
+        for vn in VENUES:
+            mk = [m for m in self.resting if self._venue(m) == vn]
+            out[vn] = {
+                "programs_fed": sum(1 for p in self.programs.values() if p.venue == vn),
+                "resting_n": len(mk),
+                "capital_usd": round(float(sum((self.committed.get(m, Decimal(0)) for m in mk), Decimal(0))), 2),
+                "budget_usd": round(float(budgets.get(vn, 0.0)), 2),
+                "risk_venue_usd": round(float(self.risk.venue_usd.get(vn, 0) or 0), 2),
+                "est_usd": format(sum(((est or {}).get(m, Decimal(0)) for m in mk), Decimal(0)), "f"),
+                "est_raw_usd": (None if accrual is None else round(sum(
+                    float(v["raw_usd"]) for m, v in accrual.items() if self._venue(m) == vn), 6)),
+                "fills_n": sum(1 for f in self.fills if self._venue(str(f.get("market_ticker"))) == vn),
+                "plan_net_usd_per_day": round(sum(float((self.last_plan.get(m) or {}).get("value_per_day") or 0.0)
+                                                  for m in mk), 4),
+            }
+        out["pmus"]["rebates_usd"] = round(self.pm_rebate_usd, 4)
+        out["pmus"]["screen"] = getattr(self, "pmus_screen", None)
+        out["ext_frames_n"] = self.ext_frames_n
+        out["refeeds_n"] = self.refeeds_n
+        return out
 
     def _side_mid_cents(self, market: str, side: str):
         accrual = self.accruals.get(market)
@@ -1762,19 +1984,42 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
         session.close()
 
 
-def _feed_programs(frames: list[dict], fed: dict, on_frame: Callable[[dict], None]) -> list[str]:
-    """Feed new programs once; send a 'shard' frame when a known one gains an index."""
+def _program_sig(frame: dict) -> tuple:
+    return tuple(frame.get(k) for k in (
+        "program_id", "start_ts", "end_ts", "period_reward_usd", "period_seconds", "target_size",
+        "discount_factor", "fee_type", "fee_multiplier", "category", "close_ts", "occurrence_ts"))
+
+
+def _feed_programs(frames: list[dict], fed: dict, on_frame: Callable[[dict], None],
+                   sigs: dict | None = None) -> list[str]:
+    """Feed new programs; send a 'shard' frame when a known one gains an index.
+
+    Patch 21 (audit): a known market whose program changed (new period window,
+    pool, target, fee_type, close) is re-fed. Before, a market was fed once per
+    process, so a program roll-over left the loop on the expired window
+    (seconds_left 0 => never selected again) and late metadata (fee_type)
+    never reached it. RunLoop.add_program keeps book/accrual when only
+    descriptive fields changed. Returns only markets new to the feed.
+    """
     new = []
     for frame in frames:
         market = frame["market"]
         idx = frame.get("exchange_index")
+        sig = _program_sig(frame)
         if market not in fed:
             on_frame(frame)
             fed[market] = idx
             new.append(market)
-        elif fed[market] is None and idx is not None:
+            if sigs is not None:
+                sigs[market] = sig
+            continue
+        if fed[market] is None and idx is not None:
             on_frame({"kind": "shard", "market": market, "exchange_index": idx})
             fed[market] = idx
+        if sigs is not None and sigs.get(market) != sig:
+            if market in sigs:
+                on_frame(frame)
+            sigs[market] = sig
     return new
 
 
@@ -1942,7 +2187,7 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
         candidates, stats = screen(ctx["programs"], ctx["meta"])
     finally:
         ctx["lock"].release()
-    new = _feed_programs(candidates, ctx["fed"], on_frame)
+    new = _feed_programs(candidates, ctx["fed"], on_frame, ctx.setdefault("sigs", {}))
     stats["fed"] = len(ctx["fed"])
     stats["new"] = len(new)
     on_frame({"kind": "screen", "stats": stats})

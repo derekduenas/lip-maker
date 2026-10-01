@@ -83,6 +83,10 @@ class Config:
         self.max_inventory = _num(env, "LIP_WD_MAX_INVENTORY_USD", 500)
         self.max_capital = _num(env, "LIP_WD_MAX_CAPITAL_USD", 1500)
         self.max_resting = _num(env, "LIP_WD_MAX_RESTING", 200)
+        # Patch 21: per-venue coverage (status `venues` / `pmus`).
+        self.max_capital_kalshi = _num(env, "LIP_WD_MAX_CAPITAL_KALSHI_USD", 1600)
+        self.max_capital_pmus = _num(env, "LIP_WD_MAX_CAPITAL_PMUS_USD", 400)
+        self.pmus_stale_s = _num(env, "LIP_WD_PMUS_STALE_S", 120)
         self.trip_on_engine_kill = _truthy(env.get("LIP_WD_TRIP_ON_ENGINE_KILL"))
         self.alert_min_interval_s = _num(env, "LIP_WD_ALERT_MIN_INTERVAL_S", 600)
         self.alert_max_per_hour = int(_num(env, "LIP_WD_ALERT_MAX_PER_HOUR", 12))
@@ -237,6 +241,22 @@ def evaluate(cfg: Config, state: dict, now: float, status, status_err, hb_ts):
     info["resting_n"] = rn
     if rn is not None and rn > cfg.max_resting:
         reasons.append(f"resting:{rn:.0f}>{cfg.max_resting:.0f}")
+    # Patch 21: per-venue capital, PM US feed freshness, blocked PM writes.
+    venues = status.get("venues") if isinstance(status.get("venues"), dict) else {}
+    for vn, cap_v in (("kalshi", cfg.max_capital_kalshi), ("pmus", cfg.max_capital_pmus)):
+        row = venues.get(vn) if isinstance(venues.get(vn), dict) else {}
+        vc = _f(row.get("capital_usd"))
+        info[f"capital_{vn}_usd"] = vc
+        if vc is not None and vc > cap_v:
+            reasons.append(f"capital_{vn}:{vc:.2f}>{cap_v:.2f}")
+    pm = status.get("pmus") if isinstance(status.get("pmus"), dict) else {}
+    pm_rest = _f((venues.get("pmus") or {}).get("resting_n")) if isinstance(venues.get("pmus"), dict) else None
+    age = _f(pm.get("book_age_s"))
+    info["pmus_book_age_s"] = age
+    if pm_rest and age is not None and age > cfg.pmus_stale_s:
+        reasons.append(f"pmus_feed_stale:{age:.0f}s>{cfg.pmus_stale_s:.0f}s")
+    if (_f(pm.get("blocked_writes")) or 0) > 0:
+        reasons.append(f"pmus_blocked_write:{int(_f(pm.get('blocked_writes')))}")
     if status.get("kill"):
         info["engine_kill"] = status.get("kill")
         if cfg.trip_on_engine_kill:

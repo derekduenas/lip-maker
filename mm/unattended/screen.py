@@ -195,6 +195,7 @@ class MetaCache:
         now = self.clock()
         return [s for s in dict.fromkeys(names)
                 if s and (s not in self.series
+                          or "fee_type" not in self.series[s]
                           or now - float(self.series[s].get("fetched") or 0) > SERIES_TTL_S)]
 
     def fetch_series(self, reader, names) -> int:
@@ -212,8 +213,12 @@ class MetaCache:
                 continue
             self.series_lookups += 1
             ser = payload.get("series") or {}
+            # Patch 21: fee_type / fee_multiplier (GET /series/{t}, verified live
+            # 2026-10-01: quadratic | quadratic_with_maker_fees |
+            # quadratic_with_combo_maker_fees) so maker fees enter net $/day.
             self.series[s] = {"category": ser.get("category"), "tags": ser.get("tags") or [],
-                              "frequency": ser.get("frequency"), "fetched": self.clock()}
+                              "frequency": ser.get("frequency"), "fee_type": ser.get("fee_type"),
+                              "fee_multiplier": ser.get("fee_multiplier"), "fetched": self.clock()}
             self.dirty = True
             got += 1
             self.sleep(PAUSE_S)
@@ -249,6 +254,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         if series not in bucket and len(bucket) < 8:
             bucket.append(series)
 
+    # Patch 21: overlapping programs on one market -> keep the richest one,
+    # deterministically (input order used to decide, which flapped re-feeds).
+    frames = sorted(frames, key=lambda f: (-pool_per_day(f), str(f.get("program_id") or "")))
     for frame in frames:
         market = frame.get("market")
         if not market or market in seen:
@@ -288,6 +296,8 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         out["close_ts"] = eff
         out["days_to_settle"] = days
         out["category"] = category
+        out["fee_type"] = (cat_row or {}).get("fee_type") or "quadratic"
+        out["fee_multiplier"] = (cat_row or {}).get("fee_multiplier")
         out["days_from_close"] = True
         rk = rank_score(frame, meta, category=category, days=days)
         out["rank_score"] = round(rk["score"], 6)

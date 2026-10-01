@@ -124,6 +124,7 @@ class KalshiMarket:
     yes_bids: list[tuple[int, float]] = field(default_factory=list)
     no_bids: list[tuple[int, float]] = field(default_factory=list)
     fee_type: str = "quadratic"
+    fee_multiplier: float = 1.0
     days_to_settle: float | None = 1.0
     has_reference: bool = False
     has_observation: bool = False
@@ -137,6 +138,13 @@ class KalshiMarket:
     empirical_markout_cents: float | None = None
     empirical_n: int = 0
     category: str | None = None
+    # Patch 21: venue abstraction. "kalshi" or "pmus" (Polymarket US, mapped
+    # to a Kalshi-shaped book: yes_bids = PM bids, no_bids = 100 - PM offers).
+    venue: str = "kalshi"
+    max_spread_usd: float | None = None
+    # PM US: single-event (game/match) program (day_of/live periods or a
+    # non-futures sports market) -> excluded like Kalshi single-match sports.
+    sports_single: bool = False
 
 
 @dataclass
@@ -229,6 +237,104 @@ def markout_cents(market: KalshiMarket) -> float:
     return prior
 
 
+def _params(market: KalshiMarket) -> ProgramParams:
+    return ProgramParams(
+        market_ticker=market.market,
+        target_size=market.target_size,
+        discount_factor=market.discount_factor,
+        period_reward_usd=market.period_reward_usd,
+        period_seconds=market.period_seconds,
+        rules="pmus" if market.venue == "pmus" else "kalshi",
+        max_spread_usd=market.max_spread_usd if market.venue == "pmus" else None,
+    )
+
+
+def pmus_side_share(bids: list[tuple[int, float]], price: int, size: float,
+                    target: float, df: float) -> float:
+    """Our normalised share of ONE PM US side with ``size`` added at ``price``
+    (ticks from that side's best price, walk to Target; docs.polymarket.us/incentives/liquidity).
+    Max Spread is a whole-book test and is applied by score_snapshot, not here."""
+    from engine.lip_scorer import _find_cutoff_price, _score_bids
+    book = _merge(_levels(bids), int(price), float(size))
+    cut = _find_cutoff_price(book, target)
+    if cut is None or not book:
+        return 0.0
+    ref = max(level.price_cents for level in book)
+    ours, total = _score_bids(book, [BookLevel(int(price), float(size))], ref, df, cut)
+    return ours / total if total > 0 else 0.0
+
+
+def pmus_max_improve_ticks() -> int:
+    return int(_env_float("LIP_PMUS_MAX_IMPROVE_TICKS", 1.0))
+
+
+def pmus_side_rung(bids: list[tuple[int, float]], opp_bids: list[tuple[int, float]],
+                   size: float, target: float, df: float) -> int | None:
+    """Reward-optimal rung for one PM US side (Patch 21).
+
+    Candidates: best + LIP_PMUS_MAX_IMPROVE_TICKS (default 1) down to best - 2,
+    never locking or crossing the opposite side (price + opposite best < 100).
+    Pick the highest side share per $ of premium (share / price); ties go to
+    the lower (more passive) price. An improving rung is worth it under PM US
+    rules because every other order is then DF^1 from the new best. A side
+    with no resting orders returns None (not quoted: our size alone would
+    have to reach Target).
+    """
+    prices = [int(p) for p, q in bids if q > 0]
+    if not prices or size <= 0:
+        return None
+    best = max(prices)
+    opp = max((int(p) for p, q in opp_bids if q > 0), default=None)
+    best_key = None
+    for price in range(best + max(0, pmus_max_improve_ticks()), best - 3, -1):
+        if price < 1 or price > 99:
+            continue
+        if opp is not None and price + opp >= 100:
+            continue
+        share = pmus_side_share(bids, price, size, target, df)
+        key = (share / price, -price)
+        if share > 0 and (best_key is None or key > best_key[0]):
+            best_key = (key, price)
+    if best_key is None:
+        return best if (opp is None or best + opp < 100) else None
+    return best_key[1]
+
+
+def side_rungs(market: KalshiMarket, size: float, *, fallback_touch: bool = True):
+    """(yes_cents, no_cents) quote rungs under the market's venue rules.
+
+    Kalshi: the LIP reference (cumulative Target/5; help.kalshi.com 13823851),
+    or the touch when the book is thinner (fallback_touch) else None.
+    PM US: pmus_side_rung per side (None when a side cannot be quoted)."""
+    if market.venue == "pmus":
+        return (pmus_side_rung(market.yes_bids, market.no_bids, size, market.target_size, market.discount_factor),
+                pmus_side_rung(market.no_bids, market.yes_bids, size, market.target_size, market.discount_factor))
+    yes_ref = reference_cents(market.yes_bids, market.target_size)
+    no_ref = reference_cents(market.no_bids, market.target_size)
+    if not fallback_touch:
+        return yes_ref, no_ref
+    return (touch(market.yes_bids) if yes_ref is None else yes_ref,
+            touch(market.no_bids) if no_ref is None else no_ref)
+
+
+def maker_fee_usd(market: KalshiMarket, price_cents: int) -> float:
+    """Per-contract maker fee (negative = rebate) for one fill.
+
+    PM US: maker REBATE 0.0125 x C x p x (1-p), paid at the trade, banker's
+    rounded per fill (https://docs.polymarket.us/fees, effective 10 AM ET
+    2026-10-01). Kalshi: the series fee schedule (kalshi_fee_usd)."""
+    if market.venue == "pmus":
+        p = int(price_cents) / 100.0
+        return -0.0125 * p * (1.0 - p) if 0 < p < 1 else 0.0
+    from decimal import Decimal as _D
+    mult = _D(str(market.fee_multiplier if market.fee_multiplier is not None else 1))
+    try:
+        return float(kalshi_fee_usd(int(price_cents), 1, fee_type=market.fee_type, multiplier=mult))
+    except ValueError:  # unknown fee_type: assume the standard maker fee (conservative)
+        return float(kalshi_fee_usd(int(price_cents), 1, fee_type="quadratic_with_maker_fees",
+                                    multiplier=mult))
+
+
 def kalshi_share(market: KalshiMarket, yes_cents: int, no_cents: int,
                  size: float) -> float:
     yes_book = _merge(_levels(market.yes_bids), yes_cents, size)
@@ -238,14 +344,7 @@ def kalshi_share(market: KalshiMarket, yes_cents: int, no_cents: int,
         yes_bids=[BookLevel(yes_cents, size)],
         no_bids=[BookLevel(no_cents, size)],
     )
-    params = ProgramParams(
-        market_ticker=market.market,
-        target_size=market.target_size,
-        discount_factor=market.discount_factor,
-        period_reward_usd=market.period_reward_usd,
-        period_seconds=market.period_seconds,
-    )
-    return snapshot_share(score_snapshot(book, ours, params))
+    return snapshot_share(score_snapshot(book, ours, _params(market)))
 
 
 def kalshi_one_sided_share(market: KalshiMarket, side: str, price_cents: int,
@@ -261,12 +360,7 @@ def kalshi_one_sided_share(market: KalshiMarket, side: str, price_cents: int,
         no_book = _merge(no_book, price_cents, size)
         ours = OurQuotes(yes_bids=[], no_bids=[BookLevel(price_cents, size)])
     book = BookState(market_ticker=market.market, yes_bids=yes_book, no_bids=no_book)
-    params = ProgramParams(
-        market_ticker=market.market, target_size=market.target_size,
-        discount_factor=market.discount_factor, period_reward_usd=market.period_reward_usd,
-        period_seconds=market.period_seconds,
-    )
-    return snapshot_share(score_snapshot(book, ours, params))
+    return snapshot_share(score_snapshot(book, ours, _params(market)))
 
 
 def _uptime(market: KalshiMarket) -> float:
@@ -287,6 +381,12 @@ def reward_per_day(share: float, market: KalshiMarket, *,
     paid = kalshi_period_payout(share, market.period_reward_usd, uptime=uptime)
     days = (market.period_seconds / 86400.0) * uptime
     if paid <= 0 or days <= 0 or reward_factor <= 0:
+        return 0.0
+    if market.venue == "pmus" and days > 1.0 and paid / days < 1.0:
+        # PM US "Rewards under $1.00 are not paid out" (docs.polymarket.us/
+        # incentives/liquidity). ASSUMPTION (docs silent on the unit;
+        # earnings are reported per (market, ET date)): apply the $1 minimum
+        # per day as well as per period - the stricter reading.
         return 0.0
     return (paid / days) * float(reward_factor)
 
@@ -314,13 +414,11 @@ def carry_apr() -> float:
 def quote_economics(market: KalshiMarket, size: float, *,
                     reward_factor: float = 1.0) -> tuple[float, float, float, int, int]:
     """Return net $/day, capital, share, yes cents, no cents at ``size``."""
-    yes_ref = reference_cents(market.yes_bids, market.target_size)
-    no_ref = reference_cents(market.no_bids, market.target_size)
-    # A book that already reaches target/5 is quoted at that reference.
-    # A thinner book has no reference yet; the touch is the price that
-    # can create one once our size is added.
-    yes_cents = touch(market.yes_bids) if yes_ref is None else yes_ref
-    no_cents = touch(market.no_bids) if no_ref is None else no_ref
+    # Kalshi: a book that already reaches target/5 is quoted at that
+    # reference; a thinner book at the touch. PM US: reward-optimal rung.
+    yes_cents, no_cents = side_rungs(market, size)
+    if yes_cents is None or no_cents is None:
+        return 0.0, 0.0, 0.0, 0, 0
     share = kalshi_share(market, yes_cents, no_cents, size) if size > 0 else 0.0
     reward = reward_per_day(share, market, reward_factor=reward_factor)
     family = family_of(market)
@@ -328,8 +426,8 @@ def quote_economics(market: KalshiMarket, size: float, *,
     fills_side = size * fraction
     mo = markout_cents(market)
     as_cost = -(mo / 100.0) * (fills_side * 2.0)
-    fee = float(kalshi_fee_usd(yes_cents, 1, fee_type=market.fee_type)) * fills_side
-    fee += float(kalshi_fee_usd(no_cents, 1, fee_type=market.fee_type)) * fills_side
+    fee = maker_fee_usd(market, yes_cents) * fills_side
+    fee += maker_fee_usd(market, no_cents) * fills_side
     days = market.days_to_settle or 0.0
     cheap = family in ("commodity", "crypto") or market.has_reference or (
         family == "weather" and market.has_observation)
@@ -352,6 +450,8 @@ def quote_economics(market: KalshiMarket, size: float, *,
 def sports_reason(market: KalshiMarket) -> str:
     """Live/same-day sports and esports match markets."""
     series = (market.series or market.market.split("-", 1)[0]).upper()
+    if market.venue == "pmus" and market.sports_single:
+        return "sports_match"
     if _re.search(sports_denylist(), series):
         return "sports_match"
     category = (market.category or "").strip().lower()
