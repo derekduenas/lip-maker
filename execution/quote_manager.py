@@ -46,7 +46,8 @@ from config import settings
 from execution.kalshi_auth import KalshiClient, KalshiAuthError
 from execution.order_request import (
     LiveExecutionBlocked, MakerSafetyError, assert_maker_safe,
-    build_limit_order, require_live_execution_allowed, would_cross,
+    build_limit_order, require_live_execution_allowed, to_event_order_v2,
+    would_cross, V2_CREATE_PATH,
 )
 from engine.account_ledger import AccountLedger, InsufficientCapital
 from engine.fees import fee_usd
@@ -97,6 +98,9 @@ class RestingOrder:
     # Flag prevents placing a duplicate same-side order until next reconcile
     # cycle clears the in-memory state via periodic_resync.
     pending_cancel: bool = False
+    # False after a price change or a size increase (Kalshi amend drops
+    # queue priority). A decrease leaves this True.
+    queue_preserved: bool = True
     # Our client_order_id ("LIP-…") when we placed it; empty for orders
     # rehydrated from the venue that we cannot prove are ours.
     client_order_id: str = ""
@@ -989,8 +993,8 @@ class QuoteManager:
                 self._release_capital(coid)
                 return None
             try:
-                resp = self.client.post("/portfolio/orders", body)
-                order_id = resp.get("order", {}).get("order_id", "")
+                resp = self.client.post(V2_CREATE_PATH, to_event_order_v2(body))
+                order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id", "")
                 _log.info(f"[LIVE] PLACED {market_ticker} {side}@{price_cents}c size={size_contracts} order_id={order_id}")
             except Exception as e:
                 # 2026-09-20 audit: an exception here does NOT prove the order
@@ -1038,6 +1042,64 @@ class QuoteManager:
                               order_id, "resting", notes=f"coid={coid}")
         return rest
 
+    def _decrease_order(self, order: RestingOrder, new_size: float) -> bool:
+        """Same price, smaller size. Kalshi decrease keeps queue position."""
+        new_size = float(new_size)
+        if new_size <= 0 or new_size >= order.size_contracts:
+            return False
+        if not self.paper:
+            try:
+                require_live_execution_allowed()
+            except LiveExecutionBlocked as e:
+                _log.error(f"[LIVE] BLOCKED decrease {order.order_id}: {e}")
+                return False
+            try:
+                self.client.post(
+                    f"{V2_CREATE_PATH}/{order.order_id}/decrease",
+                    {"reduce_to": f"{new_size:.2f}"},
+                )
+            except Exception as e:
+                _log.warning(f"decrease failed {order.order_id}: {e}")
+                return False
+        order.size_contracts = new_size
+        order.queue_preserved = True
+        return True
+
+    def _amend_order(self, order: RestingOrder, new_price: int, new_size: float) -> bool:
+        """Price change or size-up. Kalshi amend forfeits queue position.
+
+        One request, not cancel-then-place: a failed amend must not leave a
+        second order on the same side.
+        """
+        if not self.paper:
+            try:
+                require_live_execution_allowed()
+            except LiveExecutionBlocked as e:
+                _log.error(f"[LIVE] BLOCKED amend {order.order_id}: {e}")
+                return False
+            try:
+                legacy = build_limit_order(
+                    ticker=order.market_ticker, side=order.side,
+                    price_cents=int(new_price),
+                    size_contracts=max(1, int(round(new_size))),
+                    client_order_id=order.client_order_id or "amend",
+                    enforce_non_crossing=False,
+                )
+                v2 = to_event_order_v2(legacy)
+                self.client.post(
+                    f"{V2_CREATE_PATH}/{order.order_id}/amend",
+                    {"ticker": order.market_ticker, "side": v2["side"],
+                     "price": v2["price"], "count": f"{float(new_size):.2f}",
+                     "client_order_id": order.client_order_id},
+                )
+            except Exception as e:
+                _log.warning(f"amend failed {order.order_id}: {e}")
+                return False
+        order.price_cents = int(new_price)
+        order.size_contracts = float(new_size)
+        order.queue_preserved = False
+        return True
+
     def _release_capital(self, client_order_id: str) -> None:
         """Return an order's reserved capital to the available pool.
 
@@ -1065,7 +1127,10 @@ class QuoteManager:
             _log.info(f"[PAPER] CANCEL {order.market_ticker} {order.side}@{order.price_cents}c")
         else:
             try:
-                self.client.delete(f"/portfolio/orders/{order.order_id}")
+                from urllib.parse import urlencode
+                path = (f"{V2_CREATE_PATH}/{order.order_id}?"
+                        + urlencode({"market_ticker": order.market_ticker}))
+                self.client.delete(path)
                 _log.info(f"[LIVE] CANCELLED {order.market_ticker} {order.side}@{order.price_cents}c order_id={order.order_id}")
             except Exception as e:
                 if "404" in str(e) or "Not Found" in str(e):
@@ -1158,95 +1223,78 @@ class QuoteManager:
         current = self.resting.get(target.market_ticker, [])
         current_yes = [o for o in current if o.side == "yes"]
         current_no  = [o for o in current if o.side == "no"]
-
-        actions = {"cancelled": 0, "placed": 0, "kept": 0, "reason": reason}
-
-        # Yes side (#97: respects yes_size_override for inventory skew)
         yes_size = target.yes_size()
-        if target.yes_bid_cents is None:
-            for o in current_yes:
-                if self._cancel_order(o):
-                    actions["cancelled"] += 1
-        else:
-            need_replace = False
-            if len(current_yes) != 1:
-                need_replace = True
-            elif (current_yes[0].price_cents != target.yes_bid_cents
-                  or abs(current_yes[0].size_contracts - yes_size) > _QTY_EPS):
-                # Includes the partial-fill case: remaining < target ⇒ top up.
-                need_replace = True
-            if need_replace:
-                # 2026-05-02 PREDATOR C2: place ONLY if all cancels succeeded.
-                # Was: cancel returns False → we still place → two same-side
-                # orders co-exist → safety caps drift, double exposure. Now:
-                # any cancel failure marks the order pending_cancel and skips
-                # placement until next reconcile cycle (periodic_resync clears).
-                all_cancelled = True
-                for o in current_yes:
-                    if self._cancel_order(o):
-                        actions["cancelled"] += 1
-                    else:
-                        o.pending_cancel = True
-                        all_cancelled = False
-                        _log.warning(f"C2 cancel-failed yes {target.market_ticker} "
-                                     f"oid={o.order_id[:12]} — marking pending_cancel, "
-                                     f"skipping placement to avoid duplicate")
-                if all_cancelled:
-                    # The opposing bid is the other leg of our own two-sided
-                    # target: a YES buy crosses iff yes_bid + no_bid >= 100.
-                    r = self._place_order(target.market_ticker, "yes",
-                                           target.yes_bid_cents, yes_size,
-                                           best_opposing_bid_cents=target.no_bid_cents,
-                                           program_id=target.program_id)
-                    if r:
-                        actions["placed"] += 1
-                else:
-                    actions["pending_cancel_yes"] = sum(
-                        1 for o in current_yes if o.pending_cancel
-                    )
-            else:
-                actions["kept"] += 1
-
-        # No side (#97: respects no_size_override for inventory skew)
         no_size = target.no_size()
-        if target.no_bid_cents is None:
-            for o in current_no:
+
+        actions = {"cancelled": 0, "placed": 0, "kept": 0, "decreased": 0,
+                   "amended": 0, "reason": reason}
+
+        self._reconcile_side(
+            target, "yes", current_yes, target.yes_bid_cents, yes_size,
+            target.no_bid_cents, actions)
+        self._reconcile_side(
+            target, "no", current_no, target.no_bid_cents, no_size,
+            target.yes_bid_cents, actions)
+        return actions
+
+    def _reconcile_side(self, target, side: str, current: list, target_price,
+                        target_size: float, opposing, actions: dict) -> None:
+        """One side. A single resting order is decreased or amended in place.
+
+        Cancel-then-place remains for the zero-order and many-order cases,
+        and it still refuses to place when a cancel fails.
+        """
+        from mm.diff import plan_resting
+
+        label = "yes" if side == "yes" else "no"
+        if target_price is None:
+            for o in current:
                 if self._cancel_order(o):
                     actions["cancelled"] += 1
-        else:
-            need_replace = False
-            if len(current_no) != 1:
-                need_replace = True
-            elif (current_no[0].price_cents != target.no_bid_cents
-                  or abs(current_no[0].size_contracts - no_size) > _QTY_EPS):
-                need_replace = True
-            if need_replace:
-                # 2026-05-02 PREDATOR C2: same race fix as yes side above.
-                all_cancelled = True
-                for o in current_no:
-                    if self._cancel_order(o):
-                        actions["cancelled"] += 1
-                    else:
-                        o.pending_cancel = True
-                        all_cancelled = False
-                        _log.warning(f"C2 cancel-failed no {target.market_ticker} "
-                                     f"oid={o.order_id[:12]} — marking pending_cancel, "
-                                     f"skipping placement to avoid duplicate")
-                if all_cancelled:
-                    r = self._place_order(target.market_ticker, "no",
-                                           target.no_bid_cents, no_size,
-                                           best_opposing_bid_cents=target.yes_bid_cents,
-                                           program_id=target.program_id)
-                    if r:
-                        actions["placed"] += 1
-                else:
-                    actions["pending_cancel_no"] = sum(
-                        1 for o in current_no if o.pending_cancel
-                    )
-            else:
+            return
+        if len(current) == 1 and not current[0].pending_cancel:
+            o = current[0]
+            plan = plan_resting(
+                o.price_cents, o.size_contracts, target_price, target_size,
+                fade=bool(getattr(target, "fade_topup", False)),
+            )
+            if plan.action == "keep":
                 actions["kept"] += 1
-
-        return actions
+                return
+            if plan.action == "decrease":
+                if self._decrease_order(o, plan.size):
+                    actions["decreased"] += 1
+                else:
+                    o.pending_cancel = True
+                    actions[f"pending_cancel_{label}"] = 1
+                return
+            if plan.action == "amend":
+                if self._amend_order(o, plan.price_cents, plan.size):
+                    actions["amended"] += 1
+                else:
+                    o.pending_cancel = True
+                    actions[f"pending_cancel_{label}"] = 1
+                return
+        # 2026-05-02 PREDATOR C2: place ONLY if every cancel succeeded.
+        all_cancelled = True
+        for o in current:
+            if self._cancel_order(o):
+                actions["cancelled"] += 1
+            else:
+                o.pending_cancel = True
+                all_cancelled = False
+                _log.warning(f"C2 cancel-failed {label} {target.market_ticker} "
+                             f"oid={o.order_id[:12]} — marking pending_cancel, "
+                             f"skipping placement to avoid duplicate")
+        if all_cancelled:
+            if self._place_order(target.market_ticker, side, target_price,
+                                 int(round(target_size)),
+                                 best_opposing_bid_cents=opposing,
+                                 program_id=target.program_id):
+                actions["placed"] += 1
+        else:
+            actions[f"pending_cancel_{label}"] = sum(
+                1 for o in current if o.pending_cancel)
 
     def cancel_all(self, market_ticker: Optional[str] = None, *, only_ours: bool = False) -> int:
         """Cancel every resting order, optionally scoped to one market.

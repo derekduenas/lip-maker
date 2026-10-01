@@ -921,6 +921,11 @@ class PaperRunner:
         self.fill_counts[status] += 1
         if status not in ("applied", "persistence_failed", "untracked"):
             return status        # duplicates change nothing, including accrual
+        try:
+            from mm.risk import FILL_CLOCK
+            FILL_CLOCK.record(1)
+        except Exception as e:
+            _log.warning(f"fill-rate clock failed for {ev.market_ticker}: {e}")
         self._break_accrual(ev.market_ticker, "fill")
         self.qm.inventory.pop(ev.market_ticker, None)
         if settings.AS_GUARD_ENABLED and status == "applied" and ev.side in ("yes", "no"):
@@ -1609,6 +1614,31 @@ class PaperRunner:
                     no_size_override = min(no_size_override, chosen)
                 size = chosen
 
+        if suppress_sides >= {"yes", "no"}:
+            return self._skip(tkr, "as_pull:both_sides_suppressed")
+        # External-reference reservation. No-op unless a print was registered
+        # for this ticker (mm.fair_value.register_reference). The book-only
+        # inventory tick-back above is unchanged for markets without one.
+        from mm.fair_value import fair_yes, lookup_reference
+        from mm.reservation import apply_skew, quote_reservation
+        ref = lookup_reference(tkr)
+        if ref is not None and yes_bid_c is not None and no_bid_c is not None:
+            mid = yes_mid_cents(best_yes.price_cents, best_no.price_cents)
+            fair = fair_yes(tkr, mid, ref)
+            if fair.pull:
+                return self._skip(tkr, f"external_pull:{fair.pull_reason.split(' ')[0]}")
+            net_q = inv.net_yes_contracts if inv else 0
+            cap_ct = float(settings.MAX_NET_INVENTORY_USD) / 0.50
+            res = quote_reservation(
+                fair.yes_cents, net_q, cap_ct,
+                sigma_cents=max(1.0, abs(fair.yes_cents - (mid or fair.yes_cents)) + 1.0),
+                tau_hours=max(hours_settle, 1.0 / 60.0),
+            )
+            if res.skew_cents:
+                yes_bid_c, no_bid_c = apply_skew(yes_bid_c, no_bid_c, res.skew_cents)
+                self.as_decisions[tkr] = res.reason
+            if res.suppress_side:
+                suppress_sides.add(res.suppress_side)
         if suppress_sides >= {"yes", "no"}:
             return self._skip(tkr, "as_pull:both_sides_suppressed")
         return QuoteTarget(

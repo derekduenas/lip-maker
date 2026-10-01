@@ -86,8 +86,11 @@ class Sentinel:
             if not ok:
                 return False, reason
 
-            # 3. Rate limits
+            # 3. Rate limits (quotes, and the constitution's fill halt)
             ok, reason = self._check_rate_limits(target)
+            if not ok:
+                return False, reason
+            ok, reason = self._check_fill_halt()
             if not ok:
                 return False, reason
 
@@ -178,6 +181,15 @@ class Sentinel:
                 f"(cap {constitution.MAX_QUOTES_PER_MARKET_PER_MINUTE})"
             )
         return True, ""
+
+    def _check_fill_halt(self) -> tuple[bool, str]:
+        """Constitution MAX_FILLS_PER_MINUTE. Latched in mm.risk.FILL_CLOCK.
+
+        Recording happens at the fill (PaperRunner.on_fill / RiskEngine).
+        This check only reads the clock, so a quiet process is unaffected.
+        """
+        from mm.risk import FILL_CLOCK
+        return FILL_CLOCK.check()
 
     def _check_quote_quality(self, target) -> tuple[bool, str]:
         # Two-sided + size floor — these are redundant with QuoteManager's

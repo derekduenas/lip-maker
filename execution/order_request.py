@@ -241,6 +241,50 @@ def require_live_execution_allowed() -> None:
             "MAKER_ONLY_ENFORCEMENT_VERIFIED = True.")
 
 
+# Create Order (V2). Legacy POST /portfolio/orders is deprecated no earlier
+# than 6 May 2026 (OpenAPI 3.32.0, fetched 2026-10-01).
+V2_CREATE_PATH = "/portfolio/events/orders"
+
+
+def to_event_order_v2(body: dict, *, order_group_id: Optional[str] = None) -> dict:
+    """Translate a maker-safe legacy body into a Create Order (V2) body.
+
+    V2 quotes the YES book only (docs: BookSide). A YES buy at p cents is
+    ``side=bid``, ``price=p/100``. A NO buy at q cents is economically a YES
+    sell at ``1 - q/100``, so ``side=ask``. ``count`` and ``price`` are
+    fixed-point strings. ``time_in_force`` and ``self_trade_prevention_type``
+    are required. ``post_only`` stays set. ``taker_at_cross`` cancels our
+    incoming order if it would trade against our own resting order, which is
+    the STP mode that does not pull the quote we are trying to keep.
+    """
+    assert_maker_safe(body)
+    side = body["side"]
+    if side == "yes":
+        book_side = "bid"
+        dollars = int(body["yes_price"]) / CONTRACT_CENTS
+    elif side == "no":
+        book_side = "ask"
+        dollars = (CONTRACT_CENTS - int(body["no_price"])) / CONTRACT_CENTS
+    else:
+        raise MakerSafetyError(f"invalid side {side!r}")
+    tif = body.get("time_in_force") or "good_till_canceled"
+    if tif not in TIME_IN_FORCE_VALUES:
+        raise MakerSafetyError(f"time_in_force {tif!r} is not a V2 value")
+    out = {
+        "ticker": body["ticker"],
+        "client_order_id": body["client_order_id"],
+        "side": book_side,
+        "count": f"{float(body['count']):.2f}",
+        "price": f"{dollars:.4f}",
+        "time_in_force": tif,
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": True,
+    }
+    if order_group_id:
+        out["order_group_id"] = order_group_id
+    return out
+
+
 def assert_maker_safe(body: dict) -> None:
     """Last line of defence before transmission.
 
