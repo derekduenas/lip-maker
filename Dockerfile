@@ -9,4 +9,4 @@ ENV LIP_PAPER=true \
 
 # Paper/demo only. The process refuses a production websocket host.
 ENTRYPOINT ["python3", "-m", "mm.unattended"]
-CMD ["--heartbeat", "/var/lib/lip-maker/heartbeat", "--cancel-log", "/var/lib/lip-maker/startup-cancel"]
+CMD ["--run", "--heartbeat", "/var/lib/lip-maker/heartbeat", "--cancel-log", "/var/lib/lip-maker/startup-cancel"]

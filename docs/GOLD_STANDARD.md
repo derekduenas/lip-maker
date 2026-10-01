@@ -497,6 +497,7 @@ Implemented, paper by default, live writes blocked:
   matched paid/estimate ratios toward 1 and is an input to the selector
   and the sizer. With no matched credits the multiplier is 1.
 * Paper cycle `python -m mm.unattended --cycle RECORDING.jsonl --once`
+* Continuous paper loop `python -m mm.unattended --run` (demo websocket; `--replay` does not open a socket)
   runs selector, sizer, paper quote, scorer, reconciler, allocator, and
   risk on a recording. Findings and fixes are in `docs/AUDIT.md`.
 

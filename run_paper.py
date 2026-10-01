@@ -1,26 +1,12 @@
-"""LIP Maker — end-to-end paper runner.
+"""LIP Maker — paper runner classes.
 
-Ties everything together:
-  - LIP discovery (refresh active programs)
-  - Top-N market selection
-  - WebSocket orderbook subscription
-  - Per-second scoring simulation with our intended quotes
-  - Quote manager reconciliation (paper mode — logs intent only)
-  - Periodic summary with estimated $/day
-
-Quote strategy (MVP): JOIN the best bid on each side.
-  yes_bid_cents = current best yes bid
-  no_bid_cents  = current best no bid
-  size          = min(QUOTE_SIZE_AS_FRACTION_OF_TARGET × target_size, DEFAULT_QUOTE_SIZE_CONTRACTS)
-
-This is the simplest LIP-qualifying strategy. Adverse-selection risk exists
-(informed flow hits our quotes) but we measure it via the paper week.
-
-Run in background for 7 days to collect data before flipping to live.
+The long-running process is ``python -m mm.unattended --run``. Executing
+this file starts that process. ``PaperRunner`` stays importable for the
+existing paper tests. Fill simulation lives in ``execution.paper_fills``
+and the run loop uses that same simulator.
 
 Usage:
-    PYTHONPATH=. venv/bin/python run_paper.py --duration 604800  # 7 days
-    PYTHONPATH=. venv/bin/python run_paper.py --duration 300     # 5-min smoke test
+    PYTHONPATH=. python3 -m mm.unattended --run
 """
 from __future__ import annotations
 
@@ -2553,10 +2539,5 @@ async def main(duration_sec: int = 300, top_n: int = 50):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--duration", type=int, default=300,
-                   help="seconds to run (default: 300 = 5 min smoke test)")
-    p.add_argument("--top-n", type=int, default=100,
-                   help="number of top REACHABLE markets to quote (target_size ≤ 500 filter; ~$2,900/day pool at top-100)")
-    a = p.parse_args()
-    asyncio.run(main(duration_sec=a.duration, top_n=a.top_n))
+    from mm.unattended.service import main as unattended_main
+    raise SystemExit(unattended_main(["--run"]))

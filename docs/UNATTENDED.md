@@ -2,9 +2,7 @@
 
 This process is for a small always-on VM in **us-east**, close to the venue, running the paper loop continuously. It does not talk to the production exchange. `LIP_PAPER` stays `true`. A production websocket host is refused.
 
-The demo websocket path this client already signs is `/trade-api/ws/v2` on the demo host already allowed for REST: `wss://demo-api.kalshi.co/trade-api/ws/v2`. Set it with `LIP_KALSHI_WS_URL` only when a demo key is present. Leave the variable unset and the process stays on the local paper feed.
-
-A recording runs the whole paper path in one command. `python -m mm.unattended --cycle books.jsonl --once` selects, sizes, records a paper quote, scores, reconciles tagged credits, shrinks the series factor, allocates, and checks risk. Droplet install, firewall, and the env file are in `docs/DROPLET.md`. The audit of this branch is `docs/AUDIT.md`.
+`python -m mm.unattended --run` is the long-running process: demo websocket by default (`wss://demo-api.kalshi.co/trade-api/ws/v2`), then selector, sizer, quoter, per-second scorer, allocator, and risk. Selection repeats every 10 minutes. Paper mode simulates fills on live trades. `--run --replay STREAM.jsonl` does the same loop on a recording and does not open a socket. `--cycle` remains the one-shot book pass. Droplet install, firewall, and the env file are in `docs/DROPLET.md`. The audit of this branch is `docs/AUDIT.md`.
 
 ## What the process does on every start
 

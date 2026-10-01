@@ -291,6 +291,22 @@ class SecondAccrual:
     def set_resting(self, orders: list[RestingOrder]) -> None:
         self.resting = list(orders)
 
+    def omit_until(self, second: int) -> None:
+        """Mark unscored seconds before ``second`` as missed.
+
+        The second itself stays open. A missed second adds no dollars and
+        is not filled in with the previous share. The first call only
+        anchors the clock, so the history before the first book is not
+        invented as a gap.
+        """
+        second = int(second)
+        if self._next is None:
+            self._next = second
+            return
+        while self._next < second:
+            self._mark(self._next, "missed", counted=False)
+            self._next += 1
+
     def on_message(self, msg: dict, ts: float) -> str:
         second = int(ts)
         if self._next is not None and second < self._next:

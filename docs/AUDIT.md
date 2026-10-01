@@ -4,7 +4,7 @@ Paper and demo rails stay. Production stays disarmed. This file lists what was c
 
 ## Entrypoint
 
-`python -m mm.unattended --cycle RECORDING.jsonl --once` is the paper pass: selector, sizer, paper quote, per-second scorer, reconciler, series factor, compounding allocator, risk check. It does not open a socket. The systemd unit still heartbeats and refuses a production host. Droplet steps are in `docs/DROPLET.md`.
+`python -m mm.unattended --run` is the continuous paper process: demo websocket by default, then selector, sizer, quoter, per-second scorer, allocator, and risk on a 10-minute selection cadence. `--run --replay STREAM.jsonl` is that loop on a recorded websocket stream and does not open a socket. `--cycle` remains the one-shot book pass. The systemd unit runs `--run` with `LIP_PAPER=true` and the demo host. Droplet steps are in `docs/DROPLET.md`.
 
 ## Findings
 
@@ -31,6 +31,7 @@ Paper and demo rails stay. Production stays disarmed. This file lists what was c
 | medium | Discovery dropped `max_reward_per_account`. | Parsed from centi-cents into `max_reward_usd`. `test_program_parse_converts_the_account_cap`. |
 | medium | `LIP_RAMP_PHASE=later` crashed at import with `ValueError`. | A `RuntimeError` names the variable. `test_ramp_phase_rejects_text`. |
 | low | No startup check for a key pasted on argv, no rotating log, no local status, no clock-skew gate, no droplet script. The unattended unit did not load `/etc/lip-maker/lip-maker.env`. | `mm/ops.py`, `mm/status_page.py`, `deploy/droplet/setup.sh`, `docs/DROPLET.md`. The unit has `EnvironmentFile=-/etc/lip-maker/lip-maker.env` and still sets `LIP_PAPER=true`. Tests cover skew, redaction, the status JSON, and the script text. |
+| high | The systemd unit only heartbeated. `run_paper.py` was a second long-running process, and Kalshi still has no per-user LIP award route, so a balance change could not update the series factor without being treated as a confirmed payment. | `python -m mm.unattended --run` is the one process (selector, sizer, quoter, scorer, allocator, risk, T-15, fill cap, series gate on demo). Paper simulates fills with `PaperFillSimulator`. `run_paper.py` starts that process. `infer_reward_credits` splits a positive residual (balance minus fills, settlements, and deposits) by score share, marks it `inferred_balance`, and feeds `series_factors`. That source is not in `PAID_SOURCES`. Confirmed credits still require `liquidity_reward` plus a paid source. `setup.sh` enables the unit. Regression: `test_run_loop_on_a_recorded_stream`. |
 
 ## Accepted, not changed
 
@@ -39,11 +40,11 @@ Paper and demo rails stay. Production stays disarmed. This file lists what was c
 * `RiskEngine.check_quote` blocks a new quote on a limit breach and sets `cancel_all` on a kill (daily loss, disconnect, fill-rate, already dead). A soft limit is not a flatten.
 * `CrossKill.trip` still marks the book killed and calls both cancels. Waiting for both acks before tripping would leave the book running when a cancel fails.
 * The sizer's objective is reward minus a flat markout. `quote_economics` also subtracts fees and holding. They meet on price (the reference) and still differ on costs. The cycle uses the sizer for the quote size and the risk engine for the dollar check.
-* `run_paper.py` remains the long-running discovery and quote process. The cycle is the single paper entry that chains the newer modules. The heartbeat unit does not quote.
+* `Health` latches until `reset`. Aging a bad sample out of the 24-hour window does not clear the latch.
 
 ## Unverifiable against the docs fetched 1 October 2026
 
-* No Kalshi route returns our liquidity award or a per-period score. `GET /incentive_programs` is the pool, `paid_out`, and optional `max_reward_per_account`. Settlements, fills, and balance are not that credit.
+* No Kalshi route returns our liquidity award or a per-period score. `GET /incentive_programs` is the pool, `paid_out`, and optional `max_reward_per_account`. Settlements, fills, and balance are not that credit. A positive residual after fills, settlements, and deposits is an inferred attribution (`inferred_balance`), not a confirmed award.
 * The Help Center LIP article does not publish a top-N participant cap. The account cap in code is `max_reward_per_account` when the program row has one.
 * The 28 February 2026 scoring formula is not reimplemented. Programs that start before 30 July 2026 are tagged and not scored with the current formula.
 * Polymarket US: whether the $1 minimum is per program period or per user per day is not stated on the incentives page we fetched. The ranker does not apply `payable`.

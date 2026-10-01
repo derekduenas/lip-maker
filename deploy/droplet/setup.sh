@@ -34,8 +34,8 @@ ufw default allow outgoing
 ufw allow OpenSSH
 ufw --force enable
 
-echo "Paper unit is installed and not started."
-echo "Run a recording first:"
-echo "  sudo -u lip LIP_PAPER=true python3 -m mm.unattended --cycle /var/lib/lip-maker/books.jsonl --once --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel"
-echo "Then: systemctl enable --now lip-unattended.service"
+systemctl enable --now lip-unattended.service
+
+echo "Paper unit is enabled and running (selector, sizer, quoter, scorer, allocator, risk)."
+echo "LIP_PAPER=true. Websocket default is the demo host. A missing demo key keeps the process up and does not open a socket."
 echo "Live trading stays off. Arming it later takes a separate acknowledgement, allow_production, and LIP_PAPER=false. This script does not do that."

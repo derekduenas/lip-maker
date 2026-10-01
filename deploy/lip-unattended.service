@@ -10,8 +10,9 @@ Group=lip
 WorkingDirectory=/opt/lip-maker
 EnvironmentFile=-/etc/lip-maker/lip-maker.env
 Environment=LIP_PAPER=true
+Environment=LIP_KALSHI_WS_URL=wss://demo-api.kalshi.co/trade-api/ws/v2
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m mm.unattended --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel
+ExecStart=/usr/bin/python3 -m mm.unattended --run --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel --status-port 8765 --log-file /var/lib/lip-maker/lip.log --summary /var/lib/lip-maker/daily-summary
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=300

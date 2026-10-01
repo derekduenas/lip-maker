@@ -9,6 +9,10 @@ credit.
 
 This is not a fit to any historical statement. April and May 2026 payouts
 were earned under the 28 February 2026 rules and are not inputs.
+
+``inferred=True`` marks a residual the balance reconciler attributed.
+Those rows still move the multiplier, and the caller reports that the
+calibration is inferred. They are not ``PAID_SOURCES`` credits.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ class RatioObs:
     series: str
     estimated_usd: Decimal
     paid_usd: Decimal
+    inferred: bool = False
 
     @property
     def ratio(self) -> Decimal | None:
@@ -65,6 +70,7 @@ def error_distribution(observations: list[RatioObs]) -> dict:
             "paid_usd": format(obs.paid_usd, "f"),
             "ratio": None if obs.ratio is None else format(obs.ratio, "f"),
             "error_usd": format(obs.error_usd, "f"),
+            "inferred": bool(obs.inferred),
         }
         for obs in observations
     ]
