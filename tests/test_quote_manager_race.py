@@ -40,6 +40,10 @@ def test_cancel_failure_skips_placement_and_flags_pending(monkeypatch):
 
     def fail_cancel(order):
         return False
+    # Duplicate-side cleanup would collapse the two YES orders before the
+    # cancel-replace path, and it writes the quotes table. This test is the
+    # many-order path, so leave both orders in place.
+    monkeypatch.setattr(qm, "_sanity_resting", lambda m: None)
     monkeypatch.setattr(qm, "_cancel_order", fail_cancel)
 
     place_calls = []
@@ -58,7 +62,7 @@ def test_cancel_failure_skips_placement_and_flags_pending(monkeypatch):
     assert qm.resting["TEST-MKT"][0].pending_cancel is True
     yes_places = [c for c in place_calls if c[1] == "yes"]
     assert len(yes_places) == 0
-    assert actions["pending_cancel_yes"] == 1
+    assert actions["pending_cancel_yes"] == 2
 
 
 def test_price_change_amends_in_place_and_does_not_restack(monkeypatch):
@@ -131,6 +135,7 @@ def test_cancel_success_does_place(monkeypatch):
         price_cents=40, size_contracts=25, placed_at=time.time(), paper=True,
     ))
 
+    monkeypatch.setattr(qm, "_sanity_resting", lambda m: None)
     monkeypatch.setattr(qm, "_cancel_order", lambda o: True)
     place_calls = []
     monkeypatch.setattr(qm, "_place_order",

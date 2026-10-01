@@ -86,6 +86,7 @@ class PMUSAdapter:
             "participateDontInitiate": True,
         }
         resp = self._write("POST", f"/v1/order/{order_id}/modify", body, now=now)
+        resp["body"] = body
         resp["queue_preserved"] = False
         return resp
 

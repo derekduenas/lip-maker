@@ -202,10 +202,13 @@ class TestRisk:
         assert limits.per_underlying_usd == Decimal("150")
 
     def test_underlying_cap_stacks_brent(self):
+        # $5,000 book: $500 per market, $1,250 per commodity family.
+        # Three brent contracts under the market cap still share one underlying.
         eng = RiskEngine(limits=Limits.from_capital(Decimal("5000")),
                          clock=FillClock())
-        eng.commit("KXBRENTD-A", "kalshi", Decimal("700"))
-        d = eng.check_quote(market="KXBRENTW-B", venue="kalshi", add_usd=Decimal("700"))
+        eng.commit("KXBRENTD-A", "kalshi", Decimal("450"))
+        eng.commit("KXBRENTD-B", "kalshi", Decimal("450"))
+        d = eng.check_quote(market="KXBRENTW-C", venue="kalshi", add_usd=Decimal("450"))
         assert not d.allowed and "per_underlying" in d.reason
 
     def test_unrelated_events_do_not_share_an_underlying(self):

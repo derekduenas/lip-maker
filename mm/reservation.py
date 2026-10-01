@@ -21,14 +21,9 @@ cent on these markets and the price never moves):
                 +1 means long YES up to the cap
     σ           recent stdev of the YES fair value, in cents, over one hour
     τ           hours to the quoting horizon, floored at one minute
-    γ           risk aversion in 1/cent² per hour. Default 4 makes one hour
-                of a 5-cent hourly sigma and a full long position a 1-cent shift:
-                q γ σ² τ = 1 · 4 · 25 · 1 / 100 wait — σ is in cents so σ² = 25,
-                4 * 25 * 1 = 100 cents, which is too much.
-
-Recalibrated default: γ = 0.04. Then
-    1 * 0.04 * 25 * 1 = 1.0 cent
-at full inventory, σ = 5 cents per √hour, τ = 1 hour.
+    γ           risk aversion per cent. Default 0.04, so a full long, σ = 5¢
+                per √hour, and τ = 1 hour moves the reservation by
+                q γ σ² τ = 1 · 0.04 · 25 · 1 = 1 cent.
 
 The half-spread's (1/γ) ln(1+γ/k) term is computed in cents with k = 1.5
 per cent (arrival intensity falls by e^1.5 when we demand one more cent).
