@@ -12,6 +12,7 @@ both flags are set, so the droplet unit cannot send.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -38,6 +39,10 @@ from mm.session_gates import (
 from mm.unattended.feed import DEMO_WS_URL
 from mm.unattended.optimize import optimize_sizes
 from mm.unattended.service import UnattendedRefused
+
+_log = logging.getLogger("lip.readonly")
+# Pause after a failed production-book read before the service tries again.
+READONLY_DATA_BACKOFF_S = 5.0
 from mm.venues.kalshi_rest import DEMO_HOSTS, PRODUCTION_HOSTS
 
 SELECT_EVERY_S = 600.0
@@ -648,24 +653,43 @@ async def drive_socket(ws_url: str, on_frame: Callable[[dict], None]) -> None:
 
 
 async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -> None:
-    """Production books and public trades. The reader cannot place an order."""
+    """Production books and public trades. The reader cannot place an order.
+
+    A missing HTTP session used to refuse the first GET with
+    ``SystemExit(3)``, which systemd treated as a crash. The session is
+    created here. An HTTP or network failure on an allowed GET logs,
+    waits, and returns so the run loop can try again. A write, order, or
+    portfolio refusal still ends the process.
+    """
+    import asyncio
+    import requests
     from mm.venues.readonly import (
-        PUBLIC_WS_CHANNELS, ReadOnlyKalshiTransport, ReadOnlyMarketSocket, load_private_key,
+        PUBLIC_WS_CHANNELS, ReadOnlyKalshiTransport, ReadOnlyMarketSocket,
+        ReadOnlyViolation, load_private_key,
     )
     key = load_private_key(source["key_path"])
-    reader = ReadOnlyKalshiTransport(api_key=source["key_id"], private_key=key)
+    reader = ReadOnlyKalshiTransport(
+        api_key=source["key_id"], private_key=key, session=requests.Session(),
+    )
     payload: dict = {}
     try:
         payload = reader.get(
             "/incentive_programs", params={"status": "active", "type": "liquidity"},
         )
-    except Exception:
-        payload = {}
+    except ReadOnlyViolation:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "read-only market data failed (%s); backing off %.0fs",
+            exc, READONLY_DATA_BACKOFF_S,
+        )
+        await asyncio.sleep(READONLY_DATA_BACKOFF_S)
+        return
     for frame in _programs_from_incentive(payload):
         on_frame(frame)
     sock = ReadOnlyMarketSocket(api_key=source["key_id"], private_key=key, url=source["ws_url"])
-    await sock.connect()
     try:
+        await sock.connect()
         tickers = [frame["market"] for frame in _programs_from_incentive(payload)]
         await sock.subscribe(sorted(PUBLIC_WS_CHANNELS), tickers)
         async for raw in sock._ws:
@@ -677,6 +701,14 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None]) -
                 on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
             elif kind in ("orderbook_snapshot", "orderbook_delta"):
                 on_frame(msg)
+    except ReadOnlyViolation:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "read-only market data failed (%s); backing off %.0fs",
+            exc, READONLY_DATA_BACKOFF_S,
+        )
+        await asyncio.sleep(READONLY_DATA_BACKOFF_S)
     finally:
         await sock.close()
 

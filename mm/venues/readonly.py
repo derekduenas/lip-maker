@@ -10,8 +10,10 @@ Allowed: GET markets, events, series, order books, trades,
 incentive programs, and exchange status. The websocket may subscribe to
 ``orderbook_delta``, ``ticker``, and ``trade``.
 
-Anything else logs and exits. No POST, PUT, DELETE, PATCH, portfolio
-route, or private channel is sent.
+A POST, PUT, DELETE, PATCH, portfolio route, or private channel logs
+and exits. An HTTP 4xx/5xx or a network error on an allowed GET is a
+data failure: it is logged and raised as ``ReadOnlyDataError`` so the
+caller can back off and keep running.
 """
 from __future__ import annotations
 
@@ -57,6 +59,19 @@ class ReadOnlyViolation(SystemExit):
     def __init__(self, reason: str) -> None:
         self.reason = str(reason)
         super().__init__(3)
+
+
+class ReadOnlyDataError(Exception):
+    """An allowed market-data read failed.
+
+    HTTP 4xx/5xx and network errors use this. It is not a ``SystemExit``.
+    The run loop logs it, waits, and tries again. Write and portfolio
+    refusals stay ``ReadOnlyViolation``.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason)
+        super().__init__(self.reason)
 
 
 class MarketDataReader:
@@ -210,7 +225,10 @@ class ReadOnlyKalshiTransport(MarketDataReader):
             _refuse("no session")
         headers = self.sign_headers("GET", rel)
         url = self.base_url + (rel if rel.startswith("/") else "/" + rel)
-        resp = self._session.request("GET", url, headers=headers, data=None, timeout=10)
+        try:
+            resp = self._session.request("GET", url, headers=headers, data=None, timeout=10)
+        except Exception as exc:
+            raise ReadOnlyDataError(f"GET {path} {type(exc).__name__}: {exc}") from exc
         status = int(getattr(resp, "status_code", 0) or 0)
         payload = {}
         if hasattr(resp, "json"):
@@ -219,7 +237,8 @@ class ReadOnlyKalshiTransport(MarketDataReader):
             except Exception:
                 payload = {}
         if status >= 400:
-            _refuse(f"GET {path} HTTP {status}")
+            _log.warning("read-only Kalshi GET %s HTTP %s", path, status)
+            raise ReadOnlyDataError(f"GET {path} HTTP {status}")
         return payload if isinstance(payload, dict) else {}
 
     def get(self, path: str, *, params: Optional[dict] = None) -> dict:

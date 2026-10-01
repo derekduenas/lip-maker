@@ -22,6 +22,9 @@ fi
 if [[ ! -f /etc/lip-maker/lip-maker.env ]]; then
   cp /opt/lip-maker/deploy/droplet/lip-maker.env.example /etc/lip-maker/lip-maker.env
 fi
+python3 -m venv /opt/lip-maker/.venv
+/opt/lip-maker/.venv/bin/pip install -r /opt/lip-maker/requirements.txt
+
 chown -R lip:lip /opt/lip-maker /var/lib/lip-maker /etc/lip-maker
 chmod 600 /etc/lip-maker/lip-maker.env
 if [[ -f /etc/lip-maker/kalshi-prod-read.pem ]]; then
@@ -33,10 +36,17 @@ cp /opt/lip-maker/deploy/lip-unattended.service /etc/systemd/system/lip-unattend
 systemctl daemon-reload
 
 # SSH only. The status page binds 127.0.0.1 and is not allowed through here.
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow OpenSSH
-ufw --force enable
+# An active firewall that already has rules is the operator's policy.
+# Do not replace it with a default-deny or run ufw --force enable.
+ufw_status="$(ufw status 2>/dev/null || true)"
+if grep -q '^Status: active' <<<"$ufw_status" && grep -Eq 'ALLOW|DENY|REJECT|LIMIT' <<<"$ufw_status"; then
+  echo "ufw already active with rules; leaving the firewall unchanged"
+else
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow OpenSSH
+  ufw --force enable
+fi
 
 systemctl enable --now lip-unattended.service
 

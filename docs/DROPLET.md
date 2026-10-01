@@ -8,9 +8,9 @@ Paper first. The unit forces `LIP_PAPER=true` and the demo websocket `wss://demo
 sudo bash deploy/droplet/setup.sh
 ```
 
-The script installs Python 3, creates the `lip` user, copies `deploy/droplet/lip-maker.env.example` to `/etc/lip-maker/lip-maker.env` when that file is missing, installs `deploy/lip-unattended.service`, enables ufw with OpenSSH only, and runs `systemctl enable --now lip-unattended.service`. After that the paper system is up.
+The script installs Python 3, creates the `lip` user, copies `deploy/droplet/lip-maker.env.example` to `/etc/lip-maker/lip-maker.env` when that file is missing, creates `/opt/lip-maker/.venv` and installs `requirements.txt` into it, installs `deploy/lip-unattended.service` (that unit runs the venv interpreter), and runs `systemctl enable --now lip-unattended.service`. If ufw is already active and has rules, the script leaves the firewall alone. Otherwise it enables ufw with OpenSSH only. After that the paper system is up.
 
-The process is `python3 -m mm.unattended --run`. It cancels on startup, then continuously runs selector, sizer, quoter, per-second scorer, allocator, and risk. Selection repeats every 10 minutes. Quotes come off at T-15 minutes before `close_ts`. A single fill's premium is capped at $100. The live series gate applies in demo mode. Paper mode records that decision and still quotes, so a new droplet can collect the five days the gate asks for.
+The process is `/opt/lip-maker/.venv/bin/python -m mm.unattended --run`. It cancels on startup, then continuously runs selector, sizer, quoter, per-second scorer, allocator, and risk. Selection repeats every 10 minutes. Quotes come off at T-15 minutes before `close_ts`. A single fill's premium is capped at $100. The live series gate applies in demo mode. Paper mode records that decision and still quotes, so a new droplet can collect the five days the gate asks for.
 
 Heartbeat: `/var/lib/lip-maker/heartbeat`. Daily summary: `/var/lib/lip-maker/daily-summary`. Status JSON: `http://127.0.0.1:8765/status` (loopback only; ufw does not open it). Logs: `/var/lib/lip-maker/lip.log`, rotating at 1 MB, five files.
 

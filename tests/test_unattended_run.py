@@ -217,12 +217,68 @@ def test_run_without_a_key_does_not_open_a_socket(tmp_path, monkeypatch):
 def test_unit_runs_the_paper_loop():
     unit = (ROOT / "deploy" / "lip-unattended.service").read_text(encoding="utf-8")
     script = (ROOT / "deploy" / "droplet" / "setup.sh").read_text(encoding="utf-8")
+    reqs = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "--run" in unit
     assert "wss://demo-api.kalshi.co/trade-api/ws/v2" in unit
     assert "LIP_PAPER=true" in unit
     assert "LIP_PAPER=false" not in unit
     assert "api.elections.kalshi.com" not in unit
     assert "--status-port 8765" in unit
+    assert "/opt/lip-maker/.venv/bin/python" in unit
     assert "systemctl enable --now lip-unattended.service" in script
+    assert "python3 -m venv /opt/lip-maker/.venv" in script
+    assert "requirements.txt" in script
+    assert "ufw already active with rules" in script
+    for name in ("websockets", "requests", "cryptography", "certifi"):
+        assert name in reqs
+
+
+def test_prod_read_key_starts_and_survives_a_503(tmp_path, monkeypatch, caplog):
+    """A production read key must start the loop, and a 503 must not exit 3."""
+    import logging
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    caplog.set_level(logging.WARNING)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = tmp_path / "read.pem"
+    pem.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    monkeypatch.setenv("LIP_PAPER", "true")
+    monkeypatch.delenv("LIP_DEMO", raising=False)
+    monkeypatch.delenv("LIP_KALSHI_WS_URL", raising=False)
+    monkeypatch.setenv("KALSHI_PROD_READ_KEY_ID", "kid")
+    monkeypatch.setenv("KALSHI_PROD_READ_KEY_PATH", str(pem))
+    monkeypatch.setattr("mm.unattended.loop.READONLY_DATA_BACKOFF_S", 0.0)
+
+    calls = []
+
+    class Down:
+        def request(self, method, url, headers=None, data=None, timeout=10):
+            calls.append((method, url))
+            return type("R", (), {"status_code": 503, "json": lambda self: {}})()
+
+    monkeypatch.setattr("requests.Session", lambda: Down())
+    out = tmp_path / "run.json"
+    code = main([
+        "--run", "--once",
+        "--report", str(out),
+        "--heartbeat", str(tmp_path / "hb"),
+        "--cancel-log", str(tmp_path / "cancel"),
+        "--summary", str(tmp_path / "summary"),
+    ])
+    assert code == 0
+    assert calls and calls[0][0] == "GET"
+    assert "incentive_programs" in calls[0][1]
+    assert "503" in caplog.text
+    assert "backing off" in caplog.text
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["data_source"] == "production-books"
+    assert saved["paper"] is True
+    assert saved["live_armed"] is False
+    assert (tmp_path / "hb").exists()
     paper = (ROOT / "run_paper.py").read_text(encoding="utf-8")
     assert 'unattended_main(["--run"])' in paper

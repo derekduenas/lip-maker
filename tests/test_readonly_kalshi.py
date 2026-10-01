@@ -16,6 +16,7 @@ from mm.venues.readonly import (
     PROD_BOOKS_FLAG,
     PROD_REST,
     PROD_WS,
+    ReadOnlyDataError,
     ReadOnlyKalshiTransport,
     ReadOnlyMarketSocket,
     ReadOnlyViolation,
@@ -108,6 +109,39 @@ def test_order_paths_cannot_hold_the_reader(tmp_path):
     with pytest.raises(ReadOnlyViolation):
         qm._cancel_order(order)
     assert net.calls == 0
+
+
+def test_http_and_network_errors_are_not_a_hard_stop(caplog):
+    """4xx/5xx and a dropped connection stay in the data path.
+
+    A write is still a process exit. The log line for the HTTP failure is
+    a warning, not the refusal that systemd treats as a crash.
+    """
+    caplog.set_level(logging.WARNING)
+
+    class Down:
+        def request(self, *args, **kwargs):
+            return SimpleNamespace(status_code=503, json=lambda: {})
+
+    reader = ReadOnlyKalshiTransport(
+        api_key="read-key", private_key=_Key(), session=Down(), base_url=PROD_REST,
+    )
+    with pytest.raises(ReadOnlyDataError) as info:
+        reader.get("/incentive_programs", params={"status": "active"})
+    assert "503" in str(info.value)
+    assert "refused" not in caplog.text
+
+    class Drop:
+        def request(self, *args, **kwargs):
+            raise ConnectionError("reset")
+
+    dropped = ReadOnlyKalshiTransport(
+        api_key="read-key", private_key=_Key(), session=Drop(), base_url=PROD_REST,
+    )
+    with pytest.raises(ReadOnlyDataError):
+        dropped.get("/incentive_programs")
+    with pytest.raises(ReadOnlyViolation):
+        reader.post("/portfolio/events/orders", {"count": "1.00"})
 
 
 def test_public_get_is_allowed_and_demo_books_are_labeled(tmp_path, monkeypatch):
