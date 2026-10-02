@@ -63,11 +63,14 @@ Criteria (thresholds are flags):
                     also accepts n_settled|settled_n|settled_markets|
                     n_markets|n, model_brier|brier_model|model.brier,
                     book_brier|brier_book|book.brier. Absent: N/A.
-  daily_loss        the daily loss limit was never hit: no ``daily_loss`` kill
-                    (engine alert) or watchdog ``daily_loss:`` trip anywhere
-                    in the alert logs (or since --since), and today's
+  daily_loss        the daily loss limit was not hit: no ``daily_loss`` kill
+                    (engine alert) or watchdog ``daily_loss:`` trip timestamped
+                    in the last --daily-loss-lookback-days (14, the paper-days
+                    window; --since overrides it), and today's
                     daily_mtm_pnl_usd above -risk_limits.daily_loss_usd.
-                    INSUFFICIENT when no alert log can be read.
+                    Events whose timestamp cannot be parsed are not placed in
+                    the window (counted as ``undated``). INSUFFICIENT when no
+                    alert log can be read.
 
 Exit status: 0 READY, 1 NOT READY (a FAIL), 2 INSUFFICIENT DATA.
 
@@ -475,19 +478,29 @@ def crit_fv(status, a):
     return _crit("fv_calibration", title, PASS if mb < bb else FAIL, value)
 
 
-def crit_daily_loss(status, events, alert_read, a):
-    title = "daily loss limit never hit"
-    since = _ts(a.since) if a.since else None
-    hits = []
+def crit_daily_loss(status, events, alert_read, a, now=None):
+    lookback = float(getattr(a, "daily_loss_lookback_days", 14.0))
+    if a.since:
+        since = _ts(a.since)
+        window = f"since {a.since}"
+    else:
+        now = datetime.now(timezone.utc).timestamp() if now is None else float(now)
+        since = now - lookback * 86400.0
+        window = f"in the last {lookback:g} days"
+    title = f"daily loss limit not hit ({window})"
+    hits, undated = [], 0
     for ev in events:
-        if since is not None and (ev["ts"] is None or ev["ts"] < since):
-            continue
         m = ev["message"]
-        if (ev["origin"] == "engine" and "engine kill latched" in m and "daily_loss" in m) or \
-                (ev["origin"] == "watchdog" and "daily_loss:" in m):
-            hits.append({"time": None if ev["ts"] is None else
-                         datetime.fromtimestamp(ev["ts"], timezone.utc).isoformat(),
-                         "origin": ev["origin"], "message": m[:200]})
+        if not ((ev["origin"] == "engine" and "engine kill latched" in m and "daily_loss" in m) or
+                (ev["origin"] == "watchdog" and "daily_loss:" in m)):
+            continue
+        if ev["ts"] is None:
+            undated += 1
+            continue
+        if since is not None and ev["ts"] < since:
+            continue
+        hits.append({"time": datetime.fromtimestamp(ev["ts"], timezone.utc).isoformat(),
+                     "origin": ev["origin"], "message": m[:200]})
     kill = json.dumps((status or {}).get("kill") or "", default=str)
     if "daily_loss" in kill:
         hits.append({"time": "now", "origin": "status kill", "message": kill[:200]})
@@ -495,13 +508,13 @@ def crit_daily_loss(status, events, alert_read, a):
     lim = _num(_dig(status or {}, "risk_limits.daily_loss_usd"))
     if d is not None and lim is not None and d <= -abs(lim):
         hits.append({"time": "now", "origin": "status", "message": f"daily_mtm_pnl_usd {d} <= -{abs(lim)}"})
-    value = {"events": hits, "alert_logs_read": alert_read, "today_mtm_usd": d, "limit_usd": lim}
+    value = {"events": hits, "alert_logs_read": alert_read, "today_mtm_usd": d, "limit_usd": lim,
+             "lookback_days": None if a.since else lookback, "since": a.since, "undated_events": undated}
     if hits:
         return _crit("daily_loss", title, FAIL, value, f"{len(hits)} daily-loss event(s)")
     if not alert_read:
         return _crit("daily_loss", title, INSUFF, value, "no alert log could be read")
-    return _crit("daily_loss", title, PASS, value,
-                 "searched " + ("all of " if since is None else f"since {a.since} in ") + ", ".join(alert_read))
+    return _crit("daily_loss", title, PASS, value, f"searched {window} in " + ", ".join(alert_read))
 
 
 # ------------------------------------------------------------------ report
@@ -532,7 +545,10 @@ def parse_args(argv=None):
     ap.add_argument("--operator-test-regex", default=r"(?i)operator[ _-]?test")
     ap.add_argument("--health-max-age-s", type=float, default=600.0)
     ap.add_argument("--min-fv-markets", type=int, default=200)
-    ap.add_argument("--since", default=None, help="ISO date/time: daily-loss history starts here")
+    ap.add_argument("--daily-loss-lookback-days", type=float, default=14.0,
+                    help="daily-loss events count only this many days back (default 14, the paper-days window)")
+    ap.add_argument("--since", default=None,
+                    help="ISO date/time: daily-loss history starts here (overrides the lookback)")
     ap.add_argument("--now", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--json", action="store_true")
     return ap.parse_args(argv)
@@ -578,7 +594,7 @@ def build_report(a) -> dict:
         crit_markout(status, a),
         crit_no_kills(status, state, health, health_err, wd_state, events, alert_read, now, a),
         crit_fv(status, a),
-        crit_daily_loss(status, events, alert_read, a),
+        crit_daily_loss(status, events, alert_read, a, now),
     ]
     graded = [c["status"] for c in criteria if c["status"] != NA]
     overall = ("NOT READY" if FAIL in graded else

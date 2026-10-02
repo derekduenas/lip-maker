@@ -4,9 +4,11 @@ Writes one line per alert (``ISO  LEVEL  source  message``) to the engine
 alert log (``alert_path()``):
 
 * ``LIP_ENGINE_ALERT_LOG`` when set;
-* else /var/lib/lip-maker/alerts-engine.log when /var/lib/lip-maker exists
-  and is writable (outside /opt/lip-maker, which deploy.sh moves aside on
-  every deploy; not the watchdog's JSON-lines alerts.log in the same dir);
+* else /var/lib/lip-maker/alerts-engine.log when that file can be written
+  (it exists and is a writable regular file, or it does not exist yet and
+  /var/lib/lip-maker is a writable directory; outside /opt/lip-maker, which
+  deploy.sh moves aside on every deploy; not the watchdog's JSON-lines
+  alerts.log in the same dir);
 * else <repo>/logs/alerts.log (dev boxes, tests).
 
 If the chosen file cannot be written the alert falls back to
@@ -47,9 +49,17 @@ def alert_path() -> Path:
     if env:
         return Path(env)
     default = Path(DEFAULT_ENGINE_ALERT_LOG)
-    if default.parent.is_dir() and os.access(default.parent, os.W_OK):
+    if _writable(default):
         return default
     return Path(FALLBACK_ALERT_LOG)
+
+
+def _writable(path: Path) -> bool:
+    """The file itself when it exists (a root-owned log in a lip-owned dir is
+    not writable for the engine), else its directory."""
+    if path.exists():
+        return path.is_file() and os.access(path, os.W_OK)
+    return path.parent.is_dir() and os.access(path.parent, os.W_OK)
 
 
 def _append(path: Path, line: str) -> None:

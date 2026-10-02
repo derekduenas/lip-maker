@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_default_is_outside_the_code_tree():
-    assert A.DEFAULT_ENGINE_ALERT_LOG == "/var/lib/lip-maker/alerts-engine.log"
+    # tests/conftest.py repoints the module constant at tmp_path: check the source
+    src = Path(A.__file__).read_text()
+    assert 'DEFAULT_ENGINE_ALERT_LOG = "/var/lib/lip-maker/alerts-engine.log"' in src
     # never the watchdog's own JSON-lines log
     assert Path(A.DEFAULT_ENGINE_ALERT_LOG).name != "alerts.log"
 
