@@ -10,15 +10,37 @@ should flatten points the same decision at ``SafeSender.trigger_all``.
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 
 
 def write_heartbeat(path: str | Path, now: float | None = None) -> None:
+    """Write the heartbeat timestamp atomically (temp file + os.replace).
+
+    A plain ``write_text`` truncates the file and then writes it, so a
+    reader in another process (lip-watchdog) can see an EMPTY file between
+    the two steps. The watchdog read that as ``heartbeat_missing`` and
+    latched a kill on 2026-10-02 07:17 UTC (APEX outage, ~7 h of 0 quotes).
+    os.replace is atomic on POSIX: readers see the old or the new content,
+    never a partial one. Falls back to the direct write if the temp file
+    cannot be created (e.g. a directory the writer cannot create files in).
+    """
     ts = time.time() if now is None else float(now)
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(f"{ts}\n", encoding="utf-8")
+    text = f"{ts}\n"
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        dest.write_text(text, encoding="utf-8")
 
 
 def supervisor_once(heartbeat: str | Path, cancel_log: str | Path, *,

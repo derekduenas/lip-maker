@@ -67,7 +67,16 @@ def configure_logging(path: str | None = None) -> logging.Logger:
     log.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     if path:
-        handler = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=5)
+        # LIP_LOG_MAX_MB x (LIP_LOG_BACKUPS + 1) of history. The old fixed
+        # 1 MB x 5 held only ~3-4 h at the normal rate (minutes during a
+        # selection burst), so the overnight 2026-10-02 outage had no engine
+        # log left by morning.
+        try:
+            max_mb = max(1.0, float(os.environ.get("LIP_LOG_MAX_MB", "20")))
+            backups = max(1, int(os.environ.get("LIP_LOG_BACKUPS", "10")))
+        except ValueError:
+            max_mb, backups = 20.0, 10
+        handler = RotatingFileHandler(path, maxBytes=int(max_mb * 1_000_000), backupCount=backups)
         handler.setFormatter(formatter)
         handler.addFilter(lambda record: setattr(record, "msg", redact(str(record.msg))) or True)
         log.addHandler(handler)

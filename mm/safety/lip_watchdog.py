@@ -56,6 +56,15 @@ consecutive failures latch the watchdog itself (watchdog_tick_failing) and run
 the same kill-file / stop / cancel-all actions. systemd restarts the process
 if it dies (Restart=always).
 
+Auto-recover (LIP_WD_AUTO_RECOVER=1, paper only, default off): a latch whose
+reasons were all transient (heartbeat_*, status_unreachable, feed_*,
+pmus_feed_stale) is cleared after LIP_WD_AUTO_RECOVER_HEALTHY_S (300) of
+clean checks: kill file removed, engine restarted with LIP_WD_RESTART_CMD
+(needs the polkit "restart" rule in deploy/apex/deploy.sh). A latch still
+failing LIP_WD_AUTO_RESTART_AFTER_S (600) after the trip gets one engine
+restart (hung engine). At most LIP_WD_AUTO_RECOVER_MAX_PER_DAY (3) actions
+per UTC day; then it stays latched. Any other trip reason stays latched.
+
 Reset:  python -m mm.safety.lip_watchdog --reset   (then restart lip-unattended)
         Clears the latch, kill file and the persisted engine_seen_live flag.
 """
@@ -149,6 +158,21 @@ class Config:
         # `lip` user does not have by default: see deploy/apex/README.md.
         self.stop_cmd = env.get("LIP_WD_STOP_CMD", "systemctl stop lip-unattended")
         self.tick_fails = max(1, int(_num(env, "LIP_WD_TICK_FAILS", 3)))
+        # Auto-recover (2026-10-02): a latch whose reasons were ALL transient
+        # (heartbeat / status / feed) is cleared after the engine has looked
+        # healthy for LIP_WD_AUTO_RECOVER_HEALTHY_S, by removing the kill file
+        # and restarting the engine (its kill is held in memory). Loss,
+        # inventory, capital, resting, live-mismatch, blocked-write,
+        # tick-failure and corrupt-state trips stay latched for a human.
+        # Paper only (never when this watchdog's own config is armed), at most
+        # LIP_WD_AUTO_RECOVER_MAX_PER_DAY recoveries + hung-engine restarts per
+        # UTC day. Default OFF in code.
+        self.auto_recover = _truthy(env.get("LIP_WD_AUTO_RECOVER"))
+        self.auto_healthy_s = _num(env, "LIP_WD_AUTO_RECOVER_HEALTHY_S", 300)
+        self.auto_max_per_day = int(_num(env, "LIP_WD_AUTO_RECOVER_MAX_PER_DAY", 3))
+        self.auto_restart_after_s = _num(env, "LIP_WD_AUTO_RESTART_AFTER_S", 600)
+        self.auto_grace_s = _num(env, "LIP_WD_AUTO_RECOVER_GRACE_S", 180)
+        self.restart_cmd = env.get("LIP_WD_RESTART_CMD", "systemctl restart lip-unattended")
 
 
 # ----------------------------------------------------------------- io helpers
@@ -181,10 +205,26 @@ def fetch_status(cfg: Config):
         return json.loads(r.read().decode("utf-8"))
 
 
-def read_heartbeat(cfg: Config):
+def read_heartbeat(cfg: Config, attempts: int = 3, pause_s: float = 0.05):
+    """Heartbeat timestamp, or None when the file does not exist.
+
+    An empty or partial file is a writer caught mid-write (pre-2026-10-02
+    engines truncated then wrote it; see supervisor.write_heartbeat), not a
+    missing heartbeat: re-read a few times, then fall back to the file's
+    mtime, which the writer just set. Only a file that is absent on every
+    attempt reads as missing; a dead writer still shows up as stale."""
+    for i in range(max(1, attempts)):
+        try:
+            return float(cfg.heartbeat.read_text().strip().split()[0])
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        if i + 1 < attempts:
+            time.sleep(pause_s)
     try:
-        return float(cfg.heartbeat.read_text().strip().split()[0])
-    except Exception:
+        return float(cfg.heartbeat.stat().st_mtime)
+    except OSError:
         return None
 
 
@@ -636,6 +676,118 @@ def cancel_all_action(cfg: Config, state: dict, status, now, canceller=None) -> 
     return res
 
 
+# ----------------------------------------------------------------- auto-recover
+TRANSIENT_REASONS = ("heartbeat_missing", "heartbeat_stale", "status_unreachable",
+                     "feed_no_frames", "feed_stale", "pmus_feed_stale")
+
+
+def _reason_kind(r) -> str:
+    return str(r).split(":", 1)[0]
+
+
+def is_transient(reasons) -> bool:
+    """True when there is at least one reason and every one is transient."""
+    rs = list(reasons or [])
+    return bool(rs) and all(_reason_kind(r) in TRANSIENT_REASONS for r in rs)
+
+
+def _run_cmd(cmd_str: str, runner=None) -> dict:
+    try:
+        cmd = shlex.split(cmd_str or "")
+        if not cmd:
+            raise RuntimeError("empty command")
+        r = (runner or subprocess.run)(cmd, capture_output=True, text=True, timeout=90)
+        return {"cmd": cmd, "rc": r.returncode, "ok": r.returncode == 0,
+                "stderr": str(getattr(r, "stderr", "") or "")[-300:]}
+    except Exception as exc:
+        return {"cmd": cmd_str, "ok": False, "error": str(exc)[:300]}
+
+
+def _auto_budget(cfg: Config, state: dict, now: float) -> int:
+    day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+    ar = state.setdefault("auto_recover", {})
+    if ar.get("day") != day:
+        ar.update({"day": day, "used": 0})
+    return cfg.auto_max_per_day - int(ar.get("used", 0))
+
+
+def auto_recover_step(cfg: Config, state: dict, now: float, reasons_now, runner=None) -> str | None:
+    """While latched: maybe restart a hung engine, maybe clear a transient
+    latch. Mutates ``state``; returns an action tag or None. Never raises."""
+    try:
+        if not cfg.auto_recover or not state.get("latched"):
+            return None
+        seen = list(state.get("reasons") or []) + list(state.get("latched_seen") or [])
+        if not is_transient(seen):
+            return None                       # a real loss/cap/safety trip: human only
+        if config_armed(cfg):
+            return None                       # live: human only
+        ar = state.setdefault("auto_recover", {})
+        tripped = float(state.get("tripped_at") or now)
+        if reasons_now:
+            state["healthy_since"] = None
+            # Still failing: the engine may be hung. One restart per trip.
+            if (now - tripped >= cfg.auto_restart_after_s and not state.get("auto_restarted")
+                    and _auto_budget(cfg, state, now) > 0):
+                res = _run_cmd(cfg.restart_cmd, runner)
+                state["auto_restarted"] = now
+                ar["used"] = int(ar.get("used", 0)) + 1
+                ar["last_restart"] = {"ts": now, **res}
+                state["auto_grace_until"] = now + cfg.auto_grace_s
+                alert(cfg, state, "auto_restart", "WARN",
+                      f"auto-recover: still {reasons_now} {now - tripped:.0f}s after trip; "
+                      f"engine restart via `{cfg.restart_cmd}` -> {'ok' if res['ok'] else res}. "
+                      "Latch stays until healthy.", res, now, force=True)
+                return "restart"
+            return None
+        if state.get("healthy_since") is None:
+            state["healthy_since"] = now
+            return None
+        if now - float(state["healthy_since"]) < cfg.auto_healthy_s:
+            return None
+        if _auto_budget(cfg, state, now) <= 0:
+            if not state.get("auto_budget_alerted"):
+                alert(cfg, state, "auto_budget", "WARN",
+                      f"auto-recover: daily limit {cfg.auto_max_per_day} used; staying latched "
+                      "(reset by hand: python -m mm.safety.lip_watchdog --reset)", None, now, force=True)
+                state["auto_budget_alerted"] = True
+            return None
+        prev = list(state.get("reasons") or [])
+        try:
+            cfg.kill_file.unlink()
+        except FileNotFoundError:
+            pass
+        res = _run_cmd(cfg.restart_cmd, runner)
+        ar["used"] = int(ar.get("used", 0)) + 1
+        if not res["ok"]:
+            # The engine still holds its in-memory kill; put the file back and stay latched.
+            try:
+                write_kill_file(cfg, prev or ["latched"], now)
+            except Exception as exc:
+                log.error("auto-recover: kill file rewrite failed: %s", exc)
+            ar["last_fail"] = {"ts": now, **res}
+            alert(cfg, state, "auto_recover_failed", "WARN",
+                  f"auto-recover: engine restart failed ({res}); staying latched", res, now, force=True)
+            return "failed"
+        keep = {k: state[k] for k in ("alert_last", "alert_hist", "pnl_base", "auto_recover") if k in state}
+        keep["auto_recover"]["last_recover"] = {"ts": now, "prev_reasons": prev,
+                                                "tripped_at": tripped, **res}
+        keep["auto_grace_until"] = now + cfg.auto_grace_s
+        keep["reset_at"] = now
+        keep["reset_prev_reasons"] = prev
+        keep["reset_by"] = "auto_recover"
+        state.clear()
+        state.update(keep)
+        alert(cfg, state, "auto_recover", "INFO",
+              f"lip-watchdog AUTO-RECOVERED from transient trip {prev} (tripped "
+              f"{now - tripped:.0f}s ago, healthy {cfg.auto_healthy_s:.0f}s); kill file removed, engine restarted. "
+              f"{_auto_budget(cfg, state, now)} auto-recoveries left today (UTC).", None, now, force=True)
+        return "recovered"
+    except Exception as exc:
+        log.error("auto-recover step failed: %s", exc)
+        return None
+
+
 # ----------------------------------------------------------------- main tick
 def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> dict:
     now = time.time() if now is None else now
@@ -647,6 +799,12 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> 
         err = exc
     hb = read_heartbeat(cfg)
     reasons, info = evaluate(cfg, state, now, status, err, hb)
+    if cfg.auto_recover and now < float(state.get("auto_grace_until") or 0):
+        # The engine was just restarted by auto-recover: give it time to come up.
+        ignored = [r for r in reasons if _reason_kind(r) in TRANSIENT_REASONS]
+        if ignored:
+            info["auto_grace_ignored"] = ignored
+            reasons = [r for r in reasons if _reason_kind(r) not in TRANSIENT_REASONS]
     if reasons and not state.get("latched"):
         state.update({"latched": True, "reasons": reasons, "tripped_at": now, "cancel_noop_logged": False})
         alert(cfg, state, "trip", "TRIP", "lip-watchdog TRIPPED: " + "; ".join(reasons),
@@ -661,6 +819,13 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> 
               "Kill file written; fix the watchdog env (or stop the engine) now.",
               {"info": info}, now, force=not state.get("live_mismatch_alerted"))
         state["live_mismatch_alerted"] = True
+    if state.get("latched") and reasons:
+        seen = list(state.get("latched_seen") or [])
+        for r in reasons:
+            if _reason_kind(r) not in [_reason_kind(x) for x in seen]:
+                seen.append(r)
+        state["latched_seen"] = seen[:20]
+    auto_action = auto_recover_step(cfg, state, now, reasons, runner)
     if state.get("latched"):
         try:
             if not cfg.kill_file.exists():
@@ -685,6 +850,11 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> 
               "info": info, "cancel": state.get("cancel"), "kill_file": str(cfg.kill_file),
               "kill_file_present": cfg.kill_file.exists(), "live_armed": live_armed(cfg, status, state),
               "config_armed": config_armed(cfg), "engine_seen_live": state.get("engine_seen_live"),
+              "auto_recover": {"enabled": cfg.auto_recover, "action": auto_action,
+                               "healthy_since": state.get("healthy_since"),
+                               "eligible": bool(state.get("latched")) and is_transient(
+                                   list(state.get("reasons") or []) + list(state.get("latched_seen") or [])),
+                               **(state.get("auto_recover") or {})},
               "limits": {"heartbeat_stale_s": cfg.hb_stale_s, "feed_stale_s": cfg.feed_stale_s,
                          "daily_loss_usd": cfg.daily_loss, "max_inventory_usd": cfg.max_inventory,
                          "max_capital_usd": cfg.max_capital, "max_resting": cfg.max_resting},
@@ -743,7 +913,7 @@ def reset(cfg: Config) -> None:
             p.unlink()
         except FileNotFoundError:
             pass
-    keep = {k: state[k] for k in ("alert_last", "alert_hist", "pnl_base") if k in state}
+    keep = {k: state[k] for k in ("alert_last", "alert_hist", "pnl_base", "auto_recover") if k in state}
     keep["reset_at"] = time.time()
     keep["reset_prev_reasons"] = prev
     save_state(cfg, keep)
