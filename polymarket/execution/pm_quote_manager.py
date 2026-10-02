@@ -6,11 +6,15 @@ Live mode is REFUSED (2026-10-01 review): constructing with paper=False
 raises RuntimeError. mm.unattended is the only path to a live venue. The
 live branches below are kept for history and are unreachable.
 
-Unverified-but-likely bug (why live must stay off here): the NO side is
-sent as ORDER_INTENT_BUY_SHORT at the NO price (target.no_price), but the
-Polymarket US docs say an order's price always refers to the YES (long)
-side. If so, a BUY_SHORT should carry 1 - no_price; as written it would
-rest at the wrong level. Not checked against the live API.
+Price side (fixed 2026-10-01): PM US ``price.value`` is always the YES
+(long) price. docs.polymarket.us/api-reference/orders/overview: "The
+`price.value` field always represents the long side's price, regardless of
+which order intent you use." and "To trade the NO side at any price X, set
+`price.value = 1.00 - X`." QuoteTarget.no_price and RestingOrder.price stay
+in outcome terms (NO price for BUY_SHORT); ``wire_price`` converts when the
+body is built and ``outcome_price`` converts venue prices back. Before this
+fix a NO bid of 0.40 went out as a YES sell at 0.40, which crosses any YES
+bid above 0.40.
 
 Key methods:
   reconcile(slug, target_yes, target_no)  — bring resting to match target
@@ -30,6 +34,22 @@ from polymarket_us import PolymarketUS
 from config import settings
 
 _log = logging.getLogger(__name__)
+
+_SHORT_INTENTS = ("ORDER_INTENT_BUY_SHORT", "ORDER_INTENT_SELL_SHORT")
+
+
+def wire_price(intent: str, price: float) -> float:
+    """YES-side ``price.value`` for an order whose outcome price is ``price``.
+
+    LONG intents trade YES at ``price``; SHORT intents trade NO at
+    ``price`` and go out as ``1 - price`` (docs: "set `price.value = 1.00 - X`").
+    """
+    return 1.0 - float(price) if intent in _SHORT_INTENTS else float(price)
+
+
+def outcome_price(intent: str, value: float) -> float:
+    """Inverse of ``wire_price``: venue YES-side value -> outcome price."""
+    return 1.0 - float(value) if intent in _SHORT_INTENTS else float(value)
 
 
 @dataclass
@@ -92,9 +112,12 @@ class PMQuoteManager:
                 qty = int(float(o.get("leavesQuantity", o.get("quantity", 0))))
                 if not (slug and oid and qty > 0):
                     continue
+                intent = o.get("intent", "")
+                # Venue price is YES-side; keep self.resting in outcome terms.
+                price = outcome_price(intent, price) if price else 0
                 ro = RestingOrder(
                     order_id=oid, slug=slug,
-                    intent=o.get("intent", ""),
+                    intent=intent,
                     price=price, quantity=qty,
                     placed_at=time.time(),
                 )
@@ -153,6 +176,11 @@ class PMQuoteManager:
                                   ws_age_s: float | None = None) -> tuple[bool, str]:
         """Abort a live place that would cross the websocket book.
 
+        ``price`` is in outcome terms (NO price for BUY_SHORT). It is
+        compared on the YES side, where the order actually rests: a
+        BUY_SHORT is a YES sell at ``wire_price`` and crosses when the YES
+        bid is at or above it.
+
         The signed REST book is a Cloudflare cache and is not consulted.
         A missing or old websocket book is a pull, not a permission to send.
         """
@@ -163,7 +191,7 @@ class PMQuoteManager:
         if "BUY_LONG" in intent and price >= float(ws_ask):
             return False, f"shielded: BUY_LONG ${price:.3f} >= best_ask ${float(ws_ask):.3f}"
         if "BUY_SHORT" in intent:
-            yes_sell_price = 1.0 - price
+            yes_sell_price = wire_price(intent, price)
             if float(ws_bid) >= yes_sell_price:
                 return False, (
                     f"shielded: BUY_SHORT yes_sell ${yes_sell_price:.3f} "
@@ -176,7 +204,11 @@ class PMQuoteManager:
                      ws_bid: float | None = None,
                      ws_ask: float | None = None,
                      ws_age_s: float | None = None) -> Optional[RestingOrder]:
-        """Place one order. Paper mode → preview. Live mode → create."""
+        """Place one order. Paper mode → preview. Live mode → create.
+
+        ``price`` is the outcome price (NO price for BUY_SHORT); the body
+        carries the YES-side ``wire_price``.
+        """
         # A live place needs the websocket book. REST is not a substitute.
         if not self.paper:
             ok, reason = self._virtual_post_only_check(
@@ -190,7 +222,7 @@ class PMQuoteManager:
             "marketSlug": slug,
             "intent":     intent,
             "type":       "ORDER_TYPE_LIMIT",
-            "price":      {"value": f"{price:.3f}", "currency": "USD"},
+            "price":      {"value": f"{wire_price(intent, price):.3f}", "currency": "USD"},
             "quantity":   int(quantity),
             "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
         }
@@ -315,9 +347,8 @@ class PMQuoteManager:
                 if existing_no:
                     if self._cancel_order(existing_no):
                         actions["cancelled"] += 1
-                # NOTE (unverified-but-likely bug): PM US prices refer to the
-                # YES side; sending the NO price on BUY_SHORT is probably wrong.
-                # Harmless in paper (preview only); see the module docstring.
+                # target.no_price is the NO price; _place_order sends the
+                # YES-side value 1 - no_price (see the module docstring).
                 if self._place_order(target.slug, "ORDER_INTENT_BUY_SHORT",
                                      target.no_price, no_qty,
                                      ws_bid=target.ws_bid, ws_ask=target.ws_ask,

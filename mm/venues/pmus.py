@@ -18,6 +18,17 @@ Fetched 2026-10-01:
 
 There is no PM US equivalent of a Kalshi order group in the pages above.
 Cancel-all on disconnect is the protection this adapter exposes.
+
+Price side. ``price.value`` on the wire is always the YES (long) price,
+whatever the intent. https://docs.polymarket.us/api-reference/orders/overview
+(fetched 2026-10-01): "The `price.value` field always represents the long
+side's price, regardless of which order intent you use." and "To trade the
+NO side at any price X, set `price.value = 1.00 - X`." (its table: buy Iowa,
+the NO side, at 0.83 -> ORDER_INTENT_BUY_SHORT, price.value 0.17). The
+concepts page (https://docs.polymarket.us/concepts/orders) says the same:
+"when you place an order, the price always refers to the YES side".
+Callers of this adapter pass the price of the outcome they buy (YES cents
+for BUY_LONG, NO cents for BUY_SHORT); ``pmus_wire_price_cents`` converts.
 """
 from __future__ import annotations
 
@@ -29,6 +40,27 @@ from mm.types import VenueName
 from mm.venues.base import RateBudget, Transport
 
 CREATE = "/v1/orders"
+
+LONG_INTENTS = ("ORDER_INTENT_BUY_LONG", "ORDER_INTENT_SELL_LONG")
+SHORT_INTENTS = ("ORDER_INTENT_BUY_SHORT", "ORDER_INTENT_SELL_SHORT")
+
+
+def pmus_wire_price_cents(intent: str, price_cents: int) -> int:
+    """YES-side ``price.value`` cents for an order on ``intent``.
+
+    ``price_cents`` is the price of the outcome the intent trades: YES for
+    the LONG intents, NO for the SHORT intents. A short-intent price X goes
+    out as 100 - X (docs: "set `price.value = 1.00 - X`"). Raises
+    ValueError for an unknown intent or a price outside 1..99.
+    """
+    p = int(price_cents)
+    if not 1 <= p <= 99:
+        raise ValueError(f"price_cents {price_cents} outside 1..99")
+    if intent in LONG_INTENTS:
+        return p
+    if intent in SHORT_INTENTS:
+        return 100 - p
+    raise ValueError(f"unknown PM US intent {intent!r}")
 
 
 class PMUSAdapter:
@@ -46,6 +78,9 @@ class PMUSAdapter:
         self.incentives_cache = list(incentives or [])
         self.sent: list[dict] = []
         self._seq = 0
+        # order_id -> intent of orders this instance placed. ``modify`` needs
+        # the intent to put the price on the YES side.
+        self._intent_by_order: dict[str, str] = {}
 
     def _write(self, method: str, path: str, body: Optional[dict] = None, *,
                now: float) -> dict:
@@ -66,14 +101,23 @@ class PMUSAdapter:
 
     def place(self, market_slug: str, *, intent: str, price_cents: int, quantity: float,
               now: float = 0.0) -> dict:
-        """``intent`` is ORDER_INTENT_BUY_LONG (YES) or ORDER_INTENT_BUY_SHORT (NO)."""
+        """``intent`` is ORDER_INTENT_BUY_LONG (YES) or ORDER_INTENT_BUY_SHORT (NO).
+
+        ``price_cents`` is the price of the outcome bought: YES cents for
+        BUY_LONG, NO cents for BUY_SHORT. The body carries the YES-side
+        value, so a NO bid at 40 is sent as price.value "0.60".
+        """
         if intent not in ("ORDER_INTENT_BUY_LONG", "ORDER_INTENT_BUY_SHORT"):
             return {"ok": False, "error": f"intent {intent} is not a passive buy"}
+        try:
+            wire = pmus_wire_price_cents(intent, price_cents)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
         body = {
             "marketSlug": market_slug,
             "intent": intent,
             "type": "ORDER_TYPE_LIMIT",
-            "price": {"value": f"{price_cents / 100:.2f}", "currency": "USD"},
+            "price": {"value": f"{wire / 100:.2f}", "currency": "USD"},
             "quantity": float(quantity),
             "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
             "participateDontInitiate": True,
@@ -81,12 +125,31 @@ class PMUSAdapter:
         resp = self._write("POST", CREATE, body, now=now)
         resp["body"] = body
         resp["queue_preserved"] = False
+        resp["wire_price_cents"] = wire
+        if intent == "ORDER_INTENT_BUY_SHORT":
+            resp["no_price_cents"] = int(price_cents)
+        if resp.get("ok") and resp.get("order_id"):
+            self._intent_by_order[resp["order_id"]] = intent
         return resp
 
     def modify(self, order_id: str, *, price_cents: int, quantity: float,
-               now: float = 0.0) -> dict:
+               now: float = 0.0, intent: Optional[str] = None) -> dict:
+        """Reprice an order. ``price_cents`` is in the order's outcome terms.
+
+        The intent comes from ``intent`` or from this instance's own place().
+        With neither, the price side is unknown and the modify is refused
+        rather than guessed.
+        """
+        intent = intent or self._intent_by_order.get(order_id)
+        if intent is None:
+            return {"ok": False, "error": f"unknown intent for order {order_id}; "
+                                          "price side is ambiguous, pass intent="}
+        try:
+            wire = pmus_wire_price_cents(intent, price_cents)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
         body = {
-            "price": {"value": f"{price_cents / 100:.2f}", "currency": "USD"},
+            "price": {"value": f"{wire / 100:.2f}", "currency": "USD"},
             "quantity": float(quantity),
             "participateDontInitiate": True,
         }

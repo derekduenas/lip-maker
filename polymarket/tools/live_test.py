@@ -1,18 +1,20 @@
-"""Polymarket live test — place ONE small order with safety prompts.
+"""Polymarket live test — PREVIEW ONE small order. It no longer sends.
+
+2026-10-01 ops review: mm.unattended is the only path allowed to reach a
+live venue (the legacy runner already refuses PM_PAPER=false). This tool
+used to POST /v1/orders after a typed "YES TRADE" with no other gate; it
+now stops after the server-side preview and exits 2.
 
 HARD CAPS (cannot be overridden via flags):
   - $20 max notional per order
   - Single market only
-  - Requires interactive Y/N confirmation before send
 
 PROCESS:
   1. Pull current BBO + book for chosen market
   2. Compute: side, price, qty, max notional
   3. PRINT THE TRADE
-  4. Prompt: type "YES TRADE" to confirm
-  5. POST /v1/orders via SDK orders.create()
-  6. Save order_id to logs/live_orders.log
-  7. Tell user how to monitor
+  4. POST /v1/order/preview (validates; places nothing)
+  5. Refuse to send (exit 2)
 
 USAGE:
   # Auto-pick top weather market, BUY YES at best bid:
@@ -27,10 +29,8 @@ USAGE:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -185,12 +185,16 @@ def main() -> int:
     print(f"  │  tif:        GOOD_TILL_CANCEL")
     print(f"  └─────────────────────────────────────────")
 
-    # Server-side preview first
+    # Server-side preview first. ``price`` is the outcome price (NO price for
+    # --side no); PM US price.value is always the YES side ("To trade the NO
+    # side at any price X, set `price.value = 1.00 - X`",
+    # docs.polymarket.us/api-reference/orders/overview).
+    wire = price if intent == "ORDER_INTENT_BUY_LONG" else 1.0 - price
     order = {
         "marketSlug": slug,
         "intent":     intent,
         "type":       "ORDER_TYPE_LIMIT",
-        "price":      {"value": f"{price:.3f}", "currency": "USD"},
+        "price":      {"value": f"{wire:.3f}", "currency": "USD"},
         "quantity":   qty,
         "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
     }
@@ -204,44 +208,11 @@ def main() -> int:
         print(f"  🔴 preview failed: {type(e).__name__}: {str(e)[:200]}")
         return 1
 
-    # Confirmation gate
-    print(f"\n  ⚠️  This will POST a REAL order using your $270 buying power.")
-    print(f"     Type 'YES TRADE' (exact) to confirm, anything else cancels.")
-    if not confirm("", "YES TRADE"):
-        print("  ✗ cancelled")
-        return 0
-
-    # Send
-    print(f"\n  sending /v1/orders...")
-    try:
-        resp = client.orders.create(order)
-    except Exception as e:
-        print(f"  🔴 order failed: {type(e).__name__}: {str(e)[:300]}")
-        return 1
-
-    # Log
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    log_entry = {
-        "ts":       datetime.now(timezone.utc).isoformat(),
-        "request":  order,
-        "response": resp,
-    }
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(log_entry, default=str) + "\n")
-
-    # Extract order_id
-    o = resp.get("order", {}) if isinstance(resp, dict) else {}
-    order_id = o.get("id", "?")
-    state = o.get("state", "?")
-
-    print(f"\n  ✓ ORDER PLACED")
-    print(f"    order_id: {order_id}")
-    print(f"    state:    {state}")
-    print(f"    logged to: {LOG_FILE}")
-    print(f"\n  next: monitor with `python tools/watch_order.py {order_id}`")
-    print(f"        or check polymarket.us UI under Open Orders")
-    return 0
-
+    # 2026-10-01 ops review: never send from here. mm.unattended is the only
+    # path to a live venue, behind its own gates.
+    print("\n  ✗ REFUSED: polymarket/tools/live_test.py is preview-only; it does not")
+    print("    send orders. mm.unattended is the only path to a live venue.")
+    return 2
 
 if __name__ == "__main__":
     sys.exit(main())

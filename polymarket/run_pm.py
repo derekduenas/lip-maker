@@ -13,10 +13,10 @@ PAPER ONLY (2026-10-01 review):
   PM_PAPER=true (default): all orders go to /v1/order/preview
                             (server validates, no money moves)
   PM_PAPER=false:          REFUSED at startup. mm.unattended is the only
-                            path to a live venue. The NO side is also sent at
-                            the NO price although PM US prices refer to the
-                            YES side (unverified-but-likely bug; see
-                            execution/pm_quote_manager.py).
+                            path to a live venue.
+  The NO side is targeted at the NO price (1 - yes_ask) and sent as
+  ORDER_INTENT_BUY_SHORT with the YES-side price.value (yes_ask), because PM
+  US prices always refer to the YES side (see execution/pm_quote_manager.py).
 
 USAGE:
   python run_pm.py                 # paper mode, top 5, $10/market cap

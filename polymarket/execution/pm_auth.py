@@ -247,7 +247,11 @@ class PolymarketClient:
                   ORDER_INTENT_BUY_SHORT = buy NO (or sell YES short)
                   ORDER_INTENT_SELL_LONG = close long YES
                   ORDER_INTENT_SELL_SHORT = close short
-          price: dollars (e.g. 0.55 = 55 cents)
+          price: dollars (e.g. 0.55 = 55 cents), sent as price.value
+                 as given. PM US price.value is always the YES side
+                 (docs.polymarket.us/api-reference/orders/overview: "To
+                 trade the NO side at any price X, set `price.value =
+                 1.00 - X`"). Use buy_no() to pass a NO price.
           quantity: contracts
           tif: TIME_IN_FORCE_GOOD_TILL_CANCEL | FILL_OR_KILL | IMMEDIATE_OR_CANCEL
 
@@ -281,5 +285,6 @@ class PolymarketClient:
 
     def buy_no(self, market_slug: str, price: float, quantity: int,
                tif: str = "TIME_IN_FORCE_GOOD_TILL_CANCEL") -> dict:
+        """Buy NO at NO price ``price``; sent as YES-side value 1 - price."""
         return self.place_order(market_slug, "ORDER_INTENT_BUY_SHORT",
-                                price, quantity, tif=tif)
+                                1.0 - float(price), quantity, tif=tif)
