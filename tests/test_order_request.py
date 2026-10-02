@@ -8,6 +8,9 @@ order and does nothing to stop a bid crossing a stranger's offer.
 Because the live API cannot be verified from this environment (egress
 blocked), maker safety is proven LOCALLY: on Kalshi a YES buy at p crosses
 iff p + best_no_bid >= 100, since the two sides are mirror-priced.
+
+venue/kalshi.py was archived 2026-10-01 (_archive/2026-10-01/venue/) with
+its adapter tests; execution/quote_manager.py is now paper-only.
 """
 from __future__ import annotations
 
@@ -264,59 +267,3 @@ class TestQuoteManagerUsesSharedContract:
         qm.reconcile(QuoteTarget(market_ticker=TKR, yes_bid_cents=49,
                                  no_bid_cents=48, size_contracts=10))
         assert seen == {"yes": 48, "no": 49}
-
-
-class TestVenueAdapterConsolidated:
-    def test_venue_adapter_is_blocked_by_the_same_interlock(self):
-        """Both live paths must go through one gate; an adapter must not be
-        able to transmit just because it was imported instead of the other."""
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        v._client = MagicMock()
-        res = v.place_order(TKR, "yes", 40, 10, best_opposing_bid_cents=50)
-        assert not res.success and "live execution blocked" in res.error
-        v._client.post.assert_not_called()
-
-    def test_venue_adapter_sends_a_valid_time_in_force(self, allow_live):
-        """The verified enum is fill_or_kill/good_till_canceled/
-        immediate_or_cancel. The adapter used to send "GTC", which the venue
-        does not accept."""
-        from execution.order_request import TIME_IN_FORCE_VALUES
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        client = MagicMock()
-        client.post.return_value = {"order": {"order_id": "srv-9"}}
-        v._client = client
-        assert v.place_order(TKR, "yes", 49, 10,
-                             best_opposing_bid_cents=50).success
-        body = client.post.call_args[0][1]
-        assert body["time_in_force"] in TIME_IN_FORCE_VALUES
-
-    def test_venue_adapter_no_longer_substitutes_no_self_trade(self, monkeypatch,
-                                                             allow_live):
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)      # skip auth in __init__
-        client = MagicMock()
-        client.post.return_value = {"order": {"order_id": "srv-9"}}
-        v._client = client
-        res = v.place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
-        assert res.success
-        body = client.post.call_args[0][1]
-        assert body[MAKER_ONLY_FIELD] is True
-        assert "no_self_trade" not in body
-
-    def test_venue_adapter_refuses_a_crossing_order(self, allow_live):
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        v._client = MagicMock()
-        res = v.place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=50)
-        assert not res.success and "maker safety" in res.error
-        v._client.post.assert_not_called()
-
-    def test_venue_adapter_refuses_without_opposing_book(self, allow_live):
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        v._client = MagicMock()
-        res = v.place_order(TKR, "yes", 49, 10)
-        assert not res.success
-        v._client.post.assert_not_called()

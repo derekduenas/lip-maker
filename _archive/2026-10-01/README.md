@@ -32,3 +32,13 @@ hedge-effectiveness, lip-state-hygiene, markout-backfill, order-flow-tracker,
 unrealized-pnl), root `series-auto-prune.*`, `vpin-gate.*`, and
 `polymarket/deploy/*`. The only units kept are `deploy/lip-unattended.service`,
 `deploy/apex/lip-watchdog.service` and the drop-ins in `deploy/apex/`.
+
+## Decorative / dead code
+- `agents/` — 14 agent skeletons that only raised NotImplementedError; no importers.
+- `venue/` — adapter layer imported only by its own tests (those tests were
+  removed from `tests/test_order_request.py`); `mm/venues/` is the live abstraction.
+- `dislocation/` + `tools/dislocation_{backtest,parity_check,scan}.py` — self-contained,
+  no importers outside itself.
+- `engine/share_drift.py`, `engine/maker_rebate_scorer.py` — no importers anywhere.
+- `config/macro_calendar.py` + `tools/macro_blackout_sync.py` — every date was before
+  Oct 2026 and the June 2026 FOMC was wrong (real: Jun 16-17, 2026).
