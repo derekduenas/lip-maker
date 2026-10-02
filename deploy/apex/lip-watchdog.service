@@ -2,6 +2,11 @@
 Description=lip-maker independent watchdog / kill switch (patch 17)
 After=network-online.target
 Wants=network-online.target
+# Never stop restarting the watchdog: a start-rate limit would leave the engine
+# unwatched. RestartSec below throttles restarts instead.
+StartLimitIntervalSec=0
+# No OnFailure= hook is configured. If the watchdog itself keeps failing, its
+# own TICK_FAILS latch and Restart=always are the recovery path.
 
 [Service]
 Type=simple
@@ -13,6 +18,12 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/lip-maker/.venv/bin/python -m mm.safety.lip_watchdog
 Restart=always
 RestartSec=10
+# LIP_WD_STOP_CMD (default "systemctl stop lip-unattended") is the fallback when the
+# kill file cannot be written. User lip cannot stop a system unit by default: the
+# operator MUST install the polkit rule in deploy/apex/README.md (works with
+# NoNewPrivileges). A sudoers entry ("sudo -n systemctl stop lip-unattended") would
+# need NoNewPrivileges=false, so prefer polkit. Without either, the stop fails and
+# the watchdog raises a TRIP alert every tick instead.
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/lip-maker

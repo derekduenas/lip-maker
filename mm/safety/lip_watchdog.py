@@ -17,7 +17,10 @@ Every ``LIP_WD_INTERVAL_S`` (30s) it checks:
                                   YES+NO is riskless and not counted. Source, most granular first:
                                   status positions / fills / markouts.unpaired_usd, else gross
                                   premium as an upper bound (see inventory_breakdown)
-  * capital                       paper_capital_usd > LIP_WD_MAX_CAPITAL_USD (1500)
+  * capital                       paper_capital_usd > LIP_WD_MAX_CAPITAL_USD (1500 if unset; must be
+                                  >= the engine's max planned budget -- deploy/apex/watchdog.env.example
+                                  sets 1600 against the engine's pinned LIP_BANKROLL=1500); per venue
+                                  LIP_WD_MAX_CAPITAL_KALSHI_USD (1600) / LIP_WD_MAX_CAPITAL_PMUS_USD (400)
   * resting orders                resting_n > LIP_WD_MAX_RESTING (200)
   * engine-reported kill          status.kill set (alert only, not a trip by default)
   * live mismatch                 status says live_armed (or mode live) but this watchdog's own
