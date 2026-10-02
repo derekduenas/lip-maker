@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,8 @@ from mm.ops import (
 from mm.safety.supervisor import write_heartbeat
 from mm.unattended.health import render_daily_summary
 from mm.venues.kalshi_rest import PRODUCTION_HOSTS
+
+WS_RAW_TYPE = "ws_raw"   # mm.unattended.loop.WS_RAW_TYPE (the loop module is imported lazily here)
 
 
 class UnattendedRefused(RuntimeError):
@@ -185,6 +188,41 @@ class LiveStatusRefresher:
         return self.publish(self.build())
 
 
+def fv_samples_path() -> str:
+    """LIP_FV_CALIB_SAMPLES_FILE: settled model fair-value samples (JSON
+    lines, appended; read by tools/fit_fv_weather.py)."""
+    return os.environ.get("LIP_FV_CALIB_SAMPLES_FILE", "/var/lib/lip-maker/fv_calib_samples.jsonl")
+
+
+def _take_fv_samples(loop) -> list:
+    """Settled calibration samples queued by the loop (call under loop.lock)."""
+    cal = getattr(loop, "fv_calib", None)
+    return cal.take_outbox() if cal is not None and hasattr(cal, "take_outbox") else []
+
+
+def flush_fv_samples(loop, rows: list) -> bool:
+    """Append ``rows`` to ``fv_samples_path()`` (outside loop.lock). On a
+    write error the rows go back to the front of the loop's queue (bounded)
+    for the next tick, and the error is logged."""
+    if not rows:
+        return True
+    path = Path(fv_samples_path())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r, default=str, sort_keys=True) + "\n" for r in rows))
+        return True
+    except Exception:
+        logging.getLogger("lip.status").exception("fv calibration samples write failed (%s)", path)
+        from mm.unattended.fv_calib import OUTBOX_MAX
+        with loop.lock:
+            cal = loop.fv_calib
+            keep = (list(rows) + cal.outbox)[-OUTBOX_MAX:]
+            cal.outbox_dropped += len(rows) + len(cal.outbox) - len(keep)
+            cal.outbox = keep
+        return False
+
+
 class EngineTimer:
     """Once a second, independent of market-data frames: honor the kill file,
     write the heartbeat, refresh the status page and persist engine state.
@@ -213,7 +251,9 @@ class EngineTimer:
             _honor_kill_file(loop, self.kill_path)
             report = self.refresher.build() if self.refresher is not None else None
             body = loop.state_snapshot(every_s=5.0)
+            samples = _take_fv_samples(loop)
         write_heartbeat(self.heartbeat)
+        flush_fv_samples(loop, samples)
         if report is not None:
             self.refresher.publish(report)
         if body is not None:
@@ -266,8 +306,7 @@ class _Engine:
         from mm.unattended.fairvalue import FairValueCache, enabled as _fv_enabled
         if _fv_enabled():  # Patch 16: external fair value, background refresh only
             loop.fv = FairValueCache()
-            loop.fv.start(lambda loop=loop: {m for m in (set(loop.resting.copy()) | loop._fv_wanted.copy())
-                                             if not m.startswith("PMUS:")})
+            loop.fv.start(loop.fv_cache_targets)
         from mm.unattended import bookrec as _bookrec
         self.rec = None
         if _bookrec.enabled():  # Patch 19: bounded compressed frame recorder
@@ -299,6 +338,12 @@ class _Engine:
 
     def on_frame(self, msg: dict) -> None:
         loop = self.loop
+        if str(msg.get("type") or "") == WS_RAW_TYPE:
+            # Raw websocket evidence (RunLoop ignores it): filtered to the
+            # markets this engine follows and serialised off loop.lock.
+            if self.rec is not None and loop.ws_raw_wanted(msg):
+                self.rec.record(msg)
+            return
         with loop.lock:
             if self.rec is not None:
                 self.rec.record(msg)
@@ -308,9 +353,13 @@ class _Engine:
         # Status refresh and state saves run on the EngineTimer thread.
 
     def settle_candidates(self) -> list:
-        """Held Kalshi positions due a settlement check (the loop's
-        ``settle_view``, an immutable tuple: no lock needed)."""
-        return [m for m, venue in self.loop.settle_view if venue == "kalshi"]
+        """Kalshi markets due a settlement check: held positions first (the
+        loop's ``settle_view``), then markets with pending fair-value
+        calibration samples past close (``fv_settle_view``), so samples whose
+        settlement the socket missed still get scored. Both are immutable
+        tuples replaced whole: no lock needed."""
+        held = [m for m, venue in self.loop.settle_view if venue == "kalshi"]
+        return list(dict.fromkeys(held + list(getattr(self.loop, "fv_settle_view", ()))))
 
     def mark_down(self, reason: str) -> None:
         self.down_since = time.time()
@@ -335,6 +384,12 @@ class _Engine:
 
     def stop(self) -> None:
         self.timer.stop()
+        try:
+            with self.loop.lock:
+                samples = _take_fv_samples(self.loop)
+            flush_fv_samples(self.loop, samples)
+        except Exception:
+            logging.getLogger("lip.status").exception("final fv samples flush failed")
         for bg in (getattr(self.loop, "pmus", None), getattr(self.loop, "fv", None), self.rec):
             try:
                 if bg is not None and hasattr(bg, "stop"):
@@ -346,6 +401,65 @@ class _Engine:
                 self.loop.save_state(force=True)
         except Exception:
             logging.getLogger("lip.status").exception("final engine state save failed")
+
+
+# SIGTERM (systemctl stop/restart): set by the handlers below, read by main.
+_TERM = threading.Event()
+
+
+def _sigterm_flag(signum, frame) -> None:
+    """Process-level SIGTERM handler outside the asyncio driver: only sets a
+    flag (main checks it between sessions); nothing is interrupted."""
+    _TERM.set()
+
+
+def _install_sigterm_flag() -> None:
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _sigterm_flag)
+
+
+async def _until_sigterm(coro) -> bool:
+    """Run the driver coroutine as a task until it ends; SIGTERM cancels it.
+
+    The handler is registered with ``loop.add_signal_handler``: the event
+    loop runs it between callbacks, and the cancellation is delivered to the
+    task at its next ``await``. Frames are handled synchronously between
+    awaits (``on_frame``), so a SIGTERM never lands inside one. Returns
+    True when the task was cancelled by SIGTERM (the caller then shuts down
+    through its normal finally path), False when the driver returned; any
+    other exception propagates."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+
+    def on_term() -> None:
+        _TERM.set()
+        task.cancel()
+
+    installed = False
+    if threading.current_thread() is threading.main_thread():
+        try:
+            loop.add_signal_handler(signal.SIGTERM, on_term)
+            installed = True
+        except (NotImplementedError, RuntimeError, ValueError):
+            installed = False
+    if _TERM.is_set():
+        task.cancel()          # SIGTERM arrived before the handler existed
+    try:
+        await task
+        return False
+    except asyncio.CancelledError:
+        if _TERM.is_set():
+            return True
+        raise
+    finally:
+        if installed:
+            try:
+                loop.remove_signal_handler(signal.SIGTERM)
+            except (RuntimeError, ValueError):
+                pass
+            # remove_signal_handler restores SIG_DFL: keep the flag handler.
+            _install_sigterm_flag()
 
 
 def reset_state_kill(path: str) -> int:
@@ -381,10 +495,119 @@ def _paper_env() -> bool:
     return os.environ.get("LIP_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+class SummaryHistory:
+    """``<summary>.history.jsonl``: one JSON line per UTC day with that
+    day's last daily summary (day, data_source(s), fills, P&L fields,
+    attribution), so the readiness report can count days although the
+    summary file itself is overwritten with the current day.
+
+    A day's line is written when the next day's first report arrives (day
+    roll), on ``flush`` (clean shutdown) and, so a SIGTERM/crash loses at
+    most that much, every LIP_SUMMARY_HISTORY_EVERY_S (600 s; <= 0 off).
+    Writing replaces that day's line (restarts keep one line per day) and
+    keeps every data_source seen for the day in ``data_sources``. The file
+    keeps the newest LIP_SUMMARY_HISTORY_MAX (400) days and is rewritten
+    atomically (tmp + rename). Unparseable lines are dropped. Errors are
+    logged, never raised: the history must not stop the summary."""
+
+    def __init__(self, path: str, *, every_s: float | None = None, clock=time.time) -> None:
+        self.path = Path(path)
+        self.every_s = (_env_float("LIP_SUMMARY_HISTORY_EVERY_S", 600.0) if every_s is None
+                        else float(every_s))
+        self.clock = clock
+        self.current: dict | None = None
+        self.sources: set = set()
+        self._written_at = clock()
+        self._dirty = False
+
+    def note(self, row: dict) -> None:
+        day = str(row.get("day") or "")
+        if not day:
+            return
+        if self.current is not None and self.current["day"] != day:
+            self._write(self.current, self.sources)       # final line of the previous day
+            self.sources = set()
+        self.current = dict(row, day=day)
+        if row.get("data_source"):
+            self.sources.add(str(row["data_source"]))
+        self._dirty = True
+        if self.every_s > 0 and self.clock() - self._written_at >= self.every_s:
+            self._write(self.current, self.sources)
+
+    def flush(self) -> None:
+        if self.current is not None and self._dirty:
+            self._write(self.current, self.sources)
+
+    def _write(self, row: dict, sources: set) -> None:
+        self._written_at = self.clock()
+        if row is self.current:
+            self._dirty = False
+        try:
+            keep = max(1, int(_env_float("LIP_SUMMARY_HISTORY_MAX", 400)))
+            days: dict = {}
+            if self.path.exists():
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        old = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(old, dict) and old.get("day"):
+                        days[str(old["day"])] = old
+            prev = days.get(row["day"]) or {}
+            merged = set(sources) | {str(x) for x in prev.get("data_sources") or []}
+            if prev.get("data_source"):
+                merged.add(str(prev["data_source"]))
+            days[row["day"]] = dict(row, data_sources=sorted(merged), written_ts=time.time())
+            body = "".join(json.dumps(days[d], default=str, sort_keys=True) + "\n"
+                           for d in sorted(days)[-keep:])
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception:
+            logging.getLogger("lip.status").exception("daily summary history write failed (%s)", self.path)
+
+
+_SUMMARY_HISTORIES: dict[str, SummaryHistory] = {}
+
+
+def summary_history_path(summary: str) -> str:
+    return str(summary) + ".history.jsonl"
+
+
+def flush_summary_histories() -> None:
+    """Write the current day's line of every summary history (shutdown)."""
+    for hist in list(_SUMMARY_HISTORIES.values()):
+        hist.flush()
+
+
+def _summary_row(report: dict) -> dict:
+    return {"day": str(report.get("day") or ""),
+            "data_source": str(report.get("data_source") or "") or None,
+            "fills": int(report.get("fills_n") or 0),
+            "pnl_usd": float(report.get("pnl_usd") or 0),
+            "rewards_usd": float(report.get("rewards_usd") or 0),
+            "premium_paid_usd": (None if report.get("premium_paid_usd") is None
+                                 else float(report["premium_paid_usd"])),
+            "attribution": report.get("pnl_attribution")}
+
+
 def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
     from mm.status_page import status_payload
     write_heartbeat(args.heartbeat)
     if args.summary:
+        hpath = summary_history_path(args.summary)
+        hist = _SUMMARY_HISTORIES.get(hpath)
+        if hist is None:
+            hist = _SUMMARY_HISTORIES[hpath] = SummaryHistory(hpath)
+        hist.note(_summary_row(report))
         dest = Path(args.summary)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(render_daily_summary(
@@ -477,6 +700,8 @@ def main(argv: list[str] | None = None) -> int:
         from mm.unattended.loop import (
             resolve_mode, resolve_ws_url, run_recorded, socket_plan, waiting_report,
         )
+        _TERM.clear()
+        _install_sigterm_flag()
         from mm.venues.readonly import book_source
         mode = resolve_mode()
         url = resolve_ws_url(ws_url)
@@ -499,6 +724,7 @@ def main(argv: list[str] | None = None) -> int:
             report["ws_url"] = books["ws_url"] if books["reader"] else url
             report["data_source"] = books["flag"]
             _write_run_outputs(args, report, started)
+            flush_summary_histories()
             return 0
         engine = None
         try:
@@ -529,20 +755,30 @@ def main(argv: list[str] | None = None) -> int:
                     engine.reconnect_if_down()
                     try:
                         if plan.get("reader"):
-                            asyncio.run(drive_readonly_books(books, engine.on_frame,
-                                                             settle_candidates=engine.settle_candidates))
+                            stopped = asyncio.run(_until_sigterm(drive_readonly_books(
+                                books, engine.on_frame, settle_candidates=engine.settle_candidates,
+                                paper=mode == "paper")))
                         else:
-                            asyncio.run(drive_socket(plan["url"], engine.on_frame))
+                            stopped = asyncio.run(_until_sigterm(drive_socket(plan["url"], engine.on_frame)))
                     finally:
                         engine.mark_down("session_end")
+                    if stopped:
+                        logging.getLogger("lip.unattended").info("SIGTERM: stopping (state saved on the way out)")
+                        return 0
                     if args.once:
                         engine.write_final()
                 if args.once:
                     return 0
-                time.sleep(args.interval)
+                if _TERM.wait(args.interval):
+                    logging.getLogger("lip.unattended").info("SIGTERM: stopping between sessions")
+                    return 0
         finally:
             if engine is not None:
                 engine.stop()
+            # Shutdown (also on SIGTERM, which returns through here): the
+            # current day's summary goes to the history; SummaryHistory also
+            # checkpoints periodically for a crash or SIGKILL.
+            flush_summary_histories()
     if args.once:
         return 0
     while True:

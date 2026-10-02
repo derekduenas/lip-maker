@@ -103,6 +103,8 @@ def run_one(paths: list, env: dict, *, bankroll: float | None = None,
         kinds: dict = {}
         for frame in iter_frames(paths):
             kind = str(frame.get("kind") or frame.get("type") or "")
+            if kind == "ws_raw":
+                continue  # raw websocket evidence rows (verify_ws_frames); not loop input
             if kind == "program":
                 # A program row repeats in each file header; re-adding resets accrual.
                 if frame.get("market") in seen_prog:

@@ -149,6 +149,16 @@ class KalshiMarket:
     # PM US: single-event (game/match) program (day_of/live periods or a
     # non-futures sports market) -> excluded like Kalshi single-match sports.
     sports_single: bool = False
+    # FV-driven quoting (paper; mm/unattended/fairvalue.py): the market's
+    # usable model YES fair value in cents (RunLoop sets it only for an
+    # FV-quoted family with confidence >= LIP_FV_MIN_CONF), and the screen's
+    # flag for a market of such a family before any value exists. Either one
+    # applies LIP_FV_MIN_HOURS_TO_CLOSE instead of the global minimum.
+    fv_cents: float | None = None
+    fv_candidate: bool = False
+    # The model's calibration verdict passed (RunLoop: fv_calib.passed()):
+    # only then does fv_capture_per_day credit the model's edge vs the mid.
+    fv_calibrated: bool = False
 
 
 @dataclass
@@ -434,9 +444,69 @@ def carry_apr() -> float:
         return 0.10
 
 
-def quote_economics(market: KalshiMarket, size: float, *,
-                    reward_factor: float = 1.0) -> tuple[float, float, float, int, int]:
-    """Return net $/day, capital, share, yes cents, no cents at ``size``."""
+def fills_per_day(market: KalshiMarket, size: float) -> float:
+    """Expected contracts filled per day on ONE resting side of ``size``:
+    size x FILL_FRACTION_PER_DAY of the market's family (the fill model of
+    quote_economics)."""
+    return float(size) * FILL_FRACTION_PER_DAY.get(family_of(market), FILL_FRACTION_PER_DAY["event"])
+
+
+def book_mid_cents(market: KalshiMarket) -> float | None:
+    """YES mid of the market's book: (best YES bid + 100 - best NO bid) / 2,
+    None without a two-sided book."""
+    yb = max((p for p, _s in market.yes_bids), default=None)
+    nb = max((p for p, _s in market.no_bids), default=None)
+    if yb is None or nb is None:
+        return None
+    return (float(yb) + 100.0 - float(nb)) / 2.0
+
+
+def fv_capture_per_day(market: KalshiMarket, size: float, yes_cents: int, no_cents: int,
+                       sides: tuple = ("yes", "no")) -> float:
+    """Expected value of the model's view versus the book, $/day, for
+    ``sides`` resting ``size``: sum of fills/day x edge / 100 with edge =
+    FV - mid for a YES bid and mid - FV for a NO bid (mid =
+    ``book_mid_cents``). Both sides resting cancel out: the spread itself is
+    already in quote_economics and does not depend on the fair value. 0
+    without a fair value, without a two-sided book, or before the model's
+    calibration verdict passed (``market.fv_calibrated``). The price paid
+    (``yes_cents`` / ``no_cents``) is gated separately (``fv_ok_sides``)."""
+    if market.fv_cents is None or not market.fv_calibrated:
+        return 0.0
+    mid = book_mid_cents(market)
+    if mid is None:
+        return 0.0
+    fills = fills_per_day(market, size)
+    edge = {"yes": float(market.fv_cents) - mid, "no": mid - float(market.fv_cents)}
+    return sum(fills * edge[sd] / 100.0 for sd in sides if sd in edge)
+
+
+def fv_ok_sides(market: KalshiMarket, yes_cents: int, no_cents: int) -> tuple:
+    """Sides that may rest under FV-driven quoting at these prices (edge >=
+    -LIP_FV_MAX_GIVEUP_CENTS); both sides without a fair value."""
+    if market.fv_cents is None:
+        return ("yes", "no")
+    from mm.unattended.fairvalue import fv_side_ok, side_edge_cents
+    return tuple(sd for sd in ("yes", "no")
+                 if fv_side_ok(side_edge_cents(market.fv_cents, sd, yes_cents if sd == "yes" else no_cents)))
+
+
+def quote_economics(market: KalshiMarket, size: float, *, reward_factor: float = 1.0,
+                    sides: tuple | None = None) -> tuple[float, float, float, int, int]:
+    """Return net $/day, capital, share, yes cents, no cents at ``size``.
+
+    ``sides`` (default both) prices resting only those sides: one side earns
+    its one-sided snapshot share and carries half of the two-sided costs,
+    capital is that side's premium (the conversion RunLoop._size_curve used
+    to do itself). No side: all zeros.
+
+    With a model fair value on the market (``fv_cents``, FV-driven paper
+    quoting) the default sides are ``fv_ok_sides`` (a side paying more than
+    LIP_FV_MAX_GIVEUP_CENTS above fair value is not priced as resting) and
+    net adds ``fv_capture_per_day`` for the resting sides: the model's edge
+    versus the book mid, only once its calibration verdict passed
+    (``fv_calibrated``). A side that pays up loses its reward. The family
+    adverse-selection prior stays in (conservative)."""
     # Kalshi: a book that already reaches target/5 is quoted at that
     # reference; a thinner book at the touch. PM US: reward-optimal rung.
     yes_cents, no_cents = side_rungs(market, size)
@@ -472,6 +542,20 @@ def quote_economics(market: KalshiMarket, size: float, *,
             holding = rate * (days - 1.0) * (fills_side * 2.0)
     net = reward - as_cost - fee - holding
     capital = (yes_cents / 100.0) * size + (no_cents / 100.0) * size
+    if sides is None:
+        sides = fv_ok_sides(market, yes_cents, no_cents)
+    sides = tuple(sd for sd in ("yes", "no") if sd in sides)
+    if not sides:
+        return 0.0, 0.0, 0.0, yes_cents, no_cents
+    if len(sides) == 1:
+        side = sides[0]
+        price = yes_cents if side == "yes" else no_cents
+        share1 = kalshi_one_sided_share(market, side, price, float(size)) if size > 0 else 0.0
+        cost2 = reward - net
+        net = reward_per_day(share1, market, reward_factor=reward_factor) - cost2 / 2.0
+        capital = price / 100.0 * float(size)
+        share = share1
+    net += fv_capture_per_day(market, size, yes_cents, no_cents, sides)
     return net, capital, share, yes_cents, no_cents
 
 
@@ -497,8 +581,14 @@ def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> s
             return short
     if market.days_to_settle is None:
         return "settlement_time_unknown"
-    if market.days_to_settle * 24.0 < min_close_hours():
-        return f"closes_within_{min_close_hours():g}h"
+    hours = min_close_hours()
+    if market.fv_cents is not None or market.fv_candidate:
+        from mm.unattended.fairvalue import fv_min_close_hours
+        fv_hours = fv_min_close_hours()
+        if fv_hours is not None:
+            hours = min(hours, fv_hours)
+    if market.days_to_settle * 24.0 < hours:
+        return f"closes_within_{hours:g}h"
     sport = sports_reason(market)
     if sport:
         return sport

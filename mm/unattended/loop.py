@@ -278,6 +278,29 @@ class RunLoop:
         self._fv_wanted: set = set()
         self._fv_state: dict = {}
         self.fv_blocks: dict = {}
+        # FV-driven paper quoting (LIP_FV_QUOTE_ENABLE): strike hints per
+        # market, markets selected only because a fair value let them past the
+        # close-time gate (pulled when it goes away), and counters.
+        self._fv_hints: dict = {}
+        self._fv_admitted: set = set()
+        self.fv_quote_stats: dict = {}
+        # Out-of-sample scoring of model fair values vs the book (measurement).
+        from mm.unattended.fv_calib import FVCalibration
+        self.fv_calib = FVCalibration()
+        self._fv_calib_at = 0.0
+        # Calibration watch: every fed market of a model-priced FV family
+        # stays a calibration target until its close, whether or not it is
+        # quoted and even after its program left the loop (and across a
+        # restart: persisted). market -> {series, close_ts, added_ts}.
+        # ``fv_calib_view`` is its key set for the fair-value cache thread
+        # (an immutable frozenset, replaced whole).
+        self.fv_calib_watch: dict[str, dict] = {}
+        self.fv_calib_view: frozenset = frozenset()
+        # Kalshi markets with pending calibration samples past close +
+        # LIP_FV_CALIB_BACKFILL_AFTER_S: also asked by the REST settlement
+        # backfill (an immutable tuple, replaced whole; read by its thread).
+        self.fv_settle_view: tuple = ()
+        self._fv_settle_at = 0.0
         # Patch 18: inventory skew counters.
         self.skew_stats: dict = {}
         # Patch 21: external venue frames (PM US poller thread -> this loop).
@@ -303,6 +326,12 @@ class RunLoop:
         # markout (all positions) and per-bucket aggregates of their rows.
         self.realized_pruned_usd = 0.0
         self.bucket_closed: dict[str, dict] = {}
+        # Lifetime settled positions (held legs at settlement) per venue and
+        # their realized settlement P&L (payout - cost basis, fees excluded).
+        # Unlike ``settled`` these are never pruned. ``lower_bound``: seeded
+        # from an older state file that had no counters (positions pruned
+        # before then are not counted; the USD total includes them).
+        self.settled_lifetime: dict = {"by_venue": {}, "total_usd": 0.0, "lower_bound": False}
         self.refeeds_n = 0
         # Review fixes: fill aggregates (self.fills is a bounded list), MTM
         # marks, fees, settlement, inventory on the risk engine, feed state.
@@ -395,6 +424,7 @@ class RunLoop:
         )
         if prog.venue not in VENUES:
             raise ValueError(f"unknown venue {prog.venue!r}")
+        self._fv_note_program(market, prog, row)
         if old_prog is not None and old_acc is not None and (
                 old_prog.program_id, old_prog.start_ts, old_prog.end_ts, old_prog.period_reward_usd,
                 old_prog.target_size, old_prog.discount_factor, old_prog.max_spread_usd) == (
@@ -435,8 +465,25 @@ class RunLoop:
         self.accruals[market] = acc
         self.open_seconds.setdefault(market, None)
 
+    def ws_raw_wanted(self, row: dict) -> bool:
+        """Keep a raw websocket evidence row (``_ws_raw_row``) in the frame
+        recording? Replies and seq_gap rows always. market_lifecycle_v2 (all
+        Kalshi markets, no ticker filter exists) only for a market with a
+        program, a position, a calibration watch or pending calibration
+        samples here, all its events included (determined/settled too).
+        Membership reads only: callable off loop.lock from the frame thread."""
+        if row.get("channel") != "market_lifecycle_v2":
+            return True
+        inner = row.get("msg") if isinstance(row.get("msg"), dict) else {}
+        body = inner.get("msg") if isinstance(inner.get("msg"), dict) else {}
+        m = str(body.get("market_ticker") or "")
+        return bool(m) and (m in self.programs or m in self.position or m in self.fv_calib_view
+                            or m in self.fv_calib.pending)
+
     def on_frame(self, row: dict) -> None:
         kind = str(row.get("kind") or row.get("type") or "")
+        if kind == WS_RAW_TYPE:
+            return  # raw websocket evidence for the recorder only (_dispatch_ws_message)
         if kind == "program":
             self.add_program(row)
             return
@@ -654,6 +701,8 @@ class RunLoop:
         for table in (self.open_seconds, self._book_ts, self.last_plan, self._repeg_at, self._fv_state):
             table.pop(market, None)
         self._fv_wanted.discard(market)
+        self._fv_admitted.discard(market)
+        self._fv_hints.pop(market, None)
         self.quoted_ever.discard(market)
         for key in [k for k in self.cooldown if k[0] == market]:
             del self.cooldown[key]
@@ -671,6 +720,8 @@ class RunLoop:
         for market in gone:
             self.end_program(market, "program_ended")
         self._fv_wanted &= set(self.programs)
+        if self.fv_calib.prune(ts):
+            self._state_dirty = True
         # closed periods restored for markets that are no longer fed
         for market in [m for m in self.closed_periods if m not in self.programs]:
             self._fold_closed_period(market, self._venue_of(market))
@@ -737,13 +788,18 @@ class RunLoop:
         every Kalshi market, so a market with neither a position nor a
         program here is ignored (nothing to settle, and nothing is stored for
         it). A position whose result never arrives stays marked at its last
-        mark and is listed in status (see ``_check_settlements``)."""
+        mark and is listed in status (see ``_check_settlements``). A market
+        with recorded model fair values is scored first (``fv_calib``)."""
         result = str(result).lower()
         if result not in ("yes", "no") or market in self.settled:
             return
+        if self.fv_calib.on_settle(market, result):
+            # Scored even with nothing held (fv_calib: model vs book).
+            self._state_dirty = True
         if market not in self.position and market not in self.programs:
             return
         self.unresolved.pop(market, None)
+        self._count_settled(market, result)
         legs = [(str((self.position.get(market) or {}).get("venue") or self._venue_of(market)), b,
                  rows[market]["yes"], rows[market]["no"], rows[market]["yes_cost"], rows[market]["no_cost"],
                  rows[market].get("fills_n", 0))
@@ -754,6 +810,35 @@ class RunLoop:
         self._sync_inventory(market)
         self._cancel(market, "settled")
         self._state_dirty = True
+
+    @staticmethod
+    def _settle_value_usd(pos: dict, result: str) -> float:
+        """Payout of a position's legs at ``result`` minus their cost basis."""
+        mark = 100.0 if result == "yes" else 0.0
+        value = (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+        return value - float(pos["yes_cost"]) - float(pos["no_cost"])
+
+    def _count_settled(self, market: str, result: str) -> None:
+        """Lifetime counters (``settled_lifetime``) for a held position that
+        settles now. Called once per market (settle() returns early for a
+        market already in ``settled``)."""
+        pos = self.position.get(market)
+        if not pos or (float(pos.get("yes") or 0.0) <= 0.0 and float(pos.get("no") or 0.0) <= 0.0):
+            return
+        venue = str(pos.get("venue") or self._venue_of(market))
+        by = self.settled_lifetime["by_venue"]
+        by[venue] = int(by.get(venue, 0)) + 1
+        self.settled_lifetime["total_usd"] = (float(self.settled_lifetime["total_usd"])
+                                              + self._settle_value_usd(pos, result))
+
+    def settled_report(self) -> dict:
+        """Status: lifetime settled positions (never pruned) and their
+        realized settlement P&L (payout - cost basis, fees excluded)."""
+        by = {k: int(v) for k, v in sorted(self.settled_lifetime["by_venue"].items())}
+        return {"settled_positions_n": sum(by.values()),
+                "settled_positions_by_venue": by,
+                "settled_total_usd": round(float(self.settled_lifetime["total_usd"]), 6),
+                "settled_positions_lower_bound": bool(self.settled_lifetime.get("lower_bound"))}
 
     # ------------------------------------------------------------ settlement backstops
     def _close_of(self, market: str):
@@ -814,6 +899,43 @@ class RunLoop:
                 self._alert("WARNING", f"position {market} unresolved {release_s / 3600.0:.0f}h past "
                                        f"close: ${cost:.2f} released from budgets, marked as a full loss")
         self.settle_view = tuple(view)
+        if ts - self._fv_settle_at >= 60.0:
+            self._fv_settle_refresh(ts)
+
+    def _fv_calib_close(self, market: str, pend: dict):
+        """Close of a market with pending calibration samples: the watched
+        close, else its program's close, else the latest sample's
+        settlement-window end (sample time + lead)."""
+        w = self.fv_calib_watch.get(market)
+        if w is not None and w.get("close_ts") is not None:
+            return float(w["close_ts"])
+        prog = self.programs.get(market)
+        if prog is not None and prog.close_ts is not None:
+            return float(prog.close_ts)
+        ends = [float(x["ts"]) + float(x["lead_h"]) * 3600.0 for x in (pend.get("samples") or {}).values()]
+        return max(ends) if ends else None
+
+    def _fv_settle_refresh(self, ts: float) -> None:
+        """Refresh ``fv_settle_view``: Kalshi markets whose model fair values
+        await scoring (``fv_calib.pending``) and closed more than
+        LIP_FV_CALIB_BACKFILL_AFTER_S (12 h) ago, oldest close first. The
+        websocket lifecycle channel normally settles them before that; these
+        are the ones it missed (e.g. while disconnected). The delay keeps the
+        read-only REST backfill from polling every closed market until its
+        result is out."""
+        self._fv_settle_at = float(ts)
+        delay = _env_num("LIP_FV_CALIB_BACKFILL_AFTER_S", 12 * 3600.0)
+        due = []
+        for market, pend in self.fv_calib.pending.items():
+            if market.startswith("PMUS:") or market in self.settled:
+                continue
+            try:
+                close = self._fv_calib_close(market, pend)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if close is not None and ts >= close + delay:
+                due.append((close, market))
+        self.fv_settle_view = tuple(m for _c, m in sorted(due))
 
     def unresolved_report(self) -> dict:
         """Status ``unresolved_positions``: released PM US positions."""
@@ -1074,10 +1196,13 @@ class RunLoop:
             "pm_rebate_usd": self.pm_rebate_usd, "closed_periods": self.closed_periods,
             "closed_periods_n": self.closed_periods_n, "closed_periods_agg": self.closed_periods_agg,
             "realized_pruned_usd": self.realized_pruned_usd, "bucket_closed": self.bucket_closed,
+            "settled_lifetime": self.settled_lifetime,
             "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
             "kill": kill, "pnl_day": self._pnl_day,
             "markouts": self.markouts.state(),
             "unresolved": self.unresolved,
+            "fv_calibration": self.fv_calib.state(),
+            "fv_calib_watch": self.fv_calib_watch,
         }
 
     def attach_state(self, path: str) -> None:
@@ -1125,6 +1250,27 @@ class RunLoop:
                                "cost_usd": float(v.get("cost_usd") or 0.0)}
                       for m, v in dict(data.get("unresolved") or {}).items()}
         cooldown = {(str(m), str(sd)): float(until) for m, sd, until in list(data.get("cooldown") or [])}
+        raw_life = data.get("settled_lifetime")
+        if raw_life is not None:
+            if not isinstance(raw_life, dict) or not isinstance(raw_life.get("by_venue", {}), dict):
+                raise ValueError("settled_lifetime must be an object with a by_venue object")
+            by_venue = {str(k): int(v) for k, v in dict(raw_life.get("by_venue") or {}).items()}
+            if any(v < 0 for v in by_venue.values()):
+                raise ValueError("settled_lifetime counts must be >= 0")
+            settled_lifetime = {"by_venue": by_venue, "total_usd": float(raw_life.get("total_usd") or 0.0),
+                                "lower_bound": bool(raw_life.get("lower_bound"))}
+        else:
+            # Written before the lifetime counters: count the settled rows
+            # still held (pruned ones are gone: a lower bound); the USD total
+            # is exact (pruned realized P&L was kept in realized_pruned_usd).
+            by_venue, total = {}, float(data.get("realized_pruned_usd") or 0.0)
+            for m, v in settled.items():
+                pos = position.get(m)
+                if not pos or (pos["yes"] <= 0.0 and pos["no"] <= 0.0):
+                    continue
+                by_venue[pos["venue"]] = by_venue.get(pos["venue"], 0) + 1
+                total += self._settle_value_usd(pos, v["result"])
+            settled_lifetime = {"by_venue": by_venue, "total_usd": total, "lower_bound": True}
         kill = data.get("kill")
         if kill is not None and not isinstance(kill, dict):
             raise ValueError("kill must be an object")
@@ -1132,6 +1278,15 @@ class RunLoop:
         markouts = MarkoutBook()
         if data.get("markouts") is not None:  # absent in state files written before Phase 4
             markouts.load_state(data["markouts"])
+        from mm.unattended.fv_calib import FVCalibration
+        fv_calib = FVCalibration()
+        if data.get("fv_calibration") is not None:  # absent before model fair value
+            fv_calib.load_state(data["fv_calibration"])
+        watch = {}
+        for m, w in dict(data.get("fv_calib_watch") or {}).items():  # absent before the watch
+            watch[str(m)] = {"series": str(w["series"]),
+                             "close_ts": None if w.get("close_ts") is None else float(w["close_ts"]),
+                             "added_ts": float(w.get("added_ts") or 0.0)}
         # validated: apply
         self.position = position
         self.bucket_pos = bucket_pos
@@ -1152,6 +1307,7 @@ class RunLoop:
         self.closed_periods_n = int(data.get("closed_periods_n") or 0)
         self.closed_periods_agg = {str(k): float(v) for k, v in dict(data.get("closed_periods_agg") or {}).items()}
         self.realized_pruned_usd = float(data.get("realized_pruned_usd") or 0.0)
+        self.settled_lifetime = settled_lifetime
         self.bucket_closed = {str(b): {str(k): float(v) for k, v in dict(r).items()}
                               for b, r in dict(data.get("bucket_closed") or {}).items()}
         self.cooldown.update(cooldown)
@@ -1160,6 +1316,9 @@ class RunLoop:
         self._pnl_day_unknown = self._pnl_day is None and bool(self.position)
         self._daily_cache = None
         self.markouts = markouts
+        self.fv_calib = fv_calib
+        self.fv_calib_watch = watch
+        self.fv_calib_view = frozenset(watch)
         for market in self.position:
             self._sync_inventory(market)
         if kill is not None:
@@ -1246,16 +1405,231 @@ class RunLoop:
             return str(pos["venue"])
         return "pmus" if str(market).startswith("PMUS:") else "kalshi"
 
+    def _model_row_allowed(self, market: str, row: dict, *, guard: bool = False) -> bool:
+        """A model (fv_weather) fair value is used only in paper mode, and by
+        the defensive guard only when FV quoting is on for its family; other
+        sources (Polymarket match, rain ensemble) are not restricted here."""
+        from mm.unattended.fv_weather import SOURCE
+        if row.get("source") != SOURCE:
+            return True
+        if self.mode != "paper":
+            return False
+        if guard:
+            from mm.unattended.fairvalue import fv_quote_active
+            prog = self.programs.get(market)
+            series = prog.series if prog is not None else str(market).split("-", 1)[0]
+            return fv_quote_active(series)
+        return True
+
     def _fv_side_cents(self, market: str, side: str):
         """External fair value of one side in cents, or None when the fair
-        value cache (Kalshi markets only) has no current value for it."""
+        value cache (Kalshi markets only) has no current value for it (a
+        model value outside paper mode counts as none)."""
         if self.fv is None or self._venue(market) != "kalshi":
             return None
         row = self.fv.get(market, now=time.time())
-        if row is None or row.get("fv_cents") is None:
+        if row is None or row.get("fv_cents") is None or not self._model_row_allowed(market, row):
             return None
         fv = float(row["fv_cents"])
         return fv if side == "yes" else 100.0 - fv
+
+    def _fv_note_program(self, market: str, prog: "_Program", row: dict) -> None:
+        """Model families (FV quoting or calibration on): ask the fair-value
+        cache to price this market (its targets include ``_fv_wanted``), put
+        it in the calibration watch and hand the cache the strike fields from
+        the screen's metadata."""
+        from mm.unattended.fairvalue import fv_model_active, fv_model_supports
+        if prog.venue != "kalshi" or not fv_model_active(prog.series) or not fv_model_supports(prog.series):
+            return
+        self._fv_wanted.add(market)
+        self._fv_calib_watch_add(market, prog.series, prog.close_ts)
+        hint = {k: row.get(k) for k in ("strike_type", "floor_strike", "cap_strike") if row.get(k) is not None}
+        if hint:
+            self._fv_hints[market] = hint
+            self._fv_push_hint(market)
+
+    def _fv_push_hint(self, market: str) -> None:
+        note = getattr(self.fv, "note_market", None)
+        hint = self._fv_hints.get(market)
+        if note is not None and hint and market not in (getattr(self.fv, "hints", None) or {}):
+            note(market, hint)
+
+    def _fv_quote_row(self, market: str):
+        """The usable model fair-value row that drives quoting for
+        ``market``, or None (fail closed: the defensive behaviour applies).
+        Usable = paper mode, LIP_FV_QUOTE_ENABLE, a Kalshi market of a
+        LIP_FV_QUOTE_FAMILIES series, a current row from the model source
+        (fv_weather) with confidence >= LIP_FV_MIN_CONF."""
+        from mm.unattended import fairvalue as fvm
+        from mm.unattended.fv_weather import SOURCE
+        if self.fv is None or self.mode != "paper" or not fvm.fv_quote_enabled():
+            return None
+        prog = self.programs.get(market)
+        if prog is None or prog.venue != "kalshi" or not fvm.fv_quote_active(prog.series):
+            return None
+        row = self.fv.get(market, now=time.time())
+        if row is None or row.get("source") != SOURCE or row.get("fv_cents") is None:
+            return None
+        try:
+            fv, conf = float(row["fv_cents"]), float(row.get("conf") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 < fv < 100.0) or conf < fvm.fv_min_conf():
+            return None
+        return row
+
+    def _fv_count(self, key: str, side: str | None = None) -> None:
+        k = key if side is None else f"{key}_{side}"
+        self.fv_quote_stats[k] = self.fv_quote_stats.get(k, 0) + 1
+
+    def _fv_gate_sides(self, market: str, row: dict, yes_cents: int, no_cents: int,
+                       sides: tuple, size: float | None) -> tuple:
+        """Sides allowed to rest under FV-driven quoting: edge >= -
+        LIP_FV_MAX_GIVEUP_CENTS and, when ``size`` is given, per-side EV > 0
+        (edge x fills/day + that side's LIP reward - maker fees). The reward
+        of a side resting with its opposite is half the two-sided reward; a
+        lone side earns its one-sided snapshot share (Kalshi excludes a
+        snapshot whose other side does not reach target without us)."""
+        from mm.unattended.fairvalue import fv_side_ok, side_edge_cents, side_ev_usd_day
+        fv = float(row["fv_cents"])
+        keep = []
+        for sd in sides:
+            price = yes_cents if sd == "yes" else no_cents
+            edge = side_edge_cents(fv, sd, price)
+            if not fv_side_ok(edge):
+                self._fv_count("edge_withheld", sd)
+                continue
+            keep.append(sd)
+        if size is None or not keep:
+            return tuple(keep)
+        from mm.selector import (fills_per_day, kalshi_one_sided_share, kalshi_share, maker_fee_usd,
+                                 reward_per_day)
+        km = self._km(market)
+        if km is None:
+            return ()
+        try:
+            if len(keep) == 2:
+                two = reward_per_day(kalshi_share(km, int(yes_cents), int(no_cents), float(size)), km) / 2.0
+                reward = {"yes": two, "no": two}
+            else:
+                sd = keep[0]
+                price = int(yes_cents if sd == "yes" else no_cents)
+                reward = {sd: reward_per_day(kalshi_one_sided_share(km, sd, price, float(size)), km)}
+        except Exception:
+            logging.getLogger("lip.risk").exception("fv reward estimate failed for %s", market)
+            return ()
+        fills = fills_per_day(km, float(size))
+        out = []
+        for sd in keep:
+            price = int(yes_cents if sd == "yes" else no_cents)
+            fee = maker_fee_usd(km, price, min(float(size), fills) if fills > 0 else 0.0)
+            ev = side_ev_usd_day(side_edge_cents(fv, sd, price), fills, reward[sd], fee)
+            if ev > 0:
+                out.append(sd)
+            else:
+                self._fv_count("ev_withheld", sd)
+        return tuple(out)
+
+    FV_CALIB_WATCH_MAX = 2000
+    FV_CALIB_WATCH_MAX_AGE_S = 10 * 86400.0
+
+    def _fv_calib_watch_add(self, market: str, series: str, close_ts) -> None:
+        w = self.fv_calib_watch.get(market)
+        if w is not None:
+            if close_ts is not None and w.get("close_ts") != float(close_ts):
+                w["close_ts"] = float(close_ts)
+                self._state_dirty = True
+            return
+        if len(self.fv_calib_watch) >= self.FV_CALIB_WATCH_MAX:
+            oldest = min(self.fv_calib_watch, key=lambda m: self.fv_calib_watch[m]["added_ts"])
+            del self.fv_calib_watch[oldest]
+        self.fv_calib_watch[market] = {"series": str(series),
+                                       "close_ts": None if close_ts is None else float(close_ts),
+                                       "added_ts": float(self.now or time.time())}
+        self.fv_calib_view = frozenset(self.fv_calib_watch)
+        self._state_dirty = True
+
+    def _fv_calib_watch_expire(self, ts: float) -> None:
+        """Forget watched markets at their close (or 10 days after they were
+        added, the fv_calib pending horizon, when no close is known)."""
+        old = [m for m, w in self.fv_calib_watch.items()
+               if (w.get("close_ts") is not None and ts >= float(w["close_ts"]))
+               or ts - float(w["added_ts"]) > self.FV_CALIB_WATCH_MAX_AGE_S]
+        for m in old:
+            del self.fv_calib_watch[m]
+        if old:
+            self.fv_calib_view = frozenset(self.fv_calib_watch)
+            self._state_dirty = True
+
+    def fv_cache_targets(self) -> set:
+        """Markets the fair-value cache prices (called from its thread):
+        resting markets, the loop's FV targets and the calibration watch.
+        Kalshi only."""
+        wanted = set(self.resting.copy()) | self._fv_wanted.copy() | set(self.fv_calib_view)
+        return {m for m in wanted if not m.startswith("PMUS:")}
+
+    def _fv_calib_tick(self, ts: float) -> None:
+        """Every LIP_FV_CALIB_EVERY_S (30 s): record each new model fair value
+        of a model-priced FV-family market with the book mid now
+        (``fv_calib``): every fed market of the family (quoted or not) and
+        every market in the calibration watch until its close, also after
+        its program left the loop (then without a book: mid None, a
+        model-only sample). Values below LIP_FV_MIN_CONF are recorded too
+        (their conf is kept; fv_calib keeps them out of the headline). The
+        markets of one city-day event priced at this tick are also recorded
+        as one bucket distribution (``fv_calib.record_event``). Quoting
+        reads only the verdict (``fv_calib.passed``, selection credit)."""
+        if self.fv is None or ts - self._fv_calib_at < _env_num("LIP_FV_CALIB_EVERY_S", 30.0):
+            return
+        self._fv_calib_at = ts
+        from mm.unattended.fairvalue import fv_model_active
+        from mm.unattended.fv_calib import event_of
+        from mm.unattended.fv_weather import SOURCE
+        self._fv_calib_watch_expire(ts)
+        by_event: dict = {}
+        for market in sorted(self._fv_wanted | set(self.fv_calib_watch)):
+            prog = self.programs.get(market)
+            if prog is not None:
+                if prog.venue != "kalshi":
+                    continue
+                series = prog.series
+            elif market in self.fv_calib_watch:
+                series = self.fv_calib_watch[market]["series"]
+            else:
+                continue
+            if not fv_model_active(series):
+                continue
+            row = self.fv.get(market, now=time.time())
+            if row is None or row.get("source") != SOURCE or row.get("fv_cents") is None:
+                continue
+            mid = None
+            acc = self.accruals.get(market)
+            if acc is not None and acc.book.book.is_usable():
+                yb, nb = self._best(market)
+                if yb is not None and nb is not None:
+                    mid = (yb + (100 - nb)) / 2.0
+            window = row.get("window")
+            lead_h = (max(0.0, (float(window[1]) - time.time()) / 3600.0)
+                      if isinstance(window, (list, tuple)) and len(window) == 2
+                      else float(row.get("lead_h") or 0.0))
+            rng = row.get("range")
+            try:
+                if self.fv_calib.record(market, series.upper(), ts, float(row["fv_cents"]),
+                                        float(row.get("conf") or 0.0), lead_h, mid, float(row.get("ts") or 0.0),
+                                        rng=rng if isinstance(rng, (list, tuple)) else None,
+                                        ens=row.get("ens") if isinstance(row.get("ens"), dict) else None):
+                    self._state_dirty = True
+            except (TypeError, ValueError):
+                continue
+            if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                ev = by_event.setdefault(event_of(market), {"station": series.upper(), "lead_h": lead_h,
+                                                            "entries": []})
+                ev["entries"].append({"market": market, "range": list(rng), "fv": float(row["fv_cents"]),
+                                      "conf": float(row.get("conf") or 0.0), "mid": mid})
+        for event, ev in by_event.items():
+            if len(ev["entries"]) >= 2 and self.fv_calib.record_event(event, ev["station"], ts, ev["lead_h"],
+                                                                      ev["entries"]):
+                self._state_dirty = True
 
     def _book_fresh(self, market: str, ts: float) -> bool:
         """Kalshi books are WS-maintained (quiet = unchanged). PM US books are
@@ -1565,7 +1939,7 @@ class RunLoop:
             return ()
         self._fv_wanted.add(market)
         row = self.fv.get(market, now=time.time())
-        if row is None:
+        if row is None or not self._model_row_allowed(market, row, guard=True):
             self._fv_state.pop(market, None)
             return ()
         yb, nb = self._best(market)
@@ -1620,7 +1994,27 @@ class RunLoop:
                         self._paper_cross_fill(market, quote, yb, nb, ts)
                     self._pull_one(market, "trade_through", ts, cool)
                     continue
-            fv_drop = self._fv_drop(market, ts)
+            if self._fv_fail_closed(market):
+                self._fv_count("unavailable")
+                self._pull_one(market, "fv_unavailable", ts, 0.0)
+                continue
+            fv_row = self._fv_quote_row(market)
+            if fv_row is not None:
+                # FV-driven quoting: a resting side whose edge vs the current
+                # fair value is below -LIP_FV_MAX_GIVEUP_CENTS comes out.
+                live = tuple(sd for sd in ("yes", "no") if on[sd])
+                ok = self._fv_gate_sides(market, fv_row, int(quote["yes_cents"]), int(quote["no_cents"]),
+                                         live, None)
+                if ok != live:
+                    if ok:
+                        self.pulls["fv_negative_edge"] = self.pulls.get("fv_negative_edge", 0) + 1
+                        size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
+                        self._quote(market, int(quote["yes_cents"]), int(quote["no_cents"]), size, ts,
+                                    sides=ok, skewed=True)
+                    else:
+                        self._pull_one(market, "fv_negative_edge", ts, 0.0)
+                    continue
+            fv_drop = () if fv_row is not None else self._fv_drop(market, ts)
             if any(on[sd] and sd in fv_drop for sd in ("yes", "no")):
                 keep = tuple(sd for sd in ("yes", "no") if on[sd] and sd not in fv_drop)
                 if keep:
@@ -1710,7 +2104,7 @@ class RunLoop:
     def _size_curve(self, km, ladder, sides_on: tuple, penalty_100: float) -> list:
         """[(size, value $/day, capital $, yes_c, no_c)] along the ladder, at the
         reference rungs. value = plan net/day - markout penalty (scaled by size)."""
-        from mm.selector import quote_economics, kalshi_one_sided_share, reward_per_day
+        from mm.selector import quote_economics
         from mm.session_gates import max_contracts_for_fill
         lim = self.risk.limits
         per_market = float(lim.per_market_usd) * alloc_cap_fraction()
@@ -1718,25 +2112,19 @@ class RunLoop:
             per_market = min(per_market, pmus_market_cap_usd())
         out = []
         for size in ladder:
-            net, capital, share2, yc, nc = quote_economics(km, float(size))
+            # sides_on prices one-sided quotes (quote_economics ``sides``).
+            net, capital, share2, yc, nc = quote_economics(km, float(size), sides=sides_on)
             if yc > 0 and nc > 0:
                 legal = min(max_contracts_for_fill(yc, self.fill_cap), max_contracts_for_fill(nc, self.fill_cap))
                 if 0 < legal < size:
                     # The last rung is the size the order clamp would rest
                     # (single-fill cap), valued at that size.
                     size = float(legal)
-                    net, capital, share2, yc, nc = quote_economics(km, size)
+                    net, capital, share2, yc, nc = quote_economics(km, size, sides=sides_on)
                     if out and size <= out[-1][0]:
                         break
             if yc <= 0 or nc <= 0:
                 break
-            if len(sides_on) == 1:
-                side = sides_on[0]
-                price = yc if side == "yes" else nc
-                cost2 = reward_per_day(share2, km) - net
-                share1 = kalshi_one_sided_share(km, side, price, float(size))
-                net = reward_per_day(share1, km) - cost2 / 2.0
-                capital = price / 100.0 * float(size)
             if size > max_contracts_for_fill(yc, self.fill_cap) or size > max_contracts_for_fill(nc, self.fill_cap):
                 break
             if capital > per_market + 1e-9:
@@ -1795,32 +2183,61 @@ class RunLoop:
         self._select(ts)
 
     def _markets(self) -> list[KalshiMarket]:
-        rows = []
-        for market, prog in self.programs.items():
-            book = self.accruals[market].book.book
-            rows.append(KalshiMarket(
-                market=market,
-                series=prog.series,
-                period_reward_usd=prog.period_reward_usd,
-                period_seconds=prog.period_seconds,
-                seconds_left=max(0.0, prog.end_ts - self.now),
-                discount_factor=prog.discount_factor,
-                target_size=prog.target_size,
-                yes_bids=_bids(book.yes_bids),
-                no_bids=_bids(book.no_bids),
-                days_to_settle=(max(0.0, (prog.close_ts - self.now) / 86400.0)
-                                if prog.days_from_close and prog.close_ts is not None and self.now
-                                else prog.days_to_settle),
-                exchange_index=prog.exchange_index,
-                shard_cash_usd=prog.shard_cash_usd,
-                category=prog.category,
-                venue=prog.venue,
-                max_spread_usd=prog.max_spread_usd,
-                sports_single=prog.sports_single,
-                fee_type=prog.fee_type,
-                fee_multiplier=prog.fee_multiplier,
-            ))
-        return rows
+        return [km for km in (self._km(market) for market in self.programs) if km is not None]
+
+    def _km(self, market: str) -> KalshiMarket | None:
+        """Selector view of one program: live book, close, fees, and the
+        usable model fair value when FV-driven quoting applies to it."""
+        prog = self.programs.get(market)
+        if prog is None or market not in self.accruals:
+            return None
+        book = self.accruals[market].book.book
+        row = self._fv_quote_row(market)
+        return KalshiMarket(
+            market=market,
+            series=prog.series,
+            period_reward_usd=prog.period_reward_usd,
+            period_seconds=prog.period_seconds,
+            seconds_left=max(0.0, prog.end_ts - self.now),
+            discount_factor=prog.discount_factor,
+            target_size=prog.target_size,
+            yes_bids=_bids(book.yes_bids),
+            no_bids=_bids(book.no_bids),
+            days_to_settle=(max(0.0, (prog.close_ts - self.now) / 86400.0)
+                            if prog.days_from_close and prog.close_ts is not None and self.now
+                            else prog.days_to_settle),
+            exchange_index=prog.exchange_index,
+            shard_cash_usd=prog.shard_cash_usd,
+            category=prog.category,
+            venue=prog.venue,
+            max_spread_usd=prog.max_spread_usd,
+            sports_single=prog.sports_single,
+            fee_type=prog.fee_type,
+            fee_multiplier=prog.fee_multiplier,
+            fv_cents=None if row is None else float(row["fv_cents"]),
+            fv_calibrated=row is not None and self.fv_calib.passed(),
+        )
+
+    def _fv_note_admitted(self, markets: list) -> None:
+        """Markets that pass the selector only because a usable fair value
+        applied LIP_FV_MIN_HOURS_TO_CLOSE. Without that value they must not
+        rest (``_fv_fail_closed``)."""
+        from dataclasses import replace
+        from mm.selector import exclusion_reason
+        admitted = set()
+        for km in markets:
+            if km.fv_cents is None:
+                continue
+            if exclusion_reason(replace(km, fv_cents=None, fv_candidate=False)):
+                admitted.add(km.market)
+        self._fv_admitted = admitted
+        for market in self._fv_hints:
+            self._fv_push_hint(market)
+
+    def _fv_fail_closed(self, market: str) -> bool:
+        """True when ``market`` was admitted on a fair value that is no
+        longer usable: it must not rest (cancel/pull ``fv_unavailable``)."""
+        return market in self._fv_admitted and self._fv_quote_row(market) is None
 
     def _select(self, ts: float) -> None:
         self._select_t0 = time.time()
@@ -1854,6 +2271,7 @@ class RunLoop:
                 single_fill_cap_usd=self.screen_fill_cap,
             )
         self.excluded = list(selection.excluded)
+        self._fv_note_admitted(markets)
         # per_event_usd=pool: optimize_sizes groups by series and would cut a
         # series by RAW objective before the markout-penalised rank pass. The
         # per-series cap is enforced below (alloc_series) in rank order.
@@ -1927,6 +2345,11 @@ class RunLoop:
         # and per-side inventory/fill blocks before any capital is assigned.
         self.policy_skips = []
         sides_of: dict[str, tuple] = {}
+        fv_rows = {}
+        for _per, market, _row in wanted:
+            fv_row = self._fv_quote_row(market)
+            if fv_row is not None:
+                fv_rows[market] = fv_row
         kept = []
         for item in wanted:
             market = item[1]
@@ -1938,6 +2361,16 @@ class RunLoop:
                     why = blocked["yes"] or blocked["no"]
                 else:
                     sides_of[market] = sides
+            if not why and market in fv_rows:
+                # FV-driven quoting: rest only sides that do not pay up
+                # versus fair value at the reference rungs.
+                row_o = item[2]
+                sides = self._fv_gate_sides(market, fv_rows[market], int(row_o.yes_cents),
+                                            int(row_o.no_cents), sides_of[market], None)
+                if sides:
+                    sides_of[market] = sides
+                else:
+                    why = "fv_negative_edge"
             if why:
                 self._cancel(market, why)
                 self.policy_skips.append((market, why))
@@ -2208,7 +2641,19 @@ class RunLoop:
             sides = tuple(sd for sd in sides
                           if not ((sd == "yes" and nb0 is not None and int(yes_cents) + nb0 >= 100)
                                   or (sd == "no" and yb0 is not None and int(no_cents) + yb0 >= 100)))
-        fv_drop = self._fv_drop(market, ts) if sides else ()
+        fv_row = self._fv_quote_row(market)
+        if fv_row is None and self._fv_fail_closed(market):
+            self._fv_count("unavailable")
+            self._cancel(market, "fv_unavailable")
+            return False
+        if fv_row is not None and sides:
+            # FV-driven paper quoting replaces the disagreement guard here.
+            kept = self._fv_gate_sides(market, fv_row, int(yes_cents), int(no_cents), sides, size)
+            if not kept:
+                self._cancel(market, "fv_no_positive_side")
+                return False
+            sides = kept
+        fv_drop = self._fv_drop(market, ts) if (sides and fv_row is None) else ()
         if fv_drop and any(sd in fv_drop for sd in sides):
             for sd in sides:
                 if sd in fv_drop:
@@ -2320,6 +2765,7 @@ class RunLoop:
                 self._cancel(market, "close_cutoff")
         self._guard_resting(ts)
         self.markouts.on_clock(ts, self._side_mid_cents, self._fv_side_cents)
+        self._fv_calib_tick(ts)
 
     def _cancel(self, market: str, reason: str) -> None:
         had = market in self.resting
@@ -2468,6 +2914,7 @@ class RunLoop:
             "fills_synthetic_n": sum(self.fills_synthetic_by_venue.values()),
             "positions": self.positions_report(),
             "unresolved_positions": self.unresolved_report(),
+            **self.settled_report(),
             "excluded_n": len(self.excluded),
             "excluded_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
             "programs_shard_unknown": shard_unknown_n,
@@ -2483,6 +2930,7 @@ class RunLoop:
             "fills_detail": list(self.fill_marks)[-20:],
             "markouts": self.markout_summary(),
             "markout_horizons": self.markouts.report(),
+            "fv_calibration": dict(self.fv_calib.report(), watching_n=len(self.fv_calib_watch)),
             "event_calendar": self.calendar.summary(self.now or None),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),
@@ -2493,7 +2941,8 @@ class RunLoop:
             "pmus": (self.pmus.summary() if getattr(self, "pmus", None) is not None
                      else {"enabled": False}),
             "fair_value": (dict(self.fv.summary(), blocks=dict(self.fv_blocks),
-                                withheld=sorted(k for k, v in self._fv_state.items() if v))
+                                withheld=sorted(k for k, v in self._fv_state.items() if v),
+                                fv_quote=self.fv_quote_report())
                            if self.fv is not None else {"enabled": False}),
             "select_ms": getattr(self, "select_ms", None),
             "size_ladder": size_ladder(self.chunk),
@@ -2518,6 +2967,21 @@ class RunLoop:
             "budget_warning": getattr(self, "budget_warning", None),
             "day": day,
         }
+
+    def fv_quote_report(self) -> dict:
+        """Status of FV-driven paper quoting: flags, markets it drives now,
+        markets resting only on a fair value, withheld-side counters."""
+        from mm.unattended import fairvalue as fvm
+        driving = sorted(m for m in self.programs if self._fv_quote_row(m) is not None)
+        return {"enabled": fvm.fv_quote_enabled() and self.mode == "paper",
+                "families": list(fvm.fv_quote_families()), "min_conf": fvm.fv_min_conf(),
+                "max_giveup_cents": fvm.fv_max_giveup_cents(),
+                "longshot_tilt_cents": fvm.fv_longshot_tilt_cents(),
+                "min_hours_to_close": fvm.fv_min_close_hours(),
+                "driving_n": len(driving), "driving": driving[:20],
+                "resting_driven": sorted(m for m in self.resting if m in driving)[:20],
+                "admitted_on_fv": sorted(self._fv_admitted)[:20],
+                "counters": dict(self.fv_quote_stats)}
 
     def positions_report(self) -> dict:
         """Per-market held legs for /status (the watchdog's inventory
@@ -3052,8 +3516,11 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
                                max_attempts: int | None = None,
                                refresh_s: float = PROGRAM_REFRESH_S,
                                cache: "ExchangeIndexCache | None" = None,
-                               meta=None, settle_candidates: Callable | None = None) -> None:
+                               meta=None, settle_candidates: Callable | None = None,
+                               paper: bool = False) -> None:
     """Production books and public trades. The reader cannot place an order.
+    ``paper`` (False: fail closed) lets the screen feed model families early
+    (screen.fv_early_feed); the service passes True only in paper mode.
 
     Startup: load programs, screen them against the on-disk metadata cache,
     connect the websocket for the cached candidates, then fetch missing
@@ -3078,7 +3545,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
     session = requests.Session()
     ctx = {"cache": cache or ExchangeIndexCache(), "meta": meta or MetaCache().load(),
            "fed": {}, "refresh_s": float(refresh_s), "programs": [],
-           "lock": threading.Lock(), "settle_candidates": settle_candidates}
+           "lock": threading.Lock(), "settle_candidates": settle_candidates, "paper": bool(paper)}
     backoff = READONLY_BACKOFF_START_S
     attempts = 0
     last_wall = None
@@ -3358,7 +3825,7 @@ def _refresh_meta(reader, ctx: dict) -> None:
         stale = meta.stale_markets(tickers)
         if stale:
             meta.fetch_markets(reader, stale)
-        missing = needs_series(programs, meta) + meta.stale_series(
+        missing = needs_series(programs, meta, paper=bool(ctx.get("paper"))) + meta.stale_series(
             {str(f.get("series") or "") for f in programs if f.get("market") in ctx["fed"]})
         missing = [s for s in dict.fromkeys(missing) if s]
         if missing:
@@ -3372,7 +3839,7 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
     if not ctx["lock"].acquire(blocking=False):
         return []
     try:
-        candidates, stats = screen(ctx["programs"], ctx["meta"])
+        candidates, stats = screen(ctx["programs"], ctx["meta"], paper=bool(ctx.get("paper")))
     finally:
         ctx["lock"].release()
     new = _feed_programs(candidates, ctx["fed"], on_frame, ctx.setdefault("sigs", {}))
@@ -3418,15 +3885,33 @@ async def _flush_unsubscribes(sock, ctx: dict) -> None:
         await unsub(names)
 
 
+WS_RAW_TYPE = "ws_raw"
+
+
+def _ws_raw_row(kind: str, msg: dict) -> dict:
+    """A raw websocket message as an evidence row for the frame recorder
+    (tools/verify_ws_frames.py). RunLoop.on_frame ignores this type."""
+    return {"type": WS_RAW_TYPE, "ts": msg.get("ts"), "channel": kind, "msg": dict(msg)}
+
+
 def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "SidSequencer",
                          sock) -> None:
     """Route one decoded read-only websocket message. Raises SequenceGap on a
-    real book sequence gap."""
+    real book sequence gap.
+
+    Book frames reach ``on_frame`` with ``seq`` set to None (SidSequencer has
+    checked it per subscription) and the original kept as ``ws_seq``. Raw
+    market_lifecycle_v2 messages and subscribed/unsubscribed/ok replies are
+    also passed on as ``{"type": "ws_raw", "channel": <type>, "msg": <message>}``
+    rows: RunLoop ignores them, the recorder keeps them as evidence. A real
+    gap is recorded first as a ``seq_gap`` ws_raw row (sid, seq, last_seq,
+    market_ticker) before SequenceGap is raised."""
     kind = str(msg.get("type") or "")
     if kind == "trade":
         body = msg.get("msg") or msg
         on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
     elif kind == "market_lifecycle_v2":
+        on_frame(_ws_raw_row(kind, msg))
         # A determined/settled result settles paper inventory at 100/0
         # (RunLoop.settle ignores markets it holds nothing in).
         body = msg.get("msg") or {}
@@ -3435,11 +3920,19 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
             on_frame({"kind": "settlement", "ts": msg["ts"],
                       "market": body.get("market_ticker"), "result": result})
     elif kind in ("orderbook_snapshot", "orderbook_delta"):
+        prev = seqr.last.get(msg.get("sid"))
         verdict = seqr.check(msg)
         if verdict == "dup":
             return
         if verdict == "gap":
+            # Evidence row for tools/verify_ws_frames.py (the gapped frame is
+            # not applied; the session reconnects).
+            on_frame(_ws_raw_row("seq_gap", {
+                "type": "seq_gap", "ts": msg.get("ts"), "sid": msg.get("sid"), "seq": msg.get("seq"),
+                "last_seq": prev, "frame_type": kind,
+                "market_ticker": (msg.get("msg") or {}).get("market_ticker")}))
             raise SequenceGap(f"sid {msg.get('sid')} sequence gap at {msg.get('seq')}")
+        msg["ws_seq"] = msg.get("seq")
         msg["seq"] = None
         on_frame(msg)
     elif kind in ("subscribed", "unsubscribed", "ok"):
@@ -3449,6 +3942,7 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
             # update_subscription / unsubscribe acks carry the subscription's
             # seq; record it so the next book message is not seen as a gap.
             seqr.check(msg)
+        on_frame(_ws_raw_row(kind, msg))
 
 
 KALSHI_FINAL_STATUSES = ("determined", "amended", "finalized", "settled")
@@ -3489,8 +3983,9 @@ def _backfill_fetch(reader, tickers: list[str]) -> list[tuple[str, str]]:
 async def _settlement_backfill(reader, ctx: dict, on_frame, now: float | None = None) -> int:
     """Kalshi settlements missed while the socket was down or disconnected:
     ask GET /markets/{ticker} (read-only, GET only) for held positions past
-    close or with no program left (``ctx["settle_candidates"]``, the loop's
-    ``settle_view``), at most LIP_SETTLE_BACKFILL_MAX (50) tickers per
+    close or with no program left, then markets with pending fair-value
+    calibration samples past close (``ctx["settle_candidates"]``: the loop's
+    ``settle_view`` and ``fv_settle_view``), at most LIP_SETTLE_BACKFILL_MAX (50) tickers per
     refresh, each at most once per LIP_SETTLE_POLL_S (600 s). A final yes/no
     result is booked through the loop's ``settlement`` frame (RunLoop.settle).
     Returns the number booked."""

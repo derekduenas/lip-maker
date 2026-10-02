@@ -32,6 +32,10 @@ LIVE_STATUS_FIELDS = (
     "markout_horizons", "pnl_attribution", "event_calendar",
     # Final review: released unresolved positions, demo-books warning.
     "unresolved_positions", "book_source_warning",
+    # Model fair-value scoring, lifetime settled counters, report day.
+    "fv_calibration", "settled_positions_n", "settled_positions_by_venue",
+    "settled_total_usd", "settled_positions_lower_bound",
+    "day", "rewards_usd", "socket_opened",
 )
 
 
