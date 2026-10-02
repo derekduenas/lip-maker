@@ -3888,7 +3888,9 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
     checked it per subscription) and the original kept as ``ws_seq``. Raw
     market_lifecycle_v2 messages and subscribed/unsubscribed/ok replies are
     also passed on as ``{"type": "ws_raw", "channel": <type>, "msg": <message>}``
-    rows: RunLoop ignores them, the recorder keeps them as evidence."""
+    rows: RunLoop ignores them, the recorder keeps them as evidence. A real
+    gap is recorded first as a ``seq_gap`` ws_raw row (sid, seq, last_seq,
+    market_ticker) before SequenceGap is raised."""
     kind = str(msg.get("type") or "")
     if kind == "trade":
         body = msg.get("msg") or msg
@@ -3903,10 +3905,17 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
             on_frame({"kind": "settlement", "ts": msg["ts"],
                       "market": body.get("market_ticker"), "result": result})
     elif kind in ("orderbook_snapshot", "orderbook_delta"):
+        prev = seqr.last.get(msg.get("sid"))
         verdict = seqr.check(msg)
         if verdict == "dup":
             return
         if verdict == "gap":
+            # Evidence row for tools/verify_ws_frames.py (the gapped frame is
+            # not applied; the session reconnects).
+            on_frame(_ws_raw_row("seq_gap", {
+                "type": "seq_gap", "ts": msg.get("ts"), "sid": msg.get("sid"), "seq": msg.get("seq"),
+                "last_seq": prev, "frame_type": kind,
+                "market_ticker": (msg.get("msg") or {}).get("market_ticker")}))
             raise SequenceGap(f"sid {msg.get('sid')} sequence gap at {msg.get('seq')}")
         msg["ws_seq"] = msg.get("seq")
         msg["seq"] = None

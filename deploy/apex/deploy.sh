@@ -51,9 +51,11 @@ stop_services() {
 }
 
 # Informational, after the /status check: never fails the deploy.
-#  - verify_ws_frames.py on the newest frame recording, only if recordings
-#    exist (LIP_RECORD_DIR from the env file, else the unit drop-ins, else
-#    the default); its exit status is printed, not acted on.
+#  - verify_ws_frames.py on the newest frame recording opened at least 10
+#    minutes ago (--min-age-s 600: not the file the engine restarted by this
+#    deploy just opened), only if recordings exist (LIP_RECORD_DIR from the
+#    env file, else the unit drop-ins, else the default); its exit status is
+#    printed, not acted on.
 #  - the readiness report's OVERALL verdict line.
 DEFAULT_REC_DIR=${DEFAULT_REC_DIR:-/var/lib/lip-maker/recordings}
 informational_checks() {
@@ -65,9 +67,9 @@ informational_checks() {
   v=$(sed -nE 's/^LIP_RECORD_DIR=//p' "$ENV_FILE" 2>/dev/null | tr -d '"' | tail -1 || true)
   [[ -n "$v" ]] && rec_dir=$v
   if compgen -G "$rec_dir/frames-*.jsonl.gz" >/dev/null 2>&1; then
-    log "verify_ws_frames on the newest recording in $rec_dir (informational)"
+    log "verify_ws_frames on the newest recording older than 10 min in $rec_dir (informational)"
     rc=0
-    timeout 300 "$APP/.venv/bin/python" "$APP/tools/verify_ws_frames.py" --dir "$rec_dir" --newest 1 || rc=$?
+    timeout 300 "$APP/.venv/bin/python" "$APP/tools/verify_ws_frames.py" --dir "$rec_dir" --newest 1 --min-age-s 600 || rc=$?
     log "verify_ws_frames exit $rc (0 ok, 1 an engine-required field missing, 2 no frames; informational)"
   else
     log "no recordings in $rec_dir (LIP_RECORD_ENABLE off or nothing recorded yet): skipping verify_ws_frames"

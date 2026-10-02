@@ -20,7 +20,15 @@ gzip JSON lines ``frames-<UTC>.jsonl.gz`` under LIP_RECORD_DIR, default
   (later subscribe batch merged into an earlier sid) and tickers seen on
   more than one sid;
 * seq gaps per sid (snapshot gaps are the merge resyncs SidSequencer
-  allows; delta gaps are real gaps).
+  allows; delta gaps are real gaps). ``ok`` / ``unsubscribed`` replies
+  carrying a seq advance the sid's last seq exactly as the engine's
+  SidSequencer does (update_subscription acks consume a seq), so they do not
+  read as gaps; ``subscribed`` replies do not (the engine does not check
+  them either);
+* engine-detected gaps: the dispatcher records a ws_raw ``seq_gap`` row
+  (sid, seq, last_seq, market_ticker) before it raises SequenceGap and
+  reconnects; counted under ``seq.engine_gaps``. Recordings made before that
+  row existed cannot show them.
 
 What the recorder shows. The engine records the frames passed to
 RunLoop.on_frame, i.e. AFTER loop._dispatch_ws_message. That function sets
@@ -46,12 +54,14 @@ recordings / no frames.
 from __future__ import annotations
 
 import argparse
+import calendar
 import glob
 import json
 import math
 import os
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -289,6 +299,7 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
     seq_last = {}
     seq_src = Counter()
     seq_gaps = defaultdict(lambda: {"snapshot_gaps": 0, "delta_gaps": 0, "dups": 0, "n": 0})
+    engine_gaps = {"n": 0, "samples": []}
     ws_raw = Counter()
     ts_min = ts_max = None
     total = 0
@@ -402,10 +413,24 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
             settlements["sources"][str(fr.get("source") or "ws_lifecycle (default)")] += 1
             if len(settlements["samples"]) < samples:
                 settlements["samples"].append(fr)
+        elif t == "seq_gap":
+            engine_gaps["n"] += 1
+            if len(engine_gaps["samples"]) < samples:
+                engine_gaps["samples"].append(fr)
         elif t in ("subscribed", "ok", "unsubscribed"):
             replies[t] += 1
             body = fr.get("msg") if isinstance(fr.get("msg"), dict) else {}
             sid = fr.get("sid", body.get("sid"))
+            if t != "subscribed" and sid is not None and fr.get("seq") is not None:
+                # as loop._dispatch_ws_message: the ack's seq is checked by
+                # SidSequencer, so the next book frame is not a gap
+                try:
+                    rseq = int(fr["seq"])
+                except (TypeError, ValueError):
+                    rseq = None
+                key = (epoch, sid)
+                if rseq is not None and (seq_last.get(key) is None or rseq > seq_last[key]):
+                    seq_last[key] = rseq
             if t == "ok":
                 replies["ok_with_sid"] += int(sid is not None)
                 replies["ok_with_seq"] += int(fr.get("seq") is not None)
@@ -515,7 +540,8 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
                 "per_sid": [{"epoch": k[0], "sid": k[1], **v} for k, v in sorted(
                     seq_gaps.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))],
                 "snapshot_gaps": sum(v["snapshot_gaps"] for v in seq_gaps.values()),
-                "delta_gaps": sum(v["delta_gaps"] for v in seq_gaps.values())},
+                "delta_gaps": sum(v["delta_gaps"] for v in seq_gaps.values()),
+                "engine_gaps": engine_gaps},
         "dependencies": deps,
         "failures": failures,
         "notes": notes,
@@ -584,6 +610,10 @@ def render(rep: dict) -> str:
                            f"delta_gaps={r['delta_gaps']} dups={r['dups']}")
     else:
         out.append("seq: not recorded")
+    out.append(f"engine-detected seq gaps: {sq['engine_gaps']['n']} (ws_raw seq_gap rows; none in "
+               "recordings made before the dispatcher wrote them)")
+    for smp in sq["engine_gaps"]["samples"]:
+        out.append("  sample: " + json.dumps(smp, sort_keys=True)[:300])
     out.append("")
     out.append("engine-required fields:")
     for d in rep["dependencies"]:
@@ -601,13 +631,34 @@ def render(rep: dict) -> str:
 
 
 # --------------------------------------------------------------------- main
-def resolve_paths(paths, directory, newest) -> list:
+_START = re.compile(r"(\d{8}T\d{6}Z)")
+
+
+def file_start_ts(path) -> float:
+    """When a recording was opened: the UTC stamp in its name
+    (frames-YYYYmmddTHHMMSSZ[-n].jsonl.gz), else its mtime."""
+    m = _START.search(Path(path).name)
+    if m:
+        try:
+            return calendar.timegm(time.strptime(m.group(1), "%Y%m%dT%H%M%SZ"))
+        except ValueError:
+            pass
+    return Path(path).stat().st_mtime
+
+
+def resolve_paths(paths, directory, newest, min_age_s: float = 0.0, now: float | None = None) -> list:
+    """Explicit files/globs, else the recordings in ``directory``; from the
+    directory, files opened less than ``min_age_s`` ago are skipped (the file
+    a just-restarted engine is writing), then the newest ``newest`` kept."""
     files = []
     for p in paths or ():
         hits = sorted(glob.glob(p))
         files.extend(hits if hits else [p])
     if not files:
         found = list_files(directory)
+        if min_age_s > 0:
+            now = time.time() if now is None else float(now)
+            found = [p for p in found if now - file_start_ts(p) >= min_age_s]
         files = [str(p) for p in (found[-newest:] if newest else found)]
     elif newest:
         files = files[-newest:]
@@ -619,6 +670,9 @@ def main(argv=None) -> int:
     ap.add_argument("paths", nargs="*", help="recording files or globs (default: --dir)")
     ap.add_argument("--dir", default=os.environ.get("LIP_RECORD_DIR", DEFAULT_DIR))
     ap.add_argument("--newest", type=int, default=0, help="only the newest N files")
+    ap.add_argument("--min-age-s", type=float, default=0.0,
+                    help="with --dir: skip recordings opened less than this many seconds ago "
+                         "(deploy.sh: 600, so the file the restarted engine just opened is not the one checked)")
     ap.add_argument("--skew-limit", type=float, default=None,
                     help="override LIP_CLOCK_SKEW_LIMIT_S (default: env, unit config, loop.py)")
     ap.add_argument("--unit-config", action="append", default=None,
@@ -629,7 +683,7 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
-    files = resolve_paths(a.paths, a.dir, a.newest)
+    files = resolve_paths(a.paths, a.dir, a.newest, a.min_age_s)
     if not files:
         print(f"no recordings found ({a.paths or a.dir})", file=sys.stderr)
         return 2
