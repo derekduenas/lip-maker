@@ -16,7 +16,9 @@
 #        - appends missing watchdog defaults (LIP_WD_LIVE_ARMED stays false)
 #        - installs the polkit rule for the watchdog's stop fallback
 #   4. installs units + drop-ins, enables both services at boot, starts them
-#   5. verifies /status (paper, production books) and the watchdog health file
+#   5. verifies /status (paper, production books) and the watchdog health file;
+#      informational only: verify_ws_frames.py on the newest recording (if any)
+#      and the readiness report verdict
 set -euo pipefail
 
 REPO_URL=${LIP_REPO_URL:-https://github.com/derekduenas/lip-maker}
@@ -46,6 +48,34 @@ log() { echo "[deploy $(date -u +%H:%M:%S)] $*"; }
 stop_services() {
   systemctl stop lip-watchdog.service 2>/dev/null || true
   systemctl stop lip-unattended.service 2>/dev/null || true
+}
+
+# Informational, after the /status check: never fails the deploy.
+#  - verify_ws_frames.py on the newest frame recording, only if recordings
+#    exist (LIP_RECORD_DIR from the env file, else the unit drop-ins, else
+#    the default); its exit status is printed, not acted on.
+#  - the readiness report's OVERALL verdict line.
+DEFAULT_REC_DIR=${DEFAULT_REC_DIR:-/var/lib/lip-maker/recordings}
+informational_checks() {
+  local rec_dir v rc verdict
+  rec_dir=$DEFAULT_REC_DIR
+  v=$(sed -nE 's/^[[:space:]]*Environment="?LIP_RECORD_DIR=([^" ]+)"?.*/\1/p' \
+        "$UNITS"/lip-unattended.service.d/*.conf 2>/dev/null | tail -1 || true)
+  [[ -n "$v" ]] && rec_dir=$v
+  v=$(sed -nE 's/^LIP_RECORD_DIR=//p' "$ENV_FILE" 2>/dev/null | tr -d '"' | tail -1 || true)
+  [[ -n "$v" ]] && rec_dir=$v
+  if compgen -G "$rec_dir/frames-*.jsonl.gz" >/dev/null 2>&1; then
+    log "verify_ws_frames on the newest recording in $rec_dir (informational)"
+    rc=0
+    timeout 300 "$APP/.venv/bin/python" "$APP/tools/verify_ws_frames.py" --dir "$rec_dir" --newest 1 || rc=$?
+    log "verify_ws_frames exit $rc (0 ok, 1 an engine-required field missing, 2 no frames; informational)"
+  else
+    log "no recordings in $rec_dir (LIP_RECORD_ENABLE off or nothing recorded yet): skipping verify_ws_frames"
+  fi
+  verdict=$(timeout 120 "$APP/.venv/bin/python" "$APP/tools/readiness_report.py" 2>/dev/null \
+              | grep -E '^OVERALL:' || true)
+  log "readiness (informational): ${verdict:-no verdict (readiness_report failed)}"
+  return 0
 }
 
 if [[ -n "$ROLLBACK" ]]; then
@@ -205,6 +235,7 @@ if warn:
 if s.get("live_armed") or (mode not in (None, "paper")):
     print("  !!! NOT PAPER: stop now: systemctl stop lip-unattended"); sys.exit(1)
 EOF
+informational_checks
 sleep 35
 if [[ -f "$STATE/watchdog_health.json" ]]; then
   "$APP/.venv/bin/python" -c "import json;h=json.load(open('$STATE/watchdog_health.json'));print('  watchdog:', {k:h.get(k) for k in ('ok','latched','reasons_now','trip_reasons','config_armed')})"
