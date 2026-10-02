@@ -173,6 +173,20 @@ def fv_side_ok(edge_cents: float) -> bool:
     return float(edge_cents) >= -fv_max_giveup_cents()
 
 
+def _iso_ts(raw):
+    """Epoch seconds of an ISO-8601 time (Kalshi close_time), None if absent/bad."""
+    if not raw:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 def tokens(text: str) -> tuple[set, set]:
     """(words, numbers). Years and day-of-month after a month name are dropped."""
     t = re.sub(r"\d{1,2}:\d{2}", " ", (text or "").lower().replace(",", ""))
@@ -290,6 +304,7 @@ class FairValueCache:
         self.hints: dict[str, dict] = {}
         self.market_meta: dict[str, dict] = {}
         self.wx = None  # fv_weather.WeatherHighModel, created on first use
+        self._seen: dict[str, float] = {}   # market -> last refresh that targeted it
         self.stats = {"refreshes": 0, "pm_markets": 0, "targets": 0, "matched": 0,
                       "errors": 0, "last_refresh_ts": None, "last_error": None}
         self._thread = None
@@ -330,7 +345,8 @@ class FairValueCache:
         title = " ".join(x for x in (m.get("title"), m.get("yes_sub_title")) if x)
         self.titles[market] = title
         self.market_meta[market] = {"strike_type": m.get("strike_type"), "floor_strike": m.get("floor_strike"),
-                                    "cap_strike": m.get("cap_strike"), "title": m.get("title")}
+                                    "cap_strike": m.get("cap_strike"), "title": m.get("title"),
+                                    "close_ts": _iso_ts(m.get("close_time"))}
         self.sleep(0.2)
         return title
 
@@ -381,11 +397,53 @@ class FairValueCache:
             self.sleep(0.2)
         return rows
 
+    META_KEEP_AFTER_CLOSE_S = 86400.0
+    META_KEEP_UNTARGETED_S = 7 * 86400.0
+
+    def _close_ts(self, market: str):
+        """Close of ``market`` if known: the public market fetch's close_time,
+        a hint's close_ts, or a daily-HIGH market's settlement window end."""
+        for src in (self.market_meta.get(market), self.hints.get(market)):
+            if isinstance(src, dict) and src.get("close_ts") is not None:
+                try:
+                    return float(src["close_ts"])
+                except (TypeError, ValueError):
+                    pass
+        from mm.unattended import fv_weather as W
+        st, d = W.station_for(market.split("-", 1)[0]), W.measurement_date(market)
+        if st is not None and d is not None:
+            return W.settlement_window(st, d)[1]
+        return None
+
+    def _prune_meta(self, targets, now: float) -> int:
+        """Forget titles / hints / public market metadata of markets not asked
+        for now that closed more than a day ago, or (close unknown) were last
+        asked for more than a week ago. Runs on the refresh thread; the engine
+        thread only assigns single hint entries (note_market)."""
+        tset = set(targets)
+        for m in tset:
+            self._seen[m] = now
+        known = set(list(self.titles)) | set(list(self.hints)) | set(list(self.market_meta)) | set(self._seen)
+        gone = []
+        for m in known - tset:
+            close = self._close_ts(m)
+            if close is not None:
+                stale = now > close + self.META_KEEP_AFTER_CLOSE_S
+            else:
+                stale = now - self._seen.get(m, now) > self.META_KEEP_UNTARGETED_S
+            if stale:
+                gone.append(m)
+        for m in gone:
+            for d in (self.titles, self.hints, self.market_meta, self._seen):
+                d.pop(m, None)
+        return len(gone)
+
     def refresh(self, targets) -> None:
         min_conf = _env("LIP_FV_MIN_CONF", 0.6)
         max_spread = _env("LIP_FV_MAX_PM_SPREAD", 0.06)
         min_liq = _env("LIP_FV_MIN_PM_LIQ", 1000)
         targets = sorted(set(targets))
+        self._prune_meta(targets, time.time())
         pm_error = None
         try:
             pm = self._pm_rows()
