@@ -2,6 +2,12 @@
 
 Exact config running on APEX (2026-10-01). Code = this branch.
 
+## One-command deploy / update
+
+On the droplet: `curl -fsSL https://raw.githubusercontent.com/derekduenas/lip-maker/apex/patches-1-17/deploy/apex/deploy.sh -o /tmp/deploy.sh && sudo bash /tmp/deploy.sh`
+
+It backs up the code tree, env file and units to /var/backups/lip-maker/<timestamp>, swaps in the branch, builds the venv, applies the checklist below (removes LIP_BANKROLL, forces paper, carries the prod read key over from the old repo .env, installs the polkit rule), enables both services at boot (Restart=always, no start-rate limit), starts them and verifies /status. Rollback: `sudo bash /opt/lip-maker/deploy/apex/deploy.sh --rollback /var/backups/lip-maker/<timestamp>`.
+
 ## Before deploying this branch
 
 1. Delete `LIP_BANKROLL` from /etc/lip-maker/lip-maker.env if it is there (the EnvironmentFile overrides policy.conf's pinned `LIP_BANKROLL=1500`; older copies set 5000): `sudo sed -i '/^LIP_BANKROLL=/d' /etc/lip-maker/lip-maker.env`.
