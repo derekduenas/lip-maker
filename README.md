@@ -1,76 +1,78 @@
-# INNAIT — Cross-Venue Maker
+# lip-maker
 
-Single-organism market-making system across **Kalshi** (LIP) and **Polymarket US** (LIP).
-Goal: $20k/mo recurring rebate-driven yield by Sept 1, 2026.
+Paper-only market maker that quotes for liquidity-incentive rewards on
+**Kalshi** (LIP) and **Polymarket US**. Nothing in this repository is
+configured to trade live; see "Live" below.
 
-## Layout
+## What runs (APEX)
 
-```
-lip-maker/
-├── kalshi/  ← (legacy: top-level files are Kalshi)
-│   ├── engine/         lip_discovery, lip_scorer, futures_feed, yield_equation
-│   ├── execution/      kalshi_auth, kalshi_ws, quote_manager, market_blacklist
-│   ├── monitor/        alerts, ramp_controller, reconciliation
-│   ├── tools/          dashboard, settlement_reconciler, bleed_monitor,
-│   │                   share_alert, strategy_outcome_check, fills_sync,
-│   │                   competitor_density, vip_tracker, lip_sunset_alarm, ...
-│   └── run_paper.py    main runner
-│
-├── polymarket/         ← Polymarket US maker (mirrors Kalshi structure)
-│   ├── engine/         pm_scorer, rewards_schedule, pm_fair_value, yield_equation
-│   ├── execution/      pm_auth, pm_ws, pm_quote_manager
-│   ├── tools/          us_scanner, pm_dashboard, pm_bleed_monitor,
-│   │                   pm_settlement_watcher, pm_rebate_verifier, public_recorder
-│   └── run_pm.py       main runner
-│
-├── cross_venue/        ← Tools that span both venues
-│   ├── orchestrator.py        RYD per venue, capital migration recommend
-│   ├── capital_reaper.py      stale-order canceller, both venues
-│   ├── capital_injection.py   DCA allocator (split funds by trailing RYD)
-│   ├── innait_status.py       combined dashboard (one command, both venues)
-│   ├── fill_rate_tracker.py   per-series quoted vs filled
-│   ├── yield_equation.py      unified physics (deployed dual-side too)
-│   └── db_backup.sh           nightly snapshot, both DBs
-│
-├── _archive/2026-04-29/  ← dead code (kept for reference)
-└── data/                 ← Kalshi SQLite (lip_maker.db)
-```
+Two processes on the APEX droplet, user `lip`, code in `/opt/lip-maker`,
+state in `/var/lib/lip-maker`:
 
-## Production deployment
+| process | unit | entrypoint |
+|---|---|---|
+| quote loop (paper) | `deploy/lip-unattended.service` + drop-ins in `deploy/apex/lip-unattended.service.d/` | `python -m mm.unattended --run ...` |
+| watchdog / kill switch | `deploy/apex/lip-watchdog.service` | `python -m mm.safety.lip_watchdog` |
 
-Both runners deployed as systemd services on DigitalOcean:
-- `lip-maker.service` → `python run_paper.py`
-- `polymarket-maker.service` → `python run_pm.py`
+Policy knobs are the `LIP_*` variables in
+`deploy/apex/lip-unattended.service.d/policy.conf` and
+`deploy/apex/watchdog.env.example`. Offline replay of recorded frames:
+`python -m mm.replay bench`. Install: `deploy/droplet/setup.sh`
+(see `docs/DROPLET.md`).
 
-10 cron jobs: capital_reaper (5m), orchestrator (5m), bleed_monitor ×2 (10m),
-fill_rate_tracker (30m), pm_settlement_watcher (30m), share_alert (1h),
-pm_rebate_verifier (01:05), strategy_outcome_check (01:15),
-db_backup (02:30), lip_sunset_alarm (09:00).
-
-## Unified Yield Equation (engine/yield_equation.py)
+## Layout: live code vs legacy
 
 ```
-ExpectedDailyRebate = pool_per_day
-                    × our_share
-                    × qualify_prob       (smooth sigmoid around target_size)
-                    × time_factor        (exp(-d/90) — long markets dilute)
-                    × calibration        (theoretical → actual, ~0.25 Kalshi, ~0.10 PM)
-                    - adverse_cost       (0.5%/d × position × sqrt(t))
+mm/                 APEX engine: unattended loop, selector, risk (mm/risk.py),
+                    venues (Kalshi read-only, PM US paper), safety/watchdog, replay
+engine/             shared math; APEX uses lip_scorer, lip_accrual, fees,
+                    series_fees, lip_reconcile, lip_calibration, reward_provenance,
+                    calibration_ewma (and lip_discovery._parse_program)
+execution/          kalshi_auth, kalshi_ws, paper_fills, order_request (APEX);
+                    quote_manager.py is LEGACY and paper-only (live raises)
+polymarket/engine/  pm_us_lip_scorer (APEX)
+config/             settings, constitution
+---- legacy (not on the APEX path) ----
+run_paper.py        old PaperRunner; executing it just runs mm.unattended
+polymarket/         old PM runner (run_pm.py, paper-only: PM_PAPER=false is refused)
+cross_venue/        old cross-venue tools; yield_equation.py is legacy
+risk/sentinel.py    guards only the legacy QuoteManager
+tools/, monitor/    mostly operator scripts for the old /root install
+                    (exceptions imported by APEX: monitor/alerts.py,
+                    tools/attack_targets.py, tools/competitor_density.py)
+_archive/           moved-out code (see _archive/2026-10-01/README.md)
 ```
 
-Used by both venues' scorers as primary ranking signal. `.explain()` method
-exposes every component for audit.
+## Facts worth knowing
 
-## Key constraints discovered
+- **Paper only.** `mm.unattended` refuses production order hosts; the legacy
+  `QuoteManager` and `run_pm.py` refuse live outright. Unit-file
+  `Environment=LIP_PAPER=true` does not override the env file
+  (systemd.exec(5)); see `docs/DROPLET.md`.
+- **Kalshi LIP runs to Jan 1, 2027** (extended from Sept 1, 2026):
+  https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program
+- **Polymarket US incentives:** `GET /v1/incentives` exists. The engine
+  reads it from `gateway.polymarket.us`, which is undocumented and
+  unauthenticated; the documented API is `api.polymarket.us` with API
+  keys. Treat the gateway as best-effort.
+- **Calibration constants 0.25 (Kalshi) / 0.10 (PM)** in
+  `cross_venue/yield_equation.py` are unmeasured priors, not fitted to paid
+  rewards.
+- **`cross_venue/yield_equation.py` is legacy.** It is a heuristic, not either
+  venue's scoring formula, and it is not the live ranking (APEX scores with
+  `engine/lip_scorer.py` and `polymarket/engine/pm_us_lip_scorer.py`).
+- Reward figures are estimates until reconciled against a venue payment
+  (`engine/reward_provenance.py`).
 
-- **PM US has no `/v1/incentives` API** as of 2026-04-30 (404 with valid auth).
-  Hardcoded SCHEDULES from docs is the only ground truth.
-- **PM payouts**: 7-12 calendar days post-period-end (not daily).
-- **Snapshot share is the bottleneck**: at $260 PM bankroll, our share is
-  structurally ~0% in target_size≥1000 markets. Capital injection or
-  ultra-concentration required.
+## Live
 
-## Sept 1 LIP sunset
+There is no supported live path in this repository today. The former
+"$20k/mo by Sept 1, 2026" goal line is past and is not a current target.
 
-Kalshi's Liquidity Incentive Program ends Sept 1, 2026 (~123 days).
-`tools/lip_sunset_alarm.py` fires daily warnings at T-60/30/14/7/3/1.
+## Tests
+
+```bash
+python3 -m pytest -q -p no:cacheprovider
+```
+
+Runtime deps: `requirements.txt`; test deps: `requirements-dev.txt`.
