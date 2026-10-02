@@ -214,7 +214,8 @@ class FVCalibration:
             pend["samples"][bucket] = row
             new = True
         if row["mid"] is not None and bucket not in pend["paired"]:
-            pend["paired"][bucket] = row
+            # scoring needs fv/mid/conf only (range/ens go out with ``samples``)
+            pend["paired"][bucket] = dict(row, range=None, ens=None)
             new = True
         return new
 
