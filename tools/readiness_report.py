@@ -21,9 +21,12 @@ Criteria (thresholds are flags):
                     says ``data_source production-books``, and /status now
                     reports paper, production-books and no
                     book_source_warning. The engine overwrites its summary
-                    file every refresh, so it holds ONE day: pass dated
-                    copies too (``--summary 'dir/daily-summary.*'``) or this
-                    stays INSUFFICIENT.
+                    file every refresh (ONE day), and keeps one line per UTC
+                    day in ``<summary>.history.jsonl`` (written on day roll,
+                    periodically and on shutdown), which is read too; a day
+                    that saw any non-production source does not count.
+                    Dated copies (``--summary 'dir/daily-summary.*'``) and
+                    other history files (``--summary-history``) also count.
   kalshi_fills      >= --min-kalshi-fills (300) non-synthetic Kalshi fills
                     (status venues.kalshi, else the state file).
   settled_positions >= --min-settled (100). Uses the engine's lifetime
@@ -85,6 +88,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PROD_BOOKS_FLAG = "production-books"   # mm.venues.readonly.PROD_BOOKS_FLAG
+HISTORY_SUFFIX = ".history.jsonl"      # mm.unattended.service.summary_history_path
 VAR = Path("/var/lib/lip-maker")
 REWARD_KEYS = ("est_rewards_kalshi_usd", "est_rewards_pmus_usd", "rebates_usd")
 STRATEGY_KEYS = ("spread_capture_usd", "adverse_selection_usd", "inventory_mtm_usd", "fees_usd")
@@ -154,6 +158,30 @@ def parse_summary(text: str) -> dict:
                 except ValueError:
                     pass
     return out
+
+
+def read_summary_history(path) -> tuple[list, str | None]:
+    """Daily summaries from ``<summary>.history.jsonl`` (one JSON object per
+    UTC day). A day that saw several data sources yields one entry per
+    source, so a non-production source taints the day."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        return [], f"{path}: {e}"
+    out = []
+    for line in text.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or not rec.get("day"):
+            continue
+        sources = [str(x) for x in rec.get("data_sources") or []] or [rec.get("data_source")]
+        attr = rec.get("attribution") if isinstance(rec.get("attribution"), dict) else None
+        for src in sources:
+            out.append({"day": str(rec["day"]), "data_source": src, "attribution": attr,
+                        "fills": rec.get("fills"), "file": str(path)})
+    return out, None
 
 
 def _ts(raw):
@@ -270,8 +298,8 @@ def crit_paper_days(status, status_err, summaries, a):
     if len(prod_days) >= a.min_days:
         return _crit("paper_days", title, PASS, value)
     return _crit("paper_days", title, INSUFF, value,
-                 f"{len(prod_days)} production-books day(s) in the summaries read; the engine keeps "
-                 "only today's summary, so pass dated copies with --summary")
+                 f"{len(prod_days)} production-books day(s) in the summaries and summary history read "
+                 "(daily-summary.history.jsonl gains one line per UTC day)")
 
 
 def crit_kalshi_fills(status, state, a):
@@ -483,6 +511,9 @@ def parse_args(argv=None):
     ap.add_argument("--status-file", default=None, help="read status JSON from a file instead")
     ap.add_argument("--summary", action="append", default=None,
                     help="daily summary file or glob (repeatable; default /var/lib/lip-maker/daily-summary)")
+    ap.add_argument("--summary-history", action="append", default=None,
+                    help="daily summary history file or glob (repeatable; default: "
+                         "<each --summary>.history.jsonl when it exists)")
     ap.add_argument("--state", default=str(VAR / "engine_state.json"))
     ap.add_argument("--watchdog-health", default=str(VAR / "watchdog_health.json"))
     ap.add_argument("--watchdog-state", default=str(VAR / "watchdog_state.json"))
@@ -516,11 +547,23 @@ def build_report(a) -> dict:
     if status is not None and not isinstance(status, dict):
         status, status_err = None, "status is not a JSON object"
     summaries, summary_err = [], []
-    for p in _expand(a.summary or [str(VAR / "daily-summary")]):
+    summary_paths = _expand(a.summary or [str(VAR / "daily-summary")])
+    for p in summary_paths:
         try:
             summaries.append(dict(parse_summary(Path(p).read_text(encoding="utf-8")), file=p))
         except OSError as e:
             summary_err.append(f"{p}: {e}")
+    # The engine's per-day history next to each summary file
+    # (mm/unattended/service.SummaryHistory), plus any --summary-history.
+    hist_paths = [p + HISTORY_SUFFIX for p in summary_paths if not p.endswith(HISTORY_SUFFIX)]
+    hist_paths += _expand(getattr(a, "summary_history", None) or [])
+    for p in dict.fromkeys(hist_paths):
+        if not Path(p).exists() and p not in (getattr(a, "summary_history", None) or []):
+            continue
+        rows, err = read_summary_history(p)
+        summaries.extend(rows)
+        if err:
+            summary_err.append(err)
     state, state_err = _read_json(a.state)
     health, health_err = _read_json(a.watchdog_health)
     wd_state, _ = _read_json(a.watchdog_state)

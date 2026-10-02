@@ -381,10 +381,119 @@ def _paper_env() -> bool:
     return os.environ.get("LIP_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+class SummaryHistory:
+    """``<summary>.history.jsonl``: one JSON line per UTC day with that
+    day's last daily summary (day, data_source(s), fills, P&L fields,
+    attribution), so the readiness report can count days although the
+    summary file itself is overwritten with the current day.
+
+    A day's line is written when the next day's first report arrives (day
+    roll), on ``flush`` (clean shutdown) and, so a SIGTERM/crash loses at
+    most that much, every LIP_SUMMARY_HISTORY_EVERY_S (600 s; <= 0 off).
+    Writing replaces that day's line (restarts keep one line per day) and
+    keeps every data_source seen for the day in ``data_sources``. The file
+    keeps the newest LIP_SUMMARY_HISTORY_MAX (400) days and is rewritten
+    atomically (tmp + rename). Unparseable lines are dropped. Errors are
+    logged, never raised: the history must not stop the summary."""
+
+    def __init__(self, path: str, *, every_s: float | None = None, clock=time.time) -> None:
+        self.path = Path(path)
+        self.every_s = (_env_float("LIP_SUMMARY_HISTORY_EVERY_S", 600.0) if every_s is None
+                        else float(every_s))
+        self.clock = clock
+        self.current: dict | None = None
+        self.sources: set = set()
+        self._written_at = clock()
+        self._dirty = False
+
+    def note(self, row: dict) -> None:
+        day = str(row.get("day") or "")
+        if not day:
+            return
+        if self.current is not None and self.current["day"] != day:
+            self._write(self.current, self.sources)       # final line of the previous day
+            self.sources = set()
+        self.current = dict(row, day=day)
+        if row.get("data_source"):
+            self.sources.add(str(row["data_source"]))
+        self._dirty = True
+        if self.every_s > 0 and self.clock() - self._written_at >= self.every_s:
+            self._write(self.current, self.sources)
+
+    def flush(self) -> None:
+        if self.current is not None and self._dirty:
+            self._write(self.current, self.sources)
+
+    def _write(self, row: dict, sources: set) -> None:
+        self._written_at = self.clock()
+        if row is self.current:
+            self._dirty = False
+        try:
+            keep = max(1, int(_env_float("LIP_SUMMARY_HISTORY_MAX", 400)))
+            days: dict = {}
+            if self.path.exists():
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        old = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(old, dict) and old.get("day"):
+                        days[str(old["day"])] = old
+            prev = days.get(row["day"]) or {}
+            merged = set(sources) | {str(x) for x in prev.get("data_sources") or []}
+            if prev.get("data_source"):
+                merged.add(str(prev["data_source"]))
+            days[row["day"]] = dict(row, data_sources=sorted(merged), written_ts=time.time())
+            body = "".join(json.dumps(days[d], default=str, sort_keys=True) + "\n"
+                           for d in sorted(days)[-keep:])
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception:
+            logging.getLogger("lip.status").exception("daily summary history write failed (%s)", self.path)
+
+
+_SUMMARY_HISTORIES: dict[str, SummaryHistory] = {}
+
+
+def summary_history_path(summary: str) -> str:
+    return str(summary) + ".history.jsonl"
+
+
+def flush_summary_histories() -> None:
+    """Write the current day's line of every summary history (shutdown)."""
+    for hist in list(_SUMMARY_HISTORIES.values()):
+        hist.flush()
+
+
+def _summary_row(report: dict) -> dict:
+    return {"day": str(report.get("day") or ""),
+            "data_source": str(report.get("data_source") or "") or None,
+            "fills": int(report.get("fills_n") or 0),
+            "pnl_usd": float(report.get("pnl_usd") or 0),
+            "rewards_usd": float(report.get("rewards_usd") or 0),
+            "premium_paid_usd": (None if report.get("premium_paid_usd") is None
+                                 else float(report["premium_paid_usd"])),
+            "attribution": report.get("pnl_attribution")}
+
+
 def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
     from mm.status_page import status_payload
     write_heartbeat(args.heartbeat)
     if args.summary:
+        hpath = summary_history_path(args.summary)
+        hist = _SUMMARY_HISTORIES.get(hpath)
+        if hist is None:
+            hist = _SUMMARY_HISTORIES[hpath] = SummaryHistory(hpath)
+        hist.note(_summary_row(report))
         dest = Path(args.summary)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(render_daily_summary(
@@ -499,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
             report["ws_url"] = books["ws_url"] if books["reader"] else url
             report["data_source"] = books["flag"]
             _write_run_outputs(args, report, started)
+            flush_summary_histories()
             return 0
         engine = None
         try:
@@ -543,6 +653,9 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if engine is not None:
                 engine.stop()
+            # Clean shutdown: the current day's summary goes to the history
+            # (a SIGTERM bypasses this; SummaryHistory also checkpoints).
+            flush_summary_histories()
     if args.once:
         return 0
     while True:
