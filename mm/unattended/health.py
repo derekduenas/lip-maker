@@ -11,13 +11,19 @@ WINDOW_SECONDS = 86400.0
 
 
 def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: float,
-                         data_source: str | None = None, buckets: dict | None = None) -> str:
+                         data_source: str | None = None, buckets: dict | None = None,
+                         premium_paid_usd: float | None = None) -> str:
+    """``pnl_usd`` is the engine's estimated P&L (MTM markout + estimated
+    rewards + rebates - fees); ``premium_paid_usd`` is what fills cost;
+    ``rewards_usd`` is paid/inferred rewards only."""
     text = (
         f"daily summary {day}\n"
         f"fills {int(fills)}\n"
         f"pnl_usd {float(pnl_usd):.4f}\n"
         f"rewards_usd {float(rewards_usd):.4f}\n"
     )
+    if premium_paid_usd is not None:
+        text += f"premium_paid_usd {float(premium_paid_usd):.4f}\n"
     if data_source:
         text += f"data_source {data_source}\n"
     for name, b in sorted((buckets or {}).items()):
@@ -26,6 +32,7 @@ def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: f
                  f"raw_est_rewards_usd {float(b.get('raw_est_usd', 0)):.4f} "
                  f"fills {int(b.get('fills_n', 0))} "
                  f"markout_usd {float(b.get('markout_usd', 0)):.4f} "
+                 f"fees_usd {float(b.get('fees_usd', 0)):.4f} "
                  f"pnl_usd {float(b.get('pnl_usd', 0)):.4f}\n")
     return text
 

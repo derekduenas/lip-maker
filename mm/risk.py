@@ -8,6 +8,14 @@ as ``add_usd`` / inventory marks):
 A daily-loss breach, a fill-rate breach, or a disconnect longer than the
 threshold latches a kill. The kill means cancel every resting order. The
 engine does not send the cancels itself; ``killed`` tells the venue loop to.
+``on_reconnect`` is the feed-recovery check: a gap of DISCONNECT_PULL_SEC or
+more pulls every quote, and one of LIP_DISCONNECT_KILL_S (900 s) or more
+latches the kill through ``on_disconnect``.
+
+``market_usd`` / ``venue_usd`` are the caller's worst-case dollars per market
+and venue: resting quote commitments plus the cost basis of filled inventory
+(the unattended loop keeps both in these dicts), so the per-market, series,
+underlying, venue and gross caps all see held positions.
 
 ``MAX_FILLS_PER_MINUTE`` (config/constitution.py) is enforced here. The
 clock latches: it does not quietly re-arm when the minute rolls over.
@@ -25,6 +33,16 @@ from mm.fair_value import family_for_series, series_of
 
 ZERO = Decimal("0")
 DISCONNECT_PULL_SEC = 3.0
+DISCONNECT_KILL_SEC = 900.0
+
+
+def disconnect_kill_sec() -> float:
+    """LIP_DISCONNECT_KILL_S (default 900): a feed gap this long latches the kill."""
+    import os
+    try:
+        return float(os.environ.get("LIP_DISCONNECT_KILL_S", DISCONNECT_KILL_SEC))
+    except (TypeError, ValueError):
+        return DISCONNECT_KILL_SEC
 
 
 class FillClock:
@@ -141,6 +159,21 @@ class RiskEngine:
         if stale_sec >= DISCONNECT_PULL_SEC:
             return self._kill(
                 f"disconnect {stale_sec:.1f}s >= {DISCONNECT_PULL_SEC:.0f}s — cancel all")
+        return RiskDecision(True, "disconnect_within_grace")
+
+    def on_reconnect(self, stale_sec: float) -> RiskDecision:
+        """The feed came back after ``stale_sec`` seconds without data.
+
+        Under DISCONNECT_PULL_SEC: allowed. From DISCONNECT_PULL_SEC: not
+        allowed, cancel_all (pull every quote; quoting resumes on fresh
+        books), not latched. From LIP_DISCONNECT_KILL_S (900): ``on_disconnect``
+        latches the kill."""
+        if stale_sec >= disconnect_kill_sec():
+            return self.on_disconnect(stale_sec)
+        if stale_sec >= DISCONNECT_PULL_SEC:
+            return RiskDecision(
+                False, f"disconnect {stale_sec:.1f}s >= {DISCONNECT_PULL_SEC:.0f}s — pull all quotes",
+                cancel_all=True)
         return RiskDecision(True, "disconnect_within_grace")
 
     def on_exit(self) -> RiskDecision:
