@@ -296,6 +296,11 @@ class RunLoop:
         # (an immutable frozenset, replaced whole).
         self.fv_calib_watch: dict[str, dict] = {}
         self.fv_calib_view: frozenset = frozenset()
+        # Kalshi markets with pending calibration samples past close +
+        # LIP_FV_CALIB_BACKFILL_AFTER_S: also asked by the REST settlement
+        # backfill (an immutable tuple, replaced whole; read by its thread).
+        self.fv_settle_view: tuple = ()
+        self._fv_settle_at = 0.0
         # Patch 18: inventory skew counters.
         self.skew_stats: dict = {}
         # Patch 21: external venue frames (PM US poller thread -> this loop).
@@ -879,6 +884,43 @@ class RunLoop:
                 self._alert("WARNING", f"position {market} unresolved {release_s / 3600.0:.0f}h past "
                                        f"close: ${cost:.2f} released from budgets, marked as a full loss")
         self.settle_view = tuple(view)
+        if ts - self._fv_settle_at >= 60.0:
+            self._fv_settle_refresh(ts)
+
+    def _fv_calib_close(self, market: str, pend: dict):
+        """Close of a market with pending calibration samples: the watched
+        close, else its program's close, else the latest sample's
+        settlement-window end (sample time + lead)."""
+        w = self.fv_calib_watch.get(market)
+        if w is not None and w.get("close_ts") is not None:
+            return float(w["close_ts"])
+        prog = self.programs.get(market)
+        if prog is not None and prog.close_ts is not None:
+            return float(prog.close_ts)
+        ends = [float(x["ts"]) + float(x["lead_h"]) * 3600.0 for x in (pend.get("samples") or {}).values()]
+        return max(ends) if ends else None
+
+    def _fv_settle_refresh(self, ts: float) -> None:
+        """Refresh ``fv_settle_view``: Kalshi markets whose model fair values
+        await scoring (``fv_calib.pending``) and closed more than
+        LIP_FV_CALIB_BACKFILL_AFTER_S (12 h) ago, oldest close first. The
+        websocket lifecycle channel normally settles them before that; these
+        are the ones it missed (e.g. while disconnected). The delay keeps the
+        read-only REST backfill from polling every closed market until its
+        result is out."""
+        self._fv_settle_at = float(ts)
+        delay = _env_num("LIP_FV_CALIB_BACKFILL_AFTER_S", 12 * 3600.0)
+        due = []
+        for market, pend in self.fv_calib.pending.items():
+            if market.startswith("PMUS:") or market in self.settled:
+                continue
+            try:
+                close = self._fv_calib_close(market, pend)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if close is not None and ts >= close + delay:
+                due.append((close, market))
+        self.fv_settle_view = tuple(m for _c, m in sorted(due))
 
     def unresolved_report(self) -> dict:
         """Status ``unresolved_positions``: released PM US positions."""
@@ -3868,8 +3910,9 @@ def _backfill_fetch(reader, tickers: list[str]) -> list[tuple[str, str]]:
 async def _settlement_backfill(reader, ctx: dict, on_frame, now: float | None = None) -> int:
     """Kalshi settlements missed while the socket was down or disconnected:
     ask GET /markets/{ticker} (read-only, GET only) for held positions past
-    close or with no program left (``ctx["settle_candidates"]``, the loop's
-    ``settle_view``), at most LIP_SETTLE_BACKFILL_MAX (50) tickers per
+    close or with no program left, then markets with pending fair-value
+    calibration samples past close (``ctx["settle_candidates"]``: the loop's
+    ``settle_view`` and ``fv_settle_view``), at most LIP_SETTLE_BACKFILL_MAX (50) tickers per
     refresh, each at most once per LIP_SETTLE_POLL_S (600 s). A final yes/no
     result is booked through the loop's ``settlement`` frame (RunLoop.settle).
     Returns the number booked."""

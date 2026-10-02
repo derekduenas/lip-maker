@@ -307,9 +307,13 @@ class _Engine:
         # Status refresh and state saves run on the EngineTimer thread.
 
     def settle_candidates(self) -> list:
-        """Held Kalshi positions due a settlement check (the loop's
-        ``settle_view``, an immutable tuple: no lock needed)."""
-        return [m for m, venue in self.loop.settle_view if venue == "kalshi"]
+        """Kalshi markets due a settlement check: held positions first (the
+        loop's ``settle_view``), then markets with pending fair-value
+        calibration samples past close (``fv_settle_view``), so samples whose
+        settlement the socket missed still get scored. Both are immutable
+        tuples replaced whole: no lock needed."""
+        held = [m for m, venue in self.loop.settle_view if venue == "kalshi"]
+        return list(dict.fromkeys(held + list(getattr(self.loop, "fv_settle_view", ()))))
 
     def mark_down(self, reason: str) -> None:
         self.down_since = time.time()
