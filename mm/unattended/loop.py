@@ -288,6 +288,14 @@ class RunLoop:
         from mm.unattended.fv_calib import FVCalibration
         self.fv_calib = FVCalibration()
         self._fv_calib_at = 0.0
+        # Calibration watch: every fed market of a model-priced FV family
+        # stays a calibration target until its close, whether or not it is
+        # quoted and even after its program left the loop (and across a
+        # restart: persisted). market -> {series, close_ts, added_ts}.
+        # ``fv_calib_view`` is its key set for the fair-value cache thread
+        # (an immutable frozenset, replaced whole).
+        self.fv_calib_watch: dict[str, dict] = {}
+        self.fv_calib_view: frozenset = frozenset()
         # Patch 18: inventory skew counters.
         self.skew_stats: dict = {}
         # Patch 21: external venue frames (PM US poller thread -> this loop).
@@ -1137,6 +1145,7 @@ class RunLoop:
             "markouts": self.markouts.state(),
             "unresolved": self.unresolved,
             "fv_calibration": self.fv_calib.state(),
+            "fv_calib_watch": self.fv_calib_watch,
         }
 
     def attach_state(self, path: str) -> None:
@@ -1216,6 +1225,11 @@ class RunLoop:
         fv_calib = FVCalibration()
         if data.get("fv_calibration") is not None:  # absent before model fair value
             fv_calib.load_state(data["fv_calibration"])
+        watch = {}
+        for m, w in dict(data.get("fv_calib_watch") or {}).items():  # absent before the watch
+            watch[str(m)] = {"series": str(w["series"]),
+                             "close_ts": None if w.get("close_ts") is None else float(w["close_ts"]),
+                             "added_ts": float(w.get("added_ts") or 0.0)}
         # validated: apply
         self.position = position
         self.bucket_pos = bucket_pos
@@ -1246,6 +1260,8 @@ class RunLoop:
         self._daily_cache = None
         self.markouts = markouts
         self.fv_calib = fv_calib
+        self.fv_calib_watch = watch
+        self.fv_calib_view = frozenset(watch)
         for market in self.position:
             self._sync_inventory(market)
         if kill is not None:
@@ -1351,6 +1367,7 @@ class RunLoop:
         if prog.venue != "kalshi" or not fv_quote_active(prog.series) or not fv_model_supports(prog.series):
             return
         self._fv_wanted.add(market)
+        self._fv_calib_watch_add(market, prog.series, prog.close_ts)
         hint = {k: row.get(k) for k in ("strike_type", "floor_strike", "cap_strike") if row.get(k) is not None}
         if hint:
             self._fv_hints[market] = hint
@@ -1428,18 +1445,69 @@ class RunLoop:
                 self._fv_count("ev_withheld", sd)
         return tuple(out)
 
+    FV_CALIB_WATCH_MAX = 2000
+    FV_CALIB_WATCH_MAX_AGE_S = 10 * 86400.0
+
+    def _fv_calib_watch_add(self, market: str, series: str, close_ts) -> None:
+        w = self.fv_calib_watch.get(market)
+        if w is not None:
+            if close_ts is not None and w.get("close_ts") != float(close_ts):
+                w["close_ts"] = float(close_ts)
+                self._state_dirty = True
+            return
+        if len(self.fv_calib_watch) >= self.FV_CALIB_WATCH_MAX:
+            oldest = min(self.fv_calib_watch, key=lambda m: self.fv_calib_watch[m]["added_ts"])
+            del self.fv_calib_watch[oldest]
+        self.fv_calib_watch[market] = {"series": str(series),
+                                       "close_ts": None if close_ts is None else float(close_ts),
+                                       "added_ts": float(self.now or time.time())}
+        self.fv_calib_view = frozenset(self.fv_calib_watch)
+        self._state_dirty = True
+
+    def _fv_calib_watch_expire(self, ts: float) -> None:
+        """Forget watched markets at their close (or 10 days after they were
+        added, the fv_calib pending horizon, when no close is known)."""
+        old = [m for m, w in self.fv_calib_watch.items()
+               if (w.get("close_ts") is not None and ts >= float(w["close_ts"]))
+               or ts - float(w["added_ts"]) > self.FV_CALIB_WATCH_MAX_AGE_S]
+        for m in old:
+            del self.fv_calib_watch[m]
+        if old:
+            self.fv_calib_view = frozenset(self.fv_calib_watch)
+            self._state_dirty = True
+
+    def fv_cache_targets(self) -> set:
+        """Markets the fair-value cache prices (called from its thread):
+        resting markets, the loop's FV targets and the calibration watch.
+        Kalshi only."""
+        wanted = set(self.resting.copy()) | self._fv_wanted.copy() | set(self.fv_calib_view)
+        return {m for m in wanted if not m.startswith("PMUS:")}
+
     def _fv_calib_tick(self, ts: float) -> None:
         """Every LIP_FV_CALIB_EVERY_S (30 s): record each new model fair value
-        of an FV-quoted market with the book mid now (``fv_calib``). Values
-        below LIP_FV_MIN_CONF are recorded too (their conf is kept)."""
+        of a model-priced FV-family market with the book mid now
+        (``fv_calib``): every fed market of the family (quoted or not) and
+        every market in the calibration watch until its close, also after
+        its program left the loop (then without a book: mid None, a
+        model-only sample). Values below LIP_FV_MIN_CONF are recorded too
+        (their conf is kept). Quoting does not read any of this."""
         if self.fv is None or ts - self._fv_calib_at < _env_num("LIP_FV_CALIB_EVERY_S", 30.0):
             return
         self._fv_calib_at = ts
         from mm.unattended.fairvalue import fv_quote_active
         from mm.unattended.fv_weather import SOURCE
-        for market in sorted(self._fv_wanted):
+        self._fv_calib_watch_expire(ts)
+        for market in sorted(self._fv_wanted | set(self.fv_calib_watch)):
             prog = self.programs.get(market)
-            if prog is None or prog.venue != "kalshi" or not fv_quote_active(prog.series):
+            if prog is not None:
+                if prog.venue != "kalshi":
+                    continue
+                series = prog.series
+            elif market in self.fv_calib_watch:
+                series = self.fv_calib_watch[market]["series"]
+            else:
+                continue
+            if not fv_quote_active(series):
                 continue
             row = self.fv.get(market, now=time.time())
             if row is None or row.get("source") != SOURCE or row.get("fv_cents") is None:
@@ -1455,7 +1523,7 @@ class RunLoop:
                       if isinstance(window, (list, tuple)) and len(window) == 2
                       else float(row.get("lead_h") or 0.0))
             try:
-                if self.fv_calib.record(market, prog.series.upper(), ts, float(row["fv_cents"]),
+                if self.fv_calib.record(market, series.upper(), ts, float(row["fv_cents"]),
                                         float(row.get("conf") or 0.0), lead_h, mid, float(row.get("ts") or 0.0)):
                     self._state_dirty = True
             except (TypeError, ValueError):
@@ -2759,7 +2827,7 @@ class RunLoop:
             "fills_detail": list(self.fill_marks)[-20:],
             "markouts": self.markout_summary(),
             "markout_horizons": self.markouts.report(),
-            "fv_calibration": self.fv_calib.report(),
+            "fv_calibration": dict(self.fv_calib.report(), watching_n=len(self.fv_calib_watch)),
             "event_calendar": self.calendar.summary(self.now or None),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),

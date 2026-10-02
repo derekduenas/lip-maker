@@ -266,8 +266,7 @@ class _Engine:
         from mm.unattended.fairvalue import FairValueCache, enabled as _fv_enabled
         if _fv_enabled():  # Patch 16: external fair value, background refresh only
             loop.fv = FairValueCache()
-            loop.fv.start(lambda loop=loop: {m for m in (set(loop.resting.copy()) | loop._fv_wanted.copy())
-                                             if not m.startswith("PMUS:")})
+            loop.fv.start(loop.fv_cache_targets)
         from mm.unattended import bookrec as _bookrec
         self.rec = None
         if _bookrec.enabled():  # Patch 19: bounded compressed frame recorder
