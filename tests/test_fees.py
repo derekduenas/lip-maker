@@ -38,8 +38,10 @@ def _restore_schedule():
 
 class TestFormula:
     def test_documented_form_at_fifty_cents(self):
-        # 0.07 x 10 x 0.5 x 0.5 = $0.175, and ceil to $0.000001 leaves it.
-        assert fee_usd(50, 10) == D("0.1750")
+        # taker: 0.07 x 10 x 0.5 x 0.5 = $0.175; maker (maker-fee series,
+        # fee schedule 2026-07-07): 0.0175 x 10 x 0.25 = $0.04375.
+        assert fee_usd(50, 10, is_taker=True) == D("0.1750")
+        assert fee_usd(50, 10) == D("0.04375")
 
     def test_quadratic_vanishes_at_the_edges(self):
         """P(1-P) is largest at 50c and ~0 near 0 and 100."""
@@ -72,8 +74,10 @@ class TestRounding:
         assert KALSHI_UNVERIFIED.describe()["rounding"] == "ceil_6dp"
 
     def test_ceiling_is_applied_at_six_decimal_places(self):
-        # 1 contract @5c: 0.07 * 0.05 * 0.95 = $0.003325 exactly.
-        assert fee_usd(5, 1) == D("0.003325")
+        # 1 contract @5c: taker 0.07 * 0.05 * 0.95 = $0.003325 exactly;
+        # maker 0.0175 * 0.0475 = $0.00083125 -> ceil to $0.000832.
+        assert fee_usd(5, 1, is_taker=True) == D("0.003325")
+        assert fee_usd(5, 1) == D("0.000832")
 
     def test_a_sub_micro_fee_is_rounded_up_not_down(self):
         tiny = FeeSchedule(name="t", rate=D("0.0000001"), source="test")
@@ -92,15 +96,16 @@ class TestRounding:
         raw = FeeSchedule(name="t", rate=D("0.07"), source="test",
                           rounding="none")
         assert raw.fee_usd(50, 1) == D("0.0175")
-        assert KALSHI_UNVERIFIED.fee_usd(50, 1) == D("0.0175")
+        assert KALSHI_UNVERIFIED.fee_usd(50, 1, is_taker=True) == D("0.0175")
+        assert KALSHI_UNVERIFIED.fee_usd(50, 1) == D("0.004375")
 
 
 class TestProvenance:
-    def test_rate_is_still_not_verified(self):
-        """Rounding and maker-charging are verified; the RATE is not, and a
-        conservative assumption must not be promoted to a verified fact."""
+    def test_default_is_not_verified_for_a_specific_series(self):
+        """The global default does not know the series' fee_type, so the
+        maker-fee assumption must not be promoted to a verified fact."""
         assert KALSHI_UNVERIFIED.verified is False
-        assert "RATE unverified" in KALSHI_UNVERIFIED.source
+        assert "fee_type unknown" in KALSHI_UNVERIFIED.source
 
     def test_require_verified_refuses_to_guess(self):
         with pytest.raises(UnverifiedFeeSchedule, match="unverified"):
@@ -117,7 +122,7 @@ class TestProvenance:
 
     def test_warning_names_the_schedule(self):
         w = provenance_warning()
-        assert "UNVERIFIED" in w and "kalshi_documented_unverified" in w
+        assert "UNVERIFIED" in w and KALSHI_UNVERIFIED.name in w
 
     def test_describe_carries_the_audit_fields(self):
         d = KALSHI_UNVERIFIED.describe()
@@ -141,7 +146,7 @@ class TestMakerAssumption:
 
     def test_round_trip_charges_entry_and_exit(self):
         rt = round_trip_usd(50, 50, 10)
-        assert rt == D("0.3500")     # maker in, taker out
+        assert rt == D("0.04375") + D("0.1750")     # maker in, taker out
 
 
 class TestNetYieldNoLongerAssumesZero:
@@ -177,7 +182,7 @@ class TestNetYieldNoLongerAssumesZero:
         excuse to sum contracts first."""
         from tools.net_yield_logger import _day_fees_usd
         singles = self._db(tmp_path, [("yes", 1, 50, 50, 0)] * 10)
-        assert _day_fees_usd(singles, "2026-09-20") == D("0.17500")
+        assert _day_fees_usd(singles, "2026-09-20") == D("0.04375")
 
     def test_per_fill_rounding_still_bites_below_a_millionth(self):
         """Where the ceiling does apply, ten small fills cost more than one
@@ -271,8 +276,8 @@ class TestUnverifiedRateIsReportedAsARange:
     def test_range_brackets_the_working_assumption(self):
         from engine.fees import fee_range_usd, RATE_RANGE_HIGH
         lo, hi = fee_range_usd(50, 100)
-        assert lo < hi
-        assert hi == KALSHI_UNVERIFIED.fee_usd(50, 100)
+        assert lo < KALSHI_UNVERIFIED.fee_usd(50, 100) <= hi
+        assert hi == KALSHI_UNVERIFIED.fee_usd(50, 100, is_taker=True)
 
     def test_range_low_end_is_a_bound_not_a_fact(self):
         """The low end comes from a search summary of the tier table, which

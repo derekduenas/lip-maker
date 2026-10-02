@@ -140,3 +140,15 @@ def test_pmus_quote_economics_uses_rounded_rebate_at_expected_fill():
     as_cost = 2 * fills_side * abs(SEL.markout_cents(km)) / 100
     # 1.5 contracts at ~40c/55c rounds to a $0.00 rebate: no rebate credit
     assert net == pytest.approx(reward - as_cost)
+
+
+# ------------------------------------------------------------------ item 9
+@pytest.mark.parametrize("price,count", [(50, 1), (50, 10), (5, 1), (99, 1), (50, 100), (1, 1), (37, 13)])
+def test_engine_fees_default_matches_accounting_maker_fee_series(price, count):
+    from engine import fees
+    from mm.accounting import kalshi_fee_usd
+    want_maker = kalshi_fee_usd(price, count, fee_type="quadratic_with_maker_fees")
+    want_taker = kalshi_fee_usd(price, count, fee_type="quadratic_with_maker_fees", is_taker=True)
+    assert fees.KALSHI_DEFAULT.fee_usd(price, count) == want_maker
+    assert fees.KALSHI_DEFAULT.fee_usd(price, count, is_taker=True) == want_taker
+    assert fees.KALSHI_DEFAULT.verified is False
