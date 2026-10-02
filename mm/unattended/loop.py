@@ -33,11 +33,12 @@ from engine.lip_reconcile import (
 from engine.lip_scorer import ProgramParams
 from execution.paper_fills import PaperFillSimulator
 from mm.compound import MarketSample, reallocate
-from mm.ops import skew_is_excessive
+from mm.ops import SKEW_LIMIT_S, skew_is_excessive
 from mm.risk import FillClock, Limits, RiskEngine
 from mm.selector import KalshiMarket, allocate
 from mm.session_gates import (
-    clamp_contracts, inside_close_window, pull_before_close_s, single_fill_cap_usd,
+    clamp_contracts, inside_close_window, max_contracts_for_fill, pull_before_close_s,
+    single_fill_cap_usd,
 )
 from mm.unattended.feed import DEMO_WS_URL
 from mm.unattended.optimize import optimize_sizes
@@ -203,10 +204,17 @@ class RunLoop:
         self.poster = poster
         self.series_stats = series_stats or {}
         self.pull_before_s = pull_before_close_s() if pull_before_s is None else float(pull_before_s)
-        self.fill_cap = single_fill_cap_usd() if fill_cap is None else float(fill_cap)
+        # fill_cap bounds every resting order (one fill can lose at most this).
+        # The eligibility pre-passes (fast_allocate/allocate/optimize_sizes)
+        # evaluate economics at one probe size and exclude a market whose probe
+        # exceeds their cap, so they get the configured cap; the order clamp
+        # in _quote/_size_curve applies fill_cap.
+        self.fill_cap = default_fill_cap_usd() if fill_cap is None else float(fill_cap)
+        self.screen_fill_cap = single_fill_cap_usd() if fill_cap is None else float(fill_cap)
         self.sim = PaperFillSimulator(latency_ms=latency_ms)
+        from config.settings import RAMP_PHASE
         self.risk = RiskEngine(
-            limits=Limits.from_capital(Decimal(str(self.bankroll))),
+            limits=Limits.from_capital(Decimal(str(self.bankroll)), ramp=RAMP_PHASE),
             clock=FillClock(),
         )
         self.programs: dict[str, _Program] = {}
@@ -467,14 +475,21 @@ class RunLoop:
         accrual = self.accruals.get(market)
         if accrual is None:
             return
-        exchange_ts = row.get("exchange_ts")
-        if exchange_ts is not None and skew_is_excessive(ts, float(exchange_ts)):
-            accrual.book.note_disconnect()
-            return
         accrual.on_message(row, ts)
         self.open_seconds[market] = int(ts)
         self._book_ts[market] = ts
         self._note_mark(market)
+        # exchange_ts is the venue send time (Kalshi ``sending_ts_ms``, set by
+        # the read-only session). The frame is applied either way so the book
+        # stays in sequence; a quote resting on data older than the skew
+        # limit (local clock or processing lag) is pulled.
+        exchange_ts = row.get("exchange_ts")
+        if exchange_ts is not None and skew_is_excessive(
+                ts, float(exchange_ts), limit_s=_env_num("LIP_CLOCK_SKEW_LIMIT_S", SKEW_LIMIT_S)):
+            self.skew_n += 1
+            if market in self.resting:
+                self.pulls["clock_skew"] = self.pulls.get("clock_skew", 0) + 1
+                self._cancel(market, "clock_skew")
 
     # ------------------------------------------------------------ feed state
     def note_disconnect(self, reason: str = "disconnect") -> None:
@@ -500,17 +515,27 @@ class RunLoop:
         self._state_dirty = True
 
     def note_reconnect(self, stale_s: float) -> None:
-        """The feed is back after ``stale_s`` seconds without data. Books stay
-        stale until their own snapshot arrives; a fresh selection runs once
-        enough books are usable again."""
+        """The feed is back after ``stale_s`` seconds without data.
+
+        ``RiskEngine.on_reconnect`` decides: within grace nothing, past
+        DISCONNECT_PULL_SEC pull every quote, past LIP_DISCONNECT_KILL_S latch
+        the kill (``on_disconnect``). Books stay stale until their own snapshot
+        arrives; a fresh selection runs once enough books are usable again."""
+        decision = self.risk.on_reconnect(float(stale_s))
         self.connected = True
-        self.last_reconnect = {"ts": self.now, "stale_s": round(float(stale_s), 1)}
+        self.last_reconnect = {"ts": self.now, "stale_s": round(float(stale_s), 1),
+                               "decision": decision.reason}
+        if not decision.allowed:
+            if self.risk.killed:
+                self._latch_kill(decision.reason, cancel_all=True)
+            else:
+                self._cancel_all(decision.reason)
         self._reselect_pending = True
         self._state_dirty = True
 
     def settle(self, market: str, result: str) -> None:
         """Book settlement of a held position (YES pays 100c on "yes", NO on
-        "no"). The live feed
+        "no") and release its locked capital on the risk engine. The live feed
         has no settlement channel today; unsettled positions are marked at
         their last mark and listed in status."""
         result = str(result).lower()
@@ -518,6 +543,7 @@ class RunLoop:
             return
         self.settled[market] = {"result": result, "ts": self.now}
         self.last_mid[market] = 100.0 if result == "yes" else 0.0
+        self._sync_inventory(market)
         self._cancel(market, "settled")
         self._state_dirty = True
 
@@ -609,6 +635,137 @@ class RunLoop:
         parts = self.pnl_parts()
         return parts["markout_usd"] - parts["fees_usd"] + parts["rebates_usd"]
 
+    def daily_pnl_usd(self) -> Decimal:
+        """Today's (UTC) MTM P&L: session MTM minus its value when the day
+        started (0 for a session that started today). Rewards excluded.
+        Cached per loop second."""
+        key = (int(self.now or 0), self.fills_total, len(self.settled))
+        cached = getattr(self, "_daily_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        cur = self.session_mtm_usd()
+        day = datetime.fromtimestamp(self.now or time.time(), timezone.utc).date().isoformat()
+        if self._pnl_day is None:
+            self._pnl_day = {"day": day, "base": 0.0}
+        elif self._pnl_day.get("day") != day:
+            self._pnl_day = {"day": day, "base": cur}
+            self._state_dirty = True
+        out = Decimal(str(round(cur - float(self._pnl_day["base"]), 6)))
+        self._daily_cache = (key, out)
+        return out
+
+    # ------------------------------------------------------------ inventory risk
+    def _inv_exposure_usd(self, market: str) -> Decimal:
+        """Capital held by a market's filled position. Contracts net YES vs
+        NO: the paired part (min(yes, no)) locks the cost of both legs until
+        it settles at $1 a pair, and the unpaired part can lose all of its
+        cost. Paired cost + unpaired cost = the cost basis of both legs.
+        0 once settled."""
+        pos = self.position.get(market)
+        if not pos or market in self.settled:
+            return Decimal(0)
+        return Decimal(str(round(float(pos["yes_cost"]) + float(pos["no_cost"]), 6)))
+
+    def _sync_inventory(self, market: str) -> None:
+        """Keep the risk engine's market/venue dollars = resting commitment +
+        held inventory (``inv_committed``)."""
+        new = self._inv_exposure_usd(market)
+        old = self.inv_committed.get(market, Decimal(0))
+        delta = new - old
+        if delta == 0:
+            return
+        venue = (self.position.get(market) or {}).get("venue") or self._venue(market)
+        self.risk.market_usd[market] = Decimal(str(self.risk.market_usd.get(market, 0))) + delta
+        self.risk.venue_usd[venue] = Decimal(str(self.risk.venue_usd.get(venue, 0))) + delta
+        self.inv_committed[market] = new
+
+    def locked_usd(self) -> dict:
+        """Inventory capital per venue (see ``_inv_exposure_usd``)."""
+        out: dict[str, float] = {}
+        for market, usd in self.inv_committed.items():
+            venue = (self.position.get(market) or {}).get("venue") or self._venue(market)
+            out[venue] = out.get(venue, 0.0) + float(usd)
+        return out
+
+    def _side_room_contracts(self, market: str, side: str, price_cents: int):
+        """Contracts of ``side`` we may still rest without breaching the
+        unpaired-inventory caps (LIP_MARKET_INV_CAP_USD, LIP_EVENT_INV_CAP_USD)
+        if all of it filled. Contracts that pair existing inventory are always
+        allowed. None when no cap is set."""
+        cap_m = _env_num("LIP_MARKET_INV_CAP_USD", 0.0)
+        cap_e = _env_num("LIP_EVENT_INV_CAP_USD", 0.0)
+        if cap_m <= 0 and cap_e <= 0:
+            return None
+        price = max(1, int(price_cents))
+        u = self._unpaired(market, side)
+        pair = max(0.0, -u)
+        here = self._unpaired_usd(market)
+        rooms = []
+        if cap_m > 0:
+            rooms.append(cap_m - (here if u > 0 else 0.0))
+        if cap_e > 0:
+            ev = self._event_of(market)
+            held = sum(self._unpaired_usd(m) for m in self.position if self._event_of(m) == ev)
+            if u < 0:
+                held -= here  # the pairing contracts remove this market's unpaired dollars
+            rooms.append(cap_e - held)
+        room = max(0.0, min(rooms))
+        return pair + room * 100.0 / price
+
+    def _recheck_event_caps(self, market: str, ts: float) -> None:
+        """After a fill: re-clamp every resting quote in the same event to the
+        remaining inventory room now, not at the next selection."""
+        if _env_num("LIP_MARKET_INV_CAP_USD", 0.0) <= 0 and _env_num("LIP_EVENT_INV_CAP_USD", 0.0) <= 0:
+            return
+        ev = self._event_of(market)
+        for m in list(self.resting):
+            if self._event_of(m) != ev:
+                continue
+            quote = self.resting.get(m)
+            if quote is None:
+                continue
+            over = False
+            for sd in ("yes", "no"):
+                size = float(quote.get(sd) or 0)
+                if size <= 0:
+                    continue
+                room = self._side_room_contracts(m, sd, int(quote[f"{sd}_cents"]))
+                if room is not None and size > int(room) + 1e-9:
+                    over = True
+            if not over:
+                continue
+            self.cap_trims_n += 1
+            sides = tuple(sd for sd in ("yes", "no") if float(quote.get(sd) or 0) > 0)
+            size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
+            best0 = quote.get("best0")
+            if self._quote(m, int(quote["yes_cents"]), int(quote["no_cents"]), size, ts,
+                           sides=sides, skewed=True) and best0 is not None and m in self.resting:
+                self.resting[m]["best0"] = best0
+
+    # ------------------------------------------------------------ kill / alerts
+    def _latch_kill(self, reason: str, *, cancel_all: bool = True) -> None:
+        """Latch the engine kill (quoting stops), alert once, cancel all."""
+        first = self.kill is None
+        self.kill = {"reason": reason, "cancel_all": cancel_all,
+                     "paper": self.mode == "paper", "ts": self.now or None}
+        if first:
+            self._alert("CRITICAL", f"engine kill latched: {reason}")
+        self._state_dirty = True
+        if cancel_all:
+            self._cancel_all(reason)
+
+    def _alert(self, level: str, message: str) -> None:
+        """Existing alert path (monitor.alerts: alerts.log + journal) and the
+        status ``engine_alerts`` list."""
+        self.alerts.append({"ts": self.now or time.time(), "level": level, "message": message})
+        del self.alerts[:-50]
+        logging.getLogger("lip.risk").critical("ALERT %s: %s", level, message)
+        try:
+            from monitor.alerts import alert
+            alert(level, "lip_unattended", message)
+        except Exception:
+            logging.getLogger("lip.risk").exception("alert delivery failed")
+
 
     # ------------------------------------------------------------ patch 21
     def _venue(self, market: str) -> str:
@@ -666,7 +823,7 @@ class RunLoop:
             self._record_fill(fill, ts)
 
     def _record_fill(self, fill: dict, ts: float) -> bool:
-        """One paper fill: history + exact aggregates, fees, the
+        """One paper fill: history + exact aggregates, inventory, fees, the
         fills-per-minute clock. False when the fill latched a kill."""
         self.fills.append(fill)
         self.fills_total += 1
@@ -677,9 +834,7 @@ class RunLoop:
         self._note_fill(fill, ts)
         decision = self.risk.record_fill(1, now=ts)
         if not decision.allowed:
-            self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
-                         "paper": self.mode == "paper"}
-            self._cancel_all(decision.reason)
+            self._latch_kill(decision.reason, cancel_all=decision.cancel_all)
             return False
         return True
 
@@ -708,6 +863,7 @@ class RunLoop:
             bpos["fees"] += fee
             self.fees_usd_total += fee
         bpos["fills_n"] += 1
+        self._sync_inventory(market)
         self._state_dirty = True
         mid = self._side_mid_cents(market, side)
         if self._venue(market) == "pmus" and count > 0:
@@ -732,13 +888,15 @@ class RunLoop:
         if _skew.enabled() and side in ("yes", "no"):
             # Patch 18: no cooldown; re-quote both sides skewed by inventory.
             self._skew_requote(market, ts)
-            return
-        cool = _env_num("LIP_FILL_COOLDOWN_S", 0.0)
-        if cool > 0 and side in ("yes", "no"):
-            self.cooldown[(market, side)] = max(self.cooldown.get((market, side), 0.0), ts + cool)
-            # Stop buying more of what was just hit. The opposite side stays:
-            # if it fills it pairs the inventory into a $1 settlement.
-            self._drop_side(market, side, "fill_cooldown")
+        else:
+            cool = _env_num("LIP_FILL_COOLDOWN_S", 0.0)
+            if cool > 0 and side in ("yes", "no"):
+                self.cooldown[(market, side)] = max(self.cooldown.get((market, side), 0.0), ts + cool)
+                # Stop buying more of what was just hit. The opposite side stays:
+                # if it fills it pairs the inventory into a $1 settlement.
+                self._drop_side(market, side, "fill_cooldown")
+        # Inventory caps act on resting size now, for every market in the event.
+        self._recheck_event_caps(market, ts)
 
     # ------------------------------------------------------------ patch 18
     def _inv_frac(self, market: str) -> float:
@@ -928,6 +1086,8 @@ class RunLoop:
                 self._pull_one(market, "event_window", ts, 0.0)
                 continue
             if not self.accruals[market].book.book.is_usable():
+                # Fail closed: no guard can run on a stale/empty/off-grid book.
+                self._pull_one(market, "book_unusable", ts, 0.0)
                 continue
             if not self._book_fresh(market, ts):
                 self._pull_one(market, "pmus_stale_book", ts, 0.0)
@@ -1031,9 +1191,20 @@ class RunLoop:
         from mm.session_gates import max_contracts_for_fill
         lim = self.risk.limits
         per_market = float(lim.per_market_usd) * alloc_cap_fraction()
+        if km.venue == "pmus":
+            per_market = min(per_market, pmus_market_cap_usd())
         out = []
         for size in ladder:
             net, capital, share2, yc, nc = quote_economics(km, float(size))
+            if yc > 0 and nc > 0:
+                legal = min(max_contracts_for_fill(yc, self.fill_cap), max_contracts_for_fill(nc, self.fill_cap))
+                if 0 < legal < size:
+                    # The last rung is the size the order clamp would rest
+                    # (single-fill cap), valued at that size.
+                    size = float(legal)
+                    net, capital, share2, yc, nc = quote_economics(km, size)
+                    if out and size <= out[-1][0]:
+                        break
             if yc <= 0 or nc <= 0:
                 break
             if len(sides_on) == 1:
@@ -1049,6 +1220,8 @@ class RunLoop:
                 break
             value = net - penalty_100 * float(size) / 100.0 * (len(sides_on) / 2.0)
             out.append((float(size), value, capital, int(yc), int(nc)))
+            if float(size) not in [float(x) for x in ladder]:
+                break
         return out
 
     def _reduce_resting(self, fill: dict) -> None:
@@ -1148,20 +1321,23 @@ class RunLoop:
         if not live and _env_num("LIP_FAST_ALLOCATE", 0.0) > 0:
             from mm.selector import fast_allocate
             selection = fast_allocate(markets, per_market_usd=per_market, chunk=self.chunk,
-                                      single_fill_cap_usd=self.fill_cap)
+                                      single_fill_cap_usd=self.screen_fill_cap)
         else:
             selection = allocate(
                 markets, bankroll=pool, chunk=self.chunk, max_size=self.chunk,
                 per_market_usd=per_market, per_series_usd=per_series,
                 per_category_usd=pool, live=live, series_stats=self.series_stats,
-                single_fill_cap_usd=self.fill_cap,
+                single_fill_cap_usd=self.screen_fill_cap,
             )
         self.excluded = list(selection.excluded)
+        # per_event_usd=pool: optimize_sizes groups by series and would cut a
+        # series by RAW objective before the markout-penalised rank pass. The
+        # per-series cap is enforced below (alloc_series) in rank order.
         sized = optimize_sizes(
             markets, bankroll=pool, per_market_usd=per_market,
-            per_event_usd=per_series, total_usd=pool,
+            per_event_usd=pool, total_usd=pool,
             sizes=(self.chunk,), markout_usd_per_contract=0.0,
-            single_fill_cap_usd=self.fill_cap,
+            single_fill_cap_usd=self.screen_fill_cap,
         )
         chosen = {row.market: row for row in sized.chosen}
         taken = {row.market for row in selection.taken}
@@ -1255,8 +1431,11 @@ class RunLoop:
                 continue
             if len(ladder) == 1 and sides_of.get(market) == ("yes", "no"):
                 # Legacy single size: the optimizer row exactly as before.
-                size = float(row.size)
+                size = float(min(row.size, max_contracts_for_fill(int(row.yes_cents), self.fill_cap),
+                                 max_contracts_for_fill(int(row.no_cents), self.fill_cap)))
                 add = (int(row.yes_cents) + int(row.no_cents)) / 100.0 * size
+                if size <= 0 or (km.venue == "pmus" and add > pmus_market_cap_usd() + 1e-9):
+                    continue
                 val = float(plan.get(market, {}).get("rank") or 0.0) * add
                 curves[market] = [(size, val, add, int(row.yes_cents), int(row.no_cents))]
                 continue
@@ -1372,24 +1551,59 @@ class RunLoop:
                 "selection %d: %d quoted, %d skipped at caps (budget $%.0f)",
                 self.selection_count, len(self.resting), len(self.cap_skips), budget)
 
-    def venue_budgets(self) -> dict:
-        """Patch 21: unified cross-venue allocation budgets.
+    def venue_budgets(self, *, locked: dict | None = None, has_pmus: bool | None = None) -> dict:
+        """Patch 21: unified cross-venue allocation budgets for resting quotes.
 
-        kalshi = alloc fraction x min(per-venue cap, gross cap) (unchanged).
-        pmus   = min(LIP_PMUS_BUDGET_USD (300), alloc fraction x gross - kalshi)
+        Filled inventory (``locked_usd``: cost basis of held positions) is
+        capital in use, so it comes off first:
+        kalshi = min(fraction x per-venue - kalshi inventory,
+                     fraction x gross - all inventory).
+        pmus   = min(LIP_PMUS_BUDGET_USD (300) - pmus inventory,
+                     fraction x gross - all inventory - kalshi,
+                     fraction x per-venue - pmus inventory)
                  when any PM US program is loaded, else 0.
-        Sum <= alloc fraction x gross cap, so both venues together can never
-        breach the shared gross cap; the RiskEngine also checks per-venue and
-        gross caps on every quote."""
+        The sum is then scaled down to LIP_WD_MAX_CAPITAL_USD when that is set
+        (the watchdog trips above it). The RiskEngine also checks per-venue and
+        gross caps (resting + inventory) on every quote."""
+        lim = self.risk.limits
+        frac = alloc_cap_fraction()
+        locked = self.locked_usd() if locked is None else locked
+        lk, lp = float(locked.get("kalshi", 0.0)), float(locked.get("pmus", 0.0))
+        gross_room = float(lim.gross_usd) * frac - lk - lp
+        kalshi = max(0.0, min(float(lim.per_venue_usd) * frac - lk, gross_room))
+        out = {"kalshi": kalshi, "pmus": 0.0}
+        if has_pmus is None:
+            has_pmus = any(p.venue == "pmus" for p in self.programs.values())
+        if has_pmus:
+            out["pmus"] = max(0.0, min(_env_num("LIP_PMUS_BUDGET_USD", 300.0) - lp, gross_room - kalshi,
+                                       float(lim.per_venue_usd) * frac - lp))
+        wd_cap = _env_num("LIP_WD_MAX_CAPITAL_USD", 0.0)
+        total = out["kalshi"] + out["pmus"]
+        if wd_cap > 0 and total > wd_cap:
+            out = {vn: usd * wd_cap / total for vn, usd in out.items()}
+        return out
+
+    def check_watchdog_capital(self) -> str | None:
+        """Startup check: the most the engine could allocate (no inventory,
+        PM US on) against the watchdog's LIP_WD_MAX_CAPITAL_USD. Logs a loud
+        warning and returns it when the engine's own caps exceed the watchdog
+        cap (allocation is then clamped to the watchdog cap)."""
+        wd_cap = _env_num("LIP_WD_MAX_CAPITAL_USD", 0.0)
+        if wd_cap <= 0:
+            return None
         lim = self.risk.limits
         frac = alloc_cap_fraction()
         kalshi = min(float(lim.per_venue_usd), float(lim.gross_usd)) * frac
-        out = {"kalshi": kalshi, "pmus": 0.0}
-        if any(p.venue == "pmus" for p in self.programs.values()):
-            room = max(0.0, float(lim.gross_usd) * frac - kalshi)
-            out["pmus"] = max(0.0, min(_env_num("LIP_PMUS_BUDGET_USD", 300.0), room,
-                                       float(lim.per_venue_usd) * frac))
-        return out
+        pmus = max(0.0, min(_env_num("LIP_PMUS_BUDGET_USD", 300.0), float(lim.gross_usd) * frac - kalshi,
+                            float(lim.per_venue_usd) * frac))
+        if kalshi + pmus <= wd_cap:
+            return None
+        msg = (f"engine max budget ${kalshi + pmus:.0f} (bankroll ${self.bankroll:.0f}) exceeds "
+               f"LIP_WD_MAX_CAPITAL_USD ${wd_cap:.0f}; allocation clamped to the watchdog cap. "
+               "Set LIP_BANKROLL so the engine budget fits the watchdog cap.")
+        logging.getLogger("lip.risk").error("!!! CAPITAL MISMATCH: %s", msg)
+        self.budget_warning = msg
+        return msg
 
     def _dump_selection(self, chosen, taken, plan, budget) -> None:
         path = os.environ.get("LIP_SELECTION_DUMP", "/var/lib/lip-maker/last_selection.json")
@@ -1473,10 +1687,21 @@ class RunLoop:
         if not sides:
             self._cancel(market, "would_cross")
             return False
+        # Inventory caps act before fills: each side rests at most what it
+        # could fill without breaching the market/event unpaired-$ caps.
+        side_size = {}
+        for sd in sides:
+            room = self._side_room_contracts(market, sd, yes_cents if sd == "yes" else no_cents)
+            side_size[sd] = size if room is None else float(min(size, int(room)))
+        sides = tuple(sd for sd in sides if side_size[sd] >= 1)
+        if not sides:
+            self._cancel(market, "inventory_cap")
+            return False
         self._release(market)
-        add = (Decimal(yes_cents if "yes" in sides else 0) + Decimal(no_cents if "no" in sides else 0)) \
-            / Decimal(100) * Decimal(str(size))
-        decision = self.risk.check_quote(market=market, venue=self._venue(market), add_usd=add, now=ts)
+        add = sum((Decimal(yes_cents if sd == "yes" else no_cents) * Decimal(str(side_size[sd]))
+                   for sd in sides), Decimal(0)) / Decimal(100)
+        decision = self.risk.check_quote(market=market, venue=self._venue(market), add_usd=add,
+                                         daily_pnl_usd=self.daily_pnl_usd(), now=ts)
         self.risk_rows.append({
             "market": market, "allowed": decision.allowed,
             "reason": decision.reason, "cancel_all": decision.cancel_all,
@@ -1486,13 +1711,14 @@ class RunLoop:
                 # A position/exposure cap: skip this quote, keep running.
                 self._cap_skip(market, str(decision.reason))
                 return False
-            self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
-                         "paper": self.mode == "paper"}
             self._cancel(market, decision.reason)
-            if decision.cancel_all:
-                self._cancel_all(decision.reason)
+            self._latch_kill(decision.reason, cancel_all=decision.cancel_all)
             return False
         book = self.accruals[market].book.book
+        if not book.is_usable():
+            # Fail closed: never place against a stale/empty/off-grid book.
+            self._cancel(market, "book_unusable")
+            return False
         if self.mode != "paper" and self._venue(market) != "kalshi":
             # Patch 21: PM US is PAPER ONLY. No order path exists for it here.
             self._cancel(market, "pmus_paper_only")
@@ -1509,10 +1735,10 @@ class RunLoop:
                 return False
             if "yes" in sides:
                 self.poster.place(market=market, side="yes", price_cents=yes_cents,
-                                  size=size, opposing_bid_cents=no_bid)
+                                  size=side_size["yes"], opposing_bid_cents=no_bid)
             if "no" in sides:
                 self.poster.place(market=market, side="no", price_cents=no_cents,
-                                  size=size, opposing_bid_cents=yes_bid)
+                                  size=side_size["no"], opposing_bid_cents=yes_bid)
         else:
             for side, price in (("yes", yes_cents), ("no", no_cents)):
                 self.sim.untrack(f"{market}:{side}")
@@ -1520,10 +1746,11 @@ class RunLoop:
                     continue
                 self.sim.track(
                     order_id=f"{market}:{side}", market_ticker=market, side=side,
-                    price_cents=price, size=size, book=book, now=ts,
+                    price_cents=price, size=side_size[side], book=book, now=ts,
                     program_id=market,
                 )
-        quote = {"yes": size if "yes" in sides else 0.0, "no": size if "no" in sides else 0.0,
+        quote = {"yes": side_size["yes"] if "yes" in sides else 0.0,
+                 "no": side_size["no"] if "no" in sides else 0.0,
                  "yes_cents": yes_cents, "no_cents": no_cents, "ts": ts}
         if skew_info is not None:
             quote["skew"] = skew_info
@@ -1538,7 +1765,8 @@ class RunLoop:
         self.risk.commit(market, self._venue(market), add)
         self.committed[market] = add
         self.quotes.append({
-            "market": market, "size": size, "yes_cents": yes_cents, "no_cents": no_cents,
+            "market": market, "size": max(side_size[sd] for sd in sides),
+            "yes_cents": yes_cents, "no_cents": no_cents,
             "paper": self.mode == "paper", "ts": ts, "sides": list(sides),
         })
         self.quotes_total += 1
@@ -1736,10 +1964,14 @@ class RunLoop:
             "kill": self.kill,
             **self.pnl_report(accrual),
             "rewards_usd": "0",
+            "inventory_locked_usd": round(sum(self.locked_usd().values()), 6),
             "closed_periods_n": self.closed_periods_n,
             "closed_periods_raw_usd": round(sum(self.closed_periods.values()), 6),
+            "engine_alerts": list(self.alerts[-10:]),
             "feed": {"connected": self.connected, "disconnects_n": self.disconnects_n,
-                     "last_reconnect": self.last_reconnect},
+                     "last_reconnect": self.last_reconnect, "clock_skew_n": self.skew_n},
+            "cap_trims_n": self.cap_trims_n,
+            "budget_warning": getattr(self, "budget_warning", None),
             "day": day,
         }
 
@@ -1762,6 +1994,7 @@ class RunLoop:
                           "fees_usd": round(parts["fees_usd"], 6),
                           "rewards_partial": accrual is None},
             "premium_paid_usd": format(Decimal(str(round(self.premium_usd_total, 6))), "f"),
+            "daily_mtm_pnl_usd": format(self.daily_pnl_usd(), "f"),
             "unsettled_positions": parts["unsettled"][:50],
             "unmarked_positions": parts["unmarked"][:50],
         }
@@ -2073,6 +2306,24 @@ def alloc_cap_fraction() -> float:
         return 0.95
 
 
+def default_fill_cap_usd() -> float:
+    """Per-order single-fill cap. LIP_SINGLE_FILL_CAP_USD when set; unset, the
+    session default ($100) lowered to LIP_MARKET_INV_CAP_USD when that cap is
+    set, so one fill can never exceed the per-market inventory cap."""
+    cap = single_fill_cap_usd()
+    if str(os.environ.get("LIP_SINGLE_FILL_CAP_USD", "")).strip():
+        return cap
+    inv = _env_num("LIP_MARKET_INV_CAP_USD", 0.0)
+    return min(cap, inv) if inv > 0 else cap
+
+
+def pmus_market_cap_usd() -> float:
+    """LIP_PMUS_MARKET_CAP_USD: per-market capital cap for PM US (PMUS:*)
+    quotes in sizing. Unset or <= 0: no extra cap."""
+    cap = _env_num("LIP_PMUS_MARKET_CAP_USD", 0.0)
+    return cap if cap > 0 else float("inf")
+
+
 def suspect_per_100() -> float:
     """Plan $/day per $100 capital above this is flagged (LIP_SUSPECT_PER_100, default 40)."""
     try:
@@ -2248,6 +2499,18 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
             backoff = min(backoff * 2.0, READONLY_BACKOFF_MAX_S)
     finally:
         session.close()
+
+
+def _exchange_ts(msg: dict):
+    """Venue send time (epoch s) of a Kalshi websocket frame: top-level
+    ``sending_ts_ms``, else the delta's ``msg.ts_ms``. None when absent."""
+    raw = msg.get("sending_ts_ms")
+    if raw is None:
+        raw = (msg.get("msg") or {}).get("ts_ms") if isinstance(msg.get("msg"), dict) else None
+    try:
+        return None if raw is None else float(raw) / 1000.0
+    except (TypeError, ValueError):
+        return None
 
 
 def _program_sig(frame: dict) -> tuple:
@@ -2537,6 +2800,9 @@ async def _readonly_books_session(source: dict, key, session,
                 msg = json.loads(raw)
                 msg.setdefault("ts", time.time())
                 state["last_wall"] = msg["ts"]
+                ets = _exchange_ts(msg)
+                if ets is not None:
+                    msg["exchange_ts"] = ets
                 kind = str(msg.get("type") or "")
                 if kind == "trade":
                     body = msg.get("msg") or msg

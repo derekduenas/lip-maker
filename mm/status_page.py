@@ -21,6 +21,9 @@ LIVE_STATUS_FIELDS = (
     "premium_paid_usd", "pnl_usd_note", "pnl_parts",
     "unsettled_positions", "unmarked_positions",
     "closed_periods_n", "closed_periods_raw_usd", "feed",
+    # Review fixes: inventory risk, daily MTM, engine alerts, capital check.
+    "daily_mtm_pnl_usd", "inventory_locked_usd", "engine_alerts", "cap_trims_n",
+    "budget_warning",
 )
 
 
