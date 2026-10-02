@@ -288,6 +288,7 @@ class _Engine:
             loop, lambda rep: _write_run_outputs(args, rep, started),
             data_source=books["flag"], ws_url=plan["url"],
         )
+        self.refresher.warning = book_source_warning(books, mode)
         self.timer = EngineTimer(
             loop, heartbeat=args.heartbeat,
             kill_path=os.environ.get("LIP_KILL_FILE", "/var/lib/lip-maker/KILL"),
@@ -363,6 +364,17 @@ def reset_state_kill(path: str) -> int:
     os.replace(tmp, p)
     print(f"cleared engine kill latch in {path} (was: {prev!r})")
     return 0
+
+
+def book_source_warning(books: dict, mode: str) -> str | None:
+    """Paper mode reading DEMO books because the production read key is
+    not in this process's environment: say so (startup log and status)."""
+    if mode != "paper" or books.get("reader"):
+        return None
+    return ("paper engine is reading DEMO books (results not representative): "
+            "KALSHI_PROD_READ_KEY_ID / KALSHI_PROD_READ_KEY_PATH are not set in the service "
+            "environment or the key file is not readable. Set them in /etc/lip-maker/lip-maker.env "
+            "(the repo .env is not loaded) and restart.")
 
 
 def _paper_env() -> bool:
@@ -475,6 +487,9 @@ def main(argv: list[str] | None = None) -> int:
             from mm.unattended.loop import assert_demo_host
             assert_demo_host(url)
             books = book_source(force_demo=True)
+        warning = book_source_warning(books, mode)
+        if warning:
+            logging.getLogger("lip.unattended").warning("!!! %s", warning)
         write_heartbeat(args.heartbeat)
         started: list = []
         if args.replay:
@@ -500,6 +515,8 @@ def main(argv: list[str] | None = None) -> int:
                     report["paper"] = mode == "paper"
                     report["demo"] = mode == "demo"
                     report["data_source"] = books["flag"]
+                    if warning:
+                        report["book_source_warning"] = warning
                     _write_run_outputs(args, report, started)
                 if plan["socket"]:
                     if engine is None:
