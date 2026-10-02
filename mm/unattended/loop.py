@@ -296,6 +296,13 @@ class RunLoop:
         # max_reward per period) of windows that ended while we were running.
         self.closed_periods: dict[str, float] = {}
         self.closed_periods_n = 0
+        # Closed periods of ended markets, folded per "venue/bucket" (bucket
+        # "" when unknown) so the persisted map does not grow per market.
+        self.closed_periods_agg: dict[str, float] = {}
+        # Settled positions dropped after LIP_SETTLED_KEEP_DAYS: realized
+        # markout (all positions) and per-bucket aggregates of their rows.
+        self.realized_pruned_usd = 0.0
+        self.bucket_closed: dict[str, dict] = {}
         self.refeeds_n = 0
         # Review fixes: fill aggregates (self.fills is a bounded list), MTM
         # marks, fees, settlement, inventory on the risk engine, feed state.
@@ -642,6 +649,7 @@ class RunLoop:
         acc = self.accruals.pop(market, None)
         if acc is not None:
             self._archive_period(market, acc)
+        self._fold_closed_period(market, self.programs[market].venue)
         self.programs.pop(market, None)
         for table in (self.open_seconds, self._book_ts, self.last_plan, self._repeg_at, self._fv_state):
             table.pop(market, None)
@@ -663,7 +671,61 @@ class RunLoop:
         for market in gone:
             self.end_program(market, "program_ended")
         self._fv_wanted &= set(self.programs)
+        # closed periods restored for markets that are no longer fed
+        for market in [m for m in self.closed_periods if m not in self.programs]:
+            self._fold_closed_period(market, self._venue_of(market))
+        self._drop_settled(ts)
         return len(gone)
+
+    def _fold_closed_period(self, market: str, venue: str) -> None:
+        """Move an ended market's closed-period rewards into the
+        ``venue/bucket`` aggregate (status totals unchanged)."""
+        usd = self.closed_periods.pop(market, None)
+        if usd is None:
+            return
+        bucket = (getattr(self, "bucket_of", None) or {}).get(market) or ""
+        key = f"{venue}/{bucket}"
+        self.closed_periods_agg[key] = self.closed_periods_agg.get(key, 0.0) + float(usd)
+        self._state_dirty = True
+
+    def _drop_settled(self, ts: float) -> None:
+        """Forget positions settled more than LIP_SETTLED_KEEP_DAYS (7) ago
+        (and settled rows with no position). Their realized markout, fees,
+        rebates, premium and fill counts move into ``realized_pruned_usd`` /
+        ``bucket_closed``, so P&L and bucket totals do not change."""
+        keep = _env_num("LIP_SETTLED_KEEP_DAYS", 7.0) * 86400.0
+        old = [m for m, row in self.settled.items()
+               if row.get("ts") is not None and float(row["ts"]) + keep < ts and m not in self.programs]
+        for market in old:
+            pos = self.position.pop(market, None)
+            mark = 100.0 if self.settled[market]["result"] == "yes" else 0.0
+            if pos is not None:
+                value = (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+                self.realized_pruned_usd += value - float(pos["yes_cost"]) - float(pos["no_cost"])
+            for bucket, rows in self.bucket_pos.items():
+                row = rows.pop(market, None)
+                if row is None:
+                    continue
+                cost = float(row["yes_cost"]) + float(row["no_cost"])
+                value = (float(row["yes"]) * mark + float(row["no"]) * (100.0 - mark)) / 100.0
+                agg = self.bucket_closed.setdefault(bucket, {"markout_usd": 0.0, "fees_usd": 0.0,
+                                                             "rebates_usd": 0.0, "premium_usd": 0.0,
+                                                             "fills_n": 0.0, "synthetic_n": 0.0})
+                agg["markout_usd"] += value - cost
+                agg["fees_usd"] += float(row.get("fees", 0.0))
+                agg["rebates_usd"] += float(row.get("rebates", 0.0))
+                agg["premium_usd"] += cost
+                agg["fills_n"] += float(row.get("fills_n", 0.0))
+                agg["synthetic_n"] += float(row.get("synthetic_n", 0.0))
+            del self.settled[market]
+            self.inv_committed.pop(market, None)
+            self.unresolved.pop(market, None)
+            self.last_mid.pop(market, None)
+            (getattr(self, "bucket_of", None) or {}).pop(market, None)
+            self._unsettled_alerted.discard(market)
+        if old:
+            self._daily_cache = None
+            self._state_dirty = True
 
     def settle(self, market: str, result: str, *, source: str = "ws_lifecycle") -> None:
         """Book settlement of a held position (YES pays 100c on "yes", NO on
@@ -765,6 +827,8 @@ class RunLoop:
         except Exception:
             logging.getLogger("lip.risk").exception("archiving accrual for %s failed", market)
             return
+        if float(raw) <= 0.0:
+            return  # nothing earned (never quoted): nothing to keep
         self.closed_periods[market] = self.closed_periods.get(market, 0.0) + float(raw)
         self.closed_periods_n += 1
         self._state_dirty = True
@@ -823,7 +887,8 @@ class RunLoop:
         remaining side of a one-sided book, last known mark, or settlement)
         minus its cost. A position that never had a mark is valued at 0
         (worst case) and listed in ``unmarked``; a released unresolved
-        position is valued at 0 too (``unresolved``)."""
+        position is valued at 0 too. Plus the realized markout of settled
+        positions already dropped (``realized_pruned_usd``)."""
         markout = 0.0
         unmarked, unsettled = [], []
         for market, pos in self.position.items():
@@ -842,6 +907,7 @@ class RunLoop:
             close = None if prog is None else prog.close_ts
             if source != "settled" and (prog is None or (close is not None and self.now and self.now >= close)):
                 unsettled.append(market)
+        markout += self.realized_pruned_usd
         return {"markout_usd": markout, "fees_usd": self.fees_usd_total,
                 "rebates_usd": self.pm_rebate_usd, "unmarked": unmarked, "unsettled": unsettled}
 
@@ -1006,7 +1072,8 @@ class RunLoop:
             "fills_synthetic_by_venue": self.fills_synthetic_by_venue,
             "premium_usd_total": self.premium_usd_total, "fees_usd_total": self.fees_usd_total,
             "pm_rebate_usd": self.pm_rebate_usd, "closed_periods": self.closed_periods,
-            "closed_periods_n": self.closed_periods_n,
+            "closed_periods_n": self.closed_periods_n, "closed_periods_agg": self.closed_periods_agg,
+            "realized_pruned_usd": self.realized_pruned_usd, "bucket_closed": self.bucket_closed,
             "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
             "kill": kill, "pnl_day": self._pnl_day,
             "markouts": self.markouts.state(),
@@ -1083,6 +1150,10 @@ class RunLoop:
         self.pm_rebate_usd = float(data.get("pm_rebate_usd") or 0.0)
         self.closed_periods = {str(m): float(v) for m, v in dict(data.get("closed_periods") or {}).items()}
         self.closed_periods_n = int(data.get("closed_periods_n") or 0)
+        self.closed_periods_agg = {str(k): float(v) for k, v in dict(data.get("closed_periods_agg") or {}).items()}
+        self.realized_pruned_usd = float(data.get("realized_pruned_usd") or 0.0)
+        self.bucket_closed = {str(b): {str(k): float(v) for k, v in dict(r).items()}
+                              for b, r in dict(data.get("bucket_closed") or {}).items()}
         self.cooldown.update(cooldown)
         self._pnl_day = data.get("pnl_day") if isinstance(data.get("pnl_day"), dict) else None
         # No saved day base but restored positions: their MTM is not today's.
@@ -2434,7 +2505,8 @@ class RunLoop:
             "rewards_usd": "0",
             "inventory_locked_usd": round(sum(self.locked_usd().values()), 6),
             "closed_periods_n": self.closed_periods_n,
-            "closed_periods_raw_usd": round(sum(self.closed_periods.values()), 6),
+            "closed_periods_raw_usd": round(sum(self.closed_periods.values())
+                                            + sum(self.closed_periods_agg.values()), 6),
             "engine_alerts": list(self.alerts[-10:]),
             "feed": {"connected": self.connected, "disconnects_n": self.disconnects_n,
                      "last_reconnect": self.last_reconnect, "clock_skew_n": self.skew_n,
@@ -2468,6 +2540,9 @@ class RunLoop:
             by_venue[vn] = by_venue.get(vn, 0.0) + float(v.get("capped_raw_usd", v["raw_usd"]))
         for market, usd in self.closed_periods.items():
             vn = self._venue_of(market)
+            by_venue[vn] = by_venue.get(vn, 0.0) + float(usd)
+        for key, usd in self.closed_periods_agg.items():
+            vn = key.split("/", 1)[0]
             by_venue[vn] = by_venue.get(vn, 0.0) + float(usd)
         rewards = sum(by_venue.values())
         pnl = parts["markout_usd"] + rewards + parts["rebates_usd"] - parts["fees_usd"]
@@ -2568,7 +2643,9 @@ class RunLoop:
         (capped at max_reward) plus rolled-over periods. fees_usd = Kalshi
         maker fees charged on paper fills. pnl_usd = markout + raw_est + PM US
         rebates - fees (an estimate: rewards are not paid figures). A released
-        unresolved position is valued at 0 (a full loss of its cost)."""
+        unresolved position is valued at 0 (a full loss of its cost). Settled
+        positions already dropped count through ``bucket_closed``; ended
+        markets' closed periods through ``closed_periods_agg``."""
         tags = getattr(self, "bucket_of", {}) or {}
         out = {b: {"budget_usd": round(float((getattr(self, "bucket_budget", None) or {}).get(b, 0.0)), 2),
                    "selected_n": 0, "selected": [], "capital_usd": 0.0, "raw_est_usd": 0.0,
@@ -2589,6 +2666,17 @@ class RunLoop:
             b = tags.get(market)
             if b in out:
                 out[b]["raw_est_usd"] += float(usd)
+        for key, usd in self.closed_periods_agg.items():
+            b = key.split("/", 1)[1] if "/" in key else ""
+            if b in out:
+                out[b]["raw_est_usd"] += float(usd)
+        for b, agg in self.bucket_closed.items():
+            if b not in out:
+                continue
+            out[b]["fills_n"] += int(agg.get("fills_n", 0))
+            out[b]["synthetic_fills_n"] += int(agg.get("synthetic_n", 0))
+            for k in ("premium_usd", "markout_usd", "fees_usd", "rebates_usd"):
+                out[b][k] += float(agg.get(k, 0.0))
         for b, rows in self.bucket_pos.items():
             if b not in out:
                 continue
