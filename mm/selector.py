@@ -410,18 +410,49 @@ def reward_per_day(share: float, market: KalshiMarket, *,
     unchanged. The factor is a calibrated multiplier, applied after the
     exchange floor.
     """
+    if market.venue == "pmus":
+        return pmus_reward_per_day(share, market, reward_factor=reward_factor)
     uptime = _uptime(market)
     paid = kalshi_period_payout(share, market.period_reward_usd, uptime=uptime)
     days = (market.period_seconds / 86400.0) * uptime
     if paid <= 0 or days <= 0 or reward_factor <= 0:
         return 0.0
-    if market.venue == "pmus" and days > 1.0 and paid / days < 1.0:
-        # PM US "Rewards under $1.00 are not paid out" (docs.polymarket.us/
-        # incentives/liquidity). ASSUMPTION (docs silent on the unit;
-        # earnings are reported per (market, ET date)): apply the $1 minimum
-        # per day as well as per period - the stricter reading.
-        return 0.0
     return (paid / days) * float(reward_factor)
+
+
+PMUS_MIN_PAYOUT_USD = 1.0
+
+
+def pmus_reward_per_day(share: float, market: KalshiMarket, *,
+                        reward_factor: float = 1.0) -> float:
+    """PM US $/day for a steady snapshot ``share`` (2026-10-02 rules audit).
+
+    ``market.period_reward_usd`` is this market's slice of the program pool
+    (pool / member markets; "Reward pool - The total amount paid out for a
+    time period, shared across the program's markets - never summed per
+    market", polymarket.us/rewards). Each second pays pool / period seconds
+    and ``share`` is our fraction of it (score_snapshot_pmus: each side
+    "independently normalized to 1.0 per snapshot", so share = (bid + ask) / 2).
+
+    $1 minimum ("Rewards under $1.00 are not paid out", docs.polymarket.us/
+    incentives/liquidity). The docs do not name the unit. The only payout
+    granularity PM US publishes is the earnings row, one per (market, ET
+    date) with status PAID / PENDING / SKIPPED ("Each entry sums all payouts
+    for a single (market, date) pair", api-reference/incentives/overview),
+    so the floor is applied to one market's FULL ET-day payout (or the whole
+    period, if shorter than a day). It is NOT applied to the remainder of
+    today: the old Kalshi-style ``uptime`` floor zeroed a $2/day daily
+    market after ~12:00 ET and every sub-$24/day market by 23:00 ET, so
+    the estimate depended on the clock.
+    """
+    if (share <= 0 or market.period_reward_usd <= 0 or market.period_seconds <= 0
+            or market.seconds_left <= 0 or reward_factor <= 0):
+        return 0.0
+    per_s = float(share) * float(market.period_reward_usd) / float(market.period_seconds)
+    unit = per_s * min(86400.0, float(market.period_seconds))
+    if unit < PMUS_MIN_PAYOUT_USD:
+        return 0.0
+    return per_s * 86400.0 * float(reward_factor)
 
 
 def _reward_factor(series: str, factors: dict[str, float] | None) -> float:

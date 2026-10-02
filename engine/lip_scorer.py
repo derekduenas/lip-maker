@@ -209,9 +209,12 @@ def score_snapshot_pmus(book: BookState, ours: OurQuotes, params: ProgramParams)
     - Max Spread (half-width, dollars): both sides must reach Target and the
       two size-adjusted prices may be at most 2 x maxSpread apart (equality
       passes), else nobody is paid ("What is Max Spread?").
-    ASSUMPTION (docs silent, conservative): a second's pool (rewardPool /
-    period seconds) is split 50/50 between the bid side and the ask side;
-    a side that does not qualify forfeits its half (not re-allocated).
+    Bid/ask weight: "the bid side and ask side are each independently
+    normalized to 1.0 per snapshot, provided Target Size is met on that
+    side" (FAQ "How are snapshots weighted?"), so a second's pool
+    (rewardPool / period seconds) is split evenly between the two sides; a
+    side that does not qualify forfeits its half (docs: forfeited seconds
+    are "not shifted to other seconds or other makers").
     snapshot_share() = (our_yes_norm + our_no_norm) / 2 encodes this.
     """
     target = params.target_size

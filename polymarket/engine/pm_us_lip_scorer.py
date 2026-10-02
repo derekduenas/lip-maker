@@ -27,17 +27,27 @@ Live parameters come from the public gateway
 GET https://gateway.polymarket.us/v1/incentives (no key) — the repo's
 README claim that PM US has "no incentives API" is out of date.
 
-Stated assumptions (not in the docs, flagged so they can be checked
-against a real payout statement):
-  A1. The per-second pool slice is split equally between the bid side and
-      the ask side; a side that does not qualify forfeits its half.
-  A2. At the level where the walk reaches Target Size, every order at that
-      price level scores (the docs say "orders within that range score").
-  A3. A program window's rewardPool is divided across the distinct active
-      member markets carrying the same (programId, period) (see
-      ``split_pool_usd``; LIP_PMUS_POOL_SPLIT=market opts out). Shared with
-      mm/unattended/pmus_paper.py. Pending reconciliation against
-      GET /v1/incentives/earnings.
+Rules re-checked against the docs on 2026-10-02 (FAQ at
+docs.polymarket.us/incentives/liquidity, api-reference/incentives/overview,
+polymarket.us/rewards). Former assumptions, now sourced:
+  A1. Equal bid/ask weight: "the bid side and ask side are each
+      independently normalized to 1.0 per snapshot, provided Target Size is
+      met on that side", so a second's slice is split evenly between the
+      two sides and a side short of Target pays nobody. Where the docs speak
+      (Max Spread) a failed second "is forfeited, not shifted to other
+      seconds or other makers"; the same no-redistribution is assumed for a
+      lone unqualified side in programs without Max Spread (docs silent).
+  A2. The straddling level scores whole: the walk goes "one whole price
+      level at a time ... The price level that gets there is that side's
+      size-adjusted price", and "every order from the best price through
+      the size-adjusted price qualifies" (api-reference/incentives/overview).
+  A3. A program window's rewardPool is "shared across the program's markets
+      - never summed per market" (polymarket.us/rewards); with per-side
+      normalization every member market carries an equal slice, so the pool
+      is divided by the distinct active member markets carrying the same
+      (programId, period) (``split_pool_usd``). Shared with
+      mm/unattended/pmus_paper.py. Reconcile against GET
+      /v1/incentives/earnings once a key exists.
 Prices are handled in integer ticks to avoid float drift (tick 0.01 or
 0.001 dollars).
 """
@@ -183,9 +193,10 @@ def score_snapshot(bids: Sequence[Order], asks: Sequence[Order], *, tick: float,
 def effective_reward_pool_usd(reward_pool_usd: float, n_markets: int) -> float:
     """One program window has one pool. The API repeats it on every market.
 
-    Divide by the member count. That count is the conservative split: a
-    market with no qualifying book does not take a cut, so the true divisor
-    is at most about 1.25× smaller. ``n_markets`` below 1 is rejected.
+    Divide by the member count: each member market's sides are normalized
+    to 1.0 per qualifying snapshot, and an unqualified second is forfeited
+    rather than redistributed (docs, Max Spread case; assumed otherwise), so
+    every member carries an equal slice. ``n_markets`` below 1 is rejected.
     """
     n = int(n_markets)
     if n < 1:

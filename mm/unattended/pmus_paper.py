@@ -62,10 +62,18 @@ Reward rules used (https://docs.polymarket.us/incentives/liquidity):
   The rule lives in polymarket/engine/pm_us_lip_scorer.py (count_pool_members
   / split_pool_usd) and is shared with that scorer. LIP_PMUS_POOL_SPLIT=market
   (whole pool per market) contradicts that page; kept only for comparison.
-- $1 minimum payout ("Rewards under $1.00 are not paid out"): a market whose
-  split pool cannot reach $1 per ET day (or per period, if shorter) even at
-  100% share is screened out as below_min_payout before ranking and before
-  any metadata fetch (max_payable_usd), so it never takes a candidate slot.
+- $1 minimum payout ("Rewards under $1.00 are not paid out"): unit not named
+  in the docs; applied per (market, ET date), the only payout granularity PM
+  US publishes (earnings rows, status PAID/PENDING/SKIPPED, "Each entry sums
+  all payouts for a single (market, date) pair"). A market whose split pool
+  cannot reach $1 per ET day (or per period, if shorter) even at 100% share
+  is screened out as below_min_payout before ranking and before any
+  metadata fetch (max_payable_usd); selector.pmus_reward_per_day applies the
+  same floor to our FULL-day payout (not to what is left of today).
+- Scoring (score_snapshot_pmus): DF^(ticks from that side's best) x size;
+  walk each side to Target Size on raw size, whole levels; per-side
+  normalization; maxSpread only when the API sends it; volumeProgram
+  periods are ignored everywhere (records, member counts, parser).
 - Period types: early, pre_day, pre_game, day_of, live, daily_event, daily
   ("Daily" on polymarket.us/rewards; same per-day ET window as daily_event,
   accepted wherever daily_event is). Any
