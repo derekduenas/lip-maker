@@ -30,6 +30,14 @@ USAGE:
   python orchestrator.py --execute   # v2 (NOT YET IMPLEMENTED)
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+import sys as _lh_sys
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
+_LIP_PYTHON = _lh_os.environ.get("LIP_PYTHON") or _lh_sys.executable
+_PM_PYTHON = _lh_os.environ.get("PM_PYTHON") or _lh_sys.executable
 
 import argparse
 import json
@@ -39,8 +47,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
-LIP_DB = "/root/lip-maker/data/lip_maker.db"
-PM_DB  = "/root/polymarket-maker/data/polymarket_maker.db"
+LIP_DB = (_LIP_HOME + "/data/lip_maker.db")
+PM_DB  = (_PM_HOME + "/data/polymarket_maker.db")
 ORCH_LOG_DB = "/root/logs/orchestrator.db"  # rolling RYD history
 
 REBALANCE_THRESHOLD_PCT = 30.0   # min RYD diff to recommend rebalance
@@ -51,15 +59,15 @@ def kalshi_state() -> dict:
     """Subprocess to lip-maker venv. Returns capital + 24h rebate + 24h bleed."""
     script = """
 import sys, sqlite3, json, os
-sys.path.insert(0, '/root/lip-maker')
-os.chdir('/root/lip-maker')
+sys.path.insert(0, '__LIP_HOME__')
+os.chdir('__LIP_HOME__')
 from execution.kalshi_auth import KalshiClient
 c = KalshiClient()
 balance = float(c.get_balance())
 positions = c.get('/portfolio/positions', params={'limit':200}).get('market_positions', [])
 exposure = sum(float(p.get('market_exposure_dollars', 0)) for p in positions
                if float(p.get('position_fp', 0)) != 0)
-conn = sqlite3.connect('/root/lip-maker/data/lip_maker.db', timeout=5.0)
+conn = sqlite3.connect('__LIP_HOME__/data/lip_maker.db', timeout=5.0)
 try:
     r = conn.execute(\"\"\"
         SELECT COALESCE(SUM(rebate_earned_usd),0),
@@ -78,9 +86,9 @@ print(json.dumps({
     'bleed_24h': abs(r[1]),  # absolute value of negative realized
     'net_24h': r[2],
 }))
-"""
+""".replace("__LIP_HOME__", _LIP_HOME)
     try:
-        r = subprocess.run(["/root/lip-maker/venv/bin/python", "-c", script],
+        r = subprocess.run([_LIP_PYTHON, "-c", script],
                            capture_output=True, text=True, timeout=30)
         if r.returncode == 0 and r.stdout.strip():
             return json.loads(r.stdout.strip().split("\n")[-1])
@@ -93,19 +101,19 @@ def pm_state() -> dict:
     """Subprocess to PM venv. Returns capital + lifetime payouts (24h proxy)."""
     script = """
 import sys, sqlite3, json, os
-sys.path.insert(0, '/root/polymarket-maker')
-os.chdir('/root/polymarket-maker')
+sys.path.insert(0, '__PM_HOME__')
+os.chdir('__PM_HOME__')
 from execution.pm_auth import _load_dotenv_simple
-_load_dotenv_simple('/root/polymarket-maker/.env')
+_load_dotenv_simple('__PM_HOME__/.env')
 from polymarket_us import PolymarketUS
 c = PolymarketUS(
     key_id=os.getenv('PM_API_KEY_ID'),
-    secret_key=open('/root/polymarket-maker/config/polymarket_secret_key.b64').read().strip(),
+    secret_key=open('__PM_HOME__/config/polymarket_secret_key.b64').read().strip(),
 )
 b = c.account.balances().get('balances', [{}])[0]
 balance = float(b.get('currentBalance', 0))
 exposure = float(b.get('openOrders', 0)) + float(b.get('unsettledFunds', 0))
-conn = sqlite3.connect('/root/polymarket-maker/data/polymarket_maker.db', timeout=5.0)
+conn = sqlite3.connect('__PM_HOME__/data/polymarket_maker.db', timeout=5.0)
 try:
     r = conn.execute(\"\"\"
         SELECT COALESCE(SUM(payout_usd),0)
@@ -131,7 +139,7 @@ print(json.dumps({
     'bleed_24h': bleed,
     'net_24h': payout_24h - bleed,
 }))
-"""
+""".replace("__PM_HOME__", _PM_HOME)
     # Note: the 'datetime' lookup hack via sys.modules is to avoid breaking
     # heredoc f-string scope; just use date-aware SQLite directly instead.
     script = script.replace(
@@ -139,7 +147,7 @@ print(json.dumps({
         "from datetime import datetime, timezone\n    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')"
     )
     try:
-        r = subprocess.run(["/root/polymarket-maker/venv/bin/python", "-c", script],
+        r = subprocess.run([_PM_PYTHON, "-c", script],
                            capture_output=True, text=True, timeout=30)
         if r.returncode == 0 and r.stdout.strip():
             return json.loads(r.stdout.strip().split("\n")[-1])

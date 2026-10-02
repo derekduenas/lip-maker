@@ -9,6 +9,11 @@ USAGE:
 CRON: every 60s (PM activities API tolerates frequent polling).
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[2])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
 
 import argparse
 import json
@@ -18,12 +23,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, '/root/polymarket-maker')
+sys.path.insert(0, _PM_HOME)
 from execution.pm_auth import _load_dotenv_simple
-_load_dotenv_simple('/root/polymarket-maker/.env')
+_load_dotenv_simple((_PM_HOME + '/.env'))
 from polymarket_us import PolymarketUS
 
-DB = "/root/polymarket-maker/data/polymarket_maker.db"
+DB = (_PM_HOME + "/data/polymarket_maker.db")
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -56,7 +61,7 @@ def main() -> int:
 
     c = PolymarketUS(
         key_id=os.getenv("PM_API_KEY_ID"),
-        secret_key=open("/root/polymarket-maker/config/polymarket_secret_key.b64").read().strip(),
+        secret_key=open((_PM_HOME + "/config/polymarket_secret_key.b64")).read().strip(),
     )
     try:
         r = c.portfolio.activities({"limit": a.limit})

@@ -21,7 +21,7 @@ Endpoints tried (read-only, no orders):
   returns 200 vs 401/403 vs 404.
 
 USAGE
-  sudo /root/lip-maker/venv/bin/python tools/pm_us_heartbeat.py
+  sudo $LIP_HOME/venv/bin/python tools/pm_us_heartbeat.py
 """
 from __future__ import annotations
 

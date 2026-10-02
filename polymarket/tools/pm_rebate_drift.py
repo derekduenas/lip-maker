@@ -16,6 +16,11 @@ USAGE:
   python pm_rebate_drift.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[2])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
 
 import argparse
 import json
@@ -24,7 +29,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-PM_DB = "/root/polymarket-maker/data/polymarket_maker.db"
+PM_DB = (_PM_HOME + "/data/polymarket_maker.db")
 PM_CALIBRATION = 0.10        # expected theoretical→actual ratio for PM
 RATIO_LOW  = 0.5             # apply to (paid / (claimed × calib))
 RATIO_HIGH = 2.0

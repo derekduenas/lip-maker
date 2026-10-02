@@ -10,6 +10,13 @@ USAGE:
   /root/innait_status.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+import sys as _lh_sys
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
+_PM_PYTHON = _lh_os.environ.get("PM_PYTHON") or _lh_sys.executable
 
 import argparse
 import json
@@ -19,8 +26,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
-LIP_DB = "/root/lip-maker/data/lip_maker.db"
-PM_DB  = "/root/polymarket-maker/data/polymarket_maker.db"
+LIP_DB = (_LIP_HOME + "/data/lip_maker.db")
+PM_DB  = (_PM_HOME + "/data/polymarket_maker.db")
 TARGET_MO = 20_000.0  # $20k/mo W2-quit target
 
 
@@ -36,8 +43,8 @@ def _service_status(unit: str) -> str:
 def kalshi_state() -> dict:
     out = {"venue": "kalshi", "service": _service_status("lip-maker")}
     try:
-        os.chdir("/root/lip-maker")  # KalshiClient reads relative config/ paths
-        sys.path.insert(0, "/root/lip-maker")
+        os.chdir(_LIP_HOME)  # KalshiClient reads relative config/ paths
+        sys.path.insert(0, _LIP_HOME)
         from execution.kalshi_auth import KalshiClient  # type: ignore
         c = KalshiClient()
         out["balance_usd"] = float(c.get_balance())
@@ -94,16 +101,16 @@ def pm_state() -> dict:
     """Subprocess to PM venv since polymarket_us SDK lives there only.
     Avoids cross-venv import contamination."""
     out = {"venue": "polymarket", "service": _service_status("polymarket-maker")}
-    pm_python = "/root/polymarket-maker/venv/bin/python"
+    pm_python = _PM_PYTHON
     pm_script = """
 import os, sys, json
-sys.path.insert(0, '/root/polymarket-maker')
+sys.path.insert(0, '__PM_HOME__')
 from execution.pm_auth import _load_dotenv_simple
-_load_dotenv_simple('/root/polymarket-maker/.env')
+_load_dotenv_simple('__PM_HOME__/.env')
 from polymarket_us import PolymarketUS
 c = PolymarketUS(
     key_id=os.getenv('PM_API_KEY_ID'),
-    secret_key=open('/root/polymarket-maker/config/polymarket_secret_key.b64').read().strip(),
+    secret_key=open('__PM_HOME__/config/polymarket_secret_key.b64').read().strip(),
 )
 b = c.account.balances().get('balances', [{}])[0]
 orders = c.orders.list({'limit': 100}).get('orders', [])
@@ -115,7 +122,7 @@ print(json.dumps({
     'resting_orders': len(orders),
     'open_positions': len(positions) if isinstance(positions, dict) else 0,
 }))
-"""
+""".replace("__PM_HOME__", _PM_HOME)
     try:
         r = subprocess.run([pm_python, "-c", pm_script],
                            capture_output=True, text=True, timeout=15)

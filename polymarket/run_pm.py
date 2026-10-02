@@ -28,6 +28,10 @@ SYSTEMD:
   archived to _archive/2026-10-01/polymarket/deploy/.
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import argparse
 import logging
@@ -525,8 +529,8 @@ class Runner:
             # APPEND (don't insert at 0) so PM's local tools/ takes precedence
             # over Kalshi's tools/. Bug discovered when path-insert hid PM's
             # tools/us_scanner from discover_targets().
-            if "/root/lip-maker" not in _sys.path:
-                _sys.path.append("/root/lip-maker")
+            if _LIP_HOME not in _sys.path:
+                _sys.path.append(_LIP_HOME)
             from cross_venue.requote_queue import drain as _drain_requote
             requotes = _drain_requote(venue_filter="pm")
             if requotes:

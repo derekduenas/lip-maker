@@ -12,6 +12,10 @@ USAGE:
   python lip_sunset_alarm.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import argparse
 import json
@@ -20,7 +24,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-LIP_ROOT = Path("/root/lip-maker")
+LIP_ROOT = Path(_LIP_HOME)
 DB = str(LIP_ROOT / "data" / "lip_maker.db")
 
 # LIP was extended to Jan 1, 2027 (previously Sept 1, 2026). Source:

@@ -14,6 +14,10 @@ market_exposure_dollars (Kalshi-side truth), not local fill_ledger sums
 that double-count cumulative cost.
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import argparse
 import json
@@ -259,7 +263,7 @@ def render(k: dict, l: dict) -> None:
     # ── Blacklist ──
     print(f"\n🛑 ACTIVE BLACKLIST: {l['active_blacklist']} markets")
 
-    _aegis_brain_recommendations("/root/lip-maker/data/lip_maker.db")
+    _aegis_brain_recommendations((_LIP_HOME + "/data/lip_maker.db"))
 
     print()
 

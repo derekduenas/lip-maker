@@ -36,6 +36,10 @@ USAGE:
 CRON: every 15min */15 * * * *
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import argparse
 import json
@@ -45,7 +49,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-LIP_PATH = Path("/root/lip-maker")
+LIP_PATH = Path(_LIP_HOME)
 LIP_DB = LIP_PATH / "data" / "lip_maker.db"
 DEFAULT_N = 30
 HAIKU_MODEL = "claude-haiku-4-5-20251001"

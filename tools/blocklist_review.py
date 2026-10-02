@@ -23,11 +23,15 @@ USAGE:
   python blocklist_review.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 
 # === heartbeat (auto-injected, atexit) ===
 import atexit as _atexit, sys as _sys
-_sys.path.insert(0, "/root/lip-maker")
+_sys.path.insert(0, _LIP_HOME)
 try:
     from tools._heartbeat import write_heartbeat as _wh
     _atexit.register(_wh, "blocklist_review")
