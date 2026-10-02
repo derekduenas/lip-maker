@@ -321,6 +321,14 @@ class RunLoop:
         self.cap_trims_n = 0
         self.programs_pruned_n = 0
         self._pnl_day: dict | None = None
+        # Settlement backstops (F2): held, unsettled positions due a
+        # settlement check (read by the Kalshi background refresh and the PM
+        # US poller threads: an immutable tuple of (market, venue), replaced
+        # whole), PM US positions released as unresolved, alerted markets.
+        self.settle_view: tuple = ()
+        self.unresolved: dict[str, dict] = {}
+        self._unsettled_alerted: set = set()
+        self._settle_tick: int | None = None
         # Clock-skew guard (_note_clock_skew).
         self._skew_streak = 0
         self._skew_since = 0.0
@@ -453,10 +461,13 @@ class RunLoop:
             self.end_program(str(row.get("market") or ""), str(row.get("reason") or "program_end"))
             return
         if kind == "settlement":
-            self.settle(str(row.get("market") or ""), str(row.get("result") or ""))
+            self.settle(str(row.get("market") or ""), str(row.get("result") or ""),
+                        source=str(row.get("source") or "ws_lifecycle"))
             return
         ts = float(row.get("ts") if row.get("ts") is not None else self.now)
         self.now = ts
+        if kind in ("orderbook_snapshot", "orderbook_delta", "trade", "clock"):
+            self._check_settlements(ts)
         if kind in ("orderbook_snapshot", "orderbook_delta"):
             self._close_elapsed(int(ts))
             self._on_book(row, ts)
@@ -619,6 +630,15 @@ class RunLoop:
         if market not in self.programs:
             return
         self._cancel(market, reason)
+        pos = self.position.get(market)
+        if pos is not None:
+            # Keep when it should settle: its close, else now (program gone).
+            prog = self.programs[market]
+            if prog.close_ts is not None:
+                pos["close_ts"] = float(prog.close_ts)
+            elif pos.get("close_ts") is None:
+                pos["orphan_ts"] = float(self.now or time.time())
+            self._state_dirty = True
         acc = self.accruals.pop(market, None)
         if acc is not None:
             self._archive_period(market, acc)
@@ -645,29 +665,97 @@ class RunLoop:
         self._fv_wanted &= set(self.programs)
         return len(gone)
 
-    def settle(self, market: str, result: str) -> None:
+    def settle(self, market: str, result: str, *, source: str = "ws_lifecycle") -> None:
         """Book settlement of a held position (YES pays 100c on "yes", NO on
         "no") and release its locked capital on the risk engine. Fed by the
         read-only socket's market_lifecycle_v2 channel (determined/settled
-        events). That channel carries every Kalshi market, so a market with
-        neither a position nor a program here is ignored (nothing to settle,
-        and nothing is stored for it). A position whose result never arrives
-        stays marked at its last mark and is listed in status."""
+        events), the Kalshi REST backfill (``_settlement_backfill``) and the
+        PM US gateway settlement poll (``PMUSFeed.poll_settlements``); the
+        source is kept on the settled row. The lifecycle channel carries
+        every Kalshi market, so a market with neither a position nor a
+        program here is ignored (nothing to settle, and nothing is stored for
+        it). A position whose result never arrives stays marked at its last
+        mark and is listed in status (see ``_check_settlements``)."""
         result = str(result).lower()
         if result not in ("yes", "no") or market in self.settled:
             return
         if market not in self.position and market not in self.programs:
             return
+        self.unresolved.pop(market, None)
         legs = [(str((self.position.get(market) or {}).get("venue") or self._venue_of(market)), b,
                  rows[market]["yes"], rows[market]["no"], rows[market]["yes_cost"], rows[market]["no_cost"],
                  rows[market].get("fills_n", 0))
                 for b, rows in self.bucket_pos.items() if market in rows]
         self.markouts.on_settle(market, result, legs)
-        self.settled[market] = {"result": result, "ts": self.now}
+        self.settled[market] = {"result": result, "ts": self.now, "source": str(source)}
         self.last_mid[market] = 100.0 if result == "yes" else 0.0
         self._sync_inventory(market)
         self._cancel(market, "settled")
         self._state_dirty = True
+
+    # ------------------------------------------------------------ settlement backstops
+    def _close_of(self, market: str):
+        """When a held position should have settled: its program's close,
+        else the close remembered on the position, else (no program left and
+        no close known) when the program went away. None while a program
+        with no close is live."""
+        prog = self.programs.get(market)
+        if prog is not None and prog.close_ts is not None:
+            return float(prog.close_ts)
+        pos = self.position.get(market) or {}
+        if pos.get("close_ts") is not None:
+            return float(pos["close_ts"])
+        if prog is not None:
+            return None
+        return None if pos.get("orphan_ts") is None else float(pos["orphan_ts"])
+
+    def _check_settlements(self, ts: float) -> None:
+        """Once per loop second: refresh ``settle_view`` (held, unsettled
+        positions past close or with no program left: the Kalshi REST
+        backfill and the PM US settlement poll ask about these), alert once
+        for a position still unsettled LIP_UNSETTLED_ALERT_S (24 h) past
+        close, and release a PM US position's capital after close +
+        LIP_PMUS_UNSETTLED_RELEASE_S (24 h): it leaves inventory, budgets
+        and the risk caps, while P&L keeps it at a loss of its full cost
+        basis and status lists it in ``unresolved_positions`` until a
+        settlement arrives. Kalshi positions are not released (their REST
+        backfill settles them; the alert flags one that it cannot)."""
+        sec = int(ts)
+        if self._settle_tick == sec:
+            return
+        self._settle_tick = sec
+        view = []
+        alert_s = _env_num("LIP_UNSETTLED_ALERT_S", 86400.0)
+        release_s = _env_num("LIP_PMUS_UNSETTLED_RELEASE_S", 86400.0)
+        for market, pos in self.position.items():
+            if market in self.settled:
+                continue
+            if market not in self.programs and pos.get("close_ts") is None and pos.get("orphan_ts") is None:
+                pos["orphan_ts"] = float(ts)  # restored without a close: count from now
+                self._state_dirty = True
+            close = self._close_of(market)
+            venue = str(pos.get("venue") or self._venue_of(market))
+            if market not in self.programs or (close is not None and ts >= close):
+                view.append((market, venue))
+            if close is None:
+                continue
+            if ts >= close + alert_s and market not in self._unsettled_alerted:
+                self._unsettled_alerted.add(market)
+                self._alert("WARNING", f"position {market} ({venue}) unsettled "
+                                       f"{(ts - close) / 3600.0:.0f}h past close")
+            if venue == "pmus" and ts >= close + release_s and market not in self.unresolved:
+                cost = float(pos["yes_cost"]) + float(pos["no_cost"])
+                self.unresolved[market] = {"venue": venue, "since": float(ts), "close_ts": close,
+                                           "cost_usd": round(cost, 6)}
+                self._sync_inventory(market)
+                self._state_dirty = True
+                self._alert("WARNING", f"position {market} unresolved {release_s / 3600.0:.0f}h past "
+                                       f"close: ${cost:.2f} released from budgets, marked as a full loss")
+        self.settle_view = tuple(view)
+
+    def unresolved_report(self) -> dict:
+        """Status ``unresolved_positions``: released PM US positions."""
+        return {m: dict(v) for m, v in self.unresolved.items()}
 
     def _archive_period(self, market: str, acc: SecondAccrual) -> None:
         try:
@@ -734,12 +822,16 @@ class RunLoop:
         markout_usd = MTM value of every position at its mark (book mid,
         remaining side of a one-sided book, last known mark, or settlement)
         minus its cost. A position that never had a mark is valued at 0
-        (worst case) and listed in ``unmarked``."""
+        (worst case) and listed in ``unmarked``; a released unresolved
+        position is valued at 0 too (``unresolved``)."""
         markout = 0.0
         unmarked, unsettled = [], []
         for market, pos in self.position.items():
             mark, source = self._yes_mark(market)
             cost = float(pos["yes_cost"]) + float(pos["no_cost"])
+            if market in self.unresolved:
+                markout -= cost  # released unresolved: a full loss until settled
+                continue
             if mark is None:
                 value = 0.0
                 unmarked.append(market)
@@ -790,9 +882,9 @@ class RunLoop:
         NO: the paired part (min(yes, no)) locks the cost of both legs until
         it settles at $1 a pair, and the unpaired part can lose all of its
         cost. Paired cost + unpaired cost = the cost basis of both legs.
-        0 once settled."""
+        0 once settled or released as unresolved."""
         pos = self.position.get(market)
-        if not pos or market in self.settled:
+        if not pos or market in self.settled or market in self.unresolved:
             return Decimal(0)
         return Decimal(str(round(float(pos["yes_cost"]) + float(pos["no_cost"]), 6)))
 
@@ -918,6 +1010,7 @@ class RunLoop:
             "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
             "kill": kill, "pnl_day": self._pnl_day,
             "markouts": self.markouts.state(),
+            "unresolved": self.unresolved,
         }
 
     def attach_state(self, path: str) -> None:
@@ -949,13 +1042,21 @@ class RunLoop:
             row = {k: float(pos[k]) for k in ("yes", "no", "yes_cost", "no_cost")}
             row["fees"] = float(pos.get("fees", 0.0))
             row["venue"] = str(pos.get("venue") or "kalshi")
+            for key in ("close_ts", "orphan_ts"):
+                if pos.get(key) is not None:
+                    row[key] = float(pos[key])
             position[str(market)] = row
         bucket_pos = {}
         for bucket, rows in dict(data.get("bucket_pos") or {}).items():
             bucket_pos[str(bucket)] = {str(m): {k: float(v) for k, v in dict(r).items()}
                                        for m, r in dict(rows).items()}
-        settled = {str(m): {"result": str(v["result"]), "ts": v.get("ts")}
+        settled = {str(m): {"result": str(v["result"]), "ts": v.get("ts"),
+                            "source": str(v.get("source") or "ws_lifecycle")}
                    for m, v in dict(data.get("settled") or {}).items()}
+        unresolved = {str(m): {"venue": str(v.get("venue") or "pmus"), "since": float(v["since"]),
+                               "close_ts": None if v.get("close_ts") is None else float(v["close_ts"]),
+                               "cost_usd": float(v.get("cost_usd") or 0.0)}
+                      for m, v in dict(data.get("unresolved") or {}).items()}
         cooldown = {(str(m), str(sd)): float(until) for m, sd, until in list(data.get("cooldown") or [])}
         kill = data.get("kill")
         if kill is not None and not isinstance(kill, dict):
@@ -968,6 +1069,7 @@ class RunLoop:
         self.position = position
         self.bucket_pos = bucket_pos
         self.settled = settled
+        self.unresolved = {m: v for m, v in unresolved.items() if m in position and m not in settled}
         self.last_mid.update({str(m): float(v) for m, v in dict(data.get("last_mid") or {}).items()})
         if not hasattr(self, "bucket_of"):
             self.bucket_of = {}
@@ -1166,6 +1268,9 @@ class RunLoop:
                                                 "fees": 0.0, "venue": venue})
         pos.setdefault("fees", 0.0)
         pos.setdefault("venue", venue)
+        prog = self.programs.get(market)
+        if prog is not None and prog.close_ts is not None:
+            pos["close_ts"] = float(prog.close_ts)
         bucket = (getattr(self, "bucket_of", {}) or {}).get(market) or "short"
         bpos = self.bucket_pos.setdefault(bucket, {}).setdefault(
             market, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0, "fees": 0.0, "fills_n": 0.0})
@@ -2291,6 +2396,7 @@ class RunLoop:
             "fills_n": self.fills_total,
             "fills_synthetic_n": sum(self.fills_synthetic_by_venue.values()),
             "positions": self.positions_report(),
+            "unresolved_positions": self.unresolved_report(),
             "excluded_n": len(self.excluded),
             "excluded_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
             "programs_shard_unknown": shard_unknown_n,
@@ -2345,9 +2451,10 @@ class RunLoop:
         """Per-market held legs for /status (the watchdog's inventory
         source): {market: {yes, no, yes_cost, no_cost}} in contracts and USD
         cost. Settled markets are left out (their legs no longer carry
-        settlement risk)."""
+        settlement risk), and so are released unresolved positions (already
+        counted as a full loss in P&L; listed in ``unresolved_positions``)."""
         return {m: {k: round(float(p[k]), 6) for k in ("yes", "no", "yes_cost", "no_cost")}
-                for m, p in self.position.items() if m not in self.settled}
+                for m, p in self.position.items() if m not in self.settled and m not in self.unresolved}
 
     def pnl_report(self, accrual: dict | None = None) -> dict:
         """Status P&L fields. ``pnl_usd`` is an ESTIMATE: MTM markout of held
@@ -2460,7 +2567,8 @@ class RunLoop:
         minus cost. raw_est_usd = estimated raw rewards of current windows
         (capped at max_reward) plus rolled-over periods. fees_usd = Kalshi
         maker fees charged on paper fills. pnl_usd = markout + raw_est + PM US
-        rebates - fees (an estimate: rewards are not paid figures)."""
+        rebates - fees (an estimate: rewards are not paid figures). A released
+        unresolved position is valued at 0 (a full loss of its cost)."""
         tags = getattr(self, "bucket_of", {}) or {}
         out = {b: {"budget_usd": round(float((getattr(self, "bucket_budget", None) or {}).get(b, 0.0)), 2),
                    "selected_n": 0, "selected": [], "capital_usd": 0.0, "raw_est_usd": 0.0,
@@ -2487,7 +2595,8 @@ class RunLoop:
             for market, pos in rows.items():
                 cost = float(pos["yes_cost"]) + float(pos["no_cost"])
                 mark, _src = self._yes_mark(market)
-                value = 0.0 if mark is None else (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+                value = 0.0 if (mark is None or market in self.unresolved) else (
+                    float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
                 out[b]["fills_n"] += int(pos.get("fills_n", 0))
                 out[b]["synthetic_fills_n"] += int(pos.get("synthetic_n", 0))
                 out[b]["premium_usd"] += cost
@@ -2855,7 +2964,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
                                max_attempts: int | None = None,
                                refresh_s: float = PROGRAM_REFRESH_S,
                                cache: "ExchangeIndexCache | None" = None,
-                               meta=None) -> None:
+                               meta=None, settle_candidates: Callable | None = None) -> None:
     """Production books and public trades. The reader cannot place an order.
 
     Startup: load programs, screen them against the on-disk metadata cache,
@@ -2863,7 +2972,9 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
     market metadata (GET /markets?tickers=..., batched) and series
     categories in the background and add new candidates. Programs are
     re-checked every ``refresh_s``. Only the top ``LIP_CANDIDATE_TOP``
-    candidates are fed to the loop and subscribed. Transient HTTP/network/
+    candidates are fed to the loop and subscribed. Each refresh also
+    backfills settlements for ``settle_candidates()`` (held Kalshi positions
+    past close; ``_settlement_backfill``). Transient HTTP/network/
     websocket errors back off 5 s doubling to 120 s. Safety refusals
     (plain ``ReadOnlyViolation``) propagate.
     """
@@ -2879,7 +2990,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
     session = requests.Session()
     ctx = {"cache": cache or ExchangeIndexCache(), "meta": meta or MetaCache().load(),
            "fed": {}, "refresh_s": float(refresh_s), "programs": [],
-           "lock": threading.Lock()}
+           "lock": threading.Lock(), "settle_candidates": settle_candidates}
     backoff = READONLY_BACKOFF_START_S
     attempts = 0
     last_wall = None
@@ -3252,6 +3363,73 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
             seqr.check(msg)
 
 
+KALSHI_FINAL_STATUSES = ("determined", "amended", "finalized", "settled")
+
+
+def kalshi_market_result(payload: dict) -> str | None:
+    """"yes"/"no" from a GET /markets/{ticker} payload once the outcome is
+    final (status determined/amended/finalized, or legacy settled; result
+    yes/no). None otherwise: open/closed/disputed markets, scalar results.
+    docs.kalshi.com/api-reference/market/get-market."""
+    mk = payload.get("market") if isinstance(payload.get("market"), dict) else payload
+    status = str((mk or {}).get("status") or "").lower()
+    result = str((mk or {}).get("result") or "").lower()
+    if status in KALSHI_FINAL_STATUSES and result in ("yes", "no"):
+        return result
+    return None
+
+
+def _backfill_fetch(reader, tickers: list[str]) -> list[tuple[str, str]]:
+    """Thread body: read-only GET /markets/{ticker} per ticker. One
+    ticker's HTTP error is logged and skipped (retried next refresh)."""
+    from urllib.parse import quote
+    from mm.venues.readonly import ReadOnlyHTTPError
+    log = logging.getLogger("lip.readonly")
+    out = []
+    for ticker in tickers:
+        try:
+            payload = reader.get(f"/markets/{quote(ticker, safe='')}")
+        except ReadOnlyHTTPError as exc:
+            log.warning("settlement backfill %s HTTP %s", ticker, exc.status)
+            continue
+        result = kalshi_market_result(payload if isinstance(payload, dict) else {})
+        if result is not None:
+            out.append((ticker, result))
+    return out
+
+
+async def _settlement_backfill(reader, ctx: dict, on_frame, now: float | None = None) -> int:
+    """Kalshi settlements missed while the socket was down or disconnected:
+    ask GET /markets/{ticker} (read-only, GET only) for held positions past
+    close or with no program left (``ctx["settle_candidates"]``, the loop's
+    ``settle_view``), at most LIP_SETTLE_BACKFILL_MAX (50) tickers per
+    refresh, each at most once per LIP_SETTLE_POLL_S (600 s). A final yes/no
+    result is booked through the loop's ``settlement`` frame (RunLoop.settle).
+    Returns the number booked."""
+    import asyncio
+    fn = ctx.get("settle_candidates")
+    if fn is None:
+        return 0
+    now = time.time() if now is None else float(now)
+    seen = ctx.setdefault("settle_checked", {})
+    every = _env_num("LIP_SETTLE_POLL_S", 600.0)
+    due = [t for t in dict.fromkeys(fn() or []) if t and now - seen.get(t, -1e18) >= every]
+    due = due[: max(1, int(_env_num("LIP_SETTLE_BACKFILL_MAX", 50)))]
+    if not due:
+        return 0
+    for t in due:
+        seen[t] = now
+    for t in [t for t, at in seen.items() if now - at > 7 * 86400.0]:
+        del seen[t]
+    found = await asyncio.to_thread(_backfill_fetch, reader, due)
+    for ticker, result in found:
+        on_frame({"kind": "settlement", "ts": now, "market": ticker, "result": result,
+                  "source": "rest_backfill"})
+    if found:
+        logging.getLogger("lip.readonly").info("settlement backfill booked %d of %d", len(found), len(due))
+    return len(found)
+
+
 async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
     import asyncio
     log = logging.getLogger("lip.readonly")
@@ -3270,6 +3448,7 @@ async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
             if new:
                 await _subscribe(sock, new)
             await _flush_unsubscribes(sock, ctx)
+            await _settlement_backfill(reader, ctx, on_frame)
             log.info("background refresh %.1fs; subscribed %d new", time.time() - t0, len(new))
         except asyncio.CancelledError:
             raise

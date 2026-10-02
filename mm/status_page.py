@@ -30,6 +30,8 @@ LIVE_STATUS_FIELDS = (
     "positions", "fills_synthetic_n",
     # Phase 4 instrumentation (estimates, paper).
     "markout_horizons", "pnl_attribution", "event_calendar",
+    # Final review: released unresolved positions, demo-books warning.
+    "unresolved_positions", "book_source_warning",
 )
 
 

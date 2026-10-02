@@ -306,6 +306,11 @@ class _Engine:
                 loop.drain_external()  # Patch 21: PM US frames, same thread
         # Status refresh and state saves run on the EngineTimer thread.
 
+    def settle_candidates(self) -> list:
+        """Held Kalshi positions due a settlement check (the loop's
+        ``settle_view``, an immutable tuple: no lock needed)."""
+        return [m for m, venue in self.loop.settle_view if venue == "kalshi"]
+
     def mark_down(self, reason: str) -> None:
         self.down_since = time.time()
         self.on_frame({"kind": "disconnect", "ts": self.down_since, "reason": reason})
@@ -507,7 +512,8 @@ def main(argv: list[str] | None = None) -> int:
                     engine.reconnect_if_down()
                     try:
                         if plan.get("reader"):
-                            asyncio.run(drive_readonly_books(books, engine.on_frame))
+                            asyncio.run(drive_readonly_books(books, engine.on_frame,
+                                                             settle_candidates=engine.settle_candidates))
                         else:
                             asyncio.run(drive_socket(plan["url"], engine.on_frame))
                     finally:

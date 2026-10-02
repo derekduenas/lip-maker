@@ -26,6 +26,15 @@ Data (public gateway, no key; https://docs.polymarket.us/api-reference/introduct
 - GET /v1/market/slug/{slug} (endDate, orderPriceMinTickSize, marketType,
   gameStartTime, category).
 - GET /v1/markets/{slug}/book (bids/offers + stats.sharesTraded/lastTradePx).
+- GET /v1/markets/{slug}/settlement ({slug, settlement}: "Settlement price";
+  404 = not found or not settled; public gateway, no auth;
+  https://docs.polymarket.us/api-reference/markets/get-market-settlement),
+  polled for held positions past close (``poll_settlements``). Winning
+  contracts settle at $1.00, losing at $0.00
+  (https://docs.polymarket.us/learn/markets/contract-settlement); the docs
+  do not define the value further, so only exactly 1 (our YES = the PM US
+  long side wins) or 0 is booked. Any other value, or none, leaves the
+  position to RunLoop's release fallback (LIP_PMUS_UNSETTLED_RELEASE_S).
 Streaming: the Markets WebSocket (wss://api.polymarket.us/v1/ws/markets)
 requires API-key auth in the handshake
 (https://docs.polymarket.us/api-reference/websocket/markets); there is no
@@ -96,7 +105,7 @@ last-change time is unverified, and the latter would make every quiet book
 look stale. LIP_PMUS_TS_SOURCE=local ignores the headers.
 
 ORDER ENDPOINTS ARE HARD-DISABLED: the only HTTP client here is GET-only
-with a path allowlist (incentives, market book/bbo, market by slug); any
+with a path allowlist (incentives, market book/bbo/settlement, market by slug); any
 path containing "order", a "."/".." segment, a backslash or a
 percent-encoded "/", "\\", "." or "%" is refused (PMUSOrderBlocked). No API key is loaded.
 RunLoop additionally refuses any non-paper action on a pmus market.
@@ -117,7 +126,7 @@ GATEWAY = "https://gateway.polymarket.us"
 PREFIX = "PMUS:"
 _ALLOWED = (
     re.compile(r"^/v1/incentives(\?[A-Za-z0-9_=&.\-%]*)?$"),
-    re.compile(r"^/v1/markets/[A-Za-z0-9_.\-]+/(book|bbo)$"),
+    re.compile(r"^/v1/markets/[A-Za-z0-9_.\-]+/(book|bbo|settlement)$"),
     re.compile(r"^/v1/market/slug/[A-Za-z0-9_.\-]+$"),
 )
 DAY_OF_S = 6 * 3600.0
@@ -524,6 +533,26 @@ def market_meta(payload: dict, now: float) -> dict:
             "best_bid": q("bestBidQuote"), "best_ask": q("bestAskQuote"), "fetched": now}
 
 
+def settlement_result(slug: str, payload) -> str | None:
+    """"yes" / "no" from a GET /v1/markets/{slug}/settlement payload: the
+    long (our YES) side's settlement price, exactly 1 or 0, for this slug.
+    None for anything else (another slug, a missing or non-binary value)."""
+    if not isinstance(payload, dict) or str(payload.get("slug") or "") != slug:
+        return None
+    raw = payload.get("settlement")
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    try:
+        px = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if abs(px - 1.0) < 1e-9:
+        return "yes"
+    if abs(px) < 1e-9:
+        return "no"
+    return None
+
+
 class PMUSFeed:
     """Background poller (thread ``lip-pmus``) that feeds PM US frames to RunLoop.ext_queue."""
 
@@ -540,7 +569,9 @@ class PMUSFeed:
         self._next_poll: dict = {}
         self._last_get = 0.0
         self._rr = 0
+        self._settle_checked: dict = {}
         self.stats = {"refreshes": 0, "pages": 0, "records": 0, "gets": 0, "errors": 0, "http_429": 0,
+                      "settle_polls": 0, "settled": 0, "settle_unusable": 0,
                       "book_polls": 0, "trades_synth": 0, "trades_synth_dropped": 0, "blocked_writes": 0,
                       "last_error": None, "last_poll_latency_s": None,
                       "last_refresh": None, "last_book_ts": None, "refresh_s": None, "eligible": 0}
@@ -665,6 +696,44 @@ class PMUSFeed:
         self.prev[slug] = poll_state(book)
         self.stats["last_book_ts"] = ts
 
+    # ---------------------------------------------------------- settlement
+    def poll_settlements(self) -> int:
+        """GET /v1/markets/{slug}/settlement for held PM US positions the
+        loop lists as due (``loop.settle_view``: past close or no program
+        left), each at most once per LIP_PMUS_SETTLE_POLL_S (900 s). A
+        settlement of exactly 1 / 0 for the same slug becomes a
+        ``settlement`` frame (yes / no) on the loop's queue. Returns the
+        number queued."""
+        now = self.clock()
+        every = _num("LIP_PMUS_SETTLE_POLL_S", 900.0)
+        due = [m[len(PREFIX):] for m, venue in getattr(self.loop, "settle_view", ())
+               if venue == "pmus" and m.startswith(PREFIX)]
+        n = 0
+        for slug in due:
+            if now - self._settle_checked.get(slug, -1e18) < every:
+                continue
+            self._settle_checked[slug] = now
+            self.stats["settle_polls"] += 1
+            try:
+                payload = self._get(f"/v1/markets/{slug}/settlement")
+            except PMUSOrderBlocked:
+                raise
+            except Exception as exc:
+                if getattr(exc, "code", None) != 404:  # 404: not settled yet
+                    self.stats["errors"] += 1
+                    self.stats["last_error"] = f"settlement:{type(exc).__name__}"
+                continue
+            result = settlement_result(slug, payload)
+            if result is None:
+                self.stats["settle_unusable"] += 1
+                _log.warning("pmus settlement for %s not booked: %r", slug, dict(payload or {}))
+                continue
+            self._put({"kind": "settlement", "market": PREFIX + slug, "result": result,
+                       "ts": now, "source": "pmus_gateway"})
+            self.stats["settled"] += 1
+            n += 1
+        return n
+
     # -------------------------------------------------------------- thread
     def start(self) -> "PMUSFeed":
         self._thread = threading.Thread(target=self._run, name="lip-pmus", daemon=True)
@@ -677,11 +746,15 @@ class PMUSFeed:
     def _run(self) -> None:
         refresh_s = max(120.0, _num("LIP_PMUS_REFRESH_S", 900.0))
         next_refresh = 0.0
+        next_settle = 0.0
         while not self._stop.is_set():
             try:
                 if self.clock() >= next_refresh:
                     next_refresh = self.clock() + refresh_s
                     self.refresh()
+                elif self.clock() >= next_settle:
+                    next_settle = self.clock() + 60.0
+                    self.poll_settlements()
                 elif not self.poll_due():
                     self._sleep(0.25)
             except PMUSOrderBlocked:
