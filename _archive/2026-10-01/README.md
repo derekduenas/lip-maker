@@ -22,3 +22,13 @@ original repo paths.
   units. `tools/go_live_check.py`'s basis gate now reports insufficient data.
 - `monitor/ramp_controller.py` — rewrote `/etc/systemd/system/lip-maker.service`
   and restarted it.
+
+## Stale systemd units
+Every unit/timer that targeted `/root/lip-maker` or `/root/polymarket-maker`
+(the pre-APEX root install): `deploy/lip-maker.service` (set `LIP_PAPER=false`,
+ran as root, wrote the shared heartbeat), the `deploy/*.timer` + `.service`
+pairs (arb-scan, blocklist-review, dead-slot-pruner, go-live-check,
+hedge-effectiveness, lip-state-hygiene, markout-backfill, order-flow-tracker,
+unrealized-pnl), root `series-auto-prune.*`, `vpin-gate.*`, and
+`polymarket/deploy/*`. The only units kept are `deploy/lip-unattended.service`,
+`deploy/apex/lip-watchdog.service` and the drop-ins in `deploy/apex/`.
