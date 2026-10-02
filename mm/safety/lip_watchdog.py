@@ -9,8 +9,10 @@ Every ``LIP_WD_INTERVAL_S`` (30s) it checks:
   * /status unreachable           LIP_WD_STATUS_FAILS (2) consecutive failures
   * market-data feed stale        now - status.last_frame_ts > LIP_WD_FEED_STALE_S (120)
                                   (skipped for LIP_WD_GRACE_S (240) after an engine session starts)
-  * daily P&L                     < -abs(LIP_WD_DAILY_LOSS) (50). P&L = sum of bucket markout_usd
-                                  (MTM of fills, rewards excluded unless LIP_WD_PNL_INCLUDE_REWARDS=1),
+  * daily P&L                     < -abs(LIP_WD_DAILY_LOSS) (50). P&L = sum over buckets of
+                                  markout_usd - fees_usd + rebates_usd (MTM of fills net of Kalshi
+                                  maker fees and PM US rebates; rewards excluded unless
+                                  LIP_WD_PNL_INCLUDE_REWARDS=1),
                                   re-based at each UTC day and on engine restart.
   * inventory                     worst-case settlement loss of unpaired legs (+ locked loss on
                                   pairs costing > $1) > LIP_WD_MAX_INVENTORY_USD (500); paired
@@ -194,7 +196,10 @@ def _f(v):
 
 
 def session_pnl(status: dict, include_rewards: bool = False):
-    """MTM P&L of the current engine session from status buckets."""
+    """MTM P&L of the current engine session from status buckets:
+    markout_usd - fees_usd + rebates_usd per bucket (fee/rebate fields are
+    used when present; older engines report markout only), plus raw_est_usd
+    with ``include_rewards``."""
     b = status.get("buckets")
     if isinstance(b, dict) and b:
         tot = 0.0
@@ -202,6 +207,8 @@ def session_pnl(status: dict, include_rewards: bool = False):
             if not isinstance(row, dict):
                 continue
             tot += _f(row.get("markout_usd")) or 0.0
+            tot -= _f(row.get("fees_usd")) or 0.0
+            tot += _f(row.get("rebates_usd")) or 0.0
             if include_rewards:
                 tot += _f(row.get("raw_est_usd")) or 0.0
         return tot
