@@ -316,15 +316,24 @@ def pool_per_day(frame: dict) -> float:
     return float(frame.get("period_reward_usd") or 0.0) / (secs / 86400.0)
 
 
+def fv_early_feed(series: str, paper: bool) -> bool:
+    """Feed a market of a model family under LIP_FV_MIN_HOURS_TO_CLOSE (so its
+    fair value can be computed and calibrated against a live book): paper
+    mode only, FV quoting or calibration on, a station the model prices."""
+    from mm.unattended.fairvalue import fv_model_active, fv_model_supports
+    return bool(paper) and fv_model_active(series) and fv_model_supports(series)
+
+
 def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
-           top: int | None = None) -> tuple[list[dict], dict]:
+           top: int | None = None, paper: bool = False) -> tuple[list[dict], dict]:
     """Return (candidates, stats). Candidates carry market close, shard, category.
 
     Programs whose market metadata or series category is not cached yet are
     reported as ``pending_meta`` / ``pending_category`` and left out.
+    ``paper`` (default False: fail closed) allows the early feed of model
+    families (``fv_early_feed``).
     """
     from mm.selector import KalshiMarket, exclusion_reason
-    from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
     now = time.time() if now is None else float(now)
     top = candidate_top() if top is None else int(top)
     reasons: dict[str, int] = {}
@@ -373,9 +382,10 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
             target_size=float(frame.get("target_size") or 100),
             days_to_settle=days, exchange_index=meta.get("exchange_index"),
             category=category,
-            # FV-quoted family: fed under LIP_FV_MIN_HOURS_TO_CLOSE so the fair
-            # value can be computed; the loop quotes it only with a usable value.
-            fv_candidate=fv_quote_active(series) and fv_model_supports(series),
+            # Model family (paper): fed under LIP_FV_MIN_HOURS_TO_CLOSE so the
+            # fair value can be computed; the loop quotes it only with a usable
+            # value and FV quoting on.
+            fv_candidate=fv_early_feed(series, paper),
         )
         why = exclusion_reason(probe)
         if why:
@@ -424,10 +434,10 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
     return chosen, stats
 
 
-def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = None) -> list[str]:
+def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = None,
+                 paper: bool = False) -> list[str]:
     """Series still missing a category among programs that pass every non-category check."""
     from mm.selector import KalshiMarket, exclusion_reason
-    from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
     now = time.time() if now is None else float(now)
     want = []
     for frame in frames:
@@ -444,7 +454,7 @@ def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = No
             market=market, series=series, period_reward_usd=1.0, period_seconds=86400,
             seconds_left=86400, discount_factor=0.5, target_size=100,
             days_to_settle=days, exchange_index=meta.get("exchange_index"), category=None,
-            fv_candidate=fv_quote_active(series) and fv_model_supports(series),
+            fv_candidate=fv_early_feed(series, paper),
         )
         if not exclusion_reason(probe):
             want.append(series)

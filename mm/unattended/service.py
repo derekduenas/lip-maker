@@ -686,7 +686,8 @@ def main(argv: list[str] | None = None) -> int:
                     try:
                         if plan.get("reader"):
                             asyncio.run(drive_readonly_books(books, engine.on_frame,
-                                                             settle_candidates=engine.settle_candidates))
+                                                             settle_candidates=engine.settle_candidates,
+                                                             paper=mode == "paper"))
                         else:
                             asyncio.run(drive_socket(plan["url"], engine.on_frame))
                     finally:

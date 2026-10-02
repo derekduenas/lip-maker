@@ -314,20 +314,24 @@ def test_screen_keeps_strike_fields_and_feeds_kxhigh_under_fv_knob(monkeypatch, 
     frame = {"market": MKT, "series": "KXHIGHNY", "period_reward_usd": 50, "period_seconds": 86400,
              "end_ts": now + 86400, "target_size": 1000}
     monkeypatch.setenv("LIP_MIN_HOURS_TO_CLOSE", "48")
-    out, stats = SC.screen([frame], cache, now=now)
+    monkeypatch.setenv("LIP_FV_CALIB_ENABLE", "0")
+    out, stats = SC.screen([frame], cache, now=now, paper=True)
     assert out == [] and stats["reasons"].get("closes_within_48h") == 1
     _on(monkeypatch)
-    out, _ = SC.screen([frame], cache, now=now)
+    out, _ = SC.screen([frame], cache, now=now, paper=True)
     assert [f["market"] for f in out] == [MKT]
     assert out[0]["strike_type"] == "between" and out[0]["cap_strike"] == 73.0
     monkeypatch.setenv("LIP_FV_QUOTE_ENABLE", "0")
-    assert SC.screen([frame], cache, now=now)[0] == []
+    assert SC.screen([frame], cache, now=now, paper=True)[0] == []
+    # calibration alone (default on with LIP_FV_ENABLE) also feeds it early in paper
+    monkeypatch.setenv("LIP_FV_CALIB_ENABLE", "1")
+    assert [f["market"] for f in SC.screen([frame], cache, now=now, paper=True)[0]] == [MKT]
     # a KXHIGH series the model cannot price is not fed early either
     monkeypatch.setenv("LIP_FV_QUOTE_ENABLE", "1")
     lax = "KXHIGHLAX-26OCT01-B72.5"
     cache.markets[lax] = SC.market_meta(_meta_row(lax, close), now)
     cache.series["KXHIGHLAX"] = cache.series["KXHIGHNY"]
-    out, stats = SC.screen([dict(frame, market=lax, series="KXHIGHLAX")], cache, now=now)
+    out, stats = SC.screen([dict(frame, market=lax, series="KXHIGHLAX")], cache, now=now, paper=True)
     assert out == [] and stats["reasons"].get("closes_within_48h") == 1
 
 
@@ -400,6 +404,7 @@ def test_cache_bad_params_file_prices_nothing(monkeypatch, tmp_path):
 
 
 def test_cache_flag_off_does_not_price(monkeypatch):
+    monkeypatch.setenv("LIP_FV_CALIB_ENABLE", "0")    # quoting and calibration both off
     http = _Http(_ens_payload())
     cache = F.FairValueCache(session=http, sleep=lambda s: None)
     with pytest.raises(RuntimeError):

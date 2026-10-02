@@ -8,13 +8,18 @@ engine only reads the cached dict (never network on the tick path).
 The value is used only to *withhold* quotes: if |fv - kalshi_mid| exceeds
 LIP_FV_DISAGREE_CENTS, the side that would be picked off is not rested.
 
-FV-driven quoting (paper only; LIP_FV_QUOTE_ENABLE, default off): for the
-families in LIP_FV_QUOTE_FAMILIES (default KXHIGH) the cache also prices a
-model fair value (mm/unattended/fv_weather.py, source
-``open_meteo_ensemble_high``) on the same background thread. RunLoop then
-uses it to drive quoting for those markets instead of the disagreement guard
-(``side_edge_cents`` / ``side_ev_usd_day`` below; RunLoop._fv_quote_row).
-Markets in every other family keep the defensive guard only.
+Model fair value: for the families in LIP_FV_QUOTE_FAMILIES (default
+KXHIGH) the cache also prices a model fair value
+(mm/unattended/fv_weather.py, source ``open_meteo_ensemble_high``) on the
+same background thread when FV quoting (LIP_FV_QUOTE_ENABLE, default off) or
+calibration (LIP_FV_CALIB_ENABLE, default on with LIP_FV_ENABLE) is on.
+Calibration only records it (RunLoop._fv_calib_tick). FV-driven quoting
+(paper only) uses it to drive quoting for those markets instead of the
+disagreement guard (``side_edge_cents`` / ``side_ev_usd_day`` below;
+RunLoop._fv_quote_row). A model value is used by RunLoop only in paper mode
+(never by the guard or markouts outside paper) and by the guard only when
+FV quoting is on for its family. Markets in every other family keep the
+defensive guard only.
 """
 from __future__ import annotations
 
@@ -69,6 +74,25 @@ def fv_quote_enabled() -> bool:
     """LIP_FV_QUOTE_ENABLE (default 0): model fair value drives paper quoting
     for the LIP_FV_QUOTE_FAMILIES series. Needs LIP_FV_ENABLE for the cache."""
     return _env("LIP_FV_QUOTE_ENABLE", 0.0) > 0
+
+
+def fv_calib_enabled() -> bool:
+    """LIP_FV_CALIB_ENABLE (default 1; needs LIP_FV_ENABLE): price the model
+    families (LIP_FV_QUOTE_FAMILIES) and record calibration samples
+    (mm/unattended/fv_calib.py) even when FV-driven quoting is off. Paper
+    data collection only: it changes no quote."""
+    return enabled() and _env("LIP_FV_CALIB_ENABLE", 1.0) > 0
+
+
+def fv_model_active(series: str) -> bool:
+    """The model prices ``series`` (cache targets, calibration watch, the
+    screen's early feed in paper): FV quoting OR calibration is on and the
+    series is in one of LIP_FV_QUOTE_FAMILIES. Quoting itself uses
+    ``fv_quote_active``."""
+    if not (fv_quote_enabled() or fv_calib_enabled()):
+        return False
+    s = str(series or "").upper()
+    return any(s.startswith(p) for p in fv_quote_families())
 
 
 def fv_quote_families() -> tuple:
@@ -392,8 +416,7 @@ class FairValueCache:
                            "pm_slug": row.get("slug"), "kalshi_title": title, "ts": now}
         if pm_error is not None:
             out.update({k: v for k, v in self.values.items() if v.get("source") == "polymarket" and k in targets})
-        if fv_quote_enabled():
-            out.update(self._high_rows([m for m in targets if fv_quote_active(m.split("-", 1)[0])], now))
+        out.update(self._high_rows([m for m in targets if fv_model_active(m.split("-", 1)[0])], now))
         if _env("LIP_FV_WEATHER", 1.0) > 0:
             for market in targets:
                 if market.startswith("KXRAINWKND") and market not in out:
@@ -418,8 +441,9 @@ class FairValueCache:
             raise pm_error  # counted in stats["errors"] by the refresh thread
 
     def _high_rows(self, markets: list, now: float) -> dict:
-        """Model fair value for FV-quoted daily-HIGH markets (fv_weather).
-        No parameters file, or an unreadable one, prices nothing."""
+        """Model fair value for daily-HIGH markets of the model families
+        (fv_weather; FV quoting or calibration on). No LIP_FV_WX_PARAMS_FILE:
+        the unfitted defaults; a set but unreadable file prices nothing."""
         from mm.unattended import fv_weather as W
         if not markets:
             return {}

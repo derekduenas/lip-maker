@@ -1390,23 +1390,41 @@ class RunLoop:
             return str(pos["venue"])
         return "pmus" if str(market).startswith("PMUS:") else "kalshi"
 
+    def _model_row_allowed(self, market: str, row: dict, *, guard: bool = False) -> bool:
+        """A model (fv_weather) fair value is used only in paper mode, and by
+        the defensive guard only when FV quoting is on for its family; other
+        sources (Polymarket match, rain ensemble) are not restricted here."""
+        from mm.unattended.fv_weather import SOURCE
+        if row.get("source") != SOURCE:
+            return True
+        if self.mode != "paper":
+            return False
+        if guard:
+            from mm.unattended.fairvalue import fv_quote_active
+            prog = self.programs.get(market)
+            series = prog.series if prog is not None else str(market).split("-", 1)[0]
+            return fv_quote_active(series)
+        return True
+
     def _fv_side_cents(self, market: str, side: str):
         """External fair value of one side in cents, or None when the fair
-        value cache (Kalshi markets only) has no current value for it."""
+        value cache (Kalshi markets only) has no current value for it (a
+        model value outside paper mode counts as none)."""
         if self.fv is None or self._venue(market) != "kalshi":
             return None
         row = self.fv.get(market, now=time.time())
-        if row is None or row.get("fv_cents") is None:
+        if row is None or row.get("fv_cents") is None or not self._model_row_allowed(market, row):
             return None
         fv = float(row["fv_cents"])
         return fv if side == "yes" else 100.0 - fv
 
     def _fv_note_program(self, market: str, prog: "_Program", row: dict) -> None:
-        """FV-driven quoting: ask the fair-value cache to price this market
-        (its targets include ``_fv_wanted``) and hand it the strike fields
-        from the screen's metadata."""
-        from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
-        if prog.venue != "kalshi" or not fv_quote_active(prog.series) or not fv_model_supports(prog.series):
+        """Model families (FV quoting or calibration on): ask the fair-value
+        cache to price this market (its targets include ``_fv_wanted``), put
+        it in the calibration watch and hand the cache the strike fields from
+        the screen's metadata."""
+        from mm.unattended.fairvalue import fv_model_active, fv_model_supports
+        if prog.venue != "kalshi" or not fv_model_active(prog.series) or not fv_model_supports(prog.series):
             return
         self._fv_wanted.add(market)
         self._fv_calib_watch_add(market, prog.series, prog.close_ts)
@@ -1539,7 +1557,7 @@ class RunLoop:
         if self.fv is None or ts - self._fv_calib_at < _env_num("LIP_FV_CALIB_EVERY_S", 30.0):
             return
         self._fv_calib_at = ts
-        from mm.unattended.fairvalue import fv_quote_active
+        from mm.unattended.fairvalue import fv_model_active
         from mm.unattended.fv_calib import event_of
         from mm.unattended.fv_weather import SOURCE
         self._fv_calib_watch_expire(ts)
@@ -1554,7 +1572,7 @@ class RunLoop:
                 series = self.fv_calib_watch[market]["series"]
             else:
                 continue
-            if not fv_quote_active(series):
+            if not fv_model_active(series):
                 continue
             row = self.fv.get(market, now=time.time())
             if row is None or row.get("source") != SOURCE or row.get("fv_cents") is None:
@@ -1896,7 +1914,7 @@ class RunLoop:
             return ()
         self._fv_wanted.add(market)
         row = self.fv.get(market, now=time.time())
-        if row is None:
+        if row is None or not self._model_row_allowed(market, row, guard=True):
             self._fv_state.pop(market, None)
             return ()
         yb, nb = self._best(market)
@@ -3472,8 +3490,11 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
                                max_attempts: int | None = None,
                                refresh_s: float = PROGRAM_REFRESH_S,
                                cache: "ExchangeIndexCache | None" = None,
-                               meta=None, settle_candidates: Callable | None = None) -> None:
+                               meta=None, settle_candidates: Callable | None = None,
+                               paper: bool = False) -> None:
     """Production books and public trades. The reader cannot place an order.
+    ``paper`` (False: fail closed) lets the screen feed model families early
+    (screen.fv_early_feed); the service passes True only in paper mode.
 
     Startup: load programs, screen them against the on-disk metadata cache,
     connect the websocket for the cached candidates, then fetch missing
@@ -3498,7 +3519,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
     session = requests.Session()
     ctx = {"cache": cache or ExchangeIndexCache(), "meta": meta or MetaCache().load(),
            "fed": {}, "refresh_s": float(refresh_s), "programs": [],
-           "lock": threading.Lock(), "settle_candidates": settle_candidates}
+           "lock": threading.Lock(), "settle_candidates": settle_candidates, "paper": bool(paper)}
     backoff = READONLY_BACKOFF_START_S
     attempts = 0
     last_wall = None
@@ -3778,7 +3799,7 @@ def _refresh_meta(reader, ctx: dict) -> None:
         stale = meta.stale_markets(tickers)
         if stale:
             meta.fetch_markets(reader, stale)
-        missing = needs_series(programs, meta) + meta.stale_series(
+        missing = needs_series(programs, meta, paper=bool(ctx.get("paper"))) + meta.stale_series(
             {str(f.get("series") or "") for f in programs if f.get("market") in ctx["fed"]})
         missing = [s for s in dict.fromkeys(missing) if s]
         if missing:
@@ -3792,7 +3813,7 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
     if not ctx["lock"].acquire(blocking=False):
         return []
     try:
-        candidates, stats = screen(ctx["programs"], ctx["meta"])
+        candidates, stats = screen(ctx["programs"], ctx["meta"], paper=bool(ctx.get("paper")))
     finally:
         ctx["lock"].release()
     new = _feed_programs(candidates, ctx["fed"], on_frame, ctx.setdefault("sigs", {}))
