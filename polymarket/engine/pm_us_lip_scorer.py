@@ -33,6 +33,11 @@ against a real payout statement):
       the ask side; a side that does not qualify forfeits its half.
   A2. At the level where the walk reaches Target Size, every order at that
       price level scores (the docs say "orders within that range score").
+  A3. A program window's rewardPool is divided across the distinct active
+      member markets carrying the same (programId, period) (see
+      ``split_pool_usd``; LIP_PMUS_POOL_SPLIT=market opts out). Shared with
+      mm/unattended/pmus_paper.py. Pending reconciliation against
+      GET /v1/incentives/earnings.
 Prices are handled in integer ticks to avoid float drift (tick 0.01 or
 0.001 dollars).
 """
@@ -215,13 +220,85 @@ def effective_pool_from_market(market: dict) -> float:
     return effective_reward_pool_usd(float(raw or 0), int(n or 1))
 
 
+# ---------------------------------------------------------------- pool split
+# ONE rule for every PM US consumer (this module, mm/unattended/pmus_paper.py,
+# mm/selector.pm_quote_economics): a program window's pool is keyed by
+# (programId, period) and, by default, divided across the distinct member
+# markets that carry that key with status "active".
+#
+# Why "members" is the default: the docs define rewardPool as the "Total
+# reward pool for this period in USD" without saying whether it is per
+# market; the changelog quotes budgets "per game" / "per event"; live, one
+# programId repeats an identical pool across 9-41 (and up to thousands of)
+# markets. Dividing is the conservative reading. It is an ASSUMPTION until
+# it is reconciled against GET /v1/incentives/earnings (authenticated; not
+# called by this repo). LIP_PMUS_POOL_SPLIT=market opts in to the optimistic
+# whole-pool-per-market reading; any other value means "members".
+POOL_SPLIT_ENV = "LIP_PMUS_POOL_SPLIT"
+POOL_SPLIT_DEFAULT = "members"
+POOL_SPLIT_MODES = ("members", "market")
+
+
+def pool_split_mode(environ=None) -> str:
+    """``members`` (default, conservative) or ``market`` (explicit opt-in)."""
+    import os
+    env = os.environ if environ is None else environ
+    raw = str(env.get(POOL_SPLIT_ENV) or POOL_SPLIT_DEFAULT).strip().lower()
+    return raw if raw in POOL_SPLIT_MODES else POOL_SPLIT_DEFAULT
+
+
+def pool_key(program_id, period) -> tuple[str, str]:
+    return (str(program_id or ""), str(period or ""))
+
+
+def _is_active_liquidity(tp: dict) -> bool:
+    return (tp.get("programType", "liquidityProgram") == "liquidityProgram"
+            and str(tp.get("status", "")) == "active")
+
+
+def count_pool_members(records: Iterable[dict]) -> Counter:
+    """Distinct member markets per (programId, period) among active
+    liquidityProgram periods of gateway /v1/incentives records."""
+    seen: set = set()
+    counts: Counter = Counter()
+    for rec in records:
+        slug = str(rec.get("marketSlug") or "")
+        for tp in rec.get("timePeriods") or []:
+            if not _is_active_liquidity(tp):
+                continue
+            key = pool_key(tp.get("programId"), tp.get("period"))
+            if (key, slug) in seen:
+                continue
+            seen.add((key, slug))
+            counts[key] += 1
+    return counts
+
+
+def split_pool_usd(reward_pool_usd: float, n_markets: int, mode: Optional[str] = None) -> float:
+    """The pool one member market is credited with under ``mode``."""
+    mode = pool_split_mode() if mode is None else mode
+    if mode == "market":
+        return float(reward_pool_usd) if reward_pool_usd > 0 else 0.0
+    return effective_reward_pool_usd(reward_pool_usd, max(1, int(n_markets)))
+
+
 def with_shared_pools(programs: list[PMProgram]) -> list[PMProgram]:
-    """Mark every market with how many siblings share its program window."""
-    counts = Counter((p.program_id, p.period) for p in programs)
-    return [
-        replace(p, n_markets=counts[(p.program_id, p.period)])
-        for p in programs
-    ]
+    """Mark every market with how many siblings share its program window
+    (same keying as ``count_pool_members``: distinct active members per
+    (program_id, period); a non-active program counts every sibling)."""
+    active: dict = {}
+    every: dict = {}
+    for p in programs:
+        key = pool_key(p.program_id, p.period)
+        every.setdefault(key, set()).add(p.market_slug)
+        if p.status == "active":
+            active.setdefault(key, set()).add(p.market_slug)
+    out = []
+    for p in programs:
+        key = pool_key(p.program_id, p.period)
+        members = active.get(key) if p.status == "active" else every.get(key)
+        out.append(replace(p, n_markets=max(1, len(members or ()))))
+    return out
 
 
 def payable(amount_usd: float) -> float:

@@ -37,6 +37,9 @@ observed would have reached us:
 
 Every fill carries the trade_id that caused it, so a fill can be traced back
 to a real, public, timestamped market event rather than to a coin flip.
+A trade tagged ``synthetic`` (PM US: inferred from two book polls, see
+mm/unattended/pmus_paper.synth_trades) is not a public print; its fills
+carry ``synthetic: True`` so reports can label them low fidelity.
 
 What it still cannot know
 -------------------------
@@ -233,6 +236,10 @@ class PaperFillSimulator:
                         "side": o.side, "price_cents": o.price_cents,
                         "count": got, "trade_id": tid, "ts": t_ts,
                         "program_id": o.program_id}
+                if tr.get("synthetic"):
+                    # Inferred from book polls (PM US), not a public trade:
+                    # downstream reports label this fill low fidelity.
+                    fill["synthetic"] = True
                 self._record({"kind": "paper_fill", "fill": fill})
                 fills.append(fill)
                 if o.remaining <= 0:

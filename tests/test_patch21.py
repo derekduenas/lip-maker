@@ -171,7 +171,7 @@ def _meta(close_days, tick=0.01, mtype="futures"):
             "fetched": NOW}
 
 
-def test_records_policy_pool_per_market_and_meta(monkeypatch):
+def test_records_policy_pool_split_and_meta(monkeypatch):
     monkeypatch.delenv("LIP_PMUS_POOL_SPLIT", raising=False)
     monkeypatch.setenv("LIP_MIN_HOURS_TO_CLOSE", "48")  # live policy.conf
     frames, stats, need = P.records_to_programs(REC, {}, now=NOW)
@@ -181,12 +181,13 @@ def test_records_policy_pool_per_market_and_meta(monkeypatch):
     frames, stats, need = P.records_to_programs(REC, meta, now=NOW)
     assert [f["market"] for f in frames] == ["PMUS:rtc-bb-2026-10-01-a"]
     f = frames[0]
-    assert f["venue"] == "pmus" and f["period_reward_usd"] == 1000 and f["period_seconds"] == 86400
+    # default: the p1 pool (1000) is divided across its 2 member markets
+    assert f["venue"] == "pmus" and f["period_reward_usd"] == 500 and f["period_seconds"] == 86400
     assert f["max_spread_usd"] == 0.055 and f["occurrence_ts"] is None and f["exchange_index"] == 0
     assert any(k.startswith("closes_within") for k in stats["reasons"])  # 1.5 d < 48 h policy
-    monkeypatch.setenv("LIP_PMUS_POOL_SPLIT", "members")
+    monkeypatch.setenv("LIP_PMUS_POOL_SPLIT", "market")
     frames, _s, _n = P.records_to_programs(REC, {"rtc-bb-2026-10-01-a": _meta(15)}, now=NOW)
-    assert frames[0]["period_reward_usd"] == 500  # Patch 20 split, opt-in only
+    assert frames[0]["period_reward_usd"] == 1000  # whole pool per market, opt-in only
     frames, stats, _n = P.records_to_programs(REC[:1], {"rtc-bb-2026-10-01-a": _meta(15, tick=0.001)}, now=NOW)
     assert frames == [] and stats["reasons"].get("subcent_tick") == 1
 
@@ -198,10 +199,14 @@ def test_book_frame_and_trade_prints():
     fr = P.book_frame("a-b", book, 5.0)
     assert fr["msg"]["yes_dollars_fp"] == [["0.4000", "300.0000"]]
     assert fr["msg"]["no_dollars_fp"] == [["0.5500", "200.0000"]]
-    tr = P.synth_trades("a-b", {"shares_traded": 1000.0, "bb": 0.40, "bo": 0.45}, book, 5.0)
+    # the print is capped by the depth drop on the side it hits (bids 400 -> 300 here)
+    prev = {"shares_traded": 1000.0, "bb": 0.40, "bo": 0.45, "bids": [(0.40, 400.0)], "offers": [(0.45, 200.0)]}
+    tr = P.synth_trades("a-b", prev, book, 5.0)
     assert len(tr) == 1 and tr[0]["trade"]["taker_side"] == "no" and tr[0]["trade"]["count"] == 50
-    assert P.synth_trades("a-b", {"shares_traded": 1000.0, "bb": 0.38, "bo": 0.39}, book, 5.0)[0][
-        "trade"]["taker_side"] == "yes"
+    prev = {"shares_traded": 1000.0, "bb": 0.38, "bo": 0.39, "bids": [(0.38, 10.0)], "offers": [(0.39, 100.0)]}
+    assert P.synth_trades("a-b", prev, book, 5.0)[0]["trade"]["taker_side"] == "yes"
+    # no depth in the previous poll state -> no print
+    assert P.synth_trades("a-b", {"shares_traded": 1000.0, "bb": 0.40, "bo": 0.45}, book, 5.0) == []
     assert P.synth_trades("a-b", None, book, 5.0) == []
 
 

@@ -7,8 +7,12 @@ floor are ``kalshi_period_payout``. A caller may pass a per-series
 multiplier from matched paid/estimate ratios. The default multiplier is 1.
 This module does not fit a factor to April or May 2026 payouts.
 
-Polymarket US ranking waits. A caller that asks for it is told so and
-is not scored with the repeated reward-pool figure.
+Polymarket US markets (``venue="pmus"``) ARE scored here, by the same
+``quote_economics`` path: PM US reward rules (``ProgramParams.rules ==
+"pmus"``), reward-optimal rungs (``pmus_side_rung``) and the maker rebate.
+Their pool is the per-member split decided by
+polymarket/engine/pm_us_lip_scorer.split_pool_usd (applied upstream in
+mm/unattended/pmus_paper.records_to_programs).
 
 Our size is merged into the book before the share is computed, and the
 same size is passed as our quotes. The quote price is the LIP reference
@@ -179,7 +183,8 @@ class Selection:
 
 
 def defer_polymarket(market: str) -> tuple[str, str]:
-    """PM US selection is a later round. Do not score the repeated pool."""
+    """Legacy (pre-Patch 21) marker, kept for old callers/tests. The unattended
+    loop scores PM US through ``quote_economics``; nothing live calls this."""
     return market, "pm_us_deferred"
 
 
@@ -812,9 +817,15 @@ def demo_selection() -> Selection:
                     per_market_usd=100, per_series_usd=200, per_category_usd=300)
 
 
+# ---------------------------------------------------------------------------
+# NOT USED BY THE LIVE/PAPER LOOP. ``PMQuote`` / ``pm_quote_economics`` /
+# ``rank_cross_venue`` are a research/test-only side path (tests/test_compound_pm,
+# tests/test_audit_fixes). The paper loop scores PM US through
+# ``quote_economics`` above. Both use the same pool rule
+# (pm_us_lip_scorer.split_pool_usd, LIP_PMUS_POOL_SPLIT).
 @dataclass
 class PMQuote:
-    """One PM US market scored with the shared program pool.
+    """One PM US market scored with the shared program pool (test/research only).
 
     ``reward_pool_usd`` is the figure the gateway repeats. ``n_markets`` is
     the member count that figure is divided by. Fills are expected contracts
@@ -842,12 +853,14 @@ class PMQuote:
 def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, float]:
     """Return net $/day, capital, $/day per $, reward $/day, rebate $/day.
 
-    Presence is the whole period at the current snapshot share. The pool
-    is the effective (shared) pool. ``payable`` is not applied: the $1
-    unit on PM US is not verified.
+    Test/research only (see the note above ``PMQuote``). Presence is the
+    whole period at the current snapshot share. The pool follows
+    ``split_pool_usd`` (default: divided by ``n_markets``), the same rule as
+    the paper feed. ``payable`` is not applied: the $1 unit on PM US is not
+    verified.
     """
     from polymarket.engine.pm_us_lip_scorer import (
-        Order, effective_reward_pool_usd, score_snapshot,
+        Order, score_snapshot, split_pool_usd,
     )
     from mm.accounting import pm_us_maker_rebate_usd
 
@@ -859,7 +872,7 @@ def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, floa
         bids, asks, tick=quote.tick, discount_factor=quote.discount_factor,
         target_size=quote.target_size, max_spread_usd=quote.max_spread_usd,
     )
-    effective = effective_reward_pool_usd(quote.reward_pool_usd, quote.n_markets)
+    effective = split_pool_usd(quote.reward_pool_usd, quote.n_markets)
     days = quote.period_seconds / 86400.0
     reward = (effective * snap.our_share / days) if days > 0 else 0.0
     rebate = float(pm_us_maker_rebate_usd(quote.fill_price_cents, quote.fill_contracts))
@@ -872,7 +885,7 @@ def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, floa
 def rank_cross_venue(kalshi: list[KalshiMarket], pm: list[PMQuote], *,
                      kalshi_size: float = 100.0,
                      series_factors: dict[str, float] | None = None) -> list[tuple[str, str, float]]:
-    """Kalshi and PM US together, best net $/day per $ first.
+    """Kalshi and PM US together, best net $/day per $ first (test/research only).
 
     Kalshi uses ``quote_economics``. PM uses the shared pool and the
     per-fill maker rebate. Fees on Kalshi come from the series fee type
