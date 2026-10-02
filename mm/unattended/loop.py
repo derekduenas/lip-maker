@@ -1286,8 +1286,8 @@ class RunLoop:
         """FV-driven quoting: ask the fair-value cache to price this market
         (its targets include ``_fv_wanted``) and hand it the strike fields
         from the screen's metadata."""
-        from mm.unattended.fairvalue import fv_quote_active
-        if prog.venue != "kalshi" or not fv_quote_active(prog.series):
+        from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
+        if prog.venue != "kalshi" or not fv_quote_active(prog.series) or not fv_model_supports(prog.series):
             return
         self._fv_wanted.add(market)
         hint = {k: row.get(k) for k in ("strike_type", "floor_strike", "cap_strike") if row.get(k) is not None}

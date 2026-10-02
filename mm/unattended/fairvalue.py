@@ -86,6 +86,13 @@ def fv_quote_active(series: str) -> bool:
     return any(s.startswith(p) for p in fv_quote_families())
 
 
+def fv_model_supports(series: str) -> bool:
+    """A model can price this series (fv_weather.STATIONS: verified daily-HIGH
+    settlement stations only)."""
+    from mm.unattended.fv_weather import station_for
+    return station_for(series) is not None
+
+
 def fv_min_conf() -> float:
     """LIP_FV_MIN_CONF (0.6): minimum confidence for a fair value to be used."""
     return _env("LIP_FV_MIN_CONF", 0.6)

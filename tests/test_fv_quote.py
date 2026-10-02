@@ -220,6 +220,8 @@ def test_program_registers_fv_target_and_strike_hint(monkeypatch):
     assert loop.fv.hints[MKT] == {"strike_type": "between", "floor_strike": 72, "cap_strike": 73}
     loop.end_program(MKT)
     assert MKT not in loop._fv_wanted and MKT not in loop._fv_hints
+    _prog(loop, market="KXHIGHLAX-26OCT01-B72.5")       # unsupported station: not a target
+    assert "KXHIGHLAX-26OCT01-B72.5" not in loop._fv_wanted
 
 
 # ---------------------------------------------------------------- loop: selection
@@ -320,6 +322,13 @@ def test_screen_keeps_strike_fields_and_feeds_kxhigh_under_fv_knob(monkeypatch, 
     assert out[0]["strike_type"] == "between" and out[0]["cap_strike"] == 73.0
     monkeypatch.setenv("LIP_FV_QUOTE_ENABLE", "0")
     assert SC.screen([frame], cache, now=now)[0] == []
+    # a KXHIGH series the model cannot price is not fed early either
+    monkeypatch.setenv("LIP_FV_QUOTE_ENABLE", "1")
+    lax = "KXHIGHLAX-26OCT01-B72.5"
+    cache.markets[lax] = SC.market_meta(_meta_row(lax, close), now)
+    cache.series["KXHIGHLAX"] = cache.series["KXHIGHNY"]
+    out, stats = SC.screen([dict(frame, market=lax, series="KXHIGHLAX")], cache, now=now)
+    assert out == [] and stats["reasons"].get("closes_within_48h") == 1
 
 
 # ---------------------------------------------------------------- fair-value cache wiring

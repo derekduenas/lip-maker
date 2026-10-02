@@ -324,7 +324,7 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
     reported as ``pending_meta`` / ``pending_category`` and left out.
     """
     from mm.selector import KalshiMarket, exclusion_reason
-    from mm.unattended.fairvalue import fv_quote_active
+    from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
     now = time.time() if now is None else float(now)
     top = candidate_top() if top is None else int(top)
     reasons: dict[str, int] = {}
@@ -375,7 +375,7 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
             category=category,
             # FV-quoted family: fed under LIP_FV_MIN_HOURS_TO_CLOSE so the fair
             # value can be computed; the loop quotes it only with a usable value.
-            fv_candidate=fv_quote_active(series),
+            fv_candidate=fv_quote_active(series) and fv_model_supports(series),
         )
         why = exclusion_reason(probe)
         if why:
@@ -427,7 +427,7 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
 def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = None) -> list[str]:
     """Series still missing a category among programs that pass every non-category check."""
     from mm.selector import KalshiMarket, exclusion_reason
-    from mm.unattended.fairvalue import fv_quote_active
+    from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
     now = time.time() if now is None else float(now)
     want = []
     for frame in frames:
@@ -444,7 +444,7 @@ def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = No
             market=market, series=series, period_reward_usd=1.0, period_seconds=86400,
             seconds_left=86400, discount_factor=0.5, target_size=100,
             days_to_settle=days, exchange_index=meta.get("exchange_index"), category=None,
-            fv_candidate=fv_quote_active(series),
+            fv_candidate=fv_quote_active(series) and fv_model_supports(series),
         )
         if not exclusion_reason(probe):
             want.append(series)
