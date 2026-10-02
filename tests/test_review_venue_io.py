@@ -180,3 +180,30 @@ def test_screen_excludes_subcent_markets(monkeypatch):
         assert len(out) == n, stats
         if not n:
             assert stats["reasons"] == {"subcent_tick": 1}
+
+
+# ------------------------------------------------------------------ item 15
+def test_series_factor_is_clamped_ratio_of_sums_of_statement_rows():
+    from engine.lip_calibration import RatioObs, series_factors
+    D = Decimal
+    # proofs/engine/t5_calib.py: one tiny estimate used to dominate the mean of ratios
+    obs = [RatioObs("KXA", D("1.00"), D("12.00")), RatioObs("KXA", D("40.00"), D("30.00"))]
+    f = series_factors(obs, strength=5)
+    assert f["KXA"] == pytest.approx((2 * (42 / 41) + 5 * 1.0) / 7)
+    # clamped to [0, 2]
+    f = series_factors([RatioObs("KXB", D("10"), D("50"))], strength=5)
+    assert f["KXB"] == pytest.approx((1 * 2.0 + 5 * 1.0) / 6)
+    f = series_factors([RatioObs("KXC", D("10"), D("-5"))], strength=0)
+    assert f["KXC"] == 0.0
+    # inferred (balance-residual) rows carry no per-series information
+    inferred = [RatioObs("KXD", D("10"), D("30"), inferred=True)]
+    assert series_factors(inferred) == {}
+    mixed = series_factors(obs + [RatioObs("KXA", D("1"), D("100"), inferred=True)], strength=5)
+    assert mixed["KXA"] == pytest.approx((2 * (42 / 41) + 5) / 7)
+
+
+def test_inferred_credits_say_they_are_not_calibration_input():
+    from engine.lip_reconcile import infer_reward_credits
+    out = infer_reward_credits(balance_delta_usd=50, shares={"KXA-1": Decimal("10"), "KXB-1": Decimal("30")})
+    assert out["credits"] and all(c["calibration_eligible"] is False for c in out["credits"])
+    assert out["calibration_eligible"] is False
