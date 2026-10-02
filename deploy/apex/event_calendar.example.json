@@ -1,0 +1,12 @@
+{
+  "_comment": "EXAMPLE ONLY. The dates below are placeholders in 2099, not real release dates. The operator must maintain this file with real, verified event times (official release calendars) before relying on it; this repository does not know them. Copy to e.g. /etc/lip-maker/event_calendar.json and set LIP_EVENT_CALENDAR_FILE to that path. Each event pulls and refuses quotes on every market whose series or ticker starts with one of series_prefixes, from 'at' - pre_minutes to 'at' + post_minutes (loop clock). 'at' must carry a timezone (Z or an offset). A configured file that is missing or invalid blocks ALL markets (fail closed).",
+  "defaults": {"pre_minutes": 30, "post_minutes": 30},
+  "events": [
+    {"name": "EXAMPLE CPI release (placeholder date)", "series_prefixes": ["KXCPI"],
+     "at": "2099-01-15T13:30:00Z", "pre_minutes": 30, "post_minutes": 15},
+    {"name": "EXAMPLE FOMC decision (placeholder date)", "series_prefixes": ["KXFED"],
+     "at": "2099-01-28T19:00:00Z", "pre_minutes": 60, "post_minutes": 30},
+    {"name": "EXAMPLE payrolls release (placeholder date)", "series_prefixes": ["KXPAYROLLS"],
+     "at": "2099-02-05T13:30:00Z"}
+  ]
+}

@@ -321,6 +321,11 @@ class RunLoop:
         # Phase 4: multi-horizon fill markouts (measurement only).
         from mm.unattended.markouts import MarkoutBook
         self.markouts = MarkoutBook()
+        # Phase 4: operator-maintained scheduled-event calendar
+        # (LIP_EVENT_CALENDAR_FILE; unset = no pulls).
+        from config.event_calendar import EventCalendar
+        self.calendar = EventCalendar.from_env()
+        self._calendar_alerted: str | None = None
         self.state_path: str | None = None
         self.state_error: str | None = None
         self._state_dirty = False
@@ -1239,7 +1244,22 @@ class RunLoop:
                 return "event_inventory"
         return ""
 
+    def _calendar_block(self, market: str, ts: float) -> str:
+        """Scheduled-event window (config/event_calendar.py): "scheduled_event",
+        "scheduled_event_calendar_error" (configured file unusable: fail
+        closed, alerted once per error), or ""."""
+        prog = self.programs.get(market)
+        why = self.calendar.check(prog.series if prog is not None else "", market, ts)
+        if why and why != "scheduled_event" and self._calendar_alerted != self.calendar.error:
+            self._calendar_alerted = self.calendar.error
+            self._alert("CRITICAL", f"event calendar {self.calendar.path} unusable "
+                                    f"({self.calendar.error}): quoting blocked on every market")
+        return why
+
     def _policy_block(self, market: str, ts: float) -> str:
+        why = self._calendar_block(market, ts)
+        if why:
+            return why
         if self.cooldown.get((market, "*"), 0.0) > ts:
             return "move_cooldown"
         if self._in_event_window(market, ts):
@@ -1304,13 +1324,18 @@ class RunLoop:
         self._cancel(market, reason)
 
     def _guard_resting(self, ts: float) -> None:
-        """Once a second: event window, trade-through, fast move, re-peg."""
+        """Once a second: scheduled-event calendar, event window,
+        trade-through, fast move, re-peg."""
         move = _env_num("LIP_PULL_MOVE_CENTS", 0.0)
         cool = _env_num("LIP_MOVE_COOLDOWN_S", 600.0)
         repeg = _env_num("LIP_REPEG_MIN_S", 0.0)
         for market in list(self.resting):
             quote = self.resting.get(market)
             if quote is None or market not in self.accruals:
+                continue
+            why = self._calendar_block(market, ts)
+            if why:
+                self._pull_one(market, why, ts, 0.0)
                 continue
             if self._in_event_window(market, ts):
                 self._pull_one(market, "event_window", ts, 0.0)
@@ -1899,6 +1924,10 @@ class RunLoop:
         if self.kill is not None:
             self._cancel(market, self.kill["reason"])
             return False
+        why = self._calendar_block(market, ts)
+        if why:
+            self._cancel(market, why)
+            return False
         if self._inside_close(market, ts):
             self._cancel(market, "close_cutoff")
             return False
@@ -2190,6 +2219,7 @@ class RunLoop:
             "fills_detail": list(self.fill_marks)[-20:],
             "markouts": self.markout_summary(),
             "markout_horizons": self.markouts.report(),
+            "event_calendar": self.calendar.summary(self.now or None),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),
             "repegs_n": self.repegs_n,
