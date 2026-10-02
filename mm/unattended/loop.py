@@ -284,6 +284,10 @@ class RunLoop:
         self._fv_hints: dict = {}
         self._fv_admitted: set = set()
         self.fv_quote_stats: dict = {}
+        # Out-of-sample scoring of model fair values vs the book (measurement).
+        from mm.unattended.fv_calib import FVCalibration
+        self.fv_calib = FVCalibration()
+        self._fv_calib_at = 0.0
         # Patch 18: inventory skew counters.
         self.skew_stats: dict = {}
         # Patch 21: external venue frames (PM US poller thread -> this loop).
@@ -680,6 +684,8 @@ class RunLoop:
         for market in gone:
             self.end_program(market, "program_ended")
         self._fv_wanted &= set(self.programs)
+        if self.fv_calib.prune(ts):
+            self._state_dirty = True
         # closed periods restored for markets that are no longer fed
         for market in [m for m in self.closed_periods if m not in self.programs]:
             self._fold_closed_period(market, self._venue_of(market))
@@ -746,10 +752,14 @@ class RunLoop:
         every Kalshi market, so a market with neither a position nor a
         program here is ignored (nothing to settle, and nothing is stored for
         it). A position whose result never arrives stays marked at its last
-        mark and is listed in status (see ``_check_settlements``)."""
+        mark and is listed in status (see ``_check_settlements``). A market
+        with recorded model fair values is scored first (``fv_calib``)."""
         result = str(result).lower()
         if result not in ("yes", "no") or market in self.settled:
             return
+        if self.fv_calib.on_settle(market, result):
+            # Scored even with nothing held (fv_calib: model vs book).
+            self._state_dirty = True
         if market not in self.position and market not in self.programs:
             return
         self.unresolved.pop(market, None)
@@ -1087,6 +1097,7 @@ class RunLoop:
             "kill": kill, "pnl_day": self._pnl_day,
             "markouts": self.markouts.state(),
             "unresolved": self.unresolved,
+            "fv_calibration": self.fv_calib.state(),
         }
 
     def attach_state(self, path: str) -> None:
@@ -1141,6 +1152,10 @@ class RunLoop:
         markouts = MarkoutBook()
         if data.get("markouts") is not None:  # absent in state files written before Phase 4
             markouts.load_state(data["markouts"])
+        from mm.unattended.fv_calib import FVCalibration
+        fv_calib = FVCalibration()
+        if data.get("fv_calibration") is not None:  # absent before model fair value
+            fv_calib.load_state(data["fv_calibration"])
         # validated: apply
         self.position = position
         self.bucket_pos = bucket_pos
@@ -1169,6 +1184,7 @@ class RunLoop:
         self._pnl_day_unknown = self._pnl_day is None and bool(self.position)
         self._daily_cache = None
         self.markouts = markouts
+        self.fv_calib = fv_calib
         for market in self.position:
             self._sync_inventory(market)
         if kill is not None:
@@ -1350,6 +1366,39 @@ class RunLoop:
             else:
                 self._fv_count("ev_withheld", sd)
         return tuple(out)
+
+    def _fv_calib_tick(self, ts: float) -> None:
+        """Every LIP_FV_CALIB_EVERY_S (30 s): record each new model fair value
+        of an FV-quoted market with the book mid now (``fv_calib``). Values
+        below LIP_FV_MIN_CONF are recorded too (their conf is kept)."""
+        if self.fv is None or ts - self._fv_calib_at < _env_num("LIP_FV_CALIB_EVERY_S", 30.0):
+            return
+        self._fv_calib_at = ts
+        from mm.unattended.fairvalue import fv_quote_active
+        from mm.unattended.fv_weather import SOURCE
+        for market in sorted(self._fv_wanted):
+            prog = self.programs.get(market)
+            if prog is None or prog.venue != "kalshi" or not fv_quote_active(prog.series):
+                continue
+            row = self.fv.get(market, now=time.time())
+            if row is None or row.get("source") != SOURCE or row.get("fv_cents") is None:
+                continue
+            mid = None
+            acc = self.accruals.get(market)
+            if acc is not None and acc.book.book.is_usable():
+                yb, nb = self._best(market)
+                if yb is not None and nb is not None:
+                    mid = (yb + (100 - nb)) / 2.0
+            window = row.get("window")
+            lead_h = (max(0.0, (float(window[1]) - time.time()) / 3600.0)
+                      if isinstance(window, (list, tuple)) and len(window) == 2
+                      else float(row.get("lead_h") or 0.0))
+            try:
+                if self.fv_calib.record(market, prog.series.upper(), ts, float(row["fv_cents"]),
+                                        float(row.get("conf") or 0.0), lead_h, mid, float(row.get("ts") or 0.0)):
+                    self._state_dirty = True
+            except (TypeError, ValueError):
+                continue
 
     def _book_fresh(self, market: str, ts: float) -> bool:
         """Kalshi books are WS-maintained (quiet = unchanged). PM US books are
@@ -2484,6 +2533,7 @@ class RunLoop:
                 self._cancel(market, "close_cutoff")
         self._guard_resting(ts)
         self.markouts.on_clock(ts, self._side_mid_cents, self._fv_side_cents)
+        self._fv_calib_tick(ts)
 
     def _cancel(self, market: str, reason: str) -> None:
         had = market in self.resting
@@ -2647,6 +2697,7 @@ class RunLoop:
             "fills_detail": list(self.fill_marks)[-20:],
             "markouts": self.markout_summary(),
             "markout_horizons": self.markouts.report(),
+            "fv_calibration": self.fv_calib.report(),
             "event_calendar": self.calendar.summary(self.now or None),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),
