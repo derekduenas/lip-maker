@@ -55,7 +55,9 @@ Criteria (thresholds are flags):
                     in the last --health-max-age-s (600 s).
   fv_calibration    only if status has ``fv_calibration``: model Brier < book
                     Brier on >= --min-fv-markets (200) settled markets.
-                    Accepted keys: n_settled|settled_n|settled_markets|
+                    Reads the engine's report (scored_markets,
+                    overall.paired_brier_model, overall.paired_brier_book);
+                    also accepts n_settled|settled_n|settled_markets|
                     n_markets|n, model_brier|brier_model|model.brier,
                     book_brier|brier_book|book.brier. Absent: N/A.
   daily_loss        the daily loss limit was never hit: no ``daily_loss`` kill
@@ -413,9 +415,14 @@ def crit_fv(status, a):
         return _crit("fv_calibration", title, NA, None, "status has no fv_calibration")
     if not isinstance(cal, dict):
         return _crit("fv_calibration", title, INSUFF, cal, "fv_calibration is not an object")
-    n = _num(_dig(cal, "n_settled", "settled_n", "settled_markets", "n_markets", "markets", "n"))
-    mb = _num(_dig(cal, "model_brier", "brier_model", "model.brier", "fv_brier"))
-    bb = _num(_dig(cal, "book_brier", "brier_book", "book.brier", "market_brier"))
+    # RunLoop fv_calibration (mm/unattended/fv_calib.py report()): settled
+    # markets scored, and model/book Brier on the paired samples.
+    n = _num(_dig(cal, "scored_markets", "n_settled", "settled_n", "settled_markets", "n_markets",
+                  "markets", "n"))
+    mb = _num(_dig(cal, "overall.paired_brier_model", "model_brier", "brier_model", "model.brier",
+                   "fv_brier"))
+    bb = _num(_dig(cal, "overall.paired_brier_book", "book_brier", "brier_book", "book.brier",
+                   "market_brier"))
     value = {"n": n, "model_brier": mb, "book_brier": bb}
     if n is None or mb is None or bb is None:
         return _crit("fv_calibration", title, INSUFF, value, "fv_calibration lacks n / model / book Brier")
