@@ -26,12 +26,16 @@ Criteria (thresholds are flags):
                     stays INSUFFICIENT.
   kalshi_fills      >= --min-kalshi-fills (300) non-synthetic Kalshi fills
                     (status venues.kalshi, else the state file).
-  settled_positions >= --min-settled (100). Uses a lifetime counter
-                    (status ``settled_positions_n`` / state ``settled_total``)
-                    when the engine provides one; otherwise the state file's
-                    ``settled`` rows, which the engine forgets after
-                    LIP_SETTLED_KEEP_DAYS (7): a lower bound, so a short count
-                    is INSUFFICIENT, not FAIL.
+  settled_positions >= --min-settled (100). Uses the engine's lifetime
+                    counter (status ``settled_positions_n`` /
+                    ``settled_positions_by_venue`` / ``settled_total_usd``,
+                    else the state file's ``settled_lifetime``), which
+                    survives LIP_SETTLED_KEEP_DAYS pruning. When the engine
+                    seeded it from an older state file
+                    (``settled_positions_lower_bound``) or only the state
+                    file's ``settled`` rows exist (forgotten after
+                    LIP_SETTLED_KEEP_DAYS, 7), the count is a lower bound and
+                    a short count is INSUFFICIENT, not FAIL.
   pnl_ex_rewards    status pnl_attribution: spread_capture + adverse_selection
                     + inventory_mtm + fees (i.e. EXCLUDING estimated rewards
                     and rebates) >= 0. Also reports rewards+rebates and their
@@ -270,13 +274,28 @@ def crit_kalshi_fills(status, state, a):
 
 def crit_settled(status, state, a):
     title = f">= {a.min_settled} settled positions"
-    exact = _dig(status or {}, "settled_positions_n")
-    if exact is None and isinstance(state, dict):
-        exact = state.get("settled_total")
-    if exact is not None:
-        n = int(exact)
-        return _crit("settled_positions", title, PASS if n >= a.min_settled else FAIL, n,
-                     "lifetime settled counter")
+    n = by_venue = usd = None
+    lower, src = False, None
+    if isinstance(status, dict) and status.get("settled_positions_n") is not None:
+        n = int(status["settled_positions_n"])
+        by_venue = status.get("settled_positions_by_venue")
+        usd = status.get("settled_total_usd")
+        lower = bool(status.get("settled_positions_lower_bound"))
+        src = "status settled_positions_n (lifetime)"
+    elif isinstance(state, dict) and isinstance(state.get("settled_lifetime"), dict):
+        life = state["settled_lifetime"]
+        by_venue = {str(k): int(v) for k, v in dict(life.get("by_venue") or {}).items()}
+        n, usd, lower = sum(by_venue.values()), life.get("total_usd"), bool(life.get("lower_bound"))
+        src = "state settled_lifetime"
+    if n is not None:
+        value = {"n": n, "by_venue": by_venue, "settled_total_usd": usd, "lower_bound": lower}
+        if n >= a.min_settled:
+            return _crit("settled_positions", title, PASS, value, f"lifetime settled counter ({src})")
+        if lower:
+            return _crit("settled_positions", title, INSUFF, value,
+                         f"{src} was seeded from an older state file (positions pruned before the "
+                         "counter existed are missing): a lower bound")
+        return _crit("settled_positions", title, FAIL, value, f"lifetime settled counter ({src})")
     if not isinstance(state, dict) or not isinstance(state.get("settled"), dict):
         return _crit("settled_positions", title, INSUFF, None, "no settled data in status or state file")
     n = len(state["settled"])
@@ -284,7 +303,8 @@ def crit_settled(status, state, a):
         return _crit("settled_positions", title, PASS, n, "state file settled rows (lower bound)")
     return _crit("settled_positions", title, INSUFF, n,
                  "state file settled rows are a lower bound (the engine forgets them after "
-                 "LIP_SETTLED_KEEP_DAYS, 7) and the engine has no lifetime settled counter")
+                 "LIP_SETTLED_KEEP_DAYS, 7) and neither status nor the state file has the "
+                 "lifetime settled counter")
 
 
 def crit_pnl(status, summaries, a):

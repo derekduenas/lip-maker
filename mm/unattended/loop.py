@@ -313,6 +313,12 @@ class RunLoop:
         # markout (all positions) and per-bucket aggregates of their rows.
         self.realized_pruned_usd = 0.0
         self.bucket_closed: dict[str, dict] = {}
+        # Lifetime settled positions (held legs at settlement) per venue and
+        # their realized settlement P&L (payout - cost basis, fees excluded).
+        # Unlike ``settled`` these are never pruned. ``lower_bound``: seeded
+        # from an older state file that had no counters (positions pruned
+        # before then are not counted; the USD total includes them).
+        self.settled_lifetime: dict = {"by_venue": {}, "total_usd": 0.0, "lower_bound": False}
         self.refeeds_n = 0
         # Review fixes: fill aggregates (self.fills is a bounded list), MTM
         # marks, fees, settlement, inventory on the risk engine, feed state.
@@ -765,6 +771,7 @@ class RunLoop:
         if market not in self.position and market not in self.programs:
             return
         self.unresolved.pop(market, None)
+        self._count_settled(market, result)
         legs = [(str((self.position.get(market) or {}).get("venue") or self._venue_of(market)), b,
                  rows[market]["yes"], rows[market]["no"], rows[market]["yes_cost"], rows[market]["no_cost"],
                  rows[market].get("fills_n", 0))
@@ -775,6 +782,35 @@ class RunLoop:
         self._sync_inventory(market)
         self._cancel(market, "settled")
         self._state_dirty = True
+
+    @staticmethod
+    def _settle_value_usd(pos: dict, result: str) -> float:
+        """Payout of a position's legs at ``result`` minus their cost basis."""
+        mark = 100.0 if result == "yes" else 0.0
+        value = (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+        return value - float(pos["yes_cost"]) - float(pos["no_cost"])
+
+    def _count_settled(self, market: str, result: str) -> None:
+        """Lifetime counters (``settled_lifetime``) for a held position that
+        settles now. Called once per market (settle() returns early for a
+        market already in ``settled``)."""
+        pos = self.position.get(market)
+        if not pos or (float(pos.get("yes") or 0.0) <= 0.0 and float(pos.get("no") or 0.0) <= 0.0):
+            return
+        venue = str(pos.get("venue") or self._venue_of(market))
+        by = self.settled_lifetime["by_venue"]
+        by[venue] = int(by.get(venue, 0)) + 1
+        self.settled_lifetime["total_usd"] = (float(self.settled_lifetime["total_usd"])
+                                              + self._settle_value_usd(pos, result))
+
+    def settled_report(self) -> dict:
+        """Status: lifetime settled positions (never pruned) and their
+        realized settlement P&L (payout - cost basis, fees excluded)."""
+        by = {k: int(v) for k, v in sorted(self.settled_lifetime["by_venue"].items())}
+        return {"settled_positions_n": sum(by.values()),
+                "settled_positions_by_venue": by,
+                "settled_total_usd": round(float(self.settled_lifetime["total_usd"]), 6),
+                "settled_positions_lower_bound": bool(self.settled_lifetime.get("lower_bound"))}
 
     # ------------------------------------------------------------ settlement backstops
     def _close_of(self, market: str):
@@ -1095,6 +1131,7 @@ class RunLoop:
             "pm_rebate_usd": self.pm_rebate_usd, "closed_periods": self.closed_periods,
             "closed_periods_n": self.closed_periods_n, "closed_periods_agg": self.closed_periods_agg,
             "realized_pruned_usd": self.realized_pruned_usd, "bucket_closed": self.bucket_closed,
+            "settled_lifetime": self.settled_lifetime,
             "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
             "kill": kill, "pnl_day": self._pnl_day,
             "markouts": self.markouts.state(),
@@ -1147,6 +1184,27 @@ class RunLoop:
                                "cost_usd": float(v.get("cost_usd") or 0.0)}
                       for m, v in dict(data.get("unresolved") or {}).items()}
         cooldown = {(str(m), str(sd)): float(until) for m, sd, until in list(data.get("cooldown") or [])}
+        raw_life = data.get("settled_lifetime")
+        if raw_life is not None:
+            if not isinstance(raw_life, dict) or not isinstance(raw_life.get("by_venue", {}), dict):
+                raise ValueError("settled_lifetime must be an object with a by_venue object")
+            by_venue = {str(k): int(v) for k, v in dict(raw_life.get("by_venue") or {}).items()}
+            if any(v < 0 for v in by_venue.values()):
+                raise ValueError("settled_lifetime counts must be >= 0")
+            settled_lifetime = {"by_venue": by_venue, "total_usd": float(raw_life.get("total_usd") or 0.0),
+                                "lower_bound": bool(raw_life.get("lower_bound"))}
+        else:
+            # Written before the lifetime counters: count the settled rows
+            # still held (pruned ones are gone: a lower bound); the USD total
+            # is exact (pruned realized P&L was kept in realized_pruned_usd).
+            by_venue, total = {}, float(data.get("realized_pruned_usd") or 0.0)
+            for m, v in settled.items():
+                pos = position.get(m)
+                if not pos or (pos["yes"] <= 0.0 and pos["no"] <= 0.0):
+                    continue
+                by_venue[pos["venue"]] = by_venue.get(pos["venue"], 0) + 1
+                total += self._settle_value_usd(pos, v["result"])
+            settled_lifetime = {"by_venue": by_venue, "total_usd": total, "lower_bound": True}
         kill = data.get("kill")
         if kill is not None and not isinstance(kill, dict):
             raise ValueError("kill must be an object")
@@ -1178,6 +1236,7 @@ class RunLoop:
         self.closed_periods_n = int(data.get("closed_periods_n") or 0)
         self.closed_periods_agg = {str(k): float(v) for k, v in dict(data.get("closed_periods_agg") or {}).items()}
         self.realized_pruned_usd = float(data.get("realized_pruned_usd") or 0.0)
+        self.settled_lifetime = settled_lifetime
         self.bucket_closed = {str(b): {str(k): float(v) for k, v in dict(r).items()}
                               for b, r in dict(data.get("bucket_closed") or {}).items()}
         self.cooldown.update(cooldown)
@@ -2684,6 +2743,7 @@ class RunLoop:
             "fills_synthetic_n": sum(self.fills_synthetic_by_venue.values()),
             "positions": self.positions_report(),
             "unresolved_positions": self.unresolved_report(),
+            **self.settled_report(),
             "excluded_n": len(self.excluded),
             "excluded_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
             "programs_shard_unknown": shard_unknown_n,
