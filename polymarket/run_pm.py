@@ -9,20 +9,23 @@ ARCHITECTURE:
     5. Reconcile via PMQuoteManager (place/cancel as needed)
     6. Sleep, repeat
 
-PAPER vs LIVE:
+PAPER ONLY (2026-10-01 review):
   PM_PAPER=true (default): all orders go to /v1/order/preview
                             (server validates, no money moves)
-  PM_PAPER=false:          orders.create() — REAL money
+  PM_PAPER=false:          REFUSED at startup. mm.unattended is the only
+                            path to a live venue. The NO side is also sent at
+                            the NO price although PM US prices refer to the
+                            YES side (unverified-but-likely bug; see
+                            execution/pm_quote_manager.py).
 
 USAGE:
   python run_pm.py                 # paper mode, top 5, $10/market cap
   python run_pm.py --top 10
   python run_pm.py --max-per-market 25 --total-cap 200
-  PM_PAPER=false python run_pm.py  # LIVE — be careful
 
 SYSTEMD:
-  Deployed as polymarket-maker.service. Edit
-  /etc/systemd/system/polymarket-maker.service to change params.
+  The old polymarket-maker.service (targeted /root/polymarket-maker) was
+  archived to _archive/2026-10-01/polymarket/deploy/.
 """
 from __future__ import annotations
 
@@ -40,6 +43,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from execution.pm_auth import _load_dotenv_simple
 PROJECT_ROOT = Path(__file__).resolve().parent
 _load_dotenv_simple(str(PROJECT_ROOT / ".env"))
+
+# 2026-10-01 review: refuse live before anything else is imported or built.
+# Same parse as config/settings.py (PAPER_MODE is true only for "true").
+if os.getenv("PM_PAPER", "true").lower() != "true":
+    raise SystemExit("polymarket/run_pm.py is paper-only: PM_PAPER=false is "
+                     "refused; use mm.unattended")
 
 from polymarket_us import PolymarketUS
 from execution.pm_book_gate import quote_book
