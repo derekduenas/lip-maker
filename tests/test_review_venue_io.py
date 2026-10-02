@@ -54,3 +54,39 @@ def test_importing_kalshi_modules_does_not_touch_environ(tmp_path):
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip().splitlines()[-1] == "[]"
+
+
+# ------------------------------------------------------------------ item 12
+def _sim_with_yes_bid(price=41, size=10, ticker="KXA-1"):
+    from engine.lip_scorer import BookLevel, BookState
+    from execution.paper_fills import PaperFillSimulator
+    sim = PaperFillSimulator(latency_ms=0)
+    bk = BookState(market_ticker=ticker, yes_bids=[BookLevel(40, 5.0)], no_bids=[BookLevel(55, 5.0)])
+    sim.track(order_id="o", market_ticker=ticker, side="yes", price_cents=price, size=size, book=bk, now=0.0)
+    return sim
+
+
+def test_paper_fills_accept_legacy_integer_cent_prices():
+    sim = _sim_with_yes_bid()
+    fills = sim.apply_trades([{"trade_id": "t1", "ticker": "KXA-1", "count": 3, "yes_price": 41,
+                               "no_price": 59, "taker_side": "no", "created_time": "2026-10-01T00:00:01Z"}])
+    assert [(f["count"], f["price_cents"]) for f in fills] == [(3.0, 41)]
+    # yes_price only (no NO price): NO side derived as 100 - yes
+    sim = _sim_with_yes_bid()
+    fills = sim.apply_trades([{"trade_id": "t2", "ticker": "KXA-1", "count": 2, "yes_price": 40,
+                               "taker_side": "no", "created_time": "2026-10-01T00:00:01Z"}])
+    assert [f["count"] for f in fills] == [2.0]
+
+
+def test_paper_fills_seen_trades_is_bounded():
+    from execution import paper_fills as PF
+    sim = PF.PaperFillSimulator(latency_ms=0, seen_trades_max=50)
+    trades = [{"trade_id": f"t{i}", "ticker": "KXZ-1", "count": 1, "yes_price_dollars": "0.40",
+               "no_price_dollars": "0.60", "taker_side": "no", "created_time": "2026-10-01T00:00:01Z"}
+              for i in range(500)]
+    sim.apply_trades(trades)
+    assert len(sim._seen_trades) == 50 and sim.trades_observed == 500
+    assert "t499" in sim._seen_trades and "t0" not in sim._seen_trades
+    sim.apply_trades(trades[-10:])  # recent ids still de-duplicated
+    assert sim.trades_observed == 500
+    assert PF.PaperFillSimulator().seen_trades_max == PF.SEEN_TRADES_MAX
