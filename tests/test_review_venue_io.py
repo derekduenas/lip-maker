@@ -138,3 +138,45 @@ def test_screen_skips_series_names_the_reader_would_refuse():
     c = MetaCache(path="/nonexistent/x.json", sleep=lambda s: None)
     assert c.fetch_series(_Reader(), ["..", "a/b", "KXOK"]) == 1
     assert calls == ["/series/KXOK"] and c.failures == 2
+
+
+# ------------------------------------------------------------------ item 14
+def _row(**kw):
+    row = {"ticker": "KXA-26DEC-T1", "close_time": "2026-12-01T00:00:00Z", "exchange_index": 0,
+           "status": "active", "event_ticker": "KXA-26DEC"}
+    row.update(kw)
+    return row
+
+
+@pytest.mark.parametrize("extra,ok", [
+    ({}, True),                                                          # legacy row
+    ({"price_level_structure": "linear_cent"}, True),
+    ({"price_ranges": [{"start": "0.0000", "end": "1.0000", "step": "0.0100"}]}, True),
+    ({"price_level_structure": "deci_cent"}, False),
+    ({"price_level_structure": "center_deci_edge_centi_cent"}, False),
+    ({"price_level_structure": "linear_cent",                            # ranges win
+      "price_ranges": [{"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+                       {"start": "0.1000", "end": "1.0000", "step": "0.0100"}]}, False),
+    ({"tick_size": 1}, True),
+    ({"tick_size": 5}, False),
+])
+def test_market_meta_flags_non_cent_tick(extra, ok):
+    from mm.unattended.screen import market_meta
+    assert market_meta(_row(**extra), now=0.0)["tick_1c"] is ok
+
+
+def test_screen_excludes_subcent_markets(monkeypatch):
+    from mm.unattended import screen as S
+    monkeypatch.setenv("LIP_LONG_DATED_ANY_DAYS", "1e9")
+    monkeypatch.setenv("LIP_LONG_DATED_EVENT_DAYS", "1e9")
+    frame = {"market": "KXA-26DEC-T1", "series": "KXA", "program_id": "p", "period_reward_usd": 50,
+             "period_seconds": 86400, "end_ts": 2e12, "discount_factor": 0.5, "target_size": 100}
+    for structure, n in (("linear_cent", 1), ("deci_cent", 0)):
+        c = S.MetaCache(path="/nonexistent/x.json")
+        c.markets["KXA-26DEC-T1"] = S.market_meta(_row(price_level_structure=structure,
+                                                       close_time="2027-01-01T00:00:00Z"), now=0.0)
+        c.series["KXA"] = {"category": "Economics", "tags": [], "fee_type": "quadratic", "fetched": 0}
+        out, stats = S.screen([frame], c, now=1.79e9)
+        assert len(out) == n, stats
+        if not n:
+            assert stats["reasons"] == {"subcent_tick": 1}

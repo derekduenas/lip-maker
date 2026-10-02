@@ -9,7 +9,11 @@ https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program
 Reference is the level reaching TargetSize/5, not necessarily the best bid.
 Orders at or above reference receive full weight. Deeper eligible orders receive
 DiscountFactor ** distance_in_ticks. Both sides must reach TargetSize.
-This cent-grid scorer does not support fractional tick markets. Snapshot shares
+This cent-grid scorer does not support fractional tick markets: DF distances
+are counted in whole cents, so on a deci-cent or tapered grid (Kalshi
+price_level_structure other than linear_cent) the discount would be wrong.
+Such markets are excluded before selection (mm/unattended/screen.py
+"subcent_tick"; PM US: mm/unattended/pmus_paper.py). Snapshot shares
 are estimates; final payout also requires period rounding, minimum and caps.
 
 NOTE on asks: Kalshi scoring works on BID LIQUIDITY. For the YES side, the

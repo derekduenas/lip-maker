@@ -5,6 +5,11 @@ batched) and series category (GET /series/{ticker}), both cached on disk.
 Applies the selector's exclusion policy up front so the RunLoop and the
 websocket only carry the top ``LIP_CANDIDATE_TOP`` candidates.
 
+Sub-cent markets are excluded (reason ``subcent_tick``): Kalshi lists
+deci-cent / tapered grids (``price_level_structure`` / ``price_ranges``,
+docs.kalshi.com/getting_started/subpenny_pricing), but the engine's book,
+LIP scorer (DF ticks counted in whole cents) and quoting are a 1c grid.
+
 Read-only. Every call goes through ``ReadOnlyKalshiTransport.get``.
 """
 from __future__ import annotations
@@ -24,7 +29,7 @@ BATCH = 100
 PAUSE_S = 0.12
 META_TTL_S = 6 * 3600.0
 SERIES_TTL_S = 7 * 86400.0
-CACHE_VERSION = 2
+CACHE_VERSION = 3  # 3: market rows carry tick_1c (older rows are refetched)
 DEFAULT_NEWS_CATEGORIES = "Politics,Elections,World,Entertainment,Sports,Esports,Social,Mentions,Culture"
 
 
@@ -116,6 +121,37 @@ def _num(raw) -> float | None:
         return None
 
 
+def tick_is_one_cent(row: dict) -> bool:
+    """True when the market trades on a uniform 1c grid.
+
+    ``price_ranges`` ({start, end, step} bands, fixed-point dollars) is
+    authoritative: every step must be $0.01. Without it,
+    ``price_level_structure`` must be "linear_cent" (the docs warn new names
+    appear over time, so any other name is treated as non-1c), and a legacy
+    ``tick_size`` must be 1 (cent). A row with none of these is treated as a
+    1c market (rows predating sub-penny pricing)."""
+    ranges = row.get("price_ranges")
+    if isinstance(ranges, list) and ranges:
+        for band in ranges:
+            try:
+                step = float((band or {}).get("step"))
+            except (TypeError, ValueError, AttributeError):
+                return False
+            if abs(step - 0.01) > 1e-9:
+                return False
+        return True
+    structure = row.get("price_level_structure")
+    if structure not in (None, "") and str(structure) != "linear_cent":
+        return False
+    tick = row.get("tick_size")
+    if tick not in (None, ""):
+        try:
+            return abs(float(tick) - 1.0) < 1e-9
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def market_meta(row: dict, now: float | None = None) -> dict:
     """Fields kept from one GET /markets row. Effective close = min(close, occurrence)."""
     close = _ts(row.get("close_time"))
@@ -134,6 +170,8 @@ def market_meta(row: dict, now: float | None = None) -> dict:
         "yes_ask": _num(row.get("yes_ask_dollars")),
         "yes_bid_size": _num(row.get("yes_bid_size_fp")),
         "yes_ask_size": _num(row.get("yes_ask_size_fp")),
+        "price_level_structure": row.get("price_level_structure"),
+        "tick_1c": tick_is_one_cent(row),
         "fetched": time.time() if now is None else float(now),
     }
 
@@ -309,6 +347,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
             continue
         if meta.get("status") not in (None, "active", "open"):
             _bump("market_not_active", series)
+            continue
+        if meta.get("tick_1c") is False:
+            _bump("subcent_tick", series)
             continue
         eff = meta.get("effective_close_ts")
         days = None if eff is None else max(0.0, (float(eff) - now) / 86400.0)
