@@ -119,7 +119,9 @@ def test_amend_reserves_capital_and_refuses_a_cross_and_an_edge_price(tmp_path, 
         order_id="LIVE-1", market_ticker=TKR, side="yes", price_cents=40,
         size_contracts=10, placed_at=0.0, paper=False, client_order_id="LIP-b",
     )
-    assert qm._amend_order(live, 70, 10, best_opposing_bid_cents=40) is False
+    # 2026-10-01: live amend is refused outright (legacy QuoteManager is paper-only).
+    with pytest.raises(RuntimeError, match="paper-only"):
+        qm._amend_order(live, 70, 10, best_opposing_bid_cents=40)
     assert posts == []
     assert live.price_cents == 40
 

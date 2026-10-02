@@ -77,11 +77,10 @@ class TestLiveExecutionInterlock:
         qm._log_quote_row = MagicMock()
         qm._passes_safety = lambda t: (True, "ok")
         # A perfectly passive, non-crossing order still does not go out.
-        assert qm._place_order(TKR, "yes", 40, 10,
-                               best_opposing_bid_cents=50) is None
+        # 2026-10-01: the legacy QuoteManager now refuses live outright.
+        with pytest.raises(RuntimeError, match="paper-only"):
+            qm._place_order(TKR, "yes", 40, 10, best_opposing_bid_cents=50)
         qm.client.post.assert_not_called()
-        assert qm.live_blocked == 1
-        assert "live_blocked" in qm._log_quote_row.call_args.kwargs["notes"]
 
     def test_paper_is_unaffected_by_the_live_gate(self, tmp_path):
         qm = QuoteManager(paper=True, db_path=str(tmp_path / "q.db"))
@@ -216,33 +215,15 @@ class TestQuoteManagerUsesSharedContract:
         qm._log_quote_row = MagicMock()
         return qm
 
-    def test_live_order_body_comes_from_the_builder(self, tmp_path, allow_live):
+    # 2026-10-01: the three live wire-body tests that stood here
+    # (builder body, crossing refusal, unknown-book refusal) exercised the
+    # legacy live branch, which now raises before any body is built.
+    def test_live_placement_raises_even_with_gates_lifted(self, tmp_path,
+                                                          allow_live):
         qm = self._qm(tmp_path, paper=False)
-        qm._update_quote_status = MagicMock()
-        r = qm._place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
-        assert r is not None
-        body = qm.client.post.call_args[0][1]
-        assert body["post_only"] is True and "no_self_trade" not in body
-        assert body["side"] == "bid" and body["price"] == "0.4900"
-        assert qm.client.post.call_args[0][0] == "/portfolio/events/orders"
-
-    def test_live_crossing_order_is_refused_before_transmission(self, tmp_path,
-                                                                allow_live):
-        qm = self._qm(tmp_path, paper=False)
-        assert qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=50) is None
+        with pytest.raises(RuntimeError, match="paper-only"):
+            qm._place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
         qm.client.post.assert_not_called()
-        note = qm._log_quote_row.call_args.kwargs["notes"]
-        assert "maker_safety" in note
-
-    def test_live_order_without_opposing_book_is_refused(self, tmp_path,
-                                                        allow_live):
-        """Refused for the MAKER reason, with the live gate lifted, so this
-        keeps testing the unknown-book rule rather than passing because
-        something upstream blocked it."""
-        qm = self._qm(tmp_path, paper=False)
-        assert qm._place_order(TKR, "yes", 49, 10) is None
-        qm.client.post.assert_not_called()
-        assert "maker_safety" in qm._log_quote_row.call_args.kwargs["notes"]
 
     def test_paper_refuses_crossing_quote_too(self, tmp_path):
         """Catch a crossing quote in paper rather than discovering it live."""
