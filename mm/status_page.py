@@ -28,6 +28,8 @@ LIVE_STATUS_FIELDS = (
     "programs_pruned_n", "state",
     # Integration: per-market positions (watchdog inventory), synthetic fills.
     "positions", "fills_synthetic_n",
+    # Phase 4 instrumentation (estimates, paper).
+    "markout_horizons",
 )
 
 

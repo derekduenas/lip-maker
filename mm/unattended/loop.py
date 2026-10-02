@@ -318,6 +318,9 @@ class RunLoop:
         self.cap_trims_n = 0
         self.programs_pruned_n = 0
         self._pnl_day: dict | None = None
+        # Phase 4: multi-horizon fill markouts (measurement only).
+        from mm.unattended.markouts import MarkoutBook
+        self.markouts = MarkoutBook()
         self.state_path: str | None = None
         self.state_error: str | None = None
         self._state_dirty = False
@@ -607,6 +610,11 @@ class RunLoop:
             return
         if market not in self.position and market not in self.programs:
             return
+        legs = [(str((self.position.get(market) or {}).get("venue") or self._venue_of(market)), b,
+                 rows[market]["yes"], rows[market]["no"], rows[market]["yes_cost"], rows[market]["no_cost"],
+                 rows[market].get("fills_n", 0))
+                for b, rows in self.bucket_pos.items() if market in rows]
+        self.markouts.on_settle(market, result, legs)
         self.settled[market] = {"result": result, "ts": self.now}
         self.last_mid[market] = 100.0 if result == "yes" else 0.0
         self._sync_inventory(market)
@@ -852,6 +860,7 @@ class RunLoop:
             "closed_periods_n": self.closed_periods_n,
             "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
             "kill": kill, "pnl_day": self._pnl_day,
+            "markouts": self.markouts.state(),
         }
 
     def attach_state(self, path: str) -> None:
@@ -894,6 +903,10 @@ class RunLoop:
         kill = data.get("kill")
         if kill is not None and not isinstance(kill, dict):
             raise ValueError("kill must be an object")
+        from mm.unattended.markouts import MarkoutBook
+        markouts = MarkoutBook()
+        if data.get("markouts") is not None:  # absent in state files written before Phase 4
+            markouts.load_state(data["markouts"])
         # validated: apply
         self.position = position
         self.bucket_pos = bucket_pos
@@ -913,6 +926,7 @@ class RunLoop:
         self.closed_periods_n = int(data.get("closed_periods_n") or 0)
         self.cooldown.update(cooldown)
         self._pnl_day = data.get("pnl_day") if isinstance(data.get("pnl_day"), dict) else None
+        self.markouts = markouts
         for market in self.position:
             self._sync_inventory(market)
         if kill is not None:
@@ -955,6 +969,28 @@ class RunLoop:
     def _venue(self, market: str) -> str:
         prog = self.programs.get(market)
         return prog.venue if prog is not None else "kalshi"
+
+    def _venue_of(self, market: str) -> str:
+        """Venue of a market that may no longer have a program (pruned):
+        its program, else its held position, else the PM US ticker prefix."""
+        prog = self.programs.get(market)
+        if prog is not None:
+            return prog.venue
+        pos = self.position.get(market)
+        if pos and pos.get("venue"):
+            return str(pos["venue"])
+        return "pmus" if str(market).startswith("PMUS:") else "kalshi"
+
+    def _fv_side_cents(self, market: str, side: str):
+        """External fair value of one side in cents, or None when the fair
+        value cache (Kalshi markets only) has no current value for it."""
+        if self.fv is None or self._venue(market) != "kalshi":
+            return None
+        row = self.fv.get(market, now=time.time())
+        if row is None or row.get("fv_cents") is None:
+            return None
+        fv = float(row["fv_cents"])
+        return fv if side == "yes" else 100.0 - fv
 
     def _book_fresh(self, market: str, ts: float) -> bool:
         """Kalshi books are WS-maintained (quiet = unchanged). PM US books are
@@ -1063,6 +1099,8 @@ class RunLoop:
             rebate = float(pm_us_maker_rebate_usd(int(round(price)), count))
             self.pm_rebate_usd += rebate
             bpos["rebates"] = bpos.get("rebates", 0.0) + rebate
+        self.markouts.add(market=market, side=side, price_cents=price, count=count, ts=ts,
+                          venue=venue, bucket=bucket, mid0=mid, synthetic=bool(fill.get("synthetic")))
         self.fill_marks.append({
             "market": market, "side": side, "price_cents": price, "count": count, "ts": ts,
             "mid0": mid, "venue": self._venue(market), "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
@@ -1989,6 +2027,7 @@ class RunLoop:
             if self._inside_close(market, ts):
                 self._cancel(market, "close_cutoff")
         self._guard_resting(ts)
+        self.markouts.on_clock(ts, self._side_mid_cents, self._fv_side_cents)
 
     def _cancel(self, market: str, reason: str) -> None:
         had = market in self.resting
@@ -2150,6 +2189,7 @@ class RunLoop:
                 for k in ("known", "unknown", "forfeited", "idle")}),
             "fills_detail": list(self.fill_marks)[-20:],
             "markouts": self.markout_summary(),
+            "markout_horizons": self.markouts.report(),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),
             "repegs_n": self.repegs_n,
