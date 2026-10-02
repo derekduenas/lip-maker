@@ -127,7 +127,7 @@ class KalshiMarket:
     target_size: float
     yes_bids: list[tuple[int, float]] = field(default_factory=list)
     no_bids: list[tuple[int, float]] = field(default_factory=list)
-    fee_type: str = "quadratic"
+    fee_type: str = "quadratic_with_maker_fees"
     fee_multiplier: float = 1.0
     days_to_settle: float | None = 1.0
     has_reference: bool = False

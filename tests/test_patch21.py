@@ -122,10 +122,11 @@ def test_kalshi_maker_fee_type_enters_economics():
     base = dict(market="KXA-1", series="KXA", period_reward_usd=100, period_seconds=86400,
                 seconds_left=86400, discount_factor=0.5, target_size=1000,
                 yes_bids=[(40, 3000)], no_bids=[(55, 3000)], days_to_settle=20)
-    free = quote_economics(KalshiMarket(**base), 100)[0]
+    free = quote_economics(KalshiMarket(**base, fee_type="quadratic"), 100)[0]
     paid = quote_economics(KalshiMarket(**base, fee_type="quadratic_with_maker_fees"), 100)[0]
     weird = quote_economics(KalshiMarket(**base, fee_type="new_type"), 100)[0]
-    assert paid < free and weird == paid
+    default = quote_economics(KalshiMarket(**base), 100)[0]  # unknown series: conservative
+    assert paid < free and weird == paid and default == paid
 
 
 # -------------------------------------------------------- programs / windows

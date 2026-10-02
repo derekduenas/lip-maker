@@ -234,9 +234,10 @@ class MetaCache:
                 continue
             self.series_lookups += 1
             ser = payload.get("series") or {}
-            # Patch 21: fee_type / fee_multiplier (GET /series/{t}, verified live
-            # 2026-10-01: quadratic | quadratic_with_maker_fees |
-            # quadratic_with_combo_maker_fees) so maker fees enter net $/day.
+            # Patch 21: fee_type / fee_multiplier (GET /series/{t}: quadratic |
+            # quadratic_with_maker_fees | quadratic_with_combo_maker_fees | flat,
+            # docs.kalshi.com get-series) so maker fees enter net $/day. Unknown,
+            # missing and "flat" are priced as maker-fee series (screen()).
             self.series[s] = {"category": ser.get("category"), "tags": ser.get("tags") or [],
                               "frequency": ser.get("frequency"), "fee_type": ser.get("fee_type"),
                               "fee_multiplier": ser.get("fee_multiplier"), "fetched": self.clock()}
@@ -244,6 +245,18 @@ class MetaCache:
             got += 1
             self.sleep(PAUSE_S)
         return got
+
+
+# Kalshi fee types this code can price (mm/accounting.maker_coefficient).
+KNOWN_FEE_TYPES = ("quadratic", "quadratic_with_maker_fees", "quadratic_with_combo_maker_fees")
+CONSERVATIVE_FEE_TYPE = "quadratic_with_maker_fees"
+
+
+def conservative_fee_type(raw) -> str:
+    """Known Kalshi fee_type as-is; missing, unknown or "flat" (the "Specific
+    Trading Fees Table", formula not confirmed here) -> the standard maker-fee
+    type, so a series we cannot price never ranks as maker-fee-free."""
+    return raw if raw in KNOWN_FEE_TYPES else CONSERVATIVE_FEE_TYPE
 
 
 def pool_per_day(frame: dict) -> float:
@@ -317,7 +330,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         out["close_ts"] = eff
         out["days_to_settle"] = days
         out["category"] = category
-        out["fee_type"] = (cat_row or {}).get("fee_type") or "quadratic"
+        raw_fee = (cat_row or {}).get("fee_type")
+        out["fee_type"] = conservative_fee_type(raw_fee)
+        out["fee_type_raw"] = raw_fee
         out["fee_multiplier"] = (cat_row or {}).get("fee_multiplier")
         out["days_from_close"] = True
         rk = rank_score(frame, meta, category=category, days=days)

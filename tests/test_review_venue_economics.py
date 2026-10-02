@@ -71,3 +71,50 @@ def test_skew_backoff_starts_before_the_cap():
     q = SkewParams(max_ticks=2, max_backoff=1, max_reward_loss=0.5, min_frac=0.4)
     o = skew_prices(40, 55, net_yes=+10, frac=0.3, best_yes=40, best_no=55, df=0.5, params=q)
     assert o["back"] == 0 and o["agg"] == 0
+
+
+# ------------------------------------------------------------------ item 7
+def _cache_with(series_row):
+    c = S.MetaCache(path="/nonexistent/never-written.json")
+    c.markets["KXFOO-26DEC-T1"] = {"exchange_index": 0, "close_ts": None, "occurrence_ts": None,
+                                   "effective_close_ts": 1e12, "status": "active", "event_ticker": "KXFOO-26DEC",
+                                   "yes_bid": 0.4, "yes_ask": 0.45, "fetched": 0}
+    c.series["KXFOO"] = series_row
+    return c
+
+
+@pytest.mark.parametrize("raw,want", [
+    (None, "quadratic_with_maker_fees"),
+    ("flat", "quadratic_with_maker_fees"),
+    ("brand_new", "quadratic_with_maker_fees"),
+    ("quadratic", "quadratic"),
+    ("quadratic_with_combo_maker_fees", "quadratic_with_combo_maker_fees"),
+])
+def test_screen_unknown_fee_type_is_conservative(monkeypatch, raw, want):
+    monkeypatch.setenv("LIP_LONG_DATED_ANY_DAYS", "1e9")
+    monkeypatch.setenv("LIP_LONG_DATED_EVENT_DAYS", "1e9")
+    frame = dict(FRAME, program_id="p", end_ts=2e12, discount_factor=0.5)
+    cache = _cache_with({"category": "Economics", "tags": [], "fee_type": raw, "fetched": 0})
+    out, stats = S.screen([frame], cache, now=1e9)
+    assert len(out) == 1, stats
+    assert out[0]["fee_type"] == want and out[0]["fee_type_raw"] == raw
+
+
+def test_kalshimarket_default_fee_type_charges_maker_fee():
+    assert SEL.KalshiMarket(market="X-1", series="X", period_reward_usd=1, period_seconds=1,
+                            seconds_left=1, discount_factor=.5, target_size=1).fee_type \
+        == "quadratic_with_maker_fees"
+    assert SEL.maker_fee_usd(_km(fee_type="flat"), 50) == SEL.maker_fee_usd(
+        _km(fee_type="quadratic_with_maker_fees"), 50) > 0
+
+
+def test_series_fees_flat_is_maker_charged():
+    from decimal import Decimal as D
+    from engine.series_fees import schedule_from_series
+    flat = schedule_from_series({"series": {"ticker": "KXF", "fee_type": "flat", "fee_multiplier": 1}})
+    std = schedule_from_series({"series": {"ticker": "KXF", "fee_type": "quadratic_with_maker_fees",
+                                           "fee_multiplier": 1}})
+    assert flat is not None and flat.maker_charged
+    assert flat.fee_usd(50, 10) == std.fee_usd(50, 10) > D(0)
+    assert flat.fee_usd(50, 10, is_taker=True) == std.fee_usd(50, 10, is_taker=True)
+    assert "flat" in flat.describe()["fee_type"] and "unverified" in flat.source
