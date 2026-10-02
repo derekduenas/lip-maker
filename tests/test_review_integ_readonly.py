@@ -74,7 +74,7 @@ def _subscribed(sock):
     sock._ws.sent.clear()
 
 
-def test_unsubscribe_markets_deletes_from_each_subscription_then_unsubscribes():
+def test_unsubscribe_markets_deletes_from_each_subscription_never_unsubscribes():
     sock = _sock()
     _subscribed(sock)
     asyncio.run(sock.unsubscribe_markets(["A", "ZZZ"]))
@@ -85,10 +85,12 @@ def test_unsubscribe_markets_deletes_from_each_subscription_then_unsubscribes():
         assert c["params"]["action"] == "delete_markets"
         assert c["params"]["market_tickers"] == ["A"]
     sock._ws.sent.clear()
-    # the last ticker of a subscription: the whole sid is unsubscribed
+    # the last tracked ticker of a subscription: still delete_markets for
+    # that ticker only (a merged batch may share the sid), never unsubscribe
     asyncio.run(sock.unsubscribe_markets(["B"]))
-    assert [c["cmd"] for c in sock._ws.sent] == ["unsubscribe"]
-    assert sorted(sock._ws.sent[0]["params"]["sids"]) == [11, 12, 13]
+    assert [c["cmd"] for c in sock._ws.sent] == ["update_subscription"] * 3
+    assert sorted(c["params"]["sids"][0] for c in sock._ws.sent) == [11, 12, 13]
+    assert all(c["params"]["market_tickers"] == ["B"] for c in sock._ws.sent)
     sock._ws.sent.clear()
     asyncio.run(sock.unsubscribe_markets(["B"]))   # nothing left: nothing sent
     assert sock._ws.sent == []

@@ -13,9 +13,11 @@ incentive programs, and exchange status. The websocket may subscribe to
 ticker filter). Every Kalshi websocket connection is authenticated with the
 key's signed headers, private channels included, so the read-only key opens
 the same socket; what keeps it read-only is that only these market-data
-channels are ever subscribed. It may also remove tickers from, or end,
+channels are ever subscribed. It may also remove named tickers from
 subscriptions it opened itself (``update_subscription`` with
-``delete_markets``, ``unsubscribe``).
+``delete_markets``). It never ends a whole subscription (``unsubscribe``):
+Kalshi merges later subscribe batches into an existing sid, so a sid can
+carry tickers this client did not see confirmed on it.
 
 Anything else logs and exits. No POST, PUT, DELETE, PATCH, portfolio
 route, or private channel is sent.
@@ -318,7 +320,7 @@ class ReadOnlyKalshiTransport(MarketDataReader):
 class ReadOnlyMarketSocket(MarketDataReader):
     """Production websocket. Subscribes only PUBLIC_WS_CHANNELS.
 
-    Each command gets its own ``id``; the ``subscribed`` replies
+    Each command gets its own ``id``; the ``subscribed`` / ``ok`` replies
     (``note_response``) map each subscription id (sid) to its channel and
     tickers, so ``unsubscribe_markets`` can remove tickers from the
     subscriptions this socket opened (and only those)."""
@@ -364,30 +366,47 @@ class ReadOnlyMarketSocket(MarketDataReader):
         }
 
     def note_response(self, msg: dict) -> None:
-        """Track sids from ``subscribed`` / ``unsubscribed`` replies."""
+        """Track sids from ``subscribed`` / ``ok`` / ``unsubscribed`` replies.
+
+        A subscribe batch Kalshi merged into an existing sid adds its tickers
+        to that sid (a ``subscribed`` reply naming it, or an ``ok`` reply
+        carrying the sid). An ``ok`` reply listing ``market_tickers`` (the
+        full list after an update_subscription) replaces the tracked set."""
         kind = msg.get("type")
+        body = msg.get("msg") if isinstance(msg.get("msg"), dict) else {}
         if kind == "subscribed":
-            body = msg.get("msg") or {}
             sid = body.get("sid")
             if sid is None:
                 return
             row = self.sids.setdefault(int(sid), {"channel": str(body.get("channel") or ""),
                                                   "tickers": set()})
             row["tickers"].update(self._pending.get(msg.get("id"), []))
+        elif kind == "ok":
+            sid = msg.get("sid", body.get("sid"))
+            if sid is None or int(sid) not in self.sids:
+                return
+            row = self.sids[int(sid)]
+            if isinstance(body.get("market_tickers"), list):
+                row["tickers"] = {str(t) for t in body["market_tickers"]}
+            else:
+                row["tickers"].update(self._pending.get(msg.get("id"), []))
         elif kind == "unsubscribed" and msg.get("sid") is not None:
             self.sids.pop(int(msg["sid"]), None)
 
     async def unsubscribe_markets(self, tickers) -> list[dict]:
         """Remove ``tickers`` from every per-ticker subscription this socket
-        opened: ``update_subscription`` / ``delete_markets`` per sid, or
-        ``unsubscribe`` for a sid that would be left with no ticker. The
-        lifecycle subscription is never touched. Returns the commands sent."""
+        opened: one ``update_subscription`` / ``delete_markets`` per sid,
+        naming only those tickers, even when no tracked ticker would remain
+        on the sid. Never ``unsubscribe``: Kalshi merges later subscribe
+        batches into the same sid (loop.SidSequencer), so ending a sid could
+        stop tickers this client still wants. The lifecycle subscription is
+        never touched. Returns the commands sent."""
         drop = {str(t) for t in tickers or ()}
         if not drop:
             return []
         if self._ws is None:
             _refuse("websocket is not connected")
-        sent, empty = [], []
+        sent = []
         for sid, row in sorted(self.sids.items()):
             if row["channel"] not in TICKER_WS_CHANNELS:
                 continue
@@ -395,19 +414,10 @@ class ReadOnlyMarketSocket(MarketDataReader):
             if not hit:
                 continue
             row["tickers"] -= drop
-            if not row["tickers"]:
-                empty.append(sid)
-                continue
             cmd = {"id": self._cmd_id(), "cmd": "update_subscription",
                    "params": {"sids": [sid], "market_tickers": hit, "action": "delete_markets"}}
             await self._ws.send(json.dumps(cmd))
             sent.append(cmd)
-        if empty:
-            cmd = {"id": self._cmd_id(), "cmd": "unsubscribe", "params": {"sids": empty}}
-            await self._ws.send(json.dumps(cmd))
-            sent.append(cmd)
-            for sid in empty:
-                self.sids.pop(sid, None)
         return sent
 
     def auth_headers(self) -> dict:
