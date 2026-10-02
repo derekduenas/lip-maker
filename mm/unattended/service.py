@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -402,6 +403,65 @@ class _Engine:
             logging.getLogger("lip.status").exception("final engine state save failed")
 
 
+# SIGTERM (systemctl stop/restart): set by the handlers below, read by main.
+_TERM = threading.Event()
+
+
+def _sigterm_flag(signum, frame) -> None:
+    """Process-level SIGTERM handler outside the asyncio driver: only sets a
+    flag (main checks it between sessions); nothing is interrupted."""
+    _TERM.set()
+
+
+def _install_sigterm_flag() -> None:
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _sigterm_flag)
+
+
+async def _until_sigterm(coro) -> bool:
+    """Run the driver coroutine as a task until it ends; SIGTERM cancels it.
+
+    The handler is registered with ``loop.add_signal_handler``: the event
+    loop runs it between callbacks, and the cancellation is delivered to the
+    task at its next ``await``. Frames are handled synchronously between
+    awaits (``on_frame``), so a SIGTERM never lands inside one. Returns
+    True when the task was cancelled by SIGTERM (the caller then shuts down
+    through its normal finally path), False when the driver returned; any
+    other exception propagates."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+
+    def on_term() -> None:
+        _TERM.set()
+        task.cancel()
+
+    installed = False
+    if threading.current_thread() is threading.main_thread():
+        try:
+            loop.add_signal_handler(signal.SIGTERM, on_term)
+            installed = True
+        except (NotImplementedError, RuntimeError, ValueError):
+            installed = False
+    if _TERM.is_set():
+        task.cancel()          # SIGTERM arrived before the handler existed
+    try:
+        await task
+        return False
+    except asyncio.CancelledError:
+        if _TERM.is_set():
+            return True
+        raise
+    finally:
+        if installed:
+            try:
+                loop.remove_signal_handler(signal.SIGTERM)
+            except (RuntimeError, ValueError):
+                pass
+            # remove_signal_handler restores SIG_DFL: keep the flag handler.
+            _install_sigterm_flag()
+
+
 def reset_state_kill(path: str) -> int:
     """Operator reset of a kill latch persisted in the engine state file.
     Positions and aggregates are kept. An unreadable file is not touched
@@ -640,6 +700,8 @@ def main(argv: list[str] | None = None) -> int:
         from mm.unattended.loop import (
             resolve_mode, resolve_ws_url, run_recorded, socket_plan, waiting_report,
         )
+        _TERM.clear()
+        _install_sigterm_flag()
         from mm.venues.readonly import book_source
         mode = resolve_mode()
         url = resolve_ws_url(ws_url)
@@ -693,23 +755,29 @@ def main(argv: list[str] | None = None) -> int:
                     engine.reconnect_if_down()
                     try:
                         if plan.get("reader"):
-                            asyncio.run(drive_readonly_books(books, engine.on_frame,
-                                                             settle_candidates=engine.settle_candidates,
-                                                             paper=mode == "paper"))
+                            stopped = asyncio.run(_until_sigterm(drive_readonly_books(
+                                books, engine.on_frame, settle_candidates=engine.settle_candidates,
+                                paper=mode == "paper")))
                         else:
-                            asyncio.run(drive_socket(plan["url"], engine.on_frame))
+                            stopped = asyncio.run(_until_sigterm(drive_socket(plan["url"], engine.on_frame)))
                     finally:
                         engine.mark_down("session_end")
+                    if stopped:
+                        logging.getLogger("lip.unattended").info("SIGTERM: stopping (state saved on the way out)")
+                        return 0
                     if args.once:
                         engine.write_final()
                 if args.once:
                     return 0
-                time.sleep(args.interval)
+                if _TERM.wait(args.interval):
+                    logging.getLogger("lip.unattended").info("SIGTERM: stopping between sessions")
+                    return 0
         finally:
             if engine is not None:
                 engine.stop()
-            # Clean shutdown: the current day's summary goes to the history
-            # (a SIGTERM bypasses this; SummaryHistory also checkpoints).
+            # Shutdown (also on SIGTERM, which returns through here): the
+            # current day's summary goes to the history; SummaryHistory also
+            # checkpoints periodically for a crash or SIGKILL.
             flush_summary_histories()
     if args.once:
         return 0
