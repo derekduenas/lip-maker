@@ -107,20 +107,20 @@ def _km(fv=None, yes=((30, 2000.0),), no=((60, 2000.0),), days=1.25, **kw):
                           no_bids=list(no), days_to_settle=days, fv_cents=fv, **kw)
 
 
-def test_quote_economics_adds_capture_vs_fv():
+def test_quote_economics_prices_fv_sides_and_credits_edge_vs_mid():
+    # Credit rules (edge vs the book mid, only once calibration passed) are
+    # in test_review_r2_selection; the old spread credit is gone.
     base = S.quote_economics(_km(), 100)
-    # rungs 30 / 60; weather fills 0.04/day x 100 = 4 per side.
-    both = S.quote_economics(_km(fv=40.0), 100)           # edges +10 and 0: both rest
-    assert both[0] - base[0] == pytest.approx(4 * (10 + 0) / 100.0)
-    assert both[1] == base[1]                               # two-sided capital
-    # with both sides resting the capture is the spread, whatever the FV
-    assert S.quote_economics(_km(fv=35.0), 100)[0] == pytest.approx(both[0])
+    # rungs 30 / 60; weather fills 0.04/day x 100 = 4 per side; mid 35.
+    both = S.quote_economics(_km(fv=40.0, fv_calibrated=True), 100)   # edges +10 and 0: both rest
+    assert both[0] == pytest.approx(base[0]) and both[1] == base[1]
     # FV 50: NO at 60 pays 10c over fair -> priced as a one-sided YES quote
-    one = S.quote_economics(_km(fv=50.0), 100)
+    one = S.quote_economics(_km(fv=50.0, fv_calibrated=True), 100)
     assert one[1] == pytest.approx(0.30 * 100)
     explicit = S.quote_economics(_km(), 100, sides=("yes",))
-    assert one[0] == pytest.approx(explicit[0] + 4 * 20 / 100.0)
-    assert S.fv_capture_per_day(_km(fv=50.0), 100, 30, 60, sides=("no",)) == pytest.approx(-0.4)
+    assert one[0] == pytest.approx(explicit[0] + 4 * (50 - 35) / 100.0)
+    assert S.fv_capture_per_day(_km(fv=50.0, fv_calibrated=True), 100, 30, 60, sides=("no",)) == \
+        pytest.approx(-0.6)
     assert S.fv_capture_per_day(_km(), 100, 30, 60) == 0.0
     # both sides pay up: nothing to price
     assert S.quote_economics(_km(fv=29.5, no=((71, 2000.0),)), 100)[:2] == (0.0, 0.0)
@@ -136,8 +136,10 @@ def test_one_sided_pricing_matches_legacy_size_curve_conversion():
 
 
 def test_ranking_uses_model_edge():
-    plain = replace(_km(), market="KXHIGHNY-26OCT01-B70.5")
-    edge = replace(_km(fv=40.0), market="KXHIGHNY-26OCT01-B72.5")
+    # same book and FV (45 vs mid 35, YES only: NO at 60 pays 5c over fair);
+    # only a calibrated model's edge raises the net
+    plain = replace(_km(fv=45.0), market="KXHIGHNY-26OCT01-B70.5")
+    edge = replace(_km(fv=45.0, fv_calibrated=True), market="KXHIGHNY-26OCT01-B72.5")
     payup = replace(_km(fv=29.5, no=((71, 2000.0),)), market="KXHIGHNY-26OCT01-B74.5")
     sel = S.fast_allocate([plain, edge, payup], per_market_usd=1000, chunk=100)
     nets = {t.market: t.net_per_day for t in sel.taken}

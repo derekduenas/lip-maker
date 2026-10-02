@@ -1471,7 +1471,10 @@ class RunLoop:
                        sides: tuple, size: float | None) -> tuple:
         """Sides allowed to rest under FV-driven quoting: edge >= -
         LIP_FV_MAX_GIVEUP_CENTS and, when ``size`` is given, per-side EV > 0
-        (edge x fills/day + half the two-sided LIP reward - maker fees)."""
+        (edge x fills/day + that side's LIP reward - maker fees). The reward
+        of a side resting with its opposite is half the two-sided reward; a
+        lone side earns its one-sided snapshot share (Kalshi excludes a
+        snapshot whose other side does not reach target without us)."""
         from mm.unattended.fairvalue import fv_side_ok, side_edge_cents, side_ev_usd_day
         fv = float(row["fv_cents"])
         keep = []
@@ -1484,12 +1487,19 @@ class RunLoop:
             keep.append(sd)
         if size is None or not keep:
             return tuple(keep)
-        from mm.selector import fills_per_day, kalshi_share, maker_fee_usd, reward_per_day
+        from mm.selector import (fills_per_day, kalshi_one_sided_share, kalshi_share, maker_fee_usd,
+                                 reward_per_day)
         km = self._km(market)
         if km is None:
             return ()
         try:
-            reward_side = reward_per_day(kalshi_share(km, int(yes_cents), int(no_cents), float(size)), km) / 2.0
+            if len(keep) == 2:
+                two = reward_per_day(kalshi_share(km, int(yes_cents), int(no_cents), float(size)), km) / 2.0
+                reward = {"yes": two, "no": two}
+            else:
+                sd = keep[0]
+                price = int(yes_cents if sd == "yes" else no_cents)
+                reward = {sd: reward_per_day(kalshi_one_sided_share(km, sd, price, float(size)), km)}
         except Exception:
             logging.getLogger("lip.risk").exception("fv reward estimate failed for %s", market)
             return ()
@@ -1498,7 +1508,7 @@ class RunLoop:
         for sd in keep:
             price = int(yes_cents if sd == "yes" else no_cents)
             fee = maker_fee_usd(km, price, min(float(size), fills) if fills > 0 else 0.0)
-            ev = side_ev_usd_day(side_edge_cents(fv, sd, price), fills, reward_side, fee)
+            ev = side_ev_usd_day(side_edge_cents(fv, sd, price), fills, reward[sd], fee)
             if ev > 0:
                 out.append(sd)
             else:
@@ -2190,6 +2200,7 @@ class RunLoop:
             fee_type=prog.fee_type,
             fee_multiplier=prog.fee_multiplier,
             fv_cents=None if row is None else float(row["fv_cents"]),
+            fv_calibrated=row is not None and self.fv_calib.passed(),
         )
 
     def _fv_note_admitted(self, markets: list) -> None:

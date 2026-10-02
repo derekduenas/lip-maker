@@ -156,6 +156,9 @@ class KalshiMarket:
     # applies LIP_FV_MIN_HOURS_TO_CLOSE instead of the global minimum.
     fv_cents: float | None = None
     fv_candidate: bool = False
+    # The model's calibration verdict passed (RunLoop: fv_calib.passed()):
+    # only then does fv_capture_per_day credit the model's edge vs the mid.
+    fv_calibrated: bool = False
 
 
 @dataclass
@@ -448,18 +451,34 @@ def fills_per_day(market: KalshiMarket, size: float) -> float:
     return float(size) * FILL_FRACTION_PER_DAY.get(family_of(market), FILL_FRACTION_PER_DAY["event"])
 
 
+def book_mid_cents(market: KalshiMarket) -> float | None:
+    """YES mid of the market's book: (best YES bid + 100 - best NO bid) / 2,
+    None without a two-sided book."""
+    yb = max((p for p, _s in market.yes_bids), default=None)
+    nb = max((p for p, _s in market.no_bids), default=None)
+    if yb is None or nb is None:
+        return None
+    return (float(yb) + 100.0 - float(nb)) / 2.0
+
+
 def fv_capture_per_day(market: KalshiMarket, size: float, yes_cents: int, no_cents: int,
                        sides: tuple = ("yes", "no")) -> float:
-    """Expected spread capture versus model fair value, $/day, for ``sides``
-    resting ``size`` at the given prices: sum of fills/day x edge / 100 with
-    edge = fairvalue.side_edge_cents (negative when the bid pays above FV).
-    0 without a fair value (market.fv_cents None)."""
-    if market.fv_cents is None:
+    """Expected value of the model's view versus the book, $/day, for
+    ``sides`` resting ``size``: sum of fills/day x edge / 100 with edge =
+    FV - mid for a YES bid and mid - FV for a NO bid (mid =
+    ``book_mid_cents``). Both sides resting cancel out: the spread itself is
+    already in quote_economics and does not depend on the fair value. 0
+    without a fair value, without a two-sided book, or before the model's
+    calibration verdict passed (``market.fv_calibrated``). The price paid
+    (``yes_cents`` / ``no_cents``) is gated separately (``fv_ok_sides``)."""
+    if market.fv_cents is None or not market.fv_calibrated:
         return 0.0
-    from mm.unattended.fairvalue import side_edge_cents
+    mid = book_mid_cents(market)
+    if mid is None:
+        return 0.0
     fills = fills_per_day(market, size)
-    return sum(fills * side_edge_cents(market.fv_cents, sd, yes_cents if sd == "yes" else no_cents) / 100.0
-               for sd in sides)
+    edge = {"yes": float(market.fv_cents) - mid, "no": mid - float(market.fv_cents)}
+    return sum(fills * edge[sd] / 100.0 for sd in sides if sd in edge)
 
 
 def fv_ok_sides(market: KalshiMarket, yes_cents: int, no_cents: int) -> tuple:
@@ -484,8 +503,9 @@ def quote_economics(market: KalshiMarket, size: float, *, reward_factor: float =
     With a model fair value on the market (``fv_cents``, FV-driven paper
     quoting) the default sides are ``fv_ok_sides`` (a side paying more than
     LIP_FV_MAX_GIVEUP_CENTS above fair value is not priced as resting) and
-    net adds ``fv_capture_per_day`` for the resting sides: a model edge
-    raises a market's net, a side that pays up loses its reward. The family
+    net adds ``fv_capture_per_day`` for the resting sides: the model's edge
+    versus the book mid, only once its calibration verdict passed
+    (``fv_calibrated``). A side that pays up loses its reward. The family
     adverse-selection prior stays in (conservative)."""
     # Kalshi: a book that already reaches target/5 is quoted at that
     # reference; a thinner book at the touch. PM US: reward-optimal rung.
