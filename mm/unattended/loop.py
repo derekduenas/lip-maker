@@ -448,6 +448,8 @@ class RunLoop:
 
     def on_frame(self, row: dict) -> None:
         kind = str(row.get("kind") or row.get("type") or "")
+        if kind == WS_RAW_TYPE:
+            return  # raw websocket evidence for the recorder only (_dispatch_ws_message)
         if kind == "program":
             self.add_program(row)
             return
@@ -3649,15 +3651,31 @@ async def _flush_unsubscribes(sock, ctx: dict) -> None:
         await unsub(names)
 
 
+WS_RAW_TYPE = "ws_raw"
+
+
+def _ws_raw_row(kind: str, msg: dict) -> dict:
+    """A raw websocket message as an evidence row for the frame recorder
+    (tools/verify_ws_frames.py). RunLoop.on_frame ignores this type."""
+    return {"type": WS_RAW_TYPE, "ts": msg.get("ts"), "channel": kind, "msg": dict(msg)}
+
+
 def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "SidSequencer",
                          sock) -> None:
     """Route one decoded read-only websocket message. Raises SequenceGap on a
-    real book sequence gap."""
+    real book sequence gap.
+
+    Book frames reach ``on_frame`` with ``seq`` set to None (SidSequencer has
+    checked it per subscription) and the original kept as ``ws_seq``. Raw
+    market_lifecycle_v2 messages and subscribed/unsubscribed/ok replies are
+    also passed on as ``{"type": "ws_raw", "channel": <type>, "msg": <message>}``
+    rows: RunLoop ignores them, the recorder keeps them as evidence."""
     kind = str(msg.get("type") or "")
     if kind == "trade":
         body = msg.get("msg") or msg
         on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
     elif kind == "market_lifecycle_v2":
+        on_frame(_ws_raw_row(kind, msg))
         # A determined/settled result settles paper inventory at 100/0
         # (RunLoop.settle ignores markets it holds nothing in).
         body = msg.get("msg") or {}
@@ -3671,6 +3689,7 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
             return
         if verdict == "gap":
             raise SequenceGap(f"sid {msg.get('sid')} sequence gap at {msg.get('seq')}")
+        msg["ws_seq"] = msg.get("seq")
         msg["seq"] = None
         on_frame(msg)
     elif kind in ("subscribed", "unsubscribed", "ok"):
@@ -3680,6 +3699,7 @@ def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "Sid
             # update_subscription / unsubscribe acks carry the subscription's
             # seq; record it so the next book message is not seen as a gap.
             seqr.check(msg)
+        on_frame(_ws_raw_row(kind, msg))
 
 
 KALSHI_FINAL_STATUSES = ("determined", "amended", "finalized", "settled")

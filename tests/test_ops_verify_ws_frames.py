@@ -110,7 +110,11 @@ def test_healthy_engine_recording(tmp_path, capsys):
     f = _record(tmp_path, _healthy_stream())
     rep = V.analyze(bookrec.iter_frames([f]), skew=_skew())
     assert rep["failures"] == []
-    assert rep["type_counts"] == {"orderbook_snapshot": 3, "orderbook_delta": 3, "settlement": 1}
+    # raw lifecycle messages and subscribed/ok replies reach the recorder as
+    # ws_raw rows and are analysed as their own types
+    assert rep["type_counts"] == {"orderbook_snapshot": 3, "orderbook_delta": 3,
+                                  "market_lifecycle_v2": 2, "subscribed": 1, "ok": 1, "settlement": 1}
+    assert rep["ws_raw_rows"] == {"market_lifecycle_v2": 2, "subscribed": 1, "ok": 1}
     assert rep["book"]["orderbook_snapshot"]["pct_sending_ts_ms"] == 100.0
     assert rep["book"]["orderbook_delta"]["pct_msg_ts_ms"] == 100.0
     eng = rep["skew"]["recv_minus_exchange_s"]["engine"]
@@ -119,18 +123,19 @@ def test_healthy_engine_recording(tmp_path, capsys):
     # merge evidence from book frames: KXC-1 first snapshot 30 s into sid 1
     late = rep["subscriptions"]["late_tickers_on_sid"]
     assert [r["ticker"] for r in late] == ["KXC-1"]
-    # what the current engine does NOT record is reported, not guessed
-    assert rep["seq"]["recorded"] is False
-    notes = " ".join(rep["notes"])
-    assert "seq not recorded" in notes
-    assert "raw market_lifecycle_v2 messages not recorded" in notes
-    assert "subscribed/ok replies not recorded" in notes
+    # the original seq is recorded as ws_seq: the merge resync is a snapshot gap
+    assert rep["seq"]["recorded"] is True and rep["seq"]["source"] == {"ws_seq": 6}
+    assert rep["seq"]["snapshot_gaps"] == 1 and rep["seq"]["delta_gaps"] == 0
+    assert not any("not recorded" in n for n in rep["notes"])
+    assert rep["subscriptions"]["sids_in_multiple_replies"] == [
+        {"epoch": 0, "sid": 1, "replies": ["subscribed", "ok"]}]
     s = rep["lifecycle"]["settlement_frames"]
     assert s["n"] == 1 and s["samples"][0]["market"] == "KXA-1" and s["samples"][0]["result"] == "yes"
+    assert rep["lifecycle"]["raw"]["determined_or_settled"] == 1 and rep["lifecycle"]["raw"]["with_result"] == 1
     # CLI
     assert V.main([str(f), "--unit-config", str(tmp_path / "none.conf")]) == 0
     out = capsys.readouterr().out
-    assert "OK: every engine-required field" in out and "seq: not recorded" in out
+    assert "OK: every engine-required field" in out and "seq ({'ws_seq': 6})" in out
 
 
 def test_missing_exchange_time_fails(tmp_path, capsys):

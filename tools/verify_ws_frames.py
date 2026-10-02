@@ -22,15 +22,18 @@ gzip JSON lines ``frames-<UTC>.jsonl.gz`` under LIP_RECORD_DIR, default
 * seq gaps per sid (snapshot gaps are the merge resyncs SidSequencer
   allows; delta gaps are real gaps).
 
-What the recorder can and cannot show. The engine records the frame passed
-to RunLoop.on_frame, i.e. AFTER loop._dispatch_ws_message. That function
-sets ``seq`` to None on book frames, turns market_lifecycle_v2 into a
-derived ``{"kind": "settlement"}`` frame (determined/settled yes/no only)
-and does not forward ``subscribed`` / ``ok`` replies. So on recordings made
-by that code the seq-gap, raw-lifecycle and reply checks report
-``not_recorded`` instead of guessing; the book-frame merge evidence and the
-skew checks still work. A recording that carries those frames (or the
-original seq under ``ws_seq``) is analysed in full.
+What the recorder shows. The engine records the frames passed to
+RunLoop.on_frame, i.e. AFTER loop._dispatch_ws_message. That function sets
+``seq`` to None on book frames and keeps the original under ``ws_seq``;
+it turns market_lifecycle_v2 into a derived ``{"kind": "settlement"}`` frame
+(determined/settled yes/no only) and also forwards every raw
+market_lifecycle_v2 message and every ``subscribed`` / ``unsubscribed`` /
+``ok`` reply as ``{"type": "ws_raw", "channel": <type>, "msg": <message>}``
+(RunLoop ignores these rows). This tool unwraps ws_raw rows and analyses
+them as the original message types (counted under ``ws_raw_rows``).
+Recordings made before that change carry none of this: there the seq-gap,
+raw-lifecycle and reply checks report ``not recorded`` instead of guessing;
+the book-frame merge evidence and the skew checks still work.
 
 Exit status: 0 every engine-required field was seen; 1 a field the engine
 depends on is absent from ALL frames of a type that was recorded; 2 no
@@ -67,6 +70,7 @@ UNIT_CONFIGS = (
 )
 SKEW_KEYS = ("LIP_CLOCK_SKEW_LIMIT_S", "LIP_CLOCK_SKEW_N", "LIP_CLOCK_SKEW_SUSTAIN_S")
 BOOK_TYPES = ("orderbook_snapshot", "orderbook_delta")
+WS_RAW_TYPE = "ws_raw"   # mm.unattended.loop.WS_RAW_TYPE
 PMUS_PREFIX = "PMUS:"
 
 # Fields the engine reads, per frame type. Each entry is a group of
@@ -285,6 +289,7 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
     seq_last = {}
     seq_src = Counter()
     seq_gaps = defaultdict(lambda: {"snapshot_gaps": 0, "delta_gaps": 0, "dups": 0, "n": 0})
+    ws_raw = Counter()
     ts_min = ts_max = None
     total = 0
 
@@ -296,6 +301,16 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
         if fr.get("hdr"):
             header[t] += 1
             continue
+        if t == WS_RAW_TYPE:
+            # raw websocket message forwarded by loop._dispatch_ws_message
+            inner = fr.get("msg")
+            if not isinstance(inner, dict):
+                continue
+            ws_raw[str(fr.get("channel") or _ftype(inner))] += 1
+            inner = dict(inner)
+            if inner.get("ts") is None:
+                inner["ts"] = fr.get("ts")
+            fr, t = inner, _ftype(inner)
         types[t] += 1
         ts = _num(fr.get("ts"))
         if ts is not None:
@@ -446,16 +461,17 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
     notes = []
     any_book = sum(book_n.values())
     if any_book and seq_present == 0:
-        notes.append("seq not recorded: loop._dispatch_ws_message sets seq=None before on_frame, "
-                     "and the recorder stores that frame; seq-gap counts are not available "
-                     "(record the original under 'ws_seq' to enable them)")
+        notes.append("seq not recorded: book frames carry neither seq nor ws_seq (a recording "
+                     "made before loop._dispatch_ws_message kept the original seq as ws_seq); "
+                     "seq-gap counts are not available")
     if lifecycle["n"] == 0:
-        notes.append("raw market_lifecycle_v2 messages not recorded: the dispatcher forwards only "
-                     "derived settlement frames (determined/settled with result yes/no)")
+        notes.append("raw market_lifecycle_v2 messages not recorded: no ws_raw lifecycle rows in "
+                     "this window (a recording made before the dispatcher forwarded them, or no "
+                     "lifecycle traffic); only derived settlement frames are available")
     if replies["subscribed"] + replies["ok"] == 0:
-        notes.append("subscribed/ok replies not recorded: the dispatcher passes them to the socket "
-                     "(note_response) and SidSequencer, not to on_frame; merge evidence below comes "
-                     "from book frames only")
+        notes.append("subscribed/ok replies not recorded: no ws_raw reply rows in this window (a "
+                     "recording made before the dispatcher forwarded them, or a file that starts "
+                     "after the subscribes); merge evidence below comes from book frames only")
     if any(unit_suspect.values()):
         notes.append(f"exchange-time unit suspect (|skew| > 1e6 s): {dict(unit_suspect)}")
 
@@ -466,6 +482,7 @@ def analyze(frames, *, skew: dict, merge_gap_s: float = 2.0, samples: int = 3) -
         "type_counts": dict(types.most_common()),
         "header_counts": dict(header.most_common()),
         "pmus_book_frames_skipped": pmus_books,
+        "ws_raw_rows": dict(ws_raw.most_common()),
         "connections": epoch + 1,
         "book": book,
         "skew": {
@@ -521,6 +538,9 @@ def render(rep: dict) -> str:
     out.append("frame types: " + ", ".join(f"{k}={v}" for k, v in rep["type_counts"].items()))
     if rep["header_counts"]:
         out.append("header rows: " + ", ".join(f"{k}={v}" for k, v in rep["header_counts"].items()))
+    if rep.get("ws_raw_rows"):
+        out.append("raw ws rows (unwrapped below): "
+                   + ", ".join(f"{k}={v}" for k, v in rep["ws_raw_rows"].items()))
     if rep["pmus_book_frames_skipped"]:
         out.append(f"PM US poller book frames (not Kalshi ws, skipped): {rep['pmus_book_frames_skipped']}")
     out.append("")

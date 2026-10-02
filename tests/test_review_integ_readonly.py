@@ -167,4 +167,5 @@ def test_update_subscription_ack_advances_the_sid_sequence():
     L._dispatch_ws_message({"type": "orderbook_delta", "sid": 11, "seq": 3, "ts": T0 + 1,
                             "msg": {"market_ticker": K, "side": "yes", "price_dollars": "0.4000",
                                     "delta_fp": "1"}}, frames.append, seqr, None)
-    assert [f["type"] for f in frames] == ["orderbook_snapshot", "orderbook_delta"]
+    assert [f["type"] for f in frames if f["type"] != L.WS_RAW_TYPE] == [
+        "orderbook_snapshot", "orderbook_delta"]
