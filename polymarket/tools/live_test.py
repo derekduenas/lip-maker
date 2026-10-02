@@ -185,12 +185,16 @@ def main() -> int:
     print(f"  │  tif:        GOOD_TILL_CANCEL")
     print(f"  └─────────────────────────────────────────")
 
-    # Server-side preview first
+    # Server-side preview first. ``price`` is the outcome price (NO price for
+    # --side no); PM US price.value is always the YES side ("To trade the NO
+    # side at any price X, set `price.value = 1.00 - X`",
+    # docs.polymarket.us/api-reference/orders/overview).
+    wire = price if intent == "ORDER_INTENT_BUY_LONG" else 1.0 - price
     order = {
         "marketSlug": slug,
         "intent":     intent,
         "type":       "ORDER_TYPE_LIMIT",
-        "price":      {"value": f"{price:.3f}", "currency": "USD"},
+        "price":      {"value": f"{wire:.3f}", "currency": "USD"},
         "quantity":   qty,
         "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
     }
