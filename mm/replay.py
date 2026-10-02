@@ -47,13 +47,15 @@ class ReplayResult:
     settlements: dict = field(default_factory=dict)
 
 
-def replay(path: str, *, fee_type: str = "quadratic",
+def replay(path: str, *, fee_type: str = "quadratic_with_maker_fees",
            venue: str = "kalshi", latency_ms: float = 0.0) -> ReplayResult:
     """Walk a JSONL recording and return paper P&L.
 
     Quote records become resting paper orders. Trade records are fed to
     ``PaperFillSimulator``. A ``settlement`` record is ``{"market", "yes_cents"}``.
     An ``estimate`` record adds estimated reward dollars and does not change cash.
+    ``fee_type`` defaults to the standard maker-fee series, so a caller that
+    does not know the series' fee type never prices maker fills as fee-free.
     """
     sim = PaperFillSimulator(latency_ms=latency_ms)
     result = ReplayResult()

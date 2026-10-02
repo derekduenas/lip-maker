@@ -1,13 +1,18 @@
-"""Pre-trade EV check (#103) — refuse markets where 7d adverse > rebate.
+"""Pre-trade EV check (#103) — refuse series whose 7d rebate < 0.5 × adverse.
 
 DIAGNOSIS (Apr 27 audit):
   Toxicity filter is reactive — it waits for fills to accumulate before
   blacklisting. By then we've already eaten the loss. KXCOFFEEW lost
   -$71.61 settlement vs $10 rebate before any per-market detector fired.
 
-THIS MODULE: compute per-series 7d EV from settlement_log + Kalshi-paid
-rebate ledger, and reject any market in a series whose adverse cost
-exceeds rebate captured. Acts as a PROACTIVE gate before quote placement.
+THIS MODULE: compute per-series 7d totals from settlement_log
+(adverse = sum of negative our_realized_usd; rebate = rebate_earned_usd,
+which after the reward_provenance migration mirrors reconciled PAID
+rewards only) and block a series when rebate / adverse < EV_RATIO_FLOOR.
+With EV_RATIO_FLOOR = 0.5 that means a series is still ALLOWED while its
+adverse cost is up to 2× the rebate — i.e. it is not a "rebate must exceed
+adverse" (positive-EV) test. Zero rebate with losses is treated as a data
+gap and allowed. Acts as a PROACTIVE gate before legacy quote placement.
 
 CACHE: per-series EV is recomputed every CACHE_TTL_SEC (default 1h) since
 settlement data only changes when markets close.

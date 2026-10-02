@@ -14,7 +14,11 @@ headline metric:
     engine/maker_rebate_scorer.py:44  0.07 — sourced to GEMINI's docs, not
                                     Kalshi, despite the identical number
 
-Worse, `dislocation/spread.py:63-66` carries the comment
+(dislocation/ and engine/maker_rebate_scorer.py now live under
+_archive/2026-10-01/; the line numbers refer to those archived copies.)
+
+Worse, `dislocation/spread.py:63-66` (now _archive/2026-10-01/dislocation/)
+carries the comment
 
     fee = ceil(0.07 x C x P x (1-P)) cents per side
 
@@ -24,22 +28,25 @@ maker actually gets, the round-up is the DOMINANT term — a 1-contract fill at
 50c is ~0.0175c of raw fee and 1c after rounding, a ~57x understatement. Every
 edge estimate built on those constants was systematically optimistic.
 
-Why this module refuses to be confident
----------------------------------------
-The real Kalshi schedule is UNVERIFIED here: docs.kalshi.com is blocked by
-this environment's egress proxy (403 to CONNECT), so the formula below could
-not be checked against the current fee page. See
-docs/CLAUDE_INDEPENDENT_ASSESSMENT.md §0.
+The schedule (Kalshi fee schedule PDF, effective 7 July 2026; quoted in
+mm/accounting.py)
+------------------------------------------------------------------------
+    taker = round_up(M x 0.07   x C x P x (1-P))
+    maker = round_up(M x 0.0175 x C x P x (1-P))  only on maker-fee series
+                                                  (series fee_type
+                                                  quadratic_with_maker_fees;
+                                                  combo: 0.035), 0 otherwise
 
-So the schedule carries its own provenance and says out loud that it is
-unverified. `verified` is False until someone with access confirms it and
-records that in the constructor. Callers that must not guess can demand
-`require_verified=True` and get an exception instead of a plausible number.
+Per-series pricing lives in mm/accounting.kalshi_fee_usd and
+engine/series_fees.py. This module's global default (KALSHI_DEFAULT) has no
+series information, so it prices every market as a maker-fee series: maker
+0.0175, taker 0.07 - the conservative case of the real schedule. It used to
+charge the 0.07 TAKER rate on maker fills, 4x the documented maker fee.
 
-The default is deliberately CONSERVATIVE — it assumes we pay the documented
-taker-style fee on both entry and exit unless told otherwise. Being wrong in
-that direction understates profit; the $0.00 assumption it replaces was wrong
-in the direction that manufactures it.
+`verified` stays False: the default does not know the series' fee_type, so
+for most series (fee_type quadratic, no maker fee) it overstates the maker
+fee. Callers that must not guess can demand `require_verified=True` and get
+an exception instead of a plausible number.
 """
 from __future__ import annotations
 
@@ -94,15 +101,16 @@ class FeeSchedule:
     # This refutes the repo's uncited "fee-free per Kalshi" assumption.
     charge_maker: bool = True
     notes: str = ""
+    # Coefficient for maker (resting) fills when it differs from ``rate``
+    # (Kalshi: 0.0175 maker vs 0.07 taker). None = ``rate`` for both.
+    maker_rate: Optional[Decimal] = None
 
     def fee_usd(self, price_cents, contracts, *, is_taker: bool = False) -> Decimal:
         """Fee for one fill of `contracts` at `price_cents`.
 
-        Documented-but-unverified Kalshi form:
-            fee = ceil(rate x C x P x (1 - P)) cents
-        where P is the price in dollars and C the contract count. The
-        quadratic P(1-P) makes fees largest at 50c and vanish at the edges,
-        which matches a risk-based charge on a binary.
+        Kalshi form: fee = round_up(coef x C x P x (1 - P)), coef = ``rate``
+        for a taker fill and ``maker_rate`` (else ``rate``) for a maker
+        fill, P the price in dollars, C the contract count.
         """
         if not is_taker and not self.charge_maker:
             return ZERO
@@ -112,7 +120,8 @@ class FeeSchedule:
         p = Decimal(str(price_cents)) / CENTS
         if p <= 0 or p >= 1:
             return ZERO          # edge prices carry no risk premium
-        raw_cents = self.rate * c * p * (Decimal(1) - p) * CENTS
+        coef = self.rate if (is_taker or self.maker_rate is None) else self.maker_rate
+        raw_cents = coef * c * p * (Decimal(1) - p) * CENTS
         mode = "ceil_cent" if self.round_up_to_cent else self.rounding
         if mode == "ceil_cent":
             cents = Decimal(math.ceil(raw_cents))
@@ -138,7 +147,9 @@ class FeeSchedule:
                 "rounding": ("ceil_cent" if self.round_up_to_cent
                              else self.rounding),
                 "round_up_to_cent": self.round_up_to_cent,
-                "charge_maker": self.charge_maker, "notes": self.notes}
+                "charge_maker": self.charge_maker,
+                "maker_rate": None if self.maker_rate is None else str(self.maker_rate),
+                "notes": self.notes}
 
 
 # ── the venue's full fee pipeline ─────────────────────────────────────────
@@ -231,11 +242,11 @@ class OrderFeeAccumulator:
                              precision=self.precision)
 
 
-# The rate is UNVERIFIED, so fee-dependent figures are reported as a RANGE
-# rather than a point. Low end: the tiered maker rate reported by search
-# summaries (5 basis points) — NOT verbatim from the schedule and possibly
-# the perps table, so it is a bound, not a fact. High end: the 0.07
-# quadratic form this repo has always used.
+# A wide bracket for fee-dependent figures. Low end: the tiered maker rate
+# reported by search summaries (5 basis points) - NOT verbatim from the
+# schedule and possibly the perps table, so it is a bound, not a fact. High
+# end: the 0.07 taker coefficient applied to every fill (above the 0.0175
+# maker coefficient the default schedule charges).
 RATE_RANGE_LOW = Decimal("0.0005")
 RATE_RANGE_HIGH = Decimal("0.07")
 
@@ -251,27 +262,31 @@ def fee_range_usd(price_cents, contracts, *, is_taker: bool = False):
             high.fee_usd(price_cents, contracts, is_taker=is_taker))
 
 
-# The working assumption. `verified=False` is load-bearing: it is what
-# `require_verified=True` trips on, and what reports must surface.
-KALSHI_UNVERIFIED = FeeSchedule(
-    name="kalshi_documented_unverified",
+# The global default when no series fee_type is known: the maker-fee-series
+# case of the July 2026 schedule (maker 0.0175, taker 0.07). `verified=False`
+# is load-bearing: it is what `require_verified=True` trips on, and it says
+# the series' real fee_type was not applied (most series have no maker fee).
+KALSHI_DEFAULT = FeeSchedule(
+    name="kalshi_default_maker_fee_series",
     rate=Decimal("0.07"),
-    source=("RATE unverified: kalshi.com/docs/kalshi-fee-schedule.pdf "
-            "returned HTTP 429 on 2026-09-20. ROUNDING and maker-charging "
-            "ARE verified — see docs/venue_evidence/kalshi_fees_20260920.json"),
+    maker_rate=Decimal("0.0175"),
+    source=("kalshi.com/docs/kalshi-fee-schedule.pdf effective 2026-07-07: "
+            "taker 0.07, maker 0.0175 on maker-fee series (0 otherwise); "
+            "series fee_type unknown here, so the maker fee is assumed"),
     verified=False,
     rounding="ceil_6dp",
     charge_maker=True,
-    notes=("Maker fills ARE charged (verified, help.kalshi.com): this "
-           "refutes tools/net_yield_logger.py's uncited 'fee-free per "
-           "Kalshi'. Rounding is ceil to $0.000001 (verified, "
-           "docs.kalshi.com/getting_started/fee_rounding), NOT to the whole "
-           "cent as this repo briefly implemented — that overstated the fee "
-           "on small fills by orders of magnitude. The RATE constant 0.07 "
-           "remains unverified, so verified=False stands."),
+    notes=("Same rates as mm/accounting.kalshi_fee_usd for "
+           "fee_type=quadratic_with_maker_fees. Use that (or "
+           "engine.series_fees) when the series' fee_type is known: a "
+           "'quadratic' series pays no maker fee. Rounding is ceil to "
+           "$0.000001 (docs.kalshi.com/getting_started/fee_rounding)."),
 )
+# Old name kept for importers; it is the same schedule.
+KALSHI_UNVERIFIED = KALSHI_DEFAULT
 
-# An explicit zero, for A/B-ing the old assumption. Never the default.
+# An explicit zero maker fee (the 'quadratic' series case, or the old
+# uncited assumption for A/B). Never the default.
 ASSUME_FREE_MAKER = FeeSchedule(
     name="assume_free_maker",
     rate=Decimal("0.07"),

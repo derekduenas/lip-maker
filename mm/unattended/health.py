@@ -10,22 +10,39 @@ from mm.safety.supervisor import write_heartbeat
 WINDOW_SECONDS = 86400.0
 
 
+ATTRIBUTION_KEYS = ("spread_capture_usd", "adverse_selection_usd", "inventory_mtm_usd",
+                    "est_rewards_kalshi_usd", "est_rewards_pmus_usd", "rebates_usd", "fees_usd")
+
+
 def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: float,
-                         data_source: str | None = None, buckets: dict | None = None) -> str:
+                         data_source: str | None = None, buckets: dict | None = None,
+                         premium_paid_usd: float | None = None,
+                         attribution: dict | None = None) -> str:
+    """``pnl_usd`` is the engine's estimated P&L (MTM markout + estimated
+    rewards + rebates - fees); ``premium_paid_usd`` is what fills cost;
+    ``rewards_usd`` is paid/inferred rewards only. ``attribution``
+    (RunLoop.pnl_attribution) splits pnl_usd into estimated parts that sum
+    to it; it is printed as ``pnl_attribution_estimate_paper``."""
     text = (
         f"daily summary {day}\n"
         f"fills {int(fills)}\n"
         f"pnl_usd {float(pnl_usd):.4f}\n"
         f"rewards_usd {float(rewards_usd):.4f}\n"
     )
+    if premium_paid_usd is not None:
+        text += f"premium_paid_usd {float(premium_paid_usd):.4f}\n"
     if data_source:
         text += f"data_source {data_source}\n"
+    if attribution:
+        text += "pnl_attribution_estimate_paper " + " ".join(
+            f"{k} {float(attribution.get(k) or 0.0):.4f}" for k in ATTRIBUTION_KEYS) + "\n"
     for name, b in sorted((buckets or {}).items()):
         text += (f"bucket {name} selected {int(b.get('selected_n', 0))} "
                  f"capital_usd {float(b.get('capital_usd', 0)):.2f} "
                  f"raw_est_rewards_usd {float(b.get('raw_est_usd', 0)):.4f} "
                  f"fills {int(b.get('fills_n', 0))} "
                  f"markout_usd {float(b.get('markout_usd', 0)):.4f} "
+                 f"fees_usd {float(b.get('fees_usd', 0)):.4f} "
                  f"pnl_usd {float(b.get('pnl_usd', 0)):.4f}\n")
     return text
 

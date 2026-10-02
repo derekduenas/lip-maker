@@ -13,6 +13,10 @@ Usage:
     candidates = filter_by_depth(candidates, kalshi_client, min_share=0.05)
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import logging
 import time
 
@@ -224,7 +228,7 @@ def filter_by_depth(
 # Self-test / audit harness
 if __name__ == "__main__":
     import sys, json
-    sys.path.insert(0, "/root/lip-maker")
+    sys.path.insert(0, _LIP_HOME)
     from execution.kalshi_auth import KalshiClient
     from engine.capital_allocator import select_optimal_portfolio
 

@@ -1,9 +1,13 @@
 """Tiny helper — every watched cron calls write_heartbeat(name) at end of main()."""
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import sqlite3
 from datetime import datetime, timezone
 
-DB = "/root/lip-maker/data/lip_maker.db"
+DB = (_LIP_HOME + "/data/lip_maker.db")
 
 
 def write_heartbeat(cron_name: str) -> None:

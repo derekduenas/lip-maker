@@ -10,9 +10,11 @@ BACKUP_DIR=/root/backups
 mkdir -p "$BACKUP_DIR"
 TS=$(date -u +%Y%m%d_%H%M%S)
 
-# Sources
-LIP_DB=/root/lip-maker/data/lip_maker.db
-PM_DB=/root/polymarket-maker/data/polymarket_maker.db
+# Sources (2026-10-01: were hard-coded to the retired /root install).
+LIP_HOME=${LIP_HOME:-$(cd "$(dirname "$0")/.." && pwd)}
+PM_HOME=${PM_HOME:-$LIP_HOME/polymarket}
+LIP_DB=$LIP_HOME/data/lip_maker.db
+PM_DB=$PM_HOME/data/polymarket_maker.db
 
 # Use sqlite3 .backup (atomic, no lock contention with running services)
 for src in "$LIP_DB" "$PM_DB"; do

@@ -37,6 +37,9 @@ observed would have reached us:
 
 Every fill carries the trade_id that caused it, so a fill can be traced back
 to a real, public, timestamped market event rather than to a coin flip.
+A trade tagged ``synthetic`` (PM US: inferred from two book polls, see
+mm/unattended/pmus_paper.synth_trades) is not a public print; its fills
+carry ``synthetic: True`` so reports can label them low fidelity.
 
 What it still cannot know
 -------------------------
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import OrderedDict
 import ssl
 import time
 import urllib.parse
@@ -65,6 +69,10 @@ API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_LATENCY_MS = 250.0
 # Float residue from fixed-point counts. A 1e-15 "fill" is not a contract.
 DUST_QTY = 1e-9
+# De-duplication memory for trade ids. Trades arrive roughly in time order,
+# so the most recent ids are the only ones a redelivery can repeat; the set
+# used to grow for the life of the process.
+SEEN_TRADES_MAX = 200_000
 
 
 def api_base() -> str:
@@ -102,6 +110,54 @@ def _cents(v) -> int:
     return int(round(float(v) * 100))
 
 
+def _side_cents(tr: dict, side: str) -> int:
+    """Trade price for ``side`` in whole cents, 0 when absent/unparseable.
+
+    ``{side}_price_dollars`` / ``{side}_price_fp`` are dollars; the legacy
+    ``{side}_price`` is integer cents (an int, or an integer string). A
+    missing NO price is 100 - YES (as kalshi_ws._parse_fill does)."""
+    for key in (f"{side}_price_dollars", f"{side}_price_fp"):
+        raw = tr.get(key)
+        if raw not in (None, ""):
+            try:
+                return _cents(raw)
+            except (TypeError, ValueError):
+                return 0
+    raw = tr.get(f"{side}_price")
+    if raw is not None and not isinstance(raw, bool):
+        try:
+            if isinstance(raw, int):
+                return int(raw)
+            txt = str(raw).strip()
+            return _cents(txt) if (isinstance(raw, float) or "." in txt) else int(txt)
+        except (TypeError, ValueError):
+            return 0
+    if side == "no":
+        yes = _side_cents(tr, "yes")
+        return 100 - yes if 0 < yes < 100 else 0
+    return 0
+
+
+class _SeenIds:
+    """Fixed-size LRU set of trade ids."""
+
+    def __init__(self, maxlen: int) -> None:
+        self.maxlen = max(1, int(maxlen))
+        self._d: OrderedDict = OrderedDict()
+
+    def __contains__(self, key) -> bool:
+        return key in self._d
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def add(self, key) -> None:
+        self._d[key] = None
+        self._d.move_to_end(key)
+        while len(self._d) > self.maxlen:
+            self._d.popitem(last=False)
+
+
 @dataclass
 class SimOrder:
     """One resting paper order being tracked for fills."""
@@ -121,11 +177,13 @@ class PaperFillSimulator:
     """Tracks paper orders and fills them from observed public trades."""
 
     def __init__(self, *, latency_ms: float = DEFAULT_LATENCY_MS,
-                 capture_path: Optional[str] = None):
+                 capture_path: Optional[str] = None,
+                 seen_trades_max: int = SEEN_TRADES_MAX):
         self.latency_sec = latency_ms / 1000.0
         self.orders: dict[str, SimOrder] = {}
         self._ctx = _ctx()
-        self._seen_trades: set[str] = set()
+        self.seen_trades_max = int(seen_trades_max)
+        self._seen_trades = _SeenIds(self.seen_trades_max)
         self._capture = capture_path
         self.trades_observed = 0
         self.fills_generated = 0
@@ -190,8 +248,8 @@ class PaperFillSimulator:
                 continue
             if qty < DUST_QTY:
                 continue
-            yes_c = _cents(tr.get("yes_price_dollars") or 0)
-            no_c = _cents(tr.get("no_price_dollars") or 0)
+            yes_c = _side_cents(tr, "yes")
+            no_c = _side_cents(tr, "no")
             taker = (tr.get("taker_side") or "").lower()
 
             for o in list(self.orders.values()):
@@ -233,6 +291,10 @@ class PaperFillSimulator:
                         "side": o.side, "price_cents": o.price_cents,
                         "count": got, "trade_id": tid, "ts": t_ts,
                         "program_id": o.program_id}
+                if tr.get("synthetic"):
+                    # Inferred from book polls (PM US), not a public trade:
+                    # downstream reports label this fill low fidelity.
+                    fill["synthetic"] = True
                 self._record({"kind": "paper_fill", "fill": fill})
                 fills.append(fill)
                 if o.remaining <= 0:

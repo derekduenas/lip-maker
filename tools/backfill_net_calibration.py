@@ -11,11 +11,15 @@ KXCOFFEEW example:
 When net capture is < 0 we floor at 0 (calibration is unsigned in downstream
 math). When >0 we still cap at 5.0 (same as before) for numerical safety.
 """
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import sqlite3
 import sys
 from datetime import datetime, timezone
 
-DB_PATH = "/root/lip-maker/data/lip_maker.db"
+DB_PATH = (_LIP_HOME + "/data/lip_maker.db")
 ALPHA = 0.05
 RATIO_MAX = 5.0
 RATIO_MIN_FLOOR = 0.0

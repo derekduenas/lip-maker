@@ -103,18 +103,19 @@ def test_amend_posts_the_shard_it_was_given():
     assert adapter.sent[-1]["body"]["exchange_index"] == 3
 
 
-def test_decrease_posts_exchange_index(tmp_path, monkeypatch):
+def test_live_decrease_is_refused(tmp_path, monkeypatch):
+    # 2026-10-01: the legacy QuoteManager is paper-only. This used to assert
+    # the live decrease body carried exchange_index; live decrease now raises.
     import execution.order_request as orq
     monkeypatch.setattr(orq, "KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED", True)
     qm = QuoteManager(paper=True, db_path=str(tmp_path / "q.db"))
     qm.paper = False
-    posted = {}
     qm.client = MagicMock()
-    qm.client.post.side_effect = lambda path, body: posted.update(path=path, body=body) or {}
     order = RestingOrder("oid", "MKT", "yes", 40, 5, 0.0, paper=False, exchange_index=2)
-    assert qm._decrease_order(order, 2) is True
-    assert posted["body"]["exchange_index"] == 2
-    assert posted["body"]["market_ticker"] == "MKT"
+    with pytest.raises(RuntimeError, match="paper-only"):
+        qm._decrease_order(order, 2)
+    qm.client.post.assert_not_called()
+    assert order.size_contracts == 5
 
 
 def test_fill_status_counts_do_not_replace_ticker_counts():

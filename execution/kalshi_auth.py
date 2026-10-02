@@ -1,8 +1,9 @@
 """Kalshi authenticated REST + WS client — RSA-PSS signing per v2 spec.
 
-Pattern reused from Weather's `execution/kalshi_auth.py` (which has the
-.env manual-parser fix). Same private key file works across engines since
-they share one Kalshi account.
+Pattern reused from Weather's `execution/kalshi_auth.py`. Same private key
+file works across engines since they share one Kalshi account. Credentials
+come from the process environment; the repo .env is read only with
+LIP_LOAD_DOTENV=1 (see maybe_load_repo_dotenv).
 """
 from __future__ import annotations
 
@@ -20,8 +21,19 @@ from config import settings
 
 _log = logging.getLogger(__name__)
 
-# Manual .env loader — python-dotenv not guaranteed in venv.
-def _load_dotenv_simple(path: str) -> None:
+REPO_DOTENV = str(Path(__file__).resolve().parent.parent / ".env")
+DOTENV_OPT_IN = "LIP_LOAD_DOTENV"
+# Keys a .env file may never set: every LIP_* mode/arming/bankroll switch.
+_DOTENV_FORBIDDEN_PREFIXES = ("LIP_",)
+
+
+def _load_dotenv_simple(path: str, *, environ=None) -> None:
+    """Manual .env parser (python-dotenv not guaranteed in the venv).
+
+    Sets only keys that are not already set, and NEVER a LIP_* key: mode,
+    arming and bankroll switches come from the service environment only, so
+    a stray .env cannot change them after mode resolution."""
+    env = os.environ if environ is None else environ
     try:
         with open(path) as f:
             for line in f:
@@ -30,13 +42,32 @@ def _load_dotenv_simple(path: str) -> None:
                     continue
                 key, _, val = line.partition("=")
                 key = key.strip()
+                if key.startswith("export "):
+                    key = key[len("export "):].strip()
                 val = val.strip().strip("'\"")
-                if key and key not in os.environ:
-                    os.environ[key] = val
+                if not key or key.upper().startswith(_DOTENV_FORBIDDEN_PREFIXES):
+                    continue
+                if key not in env:
+                    env[key] = val
     except FileNotFoundError:
         pass
 
-_load_dotenv_simple(str(Path(__file__).resolve().parent.parent / ".env"))
+
+def maybe_load_repo_dotenv(path: str = REPO_DOTENV, *, environ=None) -> bool:
+    """Load the repo .env only when LIP_LOAD_DOTENV=1 (explicit opt-in).
+
+    Importing this module used to load it unconditionally - a hidden config
+    source. Services get their environment from systemd EnvironmentFile
+    (/etc/lip-maker/lip-maker.env); a manual tool run that wants the repo
+    .env (e.g. KALSHI_KEY_ID) sets LIP_LOAD_DOTENV=1. Never sets LIP_* keys."""
+    env = os.environ if environ is None else environ
+    if str(env.get(DOTENV_OPT_IN, "")).strip() != "1":
+        return False
+    _load_dotenv_simple(path, environ=env)
+    return True
+
+
+maybe_load_repo_dotenv()
 
 
 class KalshiAuthError(RuntimeError):

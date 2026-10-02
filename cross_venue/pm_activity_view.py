@@ -12,6 +12,13 @@ USAGE:
   python pm_activity_view.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+import sys as _lh_sys
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
+_PM_PYTHON = _lh_os.environ.get("PM_PYTHON") or _lh_sys.executable
 
 import argparse
 import json
@@ -22,21 +29,21 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-PM_DB = "/root/polymarket-maker/data/polymarket_maker.db"
+PM_DB = (_PM_HOME + "/data/polymarket_maker.db")
 
 
 def pm_account_state() -> dict:
     """Subprocess to PM venv to fetch live account + activity."""
-    pm_python = "/root/polymarket-maker/venv/bin/python"
+    pm_python = _PM_PYTHON
     script = """
 import os, sys, json
-sys.path.insert(0, '/root/polymarket-maker')
+sys.path.insert(0, '__PM_HOME__')
 from execution.pm_auth import _load_dotenv_simple
-_load_dotenv_simple('/root/polymarket-maker/.env')
+_load_dotenv_simple('__PM_HOME__/.env')
 from polymarket_us import PolymarketUS
 c = PolymarketUS(
     key_id=os.getenv('PM_API_KEY_ID'),
-    secret_key=open('/root/polymarket-maker/config/polymarket_secret_key.b64').read().strip(),
+    secret_key=open('__PM_HOME__/config/polymarket_secret_key.b64').read().strip(),
 )
 b = c.account.balances().get('balances', [{}])[0]
 out = {
@@ -68,7 +75,7 @@ try:
 except Exception as e:
     out['activities_err'] = str(e)[:80]
 print(json.dumps(out, default=str))
-"""
+""".replace("__PM_HOME__", _PM_HOME)
     try:
         r = subprocess.run([pm_python, "-c", script],
                            capture_output=True, text=True, timeout=20)

@@ -200,7 +200,7 @@ class TestSelector:
 
 
 class TestArming:
-    def test_kalshi_ack_arms_the_quote_manager_only(self, tmp_path):
+    def test_kalshi_ack_does_not_arm_the_legacy_quote_manager(self, tmp_path):
         import execution.order_request as ore
         from execution.order_request import (
             KALSHI_POST_ONLY_ACK, enable_kalshi_maker_only_enforcement,
@@ -225,18 +225,19 @@ class TestArming:
             qm.client = Client()
             qm._log_quote_row = MagicMock()
             qm._update_quote_status = MagicMock()
-            blocked = qm._place_order("M", "yes", 40, 1, best_opposing_bid_cents=50)
-            assert blocked is None
-            assert qm.live_blocked == 1
+            # 2026-10-01: the legacy QuoteManager is paper-only. Before, an
+            # unarmed live place returned None and an armed one was posted;
+            # now both raise and nothing is transmitted.
+            with pytest.raises(RuntimeError, match="paper-only"):
+                qm._place_order("M", "yes", 40, 1, best_opposing_bid_cents=50)
             assert posted == []
             assert ore.MAKER_ONLY_ENFORCEMENT_VERIFIED is False
 
             enable_kalshi_maker_only_enforcement(KALSHI_POST_ONLY_ACK)
             qm.order_group_for = lambda market: "OG-9"
-            placed = qm._place_order("M", "yes", 40, 1, best_opposing_bid_cents=50)
-            assert placed is not None
-            assert posted[0]["post_only"] is True
-            assert posted[0]["order_group_id"] == "OG-9"
+            with pytest.raises(RuntimeError, match="paper-only"):
+                qm._place_order("M", "yes", 40, 1, best_opposing_bid_cents=50)
+            assert posted == []
             assert ore.MAKER_ONLY_ENFORCEMENT_VERIFIED is False
         finally:
             ore.KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED = False

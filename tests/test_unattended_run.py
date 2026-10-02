@@ -10,7 +10,6 @@ import pytest
 
 from engine.lip_reconcile import INFERRED_SOURCE, credits_from_ledger, infer_reward_credits
 from engine.reward_provenance import PAID_SOURCES
-from mm.compound import PRIOR_STRENGTH
 from mm.session_gates import SeriesStats
 from mm.unattended.loop import (
     DemoPoster, resolve_mode, resolve_ws_url, run_recorded, socket_plan,
@@ -148,8 +147,12 @@ def test_run_loop_on_a_recorded_stream(tmp_path, monkeypatch):
     assert report["inferred"]["source"] == INFERRED_SOURCE
     assert report["inferred"]["credits"][0]["inferred"] is True
     assert Decimal(report["inferred"]["credits"][0]["amount_usd"]) == Decimal("2")
-    assert report["calibration_inferred"] is True
-    assert report["factors"]["KXBRENT"] == pytest.approx((2.0 + PRIOR_STRENGTH * 1.0) / (1 + PRIOR_STRENGTH))
+    # the inferred credit is reported, but it is not a calibration input
+    assert report["inferred_credits_excluded_n"] == 1
+    assert "calibration_inferred" not in report
+    # inferred (balance-residual) credits carry no per-series information and
+    # no longer move the series factor (engine.lip_calibration.series_factors)
+    assert "KXBRENT" not in report["factors"]
     assert MARKET in report["next_usd"]
     out = tmp_path / "run.json"
     summary = tmp_path / "summary.txt"

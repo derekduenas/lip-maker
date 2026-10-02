@@ -8,6 +8,9 @@ order and does nothing to stop a bid crossing a stranger's offer.
 Because the live API cannot be verified from this environment (egress
 blocked), maker safety is proven LOCALLY: on Kalshi a YES buy at p crosses
 iff p + best_no_bid >= 100, since the two sides are mirror-priced.
+
+venue/kalshi.py was archived 2026-10-01 (_archive/2026-10-01/venue/) with
+its adapter tests; execution/quote_manager.py is now paper-only.
 """
 from __future__ import annotations
 
@@ -74,11 +77,10 @@ class TestLiveExecutionInterlock:
         qm._log_quote_row = MagicMock()
         qm._passes_safety = lambda t: (True, "ok")
         # A perfectly passive, non-crossing order still does not go out.
-        assert qm._place_order(TKR, "yes", 40, 10,
-                               best_opposing_bid_cents=50) is None
+        # 2026-10-01: the legacy QuoteManager now refuses live outright.
+        with pytest.raises(RuntimeError, match="paper-only"):
+            qm._place_order(TKR, "yes", 40, 10, best_opposing_bid_cents=50)
         qm.client.post.assert_not_called()
-        assert qm.live_blocked == 1
-        assert "live_blocked" in qm._log_quote_row.call_args.kwargs["notes"]
 
     def test_paper_is_unaffected_by_the_live_gate(self, tmp_path):
         qm = QuoteManager(paper=True, db_path=str(tmp_path / "q.db"))
@@ -213,33 +215,15 @@ class TestQuoteManagerUsesSharedContract:
         qm._log_quote_row = MagicMock()
         return qm
 
-    def test_live_order_body_comes_from_the_builder(self, tmp_path, allow_live):
+    # 2026-10-01: the three live wire-body tests that stood here
+    # (builder body, crossing refusal, unknown-book refusal) exercised the
+    # legacy live branch, which now raises before any body is built.
+    def test_live_placement_raises_even_with_gates_lifted(self, tmp_path,
+                                                          allow_live):
         qm = self._qm(tmp_path, paper=False)
-        qm._update_quote_status = MagicMock()
-        r = qm._place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
-        assert r is not None
-        body = qm.client.post.call_args[0][1]
-        assert body["post_only"] is True and "no_self_trade" not in body
-        assert body["side"] == "bid" and body["price"] == "0.4900"
-        assert qm.client.post.call_args[0][0] == "/portfolio/events/orders"
-
-    def test_live_crossing_order_is_refused_before_transmission(self, tmp_path,
-                                                                allow_live):
-        qm = self._qm(tmp_path, paper=False)
-        assert qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=50) is None
+        with pytest.raises(RuntimeError, match="paper-only"):
+            qm._place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
         qm.client.post.assert_not_called()
-        note = qm._log_quote_row.call_args.kwargs["notes"]
-        assert "maker_safety" in note
-
-    def test_live_order_without_opposing_book_is_refused(self, tmp_path,
-                                                        allow_live):
-        """Refused for the MAKER reason, with the live gate lifted, so this
-        keeps testing the unknown-book rule rather than passing because
-        something upstream blocked it."""
-        qm = self._qm(tmp_path, paper=False)
-        assert qm._place_order(TKR, "yes", 49, 10) is None
-        qm.client.post.assert_not_called()
-        assert "maker_safety" in qm._log_quote_row.call_args.kwargs["notes"]
 
     def test_paper_refuses_crossing_quote_too(self, tmp_path):
         """Catch a crossing quote in paper rather than discovering it live."""
@@ -264,59 +248,3 @@ class TestQuoteManagerUsesSharedContract:
         qm.reconcile(QuoteTarget(market_ticker=TKR, yes_bid_cents=49,
                                  no_bid_cents=48, size_contracts=10))
         assert seen == {"yes": 48, "no": 49}
-
-
-class TestVenueAdapterConsolidated:
-    def test_venue_adapter_is_blocked_by_the_same_interlock(self):
-        """Both live paths must go through one gate; an adapter must not be
-        able to transmit just because it was imported instead of the other."""
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        v._client = MagicMock()
-        res = v.place_order(TKR, "yes", 40, 10, best_opposing_bid_cents=50)
-        assert not res.success and "live execution blocked" in res.error
-        v._client.post.assert_not_called()
-
-    def test_venue_adapter_sends_a_valid_time_in_force(self, allow_live):
-        """The verified enum is fill_or_kill/good_till_canceled/
-        immediate_or_cancel. The adapter used to send "GTC", which the venue
-        does not accept."""
-        from execution.order_request import TIME_IN_FORCE_VALUES
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        client = MagicMock()
-        client.post.return_value = {"order": {"order_id": "srv-9"}}
-        v._client = client
-        assert v.place_order(TKR, "yes", 49, 10,
-                             best_opposing_bid_cents=50).success
-        body = client.post.call_args[0][1]
-        assert body["time_in_force"] in TIME_IN_FORCE_VALUES
-
-    def test_venue_adapter_no_longer_substitutes_no_self_trade(self, monkeypatch,
-                                                             allow_live):
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)      # skip auth in __init__
-        client = MagicMock()
-        client.post.return_value = {"order": {"order_id": "srv-9"}}
-        v._client = client
-        res = v.place_order(TKR, "yes", 49, 10, best_opposing_bid_cents=50)
-        assert res.success
-        body = client.post.call_args[0][1]
-        assert body[MAKER_ONLY_FIELD] is True
-        assert "no_self_trade" not in body
-
-    def test_venue_adapter_refuses_a_crossing_order(self, allow_live):
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        v._client = MagicMock()
-        res = v.place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=50)
-        assert not res.success and "maker safety" in res.error
-        v._client.post.assert_not_called()
-
-    def test_venue_adapter_refuses_without_opposing_book(self, allow_live):
-        from venue.kalshi import KalshiVenue
-        v = KalshiVenue.__new__(KalshiVenue)
-        v._client = MagicMock()
-        res = v.place_order(TKR, "yes", 49, 10)
-        assert not res.success
-        v._client.post.assert_not_called()

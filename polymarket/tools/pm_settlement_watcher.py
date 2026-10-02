@@ -18,6 +18,11 @@ USAGE:
   python pm_settlement_watcher.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[2])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
 
 import argparse
 import json
@@ -27,7 +32,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-PM_ROOT = Path("/root/polymarket-maker")
+PM_ROOT = Path(_PM_HOME)
 sys.path.insert(0, str(PM_ROOT))
 
 from execution.pm_auth import _load_dotenv_simple

@@ -1,12 +1,13 @@
-"""Pre-trade gates from the 1 October 2026 paper sim.
+"""Pre-trade gates: the pre-close quote pull, the single-fill size cap and
+the live series gate, kept here so the quoter and the supervisor apply the
+same rule.
 
-Three hours, 7,035 fills. Quoting through the last hour before close lost
-about $924 a day per $1,000 of fills. Pulling quotes 15 minutes before
-close flipped that to about +$238. Eleven fills lost more than $100 on
-the premium of that one fill.
-
-The close pull, the single-fill size, and the live series gate live here
-so the quoter and the supervisor apply the same rule.
+Provenance: the gates were motivated by one paper session (1 October 2026)
+in which quotes resting into the final hour before close took large
+adverse fills. That session's figures were never saved as an artifact in
+this repository and have not been reproduced, so none are quoted here. The
+default constants (15-minute pull, $100 single-fill cap) are judgment
+calls, not fitted values; tune them from recorded sessions.
 """
 from __future__ import annotations
 

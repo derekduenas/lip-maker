@@ -17,6 +17,10 @@ USAGE
   python tools/pm_match_discover.py --reset      # clear candidates table
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import argparse
 import json
@@ -30,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-DB_PATH = "/root/lip-maker/data/lip_maker.db"
+DB_PATH = (_LIP_HOME + "/data/lip_maker.db")
 PM_BASE = "https://api.polymarket.us"
 PM_LIMIT = 200  # per-page
 

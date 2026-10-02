@@ -5,7 +5,7 @@ fires even if PM service has crashed/wedged. Two checks:
 
 1. INTRADAY DRAWDOWN — pull current balance, compare to today-baseline.
    If drop > $X (configurable), log alert + send notification stub.
-2. STALE SERVICE — if /root/polymarket-maker/logs/polymarket_maker.log
+2. STALE SERVICE — if $PM_HOME/logs/polymarket_maker.log
    not updated in last 5 min during expected cycle window, log alert.
 
 Usage:
@@ -13,6 +13,13 @@ Usage:
   python pm_bleed_monitor.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+import sys as _lh_sys
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[2])
+_PM_HOME = _lh_os.environ.get("PM_HOME") or _LIP_HOME + "/polymarket"
+_PM_PYTHON = _lh_os.environ.get("PM_PYTHON") or _lh_sys.executable
 
 import argparse
 import json
@@ -23,28 +30,28 @@ import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-PM_LOG = Path("/root/polymarket-maker/logs/polymarket_maker.log")
-PM_DB  = Path("/root/polymarket-maker/data/polymarket_maker.db")
+PM_LOG = Path((_PM_HOME + "/logs/polymarket_maker.log"))
+PM_DB  = Path((_PM_HOME + "/data/polymarket_maker.db"))
 DRAWDOWN_THRESHOLD_USD = 13.50  # 5% of $270 default
 STALE_LOG_MINUTES = 5
 
 
 def get_balance() -> float | None:
     """Subprocess to PM venv to fetch live balance."""
-    pm_python = "/root/polymarket-maker/venv/bin/python"
+    pm_python = _PM_PYTHON
     script = """
 import os, sys
-sys.path.insert(0, '/root/polymarket-maker')
+sys.path.insert(0, '__PM_HOME__')
 from execution.pm_auth import _load_dotenv_simple
-_load_dotenv_simple('/root/polymarket-maker/.env')
+_load_dotenv_simple('__PM_HOME__/.env')
 from polymarket_us import PolymarketUS
 c = PolymarketUS(
     key_id=os.getenv('PM_API_KEY_ID'),
-    secret_key=open('/root/polymarket-maker/config/polymarket_secret_key.b64').read().strip(),
+    secret_key=open('__PM_HOME__/config/polymarket_secret_key.b64').read().strip(),
 )
 b = c.account.balances().get('balances', [{}])[0]
 print(float(b.get('currentBalance', 0)))
-"""
+""".replace("__PM_HOME__", _PM_HOME)
     try:
         r = subprocess.run([pm_python, "-c", script],
                            capture_output=True, text=True, timeout=10)

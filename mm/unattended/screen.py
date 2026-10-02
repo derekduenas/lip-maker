@@ -5,6 +5,11 @@ batched) and series category (GET /series/{ticker}), both cached on disk.
 Applies the selector's exclusion policy up front so the RunLoop and the
 websocket only carry the top ``LIP_CANDIDATE_TOP`` candidates.
 
+Sub-cent markets are excluded (reason ``subcent_tick``): Kalshi lists
+deci-cent / tapered grids (``price_level_structure`` / ``price_ranges``,
+docs.kalshi.com/getting_started/subpenny_pricing), but the engine's book,
+LIP scorer (DF ticks counted in whole cents) and quoting are a 1c grid.
+
 Read-only. Every call goes through ``ReadOnlyKalshiTransport.get``.
 """
 from __future__ import annotations
@@ -24,7 +29,7 @@ BATCH = 100
 PAUSE_S = 0.12
 META_TTL_S = 6 * 3600.0
 SERIES_TTL_S = 7 * 86400.0
-CACHE_VERSION = 2
+CACHE_VERSION = 4  # 3: market rows carry tick_1c; 4: strike fields (older rows are refetched)
 DEFAULT_NEWS_CATEGORIES = "Politics,Elections,World,Entertainment,Sports,Esports,Social,Mentions,Culture"
 
 
@@ -33,18 +38,36 @@ def news_categories() -> set[str]:
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
+# Units of ``rank_penalty_per_day``: $/day for this many contracts per side,
+# both sides quoted. RunLoop scales it by size / RANK_PENALTY_UNIT.
+RANK_PENALTY_UNIT = 100.0
+
+
 def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | None,
                size: float = 100.0) -> dict:
     """Expected net $/day per $ of capital at our size, from market metadata only.
 
-    reward  = pool/day x share, share = 2S / (2S + touch depth on both sides)
-    penalty = S x 2 sides x fill fraction/day x adverse cents, scaled up as
-              days-to-close shrinks (1 + LIP_RANK_SHORT_K / days) and for
-              news-driven categories (x LIP_RANK_NEWS_MULT).
-    score   = (reward - penalty) / capital, capital = S x (yes bid + no bid).
+    reward  = pool/day x share, share = 2S / (2S + touch depth on both sides),
+              S = min(target, ``size``)
+    markout = per contract per day: the base charge
+              selector.adverse_cost_per_contract_day (2 sides x fill
+              fraction/day x adverse cents: family prior, -1c past
+              MARKOUT_LONG_DATED_DAYS) scaled by 24 h volume, and the whole
+              charge scaled up as days-to-close shrinks
+              (1 + LIP_RANK_SHORT_K / days) and for news-driven categories
+              (x LIP_RANK_NEWS_MULT).
+    score   = (reward - S x markout) / capital, capital = S x (yes bid + no bid).
+
+    Returned ``penalty`` (stored as the frame's ``rank_penalty_per_day``) is
+    NOT the full markout: selector.quote_economics already subtracts the
+    base charge (the same adverse_cost_per_contract_day) from ``net``, and RunLoop
+    subtracts this penalty from that net. So ``penalty`` is only the
+    increment the volume / time / news multipliers add on top of the base
+    prior, in $/day per RANK_PENALTY_UNIT (100) contracts per side. net -
+    penalty then charges the markout prior exactly once.
+    ``penalty_full`` is the full charge at S used in ``score``.
     """
-    from mm.fair_value import family_for_series
-    from mm.selector import FILL_FRACTION_PER_DAY, MARKOUT_PRIOR_CENTS
+    from mm.selector import KalshiMarket, adverse_cost_per_contract_day
     S = float(min(float(frame.get("target_size") or size), size)) or size
     yb = meta.get("yes_bid")
     ya = meta.get("yes_ask")
@@ -54,17 +77,23 @@ def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | N
     depth = float(meta.get("yes_bid_size") or 0.0) + float(meta.get("yes_ask_size") or 0.0)
     share = (2.0 * S) / (2.0 * S + depth)
     reward = pool_per_day(frame) * share
-    family = family_for_series(str(frame.get("series") or ""))
-    fill = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     vol = float(meta.get("volume_24h") or 0.0)
-    fill *= min(3.0, 1.0 + vol / 5000.0)
-    adverse = abs(MARKOUT_PRIOR_CENTS.get(family, MARKOUT_PRIOR_CENTS["event"]))
+    vol_mult = min(3.0, 1.0 + vol / 5000.0)
+    # Same probe fields RunLoop._markets passes to quote_economics (series,
+    # days to settle; no empirical markout).
+    probe = KalshiMarket(market=str(frame.get("market") or ""), series=str(frame.get("series") or ""),
+                         period_reward_usd=0.0, period_seconds=86400.0, seconds_left=0.0,
+                         discount_factor=0.5, target_size=S, days_to_settle=days)
     mult = 1.0 + _env_float("LIP_RANK_SHORT_K", 3.0) / max(0.5, float(days if days is not None else 0.5))
     news = bool(category and category.strip().lower() in news_categories())
     if news:
         mult *= _env_float("LIP_RANK_NEWS_MULT", 2.0)
-    penalty = S * 2.0 * fill * adverse / 100.0 * mult
-    return {"score": (reward - penalty) / capital, "reward": reward, "penalty": penalty,
+    base_per_contract = adverse_cost_per_contract_day(probe)        # already in quote_economics net
+    full_per_contract = base_per_contract * vol_mult * mult
+    penalty_full = S * full_per_contract
+    incremental = RANK_PENALTY_UNIT * max(0.0, full_per_contract - base_per_contract)
+    return {"score": (reward - penalty_full) / capital, "reward": reward, "penalty": incremental,
+            "penalty_full": penalty_full, "penalty_unit_contracts": int(RANK_PENALTY_UNIT),
             "capital": capital, "share": share, "news": news}
 
 
@@ -95,6 +124,37 @@ def _num(raw) -> float | None:
         return None
 
 
+def tick_is_one_cent(row: dict) -> bool:
+    """True when the market trades on a uniform 1c grid.
+
+    ``price_ranges`` ({start, end, step} bands, fixed-point dollars) is
+    authoritative: every step must be $0.01. Without it,
+    ``price_level_structure`` must be "linear_cent" (the docs warn new names
+    appear over time, so any other name is treated as non-1c), and a legacy
+    ``tick_size`` must be 1 (cent). A row with none of these is treated as a
+    1c market (rows predating sub-penny pricing)."""
+    ranges = row.get("price_ranges")
+    if isinstance(ranges, list) and ranges:
+        for band in ranges:
+            try:
+                step = float((band or {}).get("step"))
+            except (TypeError, ValueError, AttributeError):
+                return False
+            if abs(step - 0.01) > 1e-9:
+                return False
+        return True
+    structure = row.get("price_level_structure")
+    if structure not in (None, "") and str(structure) != "linear_cent":
+        return False
+    tick = row.get("tick_size")
+    if tick not in (None, ""):
+        try:
+            return abs(float(tick) - 1.0) < 1e-9
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def market_meta(row: dict, now: float | None = None) -> dict:
     """Fields kept from one GET /markets row. Effective close = min(close, occurrence)."""
     close = _ts(row.get("close_time"))
@@ -113,6 +173,13 @@ def market_meta(row: dict, now: float | None = None) -> dict:
         "yes_ask": _num(row.get("yes_ask_dollars")),
         "yes_bid_size": _num(row.get("yes_bid_size_fp")),
         "yes_ask_size": _num(row.get("yes_ask_size_fp")),
+        "price_level_structure": row.get("price_level_structure"),
+        "tick_1c": tick_is_one_cent(row),
+        # Bucket/threshold definition (docs.kalshi.com get-market: strike_type,
+        # floor_strike, cap_strike) for model fair value (fv_weather.strike_range).
+        "strike_type": row.get("strike_type"),
+        "floor_strike": _num(row.get("floor_strike")),
+        "cap_strike": _num(row.get("cap_strike")),
         "fetched": time.time() if now is None else float(now),
     }
 
@@ -199,11 +266,17 @@ class MetaCache:
                           or now - float(self.series[s].get("fetched") or 0) > SERIES_TTL_S)]
 
     def fetch_series(self, reader, names) -> int:
-        from mm.venues.readonly import ReadOnlyHTTPError
+        from mm.venues.readonly import ReadOnlyHTTPError, path_has_traversal
         got = 0
         for s in names:
+            path = f"/series/{quote(s, safe='')}"
+            if path_has_traversal(path):
+                # the read-only transport would refuse (and exit); skip the name
+                self.failures += 1
+                _log.warning("series name not fetchable read-only: %r", s[:40])
+                continue
             try:
-                payload = reader.get(f"/series/{quote(s, safe='')}")
+                payload = reader.get(path)
             except ReadOnlyHTTPError as exc:
                 self.failures += 1
                 if exc.status == 404:
@@ -213,9 +286,10 @@ class MetaCache:
                 continue
             self.series_lookups += 1
             ser = payload.get("series") or {}
-            # Patch 21: fee_type / fee_multiplier (GET /series/{t}, verified live
-            # 2026-10-01: quadratic | quadratic_with_maker_fees |
-            # quadratic_with_combo_maker_fees) so maker fees enter net $/day.
+            # Patch 21: fee_type / fee_multiplier (GET /series/{t}: quadratic |
+            # quadratic_with_maker_fees | quadratic_with_combo_maker_fees | flat,
+            # docs.kalshi.com get-series) so maker fees enter net $/day. Unknown,
+            # missing and "flat" are priced as maker-fee series (screen()).
             self.series[s] = {"category": ser.get("category"), "tags": ser.get("tags") or [],
                               "frequency": ser.get("frequency"), "fee_type": ser.get("fee_type"),
                               "fee_multiplier": ser.get("fee_multiplier"), "fetched": self.clock()}
@@ -225,17 +299,39 @@ class MetaCache:
         return got
 
 
+# Kalshi fee types this code can price (mm/accounting.maker_coefficient).
+KNOWN_FEE_TYPES = ("quadratic", "quadratic_with_maker_fees", "quadratic_with_combo_maker_fees")
+CONSERVATIVE_FEE_TYPE = "quadratic_with_maker_fees"
+
+
+def conservative_fee_type(raw) -> str:
+    """Known Kalshi fee_type as-is; missing, unknown or "flat" (the "Specific
+    Trading Fees Table", formula not confirmed here) -> the standard maker-fee
+    type, so a series we cannot price never ranks as maker-fee-free."""
+    return raw if raw in KNOWN_FEE_TYPES else CONSERVATIVE_FEE_TYPE
+
+
 def pool_per_day(frame: dict) -> float:
     secs = float(frame.get("period_seconds") or 86400) or 86400.0
     return float(frame.get("period_reward_usd") or 0.0) / (secs / 86400.0)
 
 
+def fv_early_feed(series: str, paper: bool) -> bool:
+    """Feed a market of a model family under LIP_FV_MIN_HOURS_TO_CLOSE (so its
+    fair value can be computed and calibrated against a live book): paper
+    mode only, FV quoting or calibration on, a station the model prices."""
+    from mm.unattended.fairvalue import fv_model_active, fv_model_supports
+    return bool(paper) and fv_model_active(series) and fv_model_supports(series)
+
+
 def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
-           top: int | None = None) -> tuple[list[dict], dict]:
+           top: int | None = None, paper: bool = False) -> tuple[list[dict], dict]:
     """Return (candidates, stats). Candidates carry market close, shard, category.
 
     Programs whose market metadata or series category is not cached yet are
     reported as ``pending_meta`` / ``pending_category`` and left out.
+    ``paper`` (default False: fail closed) allows the early feed of model
+    families (``fv_early_feed``).
     """
     from mm.selector import KalshiMarket, exclusion_reason
     now = time.time() if now is None else float(now)
@@ -270,6 +366,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         if meta.get("status") not in (None, "active", "open"):
             _bump("market_not_active", series)
             continue
+        if meta.get("tick_1c") is False:
+            _bump("subcent_tick", series)
+            continue
         eff = meta.get("effective_close_ts")
         days = None if eff is None else max(0.0, (float(eff) - now) / 86400.0)
         cat_row = cache.series.get(series)
@@ -283,6 +382,10 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
             target_size=float(frame.get("target_size") or 100),
             days_to_settle=days, exchange_index=meta.get("exchange_index"),
             category=category,
+            # Model family (paper): fed under LIP_FV_MIN_HOURS_TO_CLOSE so the
+            # fair value can be computed; the loop quotes it only with a usable
+            # value and FV quoting on.
+            fv_candidate=fv_early_feed(series, paper),
         )
         why = exclusion_reason(probe)
         if why:
@@ -296,7 +399,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         out["close_ts"] = eff
         out["days_to_settle"] = days
         out["category"] = category
-        out["fee_type"] = (cat_row or {}).get("fee_type") or "quadratic"
+        raw_fee = (cat_row or {}).get("fee_type")
+        out["fee_type"] = conservative_fee_type(raw_fee)
+        out["fee_type_raw"] = raw_fee
         out["fee_multiplier"] = (cat_row or {}).get("fee_multiplier")
         out["days_from_close"] = True
         rk = rank_score(frame, meta, category=category, days=days)
@@ -304,6 +409,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         out["rank_penalty_per_day"] = round(rk["penalty"], 6)
         out["occurrence_ts"] = meta.get("occurrence_ts")
         out["event_ticker"] = meta.get("event_ticker")
+        for key in ("strike_type", "floor_strike", "cap_strike"):
+            if meta.get(key) is not None:
+                out[key] = meta[key]
         ok.append(out)
     ok.sort(key=lambda f: (-f["rank_score"], -pool_per_day(f)))
     chosen = ok[:top]
@@ -326,7 +434,8 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
     return chosen, stats
 
 
-def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = None) -> list[str]:
+def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = None,
+                 paper: bool = False) -> list[str]:
     """Series still missing a category among programs that pass every non-category check."""
     from mm.selector import KalshiMarket, exclusion_reason
     now = time.time() if now is None else float(now)
@@ -345,6 +454,7 @@ def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = No
             market=market, series=series, period_reward_usd=1.0, period_seconds=86400,
             seconds_left=86400, discount_factor=0.5, target_size=100,
             days_to_settle=days, exchange_index=meta.get("exchange_index"), category=None,
+            fv_candidate=fv_early_feed(series, paper),
         )
         if not exclusion_reason(probe):
             want.append(series)

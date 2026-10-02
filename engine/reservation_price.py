@@ -6,11 +6,20 @@ https://people.orie.cornell.edu/sfs33/LimitOrderBook.pdf):
     r(s, q, t) = s − q·γ·σ²·(T−t)
 
 where:
-    s    fair-value reference  (we use the microprice from A.1)
+    s    fair-value reference  (we use the size-weighted mid from A.1;
+         see engine/microprice.py — not Stoikov's micro-price)
     q    signed inventory (positive = long the asset)
     γ    risk-aversion knob
-    σ²   variance of fair value
+    σ²   variance of fair value PER UNIT TIME (A-S: diffusion variance)
     T-t  time remaining to settle
+
+UNITS CAVEAT (2026-10-01): this is A-S in form only. Callers pass
+`sigma_cents` from realized_sigma_cents(), the sample stdev of whatever
+window of observations they kept — it carries no time unit — while (T-t)
+is converted to years. σ²·(T-t) is therefore not the A-S variance over
+the horizon, and γ silently absorbs the missing scaling (sampling interval
+× window length). γ (AS_GAMMA) has not been calibrated; read the output
+as an inventory-proportional heuristic shift, not an A-S optimum.
 
 The reservation price is the maker's *indifference midpoint* — quoting
 both sides symmetric around `r` rather than around `s` biases fills
@@ -76,8 +85,10 @@ def reservation_price(
       - sigma_cents = stdev of YES price in cents over a recent window
       - hours_to_settle in hours
 
-    Internally converts (T-t) to years so γ, σ have the standard A-S
-    dimensions. With γ ≈ 0.1, σ ≈ 5c, net ≈ 100, T-t = 24h:
+    Internally converts (T-t) to years. That gives standard A-S dimensions
+    ONLY if sigma_cents is a per-sqrt(year) volatility; realized_sigma_cents()
+    returns a unitless window stdev, so it is not (see module docstring).
+    Arithmetic example, γ = 0.1, σ = 5c, net = 100, T-t = 24h:
         skew = 100 × 0.1 × 25 × (24/8760) ≈ 0.68c
     """
     if mp_cents is None:

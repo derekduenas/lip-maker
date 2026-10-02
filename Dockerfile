@@ -1,6 +1,9 @@
-FROM python:3.12-slim
+# requirements.txt was pinned on Python 3.13; keep the image on the same minor.
+FROM python:3.13-slim
 
 WORKDIR /opt/lip-maker
+COPY requirements.txt /opt/lip-maker/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . /opt/lip-maker
 
 ENV LIP_PAPER=true \

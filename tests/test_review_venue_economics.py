@@ -1,0 +1,154 @@
+"""Review fixes (venue area): selection economics - adverse selection counted
+once, skew back-off, conservative fee types, PM US rebate rounding."""
+import pytest
+
+from mm import selector as SEL
+from mm.unattended import screen as S
+
+FRAME = {"market": "KXFOO-26DEC-T1", "series": "KXFOO", "period_reward_usd": 50,
+         "period_seconds": 86400, "target_size": 50}
+META = {"yes_bid": 0.40, "yes_ask": 0.45, "yes_bid_size": 200, "yes_ask_size": 200,
+        "volume_24h": 5000}
+
+
+def _km(**kw):
+    base = dict(market="KXFOO-26DEC-T1", series="KXFOO", period_reward_usd=50, period_seconds=86400,
+                seconds_left=86400, discount_factor=0.5, target_size=50,
+                yes_bids=[(40, 200)], no_bids=[(55, 200)], fee_type="quadratic",
+                days_to_settle=1.0, exchange_index=0)
+    base.update(kw)
+    return SEL.KalshiMarket(**base)
+
+
+# ------------------------------------------------------------------ item 5
+def _as_in_net(km, size=100.0):
+    net, _cap, share, _y, _n = SEL.quote_economics(km, size)
+    # fee_type quadratic (no maker fee), days_to_settle 1 (no holding):
+    # everything net subtracts from the reward is the adverse-selection term.
+    return SEL.reward_per_day(share, km) - net
+
+
+def test_markout_prior_is_charged_once(monkeypatch):
+    # No volume / time / news multiplier: the screen adds nothing on top of net.
+    monkeypatch.setenv("LIP_RANK_SHORT_K", "0")
+    meta = dict(META, volume_24h=0)
+    km = _km()
+    prior_charge = 100 * 2 * SEL.FILL_FRACTION_PER_DAY["event"] * abs(SEL.MARKOUT_PRIOR_CENTS["event"]) / 100
+    assert _as_in_net(km) == pytest.approx(prior_charge)
+    pen = S.rank_score(FRAME, meta, category="Economics", days=1.0)["penalty"]
+    assert pen == pytest.approx(0.0)
+    assert _as_in_net(km) + pen == pytest.approx(prior_charge)  # once, not twice
+
+
+def test_rank_penalty_is_the_incremental_part_per_100_contracts(monkeypatch):
+    monkeypatch.setenv("LIP_RANK_SHORT_K", "3")
+    monkeypatch.setenv("LIP_RANK_NEWS_MULT", "2")
+    km = _km()
+    fill = SEL.FILL_FRACTION_PER_DAY["event"]
+    adverse = abs(SEL.MARKOUT_PRIOR_CENTS["event"])
+    vol_mult, time_mult, news_mult = 2.0, 1.0 + 3.0 / 1.0, 2.0
+    full_100 = 100 * 2 * fill * vol_mult * adverse / 100 * time_mult * news_mult
+    rk = S.rank_score(FRAME, META, category="Entertainment", days=1.0)
+    # per-100 units even though target_size (50) < 100
+    assert _as_in_net(km) + rk["penalty"] == pytest.approx(full_100)
+    assert rk["penalty_unit_contracts"] == 100
+    # the screen's own score still charges the full markout at its size S
+    S_ = 50.0
+    assert rk["penalty_full"] == pytest.approx(full_100 * S_ / 100)
+
+
+# ------------------------------------------------------------------ item 6
+def test_skew_backoff_starts_before_the_cap():
+    from mm.unattended.skew import SkewParams, skew_prices
+    p = SkewParams(max_ticks=2, max_backoff=1, max_reward_loss=0.5)
+    for frac in (0.01, 0.3, 0.5, 0.99):
+        o = skew_prices(40, 55, net_yes=+10, frac=frac, best_yes=40, best_no=55, df=0.5, params=p)
+        assert o["back"] == 1 and o["yes_cents"] == 39, frac
+    # still limited by the reward-loss bound (1 tick at DF 0.3 costs 70% > 50%)
+    o = skew_prices(40, 55, net_yes=+10, frac=0.3, best_yes=40, best_no=55, df=0.3, params=p)
+    assert o["back"] == 0 and o["yes_cents"] == 40
+    # min_frac still gates everything
+    q = SkewParams(max_ticks=2, max_backoff=1, max_reward_loss=0.5, min_frac=0.4)
+    o = skew_prices(40, 55, net_yes=+10, frac=0.3, best_yes=40, best_no=55, df=0.5, params=q)
+    assert o["back"] == 0 and o["agg"] == 0
+
+
+# ------------------------------------------------------------------ item 7
+def _cache_with(series_row):
+    c = S.MetaCache(path="/nonexistent/never-written.json")
+    c.markets["KXFOO-26DEC-T1"] = {"exchange_index": 0, "close_ts": None, "occurrence_ts": None,
+                                   "effective_close_ts": 1e12, "status": "active", "event_ticker": "KXFOO-26DEC",
+                                   "yes_bid": 0.4, "yes_ask": 0.45, "fetched": 0}
+    c.series["KXFOO"] = series_row
+    return c
+
+
+@pytest.mark.parametrize("raw,want", [
+    (None, "quadratic_with_maker_fees"),
+    ("flat", "quadratic_with_maker_fees"),
+    ("brand_new", "quadratic_with_maker_fees"),
+    ("quadratic", "quadratic"),
+    ("quadratic_with_combo_maker_fees", "quadratic_with_combo_maker_fees"),
+])
+def test_screen_unknown_fee_type_is_conservative(monkeypatch, raw, want):
+    monkeypatch.setenv("LIP_LONG_DATED_ANY_DAYS", "1e9")
+    monkeypatch.setenv("LIP_LONG_DATED_EVENT_DAYS", "1e9")
+    frame = dict(FRAME, program_id="p", end_ts=2e12, discount_factor=0.5)
+    cache = _cache_with({"category": "Economics", "tags": [], "fee_type": raw, "fetched": 0})
+    out, stats = S.screen([frame], cache, now=1e9)
+    assert len(out) == 1, stats
+    assert out[0]["fee_type"] == want and out[0]["fee_type_raw"] == raw
+
+
+def test_kalshimarket_default_fee_type_charges_maker_fee():
+    assert SEL.KalshiMarket(market="X-1", series="X", period_reward_usd=1, period_seconds=1,
+                            seconds_left=1, discount_factor=.5, target_size=1).fee_type \
+        == "quadratic_with_maker_fees"
+    assert SEL.maker_fee_usd(_km(fee_type="flat"), 50) == SEL.maker_fee_usd(
+        _km(fee_type="quadratic_with_maker_fees"), 50) > 0
+
+
+def test_series_fees_flat_is_maker_charged():
+    from decimal import Decimal as D
+    from engine.series_fees import schedule_from_series
+    flat = schedule_from_series({"series": {"ticker": "KXF", "fee_type": "flat", "fee_multiplier": 1}})
+    std = schedule_from_series({"series": {"ticker": "KXF", "fee_type": "quadratic_with_maker_fees",
+                                           "fee_multiplier": 1}})
+    assert flat is not None and flat.maker_charged
+    assert flat.fee_usd(50, 10) == std.fee_usd(50, 10) > D(0)
+    assert flat.fee_usd(50, 10, is_taker=True) == std.fee_usd(50, 10, is_taker=True)
+    assert "flat" in flat.describe()["fee_type"] and "unverified" in flat.source
+
+
+# ------------------------------------------------------------------ item 8
+def test_pmus_rebate_is_bankers_rounded_per_fill():
+    km = _km(market="PMUS:x", series="PMUS:x", venue="pmus")
+    # 1 contract @50c: 0.0125 x 0.25 = $0.003125 -> $0.00 after rounding to the cent
+    assert SEL.maker_fee_usd(km, 50, fill_size=1) == 0.0
+    # 4 contracts @50c: $0.0125 -> $0.01 (half-even), i.e. -$0.0025/contract
+    assert SEL.maker_fee_usd(km, 50, fill_size=4) == pytest.approx(-0.0025)
+    # 100 @50c: $0.3125 -> $0.31
+    assert SEL.maker_fee_usd(km, 50, fill_size=100) == pytest.approx(-0.0031)
+
+
+def test_pmus_quote_economics_uses_rounded_rebate_at_expected_fill():
+    km = _km(market="PMUS:x", series="PMUS:x", venue="pmus", target_size=100,
+             yes_bids=[(40, 500)], no_bids=[(55, 500)])
+    net, _c, share, y, n = SEL.quote_economics(km, 10)
+    fills_side = 10 * SEL.FILL_FRACTION_PER_DAY["event"]  # 1.5 contracts/day/side
+    reward = SEL.reward_per_day(share, km)
+    as_cost = 2 * fills_side * abs(SEL.markout_cents(km)) / 100
+    # 1.5 contracts at ~40c/55c rounds to a $0.00 rebate: no rebate credit
+    assert net == pytest.approx(reward - as_cost)
+
+
+# ------------------------------------------------------------------ item 9
+@pytest.mark.parametrize("price,count", [(50, 1), (50, 10), (5, 1), (99, 1), (50, 100), (1, 1), (37, 13)])
+def test_engine_fees_default_matches_accounting_maker_fee_series(price, count):
+    from engine import fees
+    from mm.accounting import kalshi_fee_usd
+    want_maker = kalshi_fee_usd(price, count, fee_type="quadratic_with_maker_fees")
+    want_taker = kalshi_fee_usd(price, count, fee_type="quadratic_with_maker_fees", is_taker=True)
+    assert fees.KALSHI_DEFAULT.fee_usd(price, count) == want_maker
+    assert fees.KALSHI_DEFAULT.fee_usd(price, count, is_taker=True) == want_taker
+    assert fees.KALSHI_DEFAULT.verified is False

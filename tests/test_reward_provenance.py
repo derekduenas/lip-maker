@@ -200,7 +200,7 @@ class TestGoLiveGate:
         from tools.go_live_check import _gate_paid_reward_evidence
         db = _settlement_db(tmp_path, rebate_earned=500.0)   # big ESTIMATE
         prov.migrate_estimates(db)
-        g = _gate_paid_reward_evidence(db)
+        g = _gate_paid_reward_evidence(db, "2026-01-01")   # window now required
         assert not g.passed and g.insufficient_data
         assert "model estimate" in g.detail
 
@@ -209,7 +209,7 @@ class TestGoLiveGate:
         db = _settlement_db(tmp_path)
         prov.migrate_estimates(db)
         prov.record_payment(TKR, 3.0, source="kalshi_statement", db_path=db)
-        g = _gate_paid_reward_evidence(db)
+        g = _gate_paid_reward_evidence(db, "2026-01-01")   # window now required
         assert g.passed and g.observed == 3.0
 
     def test_estimate_no_longer_inflates_the_pnl_series(self, tmp_path):

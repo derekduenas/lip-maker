@@ -33,9 +33,11 @@ Rules
 1. Age. Inventory older than `max_holding_sec` should go. A maker holding
    overnight is no longer making a market.
 2. Size. |net| above `max_net_contracts` should be reduced regardless of age.
-3. Cost awareness. Never pay more to exit than the exposure is worth. A
-   1-contract net at 50c risks at most $0.50; paying $0.36 of round-trip fee
-   to flatten it is worse than holding.
+3. Cost awareness. An exit is refused when its fee (from the supplied
+   fee_schedule) exceeds `max_exit_cost_fraction` of the exposure notional.
+   For scale: under engine/fees.py's working (unverified) 0.07 rate,
+   1 contract at 50c costs ~$0.0175 per side, ~$0.035 round trip — not the
+   "$0.36 round-trip" this docstring used to claim.
 4. Reduce only. An exit may never increase |net| or open a new position.
    This is what separates "unwind" from "double down", and it is checked
    rather than assumed.

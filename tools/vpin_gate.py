@@ -1,18 +1,26 @@
-"""VPIN Gate — formalized adverse-selection detector (Easley/López de Prado).
+"""Fill-imbalance gate (named "VPIN" historically; it is NOT VPIN).
 
-For each market with recent fills, compute the volume imbalance:
-  VPIN = |buy_volume - sell_volume| / total_volume
+For each market with recent fills, compute OUR fill imbalance:
+  imbalance = |our YES fills - our NO fills| / our total fills
 
 Buy volume = fills where we BOUGHT YES (someone hit our YES bid → YES going to us).
 Sell volume = fills where we BOUGHT NO (someone hit our NO bid → NO going to us).
 
-When VPIN > VPIN_THRESHOLD on N+ fills, sharp informed flow is hitting one side.
-We add the market to market_blacklist for VPIN_BAN_MINUTES so quote_manager
-stops posting quotes there. Auto-expires; market re-enters next refresh.
+When the imbalance > VPIN_THRESHOLD on N+ fills, we add the market to
+market_blacklist for VPIN_BAN_MINUTES so the legacy quote_manager stops
+posting there. Auto-expires; market re-enters next refresh.
 
-This formalizes our ad-hoc toxicity filter using academic VPIN methodology.
-Per agent research (Bürgi/Whelan, Easley/Lopez de Prado): VPIN > 0.65 is the
-empirical adverse-flow threshold in maker-side decisions on event markets.
+Why this is not VPIN (Easley, López de Prado & O'Hara 2012): VPIN uses ALL
+market trades in equal-VOLUME buckets, classifies buy/sell volume by bulk
+volume classification, and averages the imbalance over a rolling window of
+buckets. This uses only our own fills, in a fixed 60-minute CLOCK window,
+classified by which of our bids was hit, with no bucketing.
+
+The 0.65 threshold is not an empirical result from the literature. The
+previous citation ("Bürgi/Whelan, Easley/Lopez de Prado: VPIN > 0.65 is the
+empirical adverse-flow threshold ... on event markets") was wrong: neither
+source establishes such a threshold for this statistic. Treat 0.65 as an
+untested heuristic.
 
 USAGE:
   python tools/vpin_gate.py            # one-shot scan

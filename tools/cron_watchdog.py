@@ -7,11 +7,15 @@ Each critical cron writes to a heartbeat table. This watchdog checks:
 Run via cron every 5 min.
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import sqlite3, os
 from datetime import datetime, timezone, timedelta
 
-DB = "/root/lip-maker/data/lip_maker.db"
-ALERTS_LOG = "/root/lip-maker/logs/alerts.log"
+DB = (_LIP_HOME + "/data/lip_maker.db")
+ALERTS_LOG = (_LIP_HOME + "/logs/alerts.log")
 
 # (cron_name, expected_interval_seconds, criticality)
 WATCHED = [

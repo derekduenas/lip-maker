@@ -12,6 +12,10 @@ USAGE:
   python share_alert.py --hours 4
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[0])
 
 import argparse
 import json
@@ -20,7 +24,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-LIP_DB = "/root/lip-maker/data/lip_maker.db"
+LIP_DB = (_LIP_HOME + "/data/lip_maker.db")
 MIN_SNAPS = 100             # only flag if we have data
 SHARE_ALERT_THRESHOLD = 0.001  # 0.1%
 

@@ -1,14 +1,21 @@
 """risk/sentinel.py — unconditional risk veto on every order.
 
-Sentinel wraps execution.quote_manager.QuoteManager._passes_safety as
-the FIRST check. Returns (approved, reason) for every proposed
-QuoteTarget. Approval requires ALL constitution limits to pass.
+SCOPE (2026-10-01): Sentinel is called from the LEGACY
+execution.quote_manager.QuoteManager._passes_safety (run_paper.py and
+tools). It is NOT on the APEX path: mm.unattended uses mm.risk, not this
+module. Returns (approved, reason) for every proposed QuoteTarget.
+Approval requires ALL constitution limits to pass.
+
+Paper bypass: when constitution.PAPER_BYPASS and settings.PAPER_MODE are
+both true, approve() returns (True, "paper_bypass") without checking.
 
 DESIGN PRINCIPLES (from strategic plan Section A):
   1. Pure Python — no LLM, no async, no agent-mediated approval
-  2. Hard limits from config/constitution.py — no runtime override
-  3. Fail-closed — if Sentinel itself errors, the order is REJECTED
-     (better to miss a quote than to skip the gate)
+  2. Hard limits from config/constitution.py (module constants; a test or
+     caller can still monkeypatch them — there is no runtime lock)
+  3. Fail-closed — if Sentinel itself errors, including a failed read of
+     daily P&L or inventory, the order is REJECTED (better to miss a
+     quote than to skip the gate)
   4. Idempotent — same proposal evaluated twice yields the same answer
   5. Read-only — Sentinel never mutates the proposal or DB state;
      it only inspects + decides
@@ -71,7 +78,9 @@ class Sentinel:
         suitable for logging/journaling.
         """
         # Paper mode bypass (configurable in constitution)
-        if constitution.PAPER_BYPASS and getattr(settings, "LIP_PAPER", False):
+        # 2026-10-01: read PAPER_MODE. config.settings never defined
+        # LIP_PAPER, so the old getattr(settings, "LIP_PAPER") never bypassed.
+        if constitution.PAPER_BYPASS and getattr(settings, "PAPER_MODE", False):
             return True, "paper_bypass"
 
         # Wrap everything in try/except — fail-CLOSED on any error
@@ -255,8 +264,11 @@ class Sentinel:
             finally:
                 conn.close()
             val = float(row[0]) if row and row[0] is not None else 0.0
-        except Exception:
-            val = 0.0
+        except Exception as e:
+            # 2026-10-01: fail CLOSED. An unreadable loss figure (missing
+            # table, locked/corrupt DB) used to read as $0 and approve.
+            # Raising lets approve() reject with sentinel_error.
+            raise RuntimeError(f"daily P&L unreadable: {e}") from e
         self._daily_pnl_cache = (val, now)
         return val
 
@@ -277,8 +289,9 @@ class Sentinel:
                 conn.close()
             for t, g in rows:
                 out[t] = float(g or 0)
-        except Exception:
-            out = {}
+        except Exception as e:
+            # 2026-10-01: fail CLOSED (was: empty inventory = no exposure).
+            raise RuntimeError(f"inventory unreadable: {e}") from e
         self._inventory_cache = (out, now)
         return out
 
@@ -343,7 +356,8 @@ def _self_test() -> None:
         conn.close()
 
         # Force LIVE mode for the test (paper would bypass)
-        settings.LIP_PAPER = False
+        _prior_paper = settings.PAPER_MODE
+        settings.PAPER_MODE = False
         settings.BANKROLL_USD = 1000.0
         settings.RAMP_PHASE = 4
 
@@ -408,12 +422,12 @@ def _self_test() -> None:
         print(f"  ✓ thin_bid veto: {reason}")
 
         # Paper mode bypass
-        settings.LIP_PAPER = True
+        settings.PAPER_MODE = True
         ok, reason = s.approve(thin)  # would normally reject
         assert ok, f"paper bypass should approve: {reason}"
         assert reason == "paper_bypass", reason
         print(f"  ✓ paper bypass: {reason}")
-        settings.LIP_PAPER = False  # reset
+        settings.PAPER_MODE = _prior_paper  # reset
 
         print("sentinel self-test: PASS")
     finally:

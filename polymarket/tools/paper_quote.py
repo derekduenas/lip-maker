@@ -81,14 +81,18 @@ def preview_quote(client, slug: str, size: int, verbose: bool = True) -> dict:
     except Exception as e:
         out["yes_error"] = f"{type(e).__name__}: {str(e)[:200]}"
 
-    # 3. Build NO side preview (buy no at implied no-bid = 1 - yes_ask)
+    # 3. Build NO side preview (buy no at implied no-bid = 1 - yes_ask).
+    # PM US price.value is always the YES side ("To trade the NO side at any
+    # price X, set `price.value = 1.00 - X`", api-reference/orders/overview),
+    # so the body carries 1 - no_price = yes_ask.
     try:
         no_price = round(1.0 - yes_ask, 3)
+        out["no_price"] = no_price
         no_req = {
             "marketSlug": slug,
             "intent":     "ORDER_INTENT_BUY_SHORT",
             "type":       "ORDER_TYPE_LIMIT",
-            "price":      {"value": f"{no_price:.3f}", "currency": "USD"},
+            "price":      {"value": f"{1.0 - no_price:.3f}", "currency": "USD"},
             "quantity":   size,
             "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
         }

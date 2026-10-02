@@ -17,6 +17,25 @@ LIVE_STATUS_FIELDS = (
     "estimated_raw_usd", "estimated_usd_note", "accrual_seconds",
     "buckets", "durable_reserve",
     "fills_detail", "markouts", "policy_skips", "pulls", "repegs_n", "skew", "recorder", "pmus", "venues", "fair_value", "select_ms", "size_ladder",
+    # Review fixes: honest P&L, rolled-over periods, feed state.
+    "premium_paid_usd", "pnl_usd_note", "pnl_parts",
+    "unsettled_positions", "unmarked_positions",
+    "closed_periods_n", "closed_periods_raw_usd", "feed",
+    # Review fixes: inventory risk, daily MTM, engine alerts, capital check.
+    "daily_mtm_pnl_usd", "inventory_locked_usd", "engine_alerts", "cap_trims_n",
+    "budget_warning",
+    # Review fixes: program pruning, engine state file.
+    "programs_pruned_n", "state",
+    # Integration: per-market positions (watchdog inventory), synthetic fills.
+    "positions", "fills_synthetic_n",
+    # Phase 4 instrumentation (estimates, paper).
+    "markout_horizons", "pnl_attribution", "event_calendar",
+    # Final review: released unresolved positions, demo-books warning.
+    "unresolved_positions", "book_source_warning",
+    # Model fair-value scoring, lifetime settled counters, report day.
+    "fv_calibration", "settled_positions_n", "settled_positions_by_venue",
+    "settled_total_usd", "settled_positions_lower_bound",
+    "day", "rewards_usd", "socket_opened",
 )
 
 

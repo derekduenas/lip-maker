@@ -1,6 +1,6 @@
 # DigitalOcean droplet (Ubuntu 24.04)
 
-Paper first. The unit forces `LIP_PAPER=true` and the demo websocket `wss://demo-api.kalshi.co/trade-api/ws/v2`. It does not set a production host.
+Paper first. The unit sets `LIP_PAPER=true` and the demo websocket `wss://demo-api.kalshi.co/trade-api/ws/v2`. It does not set a production host. Note that the unit's `Environment=LIP_PAPER=true` does NOT override the env file: per systemd.exec(5), variables read from `EnvironmentFile=` override those set with `Environment=`, whatever their order in the unit. An env file containing `LIP_PAPER=false` therefore wins. Paper is enforced in code by `LIP_FORCE_PAPER=1` (set in the unit, `policy.conf` and the APEX `override.conf` ExecStart via `/usr/bin/env`), not by unit ordering: with it set, `resolve_mode` refuses anything but paper.
 
 ## Install
 
@@ -8,9 +8,9 @@ Paper first. The unit forces `LIP_PAPER=true` and the demo websocket `wss://demo
 sudo bash deploy/droplet/setup.sh
 ```
 
-The script installs Python 3, creates the `lip` user, copies `deploy/droplet/lip-maker.env.example` to `/etc/lip-maker/lip-maker.env` when that file is missing, installs `deploy/lip-unattended.service`, enables ufw with OpenSSH only, and runs `systemctl enable --now lip-unattended.service`. After that the paper system is up.
+The script installs Python 3, creates the `lip` user, makes `/opt/lip-maker` root-owned (read-only to `lip`), creates `/opt/lip-maker/.venv` and installs `requirements.txt` into it, copies `deploy/droplet/lip-maker.env.example` to `/etc/lip-maker/lip-maker.env` when that file is missing and appends `deploy/apex/watchdog.env.example` once (env file `root:lip 0640`), gives `/var/lib/lip-maker` to `lip`, installs `deploy/lip-unattended.service` with the `deploy/apex/lip-unattended.service.d/` drop-ins and `deploy/apex/lip-watchdog.service`, enables ufw with OpenSSH only, and enables both units. After that the paper system is up.
 
-The process is `python3 -m mm.unattended --run`. It cancels on startup, then continuously runs selector, sizer, quoter, per-second scorer, allocator, and risk. Selection repeats every 10 minutes. Quotes come off at T-15 minutes before `close_ts`. A single fill's premium is capped at $100. The live series gate applies in demo mode. Paper mode records that decision and still quotes, so a new droplet can collect the five days the gate asks for.
+The process is `python -m mm.unattended --run` (venv python, via the drop-in). On startup it logs `cancel_all` to the cancel log (no venue cancel; see `docs/UNATTENDED.md`), then continuously runs selector, sizer, quoter, per-second scorer, allocator, and risk. Selection repeats every 10 minutes. Quotes come off at T-15 minutes before `close_ts`. A single fill's premium is capped at $100. The live series gate applies in demo mode. Paper mode records that decision and still quotes, so a new droplet can collect the five days the gate asks for.
 
 Heartbeat: `/var/lib/lip-maker/heartbeat`. Daily summary: `/var/lib/lip-maker/daily-summary`. Status JSON: `http://127.0.0.1:8765/status` (loopback only; ufw does not open it). Logs: `/var/lib/lip-maker/lip.log`, rotating at 1 MB, five files.
 
@@ -62,7 +62,7 @@ That replay does not open a socket. `--cycle` remains the one-shot recording use
 
 ## Demo orders later
 
-`LIP_DEMO=true` together with `LIP_PAPER=false` sends post-only orders to a demo host only (`demo-api.kalshi.co` or `external-api.demo.kalshi.co`). The unit file sets `LIP_PAPER=true` after the env file, so the installed service stays on simulated fills even if the env file also sets `LIP_DEMO`. Demo mode applies the series go/no-go gate. It does not set `allow_production`, the maker-only acknowledgement, or `LIVE_ARMED`.
+`LIP_DEMO=true` together with `LIP_PAPER=false` sends post-only orders to a demo host only (`demo-api.kalshi.co` or `external-api.demo.kalshi.co`). The unit file's `Environment=LIP_PAPER=true` does not stop this: an `EnvironmentFile=` value overrides `Environment=` (systemd.exec(5)), so without a code-level guard an env file with `LIP_PAPER=false` and `LIP_DEMO=true` would switch the service to demo orders. `LIP_FORCE_PAPER=1` closes this: `resolve_mode` then refuses to start unless `LIP_PAPER` is true. Demo mode applies the series go/no-go gate. It does not set `allow_production`, the maker-only acknowledgement, or `LIVE_ARMED`.
 
 ## Arming live later
 

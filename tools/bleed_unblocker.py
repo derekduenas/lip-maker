@@ -11,10 +11,14 @@ This cron runs every 10 min:
 
 Also clears toxicity entries older than 6h (give markets a chance to recover).
 """
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import os, sys, sqlite3
 from pathlib import Path
 
-LIP_PATH = Path("/root/lip-maker")
+LIP_PATH = Path(_LIP_HOME)
 LIP_DB = LIP_PATH / "data" / "lip_maker.db"
 
 
