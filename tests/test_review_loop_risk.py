@@ -194,17 +194,20 @@ def test_exchange_timestamp_is_read_from_kalshi_frames():
     assert L._exchange_ts({"type": "orderbook_delta", "msg": {}}) is None
 
 
-def test_skewed_frame_is_applied_and_pulls_the_quote():
+def test_skewed_frames_are_applied_and_sustained_skew_pulls_the_quote():
+    # Final review F3: one late frame no longer pulls; LIP_CLOCK_SKEW_N (3)
+    # consecutive skewed frames do (tests/test_review_final_skew.py).
     lp = _filled_loop()
     lp.on_frame(snap(M, T0 + 3, [(38, 2000)], [(55, 2000)]))
     lp._select(T0 + 3)
     assert M in lp.resting
-    frame = snap(M, T0 + 4, [(37, 2000)], [(56, 2000)])
-    frame["exchange_ts"] = T0 + 4 - 30.0  # 30 s old data
-    lp.on_frame(frame)
-    assert M not in lp.resting and lp.skew_n == 1
-    assert lp.accruals[M].book.book.is_usable()  # frame applied, book still in sequence
-    assert max(l.price_cents for l in lp.accruals[M].book.book.yes_bids) == 37
+    for k, top in enumerate((37, 36, 35)):
+        frame = snap(M, T0 + 4 + 0.1 * k, [(top, 2000)], [(56, 2000)])
+        frame["exchange_ts"] = T0 + 4 - 30.0  # 30 s old data
+        lp.on_frame(frame)
+    assert M not in lp.resting and lp.skew_n == 3
+    assert lp.accruals[M].book.book.is_usable()  # frames applied, book still in sequence
+    assert max(l.price_cents for l in lp.accruals[M].book.book.yes_bids) == 35
 
 
 # ------------------------------------------------------------------ 15. fills/min alert

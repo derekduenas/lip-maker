@@ -92,9 +92,13 @@ class LiveStatusRefresher:
 
     Counts refresh every ``every_s`` seconds (default 10). Per-market USD
     estimates are heavier (they walk scored seconds), so they refresh every
-    ``estimate_every_s`` (default 60) and only for markets that were quoted.
-    Never calls ``loop.finish()``. A failure here logs and is swallowed so
-    the feed keeps running.
+    ``estimate_every_s`` (default 60), only for markets that were quoted,
+    in batches of LIP_STATUS_EST_BATCH (25) markets per ``step`` (the timer
+    steps once a second under the loop lock), so one refresh never holds the
+    lock for the whole quoted set. ``build`` (under the lock) returns the
+    report; ``publish`` writes it (no lock needed). Never calls
+    ``loop.finish()``. A failure here logs and is swallowed so the feed
+    keeps running.
     """
 
     def __init__(self, loop, write, *, data_source: str, ws_url: str,
@@ -110,29 +114,66 @@ class LiveStatusRefresher:
         self._last = None
         self._last_est = None
         self._estimates = None
+        self._accrual = None
+        self._est_todo = None
+        self._est_new: dict = {}
+        self._acc_new: dict = {}
         self._session_start = None
         self.refreshes = 0
+        self.warning = None
 
-    def maybe_refresh(self) -> bool:
+    def step(self) -> None:
+        """One bounded batch of the estimate refresh (call under the lock).
+        A pass starts every ``estimate_every_s``; its results replace the
+        previous ones when the whole quoted set is done."""
+        now = self.clock()
+        if self._est_todo is None:
+            if self._last_est is not None and now - self._last_est < self.estimate_every_s:
+                return
+            quoted = (set(getattr(self.loop, "quoted_ever", ()) or ())
+                      | {q["market"] for q in self.loop.quotes} | set(self.loop.resting))
+            self._est_todo, self._est_new, self._acc_new = sorted(quoted), {}, {}
+        try:
+            n = max(1, int(float(os.environ.get("LIP_STATUS_EST_BATCH", 25))))
+        except (TypeError, ValueError):
+            n = 25
+        batch, self._est_todo = self._est_todo[:n], self._est_todo[n:]
+        if batch:
+            self._est_new.update(self.loop.live_estimates(batch))
+            self._acc_new.update(self.loop.live_accrual(batch))
+        if not self._est_todo:
+            self._estimates, self._accrual = self._est_new, self._acc_new
+            self._est_todo = None
+            self._last_est = now
+
+    def build(self):
+        """The status report when one is due, else None (call under the lock)."""
         now = self.clock()
         if self._session_start is None and self.loop.now:
             self._session_start = float(self.loop.now)
-        if self._last is not None and now - self._last < self.every_s:
-            return False
-        self._last = now
         try:
-            if self._last_est is None or now - self._last_est >= self.estimate_every_s:
-                quoted = (set(getattr(self.loop, "quoted_ever", ()) or ())
-                          | {q["market"] for q in self.loop.quotes} | set(self.loop.resting))
-                self._estimates = self.loop.live_estimates(quoted)
-                self._accrual = self.loop.live_accrual(quoted)
-                self._last_est = now
+            self.step()
+            if self._last is not None and now - self._last < self.every_s:
+                return None
+            self._last = now
             report = self.loop.live_snapshot(
                 estimates=self._estimates, session_start_ts=self._session_start,
-                accrual=getattr(self, "_accrual", None),
+                accrual=self._accrual,
             )
             report["data_source"] = self.data_source
             report["ws_url"] = self.ws_url
+            if self.warning:
+                report["book_source_warning"] = self.warning
+            return report
+        except Exception:
+            logging.getLogger("lip.status").exception("live status refresh failed")
+            return None
+
+    def publish(self, report) -> bool:
+        """Write a ``build`` report (status page, summary, report file)."""
+        if report is None:
+            return False
+        try:
             self.write(report)
             self.refreshes += 1
             return True
@@ -140,15 +181,20 @@ class LiveStatusRefresher:
             logging.getLogger("lip.status").exception("live status refresh failed")
             return False
 
+    def maybe_refresh(self) -> bool:
+        return self.publish(self.build())
+
 
 class EngineTimer:
     """Once a second, independent of market-data frames: honor the kill file,
     write the heartbeat, refresh the status page and persist engine state.
 
-    Holds ``loop.lock`` for each tick, the same lock the frame callback
-    holds, so a kill-file cancel never races a frame. If the frame thread
-    wedges while holding the lock, ticks stop and the heartbeat goes stale
-    (the watchdog notices)."""
+    Takes ``loop.lock`` (the lock the frame callback holds) for the kill
+    file, the status snapshot and the state snapshot, so a kill-file cancel
+    never races a frame; the heartbeat, status files and the state file
+    (fsync) are written after the lock is released, so disk I/O never
+    stalls the frame thread. If the frame thread wedges while holding the
+    lock, ticks stop and the heartbeat goes stale (the watchdog notices)."""
 
     def __init__(self, loop, *, heartbeat: str, kill_path: str, refresher=None,
                  every_s: float = 1.0) -> None:
@@ -162,12 +208,20 @@ class EngineTimer:
         self.ticks = 0
 
     def tick(self) -> None:
-        with self.loop.lock:
-            _honor_kill_file(self.loop, self.kill_path)
-            write_heartbeat(self.heartbeat)
-            if self.refresher is not None:
-                self.refresher.maybe_refresh()
-            self.loop.maybe_save_state()
+        loop = self.loop
+        with loop.lock:
+            _honor_kill_file(loop, self.kill_path)
+            report = self.refresher.build() if self.refresher is not None else None
+            body = loop.state_snapshot(every_s=5.0)
+        write_heartbeat(self.heartbeat)
+        if report is not None:
+            self.refresher.publish(report)
+        if body is not None:
+            try:
+                loop.write_state(body)
+            except Exception as exc:
+                with loop.lock:
+                    loop.note_state_save_failed(exc)
         self.ticks += 1
 
     def _run(self) -> None:
@@ -250,7 +304,7 @@ class _Engine:
             loop.on_frame(msg)
             if getattr(loop, "pmus", None) is not None:
                 loop.drain_external()  # Patch 21: PM US frames, same thread
-            self.refresher.maybe_refresh()
+        # Status refresh and state saves run on the EngineTimer thread.
 
     def mark_down(self, reason: str) -> None:
         self.down_since = time.time()

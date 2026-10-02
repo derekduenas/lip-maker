@@ -33,7 +33,7 @@ from engine.lip_reconcile import (
 from engine.lip_scorer import ProgramParams
 from execution.paper_fills import PaperFillSimulator
 from mm.compound import MarketSample, reallocate
-from mm.ops import SKEW_LIMIT_S, skew_is_excessive
+from mm.ops import skew_is_excessive
 from mm.risk import FillClock, Limits, RiskEngine
 from mm.selector import KalshiMarket, allocate
 from mm.session_gates import (
@@ -47,6 +47,9 @@ from mm.unattended.service import UnattendedRefused
 from mm.venues.kalshi_rest import DEMO_HOSTS, PRODUCTION_HOSTS
 
 SELECT_EVERY_S = 600.0
+# Default LIP_CLOCK_SKEW_LIMIT_S for the loop's skew guard (mm.ops.SKEW_LIMIT_S,
+# 2 s, pulled quotes on ordinary network jitter).
+CLOCK_SKEW_LIMIT_S = 5.0
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -318,6 +321,10 @@ class RunLoop:
         self.cap_trims_n = 0
         self.programs_pruned_n = 0
         self._pnl_day: dict | None = None
+        # Clock-skew guard (_note_clock_skew).
+        self._skew_streak = 0
+        self._skew_since = 0.0
+        self._skew_active = False
         # Phase 4: multi-horizon fill markouts (measurement only).
         from mm.unattended.markouts import MarkoutBook
         self.markouts = MarkoutBook()
@@ -515,17 +522,53 @@ class RunLoop:
         data_ts = row.get("data_ts") if self._venue(market) == "pmus" else None
         self._book_ts[market] = ts if data_ts is None else min(ts, float(data_ts))
         self._note_mark(market)
-        # exchange_ts is the venue send time (Kalshi ``sending_ts_ms``, set by
-        # the read-only session). The frame is applied either way so the book
-        # stays in sequence; a quote resting on data older than the skew
-        # limit (local clock or processing lag) is pulled.
         exchange_ts = row.get("exchange_ts")
-        if exchange_ts is not None and skew_is_excessive(
-                ts, float(exchange_ts), limit_s=_env_num("LIP_CLOCK_SKEW_LIMIT_S", SKEW_LIMIT_S)):
-            self.skew_n += 1
-            if market in self.resting:
-                self.pulls["clock_skew"] = self.pulls.get("clock_skew", 0) + 1
-                self._cancel(market, "clock_skew")
+        if exchange_ts is not None:
+            self._note_clock_skew(ts, float(exchange_ts))
+
+    def _note_clock_skew(self, ts: float, exchange_ts: float) -> None:
+        """Clock-skew guard on Kalshi book frames (snapshots and deltas).
+
+        ``exchange_ts`` is Kalshi's ``sending_ts_ms`` ("when Kalshi queued
+        this message at the network layer", on both orderbook_snapshot and
+        orderbook_delta; docs.kalshi.com/websockets/orderbook-updates), else
+        a delta's ``ts_ms`` (when the change was recorded). Both are send /
+        change times, never a "last change" time of an unchanged book, so a
+        snapshot's age is real lag and the guard applies to both kinds.
+        Frames without it (replay, PM US polls) neither count nor reset.
+
+        Every frame is applied (the book stays in sequence). One late frame
+        is noise; skew beyond LIP_CLOCK_SKEW_LIMIT_S (5 s) on
+        LIP_CLOCK_SKEW_N (3) consecutive frames, or on two or more
+        consecutive frames spanning LIP_CLOCK_SKEW_SUSTAIN_S (3 s), means the
+        local clock or processing is behind: every resting quote is pulled
+        (the lag is process-wide) and selection is held. The first clean
+        frame clears it and re-selects (re-quotes) at once."""
+        limit = _env_num("LIP_CLOCK_SKEW_LIMIT_S", CLOCK_SKEW_LIMIT_S)
+        if not skew_is_excessive(ts, exchange_ts, limit_s=limit):
+            self._skew_streak = 0
+            if self._skew_active:
+                self._skew_active = False
+                self._reselect_pending = True
+                logging.getLogger("lip.risk").warning("clock skew cleared: re-selecting")
+            return
+        self.skew_n += 1
+        if self._skew_streak == 0:
+            self._skew_since = ts
+        self._skew_streak += 1
+        if self._skew_active:
+            return
+        need = max(1, int(_env_num("LIP_CLOCK_SKEW_N", 3)))
+        sustain = _env_num("LIP_CLOCK_SKEW_SUSTAIN_S", 3.0)
+        if self._skew_streak >= need or (self._skew_streak >= 2 and ts - self._skew_since >= sustain):
+            self._skew_active = True
+            n = len(self.resting)
+            if n:
+                self.pulls["clock_skew"] = self.pulls.get("clock_skew", 0) + n
+                self._cancel_all("clock_skew")
+            logging.getLogger("lip.risk").warning(
+                "clock skew %.1fs > %.1fs on %d frames: %d quotes pulled until a clean frame",
+                ts - exchange_ts, limit, self._skew_streak, n)
 
     # ------------------------------------------------------------ feed state
     def note_disconnect(self, reason: str = "disconnect") -> None:
@@ -950,36 +993,68 @@ class RunLoop:
             self.kill = dict(kill)
             self._alert("CRITICAL", f"engine kill restored from state file: {kill.get('reason')}")
 
-    def save_state(self, *, force: bool = False) -> bool:
-        """Atomic write (tmp + fsync + rename). Never writes over a state file
-        that failed to load."""
+    def state_snapshot(self, *, force: bool = False, every_s: float = 0.0) -> str | None:
+        """The state JSON to write, or None (no state file, a state file that
+        failed to load, nothing changed, or saved less than ``every_s`` ago).
+        Call under ``lock``; the result is a string, so ``write_state`` can
+        do the disk I/O after the lock is released. Clears the dirty flag
+        (``write_state`` sets it again on failure)."""
         if not self.state_path or self.state_error is not None:
-            return False
-        if not force and not self._state_dirty:
-            return False
-        path = Path(self.state_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+            return None
+        if not force and (not self._state_dirty or time.time() - self._state_saved_at < every_s):
+            return None
         body = json.dumps(self.state_dict(), default=str)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(body)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
         self._state_dirty = False
         self._state_saved_at = time.time()
+        return body
+
+    def write_state(self, body: str) -> None:
+        """Atomic write of a ``state_snapshot`` (tmp + fsync + rename). Needs
+        no lock. On failure the state is marked dirty again and the error
+        raised."""
+        import threading as _threading
+        try:
+            path = Path(self.state_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{_threading.get_ident()}")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(body)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            self._state_dirty = True
+            self._state_saved_at = 0.0
+            raise
         self._state_save_failed = False
+
+    def note_state_save_failed(self, exc: BaseException) -> None:
+        """Alert once per failure streak (call under ``lock``)."""
+        if not getattr(self, "_state_save_failed", False):
+            self._alert("CRITICAL", f"engine state save failed: {type(exc).__name__}: {exc}")
+        self._state_save_failed = True
+
+    def save_state(self, *, force: bool = False) -> bool:
+        """Snapshot and write now (clean shutdown, tests). Never writes over
+        a state file that failed to load."""
+        body = self.state_snapshot(force=force)
+        if body is None:
+            return False
+        self.write_state(body)
         return True
 
     def maybe_save_state(self, every_s: float = 5.0) -> bool:
-        if not self._state_dirty or time.time() - self._state_saved_at < every_s:
+        """Debounced save: at most once per ``every_s`` while dirty. The
+        service's timer uses state_snapshot/write_state instead so the write
+        runs outside the lock."""
+        body = self.state_snapshot(every_s=every_s)
+        if body is None:
             return False
         try:
-            return self.save_state()
+            self.write_state(body)
+            return True
         except Exception as exc:
-            if not getattr(self, "_state_save_failed", False):
-                self._alert("CRITICAL", f"engine state save failed: {type(exc).__name__}: {exc}")
-            self._state_save_failed = True
+            self.note_state_save_failed(exc)
             return False
 
     # ------------------------------------------------------------ patch 21
@@ -1142,8 +1217,8 @@ class RunLoop:
                 # if it fills it pairs the inventory into a $1 settlement.
                 self._drop_side(market, side, "fill_cooldown")
         # Inventory caps act on resting size now, for every market in the event.
+        # The state file is saved by the service timer (debounced, <= 1/5 s).
         self._recheck_event_caps(market, ts)
-        self.maybe_save_state(every_s=0.0)
 
     # ------------------------------------------------------------ patch 18
     def _inv_frac(self, market: str) -> float:
@@ -1526,7 +1601,7 @@ class RunLoop:
         return have >= self.books_ready_fraction * len(self.programs)
 
     def _maybe_select(self, ts: float) -> None:
-        if not self.programs:
+        if not self.programs or self._skew_active:
             return
         if self._reselect_pending and self.connected and self._books_ready():
             # Quotes were pulled for a disconnect: re-select as soon as books
@@ -2256,7 +2331,8 @@ class RunLoop:
             "closed_periods_raw_usd": round(sum(self.closed_periods.values()), 6),
             "engine_alerts": list(self.alerts[-10:]),
             "feed": {"connected": self.connected, "disconnects_n": self.disconnects_n,
-                     "last_reconnect": self.last_reconnect, "clock_skew_n": self.skew_n},
+                     "last_reconnect": self.last_reconnect, "clock_skew_n": self.skew_n,
+                     "clock_skew_active": self._skew_active},
             "cap_trims_n": self.cap_trims_n,
             "programs_pruned_n": self.programs_pruned_n,
             "state": {"path": self.state_path, "error": self.state_error,
@@ -2849,8 +2925,10 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
 
 
 def _exchange_ts(msg: dict):
-    """Venue send time (epoch s) of a Kalshi websocket frame: top-level
-    ``sending_ts_ms``, else the delta's ``msg.ts_ms``. None when absent."""
+    """Venue time (epoch s) of a Kalshi websocket frame: top-level
+    ``sending_ts_ms`` (when Kalshi queued the message, snapshots and deltas),
+    else the delta's ``msg.ts_ms`` (when the change was recorded). None when
+    absent. See RunLoop._note_clock_skew."""
     raw = msg.get("sending_ts_ms")
     if raw is None:
         raw = (msg.get("msg") or {}).get("ts_ms") if isinstance(msg.get("msg"), dict) else None
