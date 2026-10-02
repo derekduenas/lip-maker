@@ -1,9 +1,13 @@
 """LIP Maker — paper runner classes.
 
 The long-running process is ``python -m mm.unattended --run``. Executing
-this file starts that process. ``PaperRunner`` stays importable for the
-existing paper tests. Fill simulation lives in ``execution.paper_fills``
-and the run loop uses that same simulator.
+this file (``python run_paper.py ...``) IGNORES every command-line argument
+(old flags such as --duration / --top-n do nothing) and calls
+``mm.unattended.service.main(["--run"])`` with that module's defaults — no
+--heartbeat, --status-port, --log-file or --summary. The legacy async
+``main()`` below is not reachable from ``__main__``. ``PaperRunner`` stays
+importable for the existing paper tests. Fill simulation lives in
+``execution.paper_fills``.
 
 Usage:
     PYTHONPATH=. python3 -m mm.unattended --run
@@ -1876,8 +1880,10 @@ class PaperRunner:
         """Observed-to-modelled reward ratio, when we have one. Defaults to
         1.0 (no adjustment) rather than to an invented discount."""
         try:
-            from engine.calibration_ewma import calibration_for
-            c = calibration_for(ticker)
+            # 2026-10-01: the module defines calib_for; the old import of
+            # calibration_for raised ImportError and always fell back to 1.0.
+            from engine.calibration_ewma import calib_for
+            c = calib_for(ticker, fallback=1.0)
             return float(c) if c else 1.0
         except Exception:
             return 1.0
@@ -2679,5 +2685,6 @@ async def main(duration_sec: int = 300, top_n: int = 50):
 
 
 if __name__ == "__main__":
+    # sys.argv is deliberately ignored; see the module docstring.
     from mm.unattended.service import main as unattended_main
     raise SystemExit(unattended_main(["--run"]))
