@@ -183,9 +183,13 @@ def make_model(name):
         from sklearn.impute import SimpleImputer
         from sklearn.linear_model import LogisticRegression
         from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import StandardScaler
+        import numpy as np
+        from sklearn.preprocessing import FunctionTransformer, StandardScaler
+        # clip z-scores: a test block outside the train range (time of day,
+        # hours to period end) must not extrapolate to p = 0/1
         return make_pipeline(SimpleImputer(strategy="median", add_indicator=True, keep_empty_features=True),
-                             StandardScaler(), LogisticRegression(C=0.5, max_iter=2000))
+                             StandardScaler(), FunctionTransformer(lambda z: np.clip(z, -4.0, 4.0)),
+                             LogisticRegression(C=0.1, max_iter=2000))
     if name == "lgbm":
         from lightgbm import LGBMClassifier
         return LGBMClassifier(n_estimators=200, learning_rate=0.05, num_leaves=15, min_child_samples=20,
