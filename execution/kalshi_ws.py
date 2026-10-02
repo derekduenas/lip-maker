@@ -49,11 +49,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import websockets
 
 from config import settings
-from execution.kalshi_auth import _load_dotenv_simple
 import os
 
-# Ensure .env is loaded (kalshi_auth import does this; belt-and-suspenders).
-_load_dotenv_simple(str(Path(__file__).resolve().parent.parent / ".env"))
+# The repo .env is NOT loaded on import: execution.kalshi_auth loads it only
+# with LIP_LOAD_DOTENV=1 and never sets LIP_* keys (importing it here keeps
+# that single opt-in path for callers that only import this module).
+import execution.kalshi_auth  # noqa: F401
 
 _log = logging.getLogger(__name__)
 
