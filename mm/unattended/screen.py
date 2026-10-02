@@ -49,24 +49,25 @@ def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | N
 
     reward  = pool/day x share, share = 2S / (2S + touch depth on both sides),
               S = min(target, ``size``)
-    markout = per contract per day: 2 sides x fill fraction/day x adverse
-              cents (the family MARKOUT_PRIOR_CENTS), with the fill fraction
-              scaled by 24 h volume, and the whole charge scaled up as
-              days-to-close shrinks (1 + LIP_RANK_SHORT_K / days) and for
-              news-driven categories (x LIP_RANK_NEWS_MULT).
+    markout = per contract per day: the base charge
+              selector.adverse_cost_per_contract_day (2 sides x fill
+              fraction/day x adverse cents: family prior, -1c past
+              MARKOUT_LONG_DATED_DAYS) scaled by 24 h volume, and the whole
+              charge scaled up as days-to-close shrinks
+              (1 + LIP_RANK_SHORT_K / days) and for news-driven categories
+              (x LIP_RANK_NEWS_MULT).
     score   = (reward - S x markout) / capital, capital = S x (yes bid + no bid).
 
     Returned ``penalty`` (stored as the frame's ``rank_penalty_per_day``) is
     NOT the full markout: selector.quote_economics already subtracts the
-    base markout prior (2 x fill fraction x |prior|) from ``net``, and RunLoop
+    base charge (the same adverse_cost_per_contract_day) from ``net``, and RunLoop
     subtracts this penalty from that net. So ``penalty`` is only the
     increment the volume / time / news multipliers add on top of the base
     prior, in $/day per RANK_PENALTY_UNIT (100) contracts per side. net -
     penalty then charges the markout prior exactly once.
     ``penalty_full`` is the full charge at S used in ``score``.
     """
-    from mm.fair_value import family_for_series
-    from mm.selector import FILL_FRACTION_PER_DAY, MARKOUT_PRIOR_CENTS
+    from mm.selector import KalshiMarket, adverse_cost_per_contract_day
     S = float(min(float(frame.get("target_size") or size), size)) or size
     yb = meta.get("yes_bid")
     ya = meta.get("yes_ask")
@@ -76,16 +77,18 @@ def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | N
     depth = float(meta.get("yes_bid_size") or 0.0) + float(meta.get("yes_ask_size") or 0.0)
     share = (2.0 * S) / (2.0 * S + depth)
     reward = pool_per_day(frame) * share
-    family = family_for_series(str(frame.get("series") or ""))
-    base_fill = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     vol = float(meta.get("volume_24h") or 0.0)
     vol_mult = min(3.0, 1.0 + vol / 5000.0)
-    adverse = abs(MARKOUT_PRIOR_CENTS.get(family, MARKOUT_PRIOR_CENTS["event"]))
+    # Same probe fields RunLoop._markets passes to quote_economics (series,
+    # days to settle; no empirical markout).
+    probe = KalshiMarket(market=str(frame.get("market") or ""), series=str(frame.get("series") or ""),
+                         period_reward_usd=0.0, period_seconds=86400.0, seconds_left=0.0,
+                         discount_factor=0.5, target_size=S, days_to_settle=days)
     mult = 1.0 + _env_float("LIP_RANK_SHORT_K", 3.0) / max(0.5, float(days if days is not None else 0.5))
     news = bool(category and category.strip().lower() in news_categories())
     if news:
         mult *= _env_float("LIP_RANK_NEWS_MULT", 2.0)
-    base_per_contract = 2.0 * base_fill * adverse / 100.0          # already in quote_economics net
+    base_per_contract = adverse_cost_per_contract_day(probe)        # already in quote_economics net
     full_per_contract = base_per_contract * vol_mult * mult
     penalty_full = S * full_per_contract
     incremental = RANK_PENALTY_UNIT * max(0.0, full_per_contract - base_per_contract)

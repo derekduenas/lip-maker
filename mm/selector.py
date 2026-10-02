@@ -242,6 +242,17 @@ def markout_cents(market: KalshiMarket) -> float:
     return prior
 
 
+def adverse_cost_per_contract_day(market: KalshiMarket) -> float:
+    """Base adverse-selection charge in $/day per contract quoted on each
+    side, both sides: 2 x fill fraction/day x -markout_cents / 100. The one
+    base charge quote_economics subtracts from net (markout_cents: family
+    prior, -1c past MARKOUT_LONG_DATED_DAYS, empirical blend).
+    screen.rank_score computes its base with this same function, so its
+    rank penalty adds only the increment on top of it."""
+    fraction = FILL_FRACTION_PER_DAY.get(family_of(market), FILL_FRACTION_PER_DAY["event"])
+    return 2.0 * fraction * -markout_cents(market) / 100.0
+
+
 def _params(market: KalshiMarket) -> ProgramParams:
     return ProgramParams(
         market_ticker=market.market,
@@ -436,11 +447,10 @@ def quote_economics(market: KalshiMarket, size: float, *,
     family = family_of(market)
     fraction = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     fills_side = size * fraction
-    mo = markout_cents(market)
     # The ONE base adverse-selection charge. screen.rank_score's
     # rank_penalty_per_day (subtracted by RunLoop) adds only the
-    # volume/time/news increment on top of this, never the prior again.
-    as_cost = -(mo / 100.0) * (fills_side * 2.0)
+    # volume/time/news increment on top of this same function's value.
+    as_cost = size * adverse_cost_per_contract_day(market)
     # PM US rebate is rounded per fill: expected fill = one side's expected
     # daily fill volume (fills_side), never more than our resting size.
     fill_size = min(float(size), fills_side) if fills_side > 0 else 0.0
