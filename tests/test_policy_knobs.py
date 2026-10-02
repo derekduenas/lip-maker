@@ -20,13 +20,6 @@ WATCHDOG_ENV = ROOT / "deploy" / "apex" / "watchdog.env.example"
 SKIP_DIRS = {"tests", "_archive", "archive", ".git", "__pycache__", ".venv", "venv"}
 NAME = re.compile(r"\bLIP_[A-Z0-9_]*[A-Z0-9]\b")   # "LIP_WD_*" (a glob) is not a name
 
-# Being implemented on other branches right now; the integrator removes these.
-PENDING = {
-    "LIP_PMUS_PERIODS": "implemented on fix/venue and fix/loop",
-    "LIP_PMUS_MARKET_CAP_USD": "implemented on fix/venue and fix/loop",
-}
-
-
 def _knobs() -> list[str]:
     names: set[str] = set()
     for path in (POLICY, WATCHDOG_ENV):
@@ -57,10 +50,6 @@ def test_config_files_name_some_knobs():
     assert len(_knobs()) > 20
 
 
-@pytest.mark.parametrize("name", [
-    pytest.param(n, marks=pytest.mark.xfail(reason=PENDING[n], strict=False))
-    if n in PENDING else n
-    for n in _knobs()
-])
+@pytest.mark.parametrize("name", _knobs())
 def test_knob_is_read_by_code(name):
     assert name in LITERALS, f"{name} is set in deploy/apex but no Python source reads it"
