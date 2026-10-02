@@ -33,7 +33,8 @@ It backs up the code tree, env file and units to /var/backups/lip-maker/<timesta
   polkit.addRule(function(action, subject) {
       if (action.id == "org.freedesktop.systemd1.manage-units" &&
           action.lookup("unit") == "lip-unattended.service" &&
-          action.lookup("verb") == "stop" && subject.user == "lip") {
+          (action.lookup("verb") == "stop" || action.lookup("verb") == "restart") &&
+          subject.user == "lip") {
           return polkit.Result.YES;
       }
   });
@@ -103,3 +104,26 @@ Data it cannot get from the engine today (so those criteria stay INSUFFICIENT un
 - Settled positions: the engine keeps lifetime counters that survive `LIP_SETTLED_KEEP_DAYS` (7) pruning: /status `settled_positions_n`, `settled_positions_by_venue`, `settled_total_usd` (realized settlement P&L: payout minus cost basis, fees excluded), persisted as `settled_lifetime` in engine_state.json. A state file written before the counters existed seeds them from its remaining settled rows (`settled_positions_lower_bound: true`); a short lower-bound count is INSUFFICIENT, not FAIL.
 - Engine alerts (kill latches) are written to /var/lib/lip-maker/alerts-engine.log (or `LIP_ENGINE_ALERT_LOG`), which deploys do not move; the report reads it next to the watchdog's /var/lib/lip-maker/alerts.log. Engines before this change wrote /opt/lip-maker/logs/alerts.log inside the code tree (deploy.sh moves it to /opt/lip-maker.prev, and user lip could not create it in the root-owned tree); the report still reads /opt/lip-maker/logs/alerts.log and /opt/lip-maker.prev/logs/alerts.log, and older history is in /var/backups/lip-maker/<timestamp>/app/logs/alerts.log (pass it with `--alerts`).
 - P&L attribution is cumulative over the engine state file's life, not a trailing window.
+
+
+## Auto-recover for transient watchdog trips (2026-10-02)
+
+The 2026-10-01/02 overnight outage was a false `heartbeat_missing` trip: the engine's heartbeat
+write (truncate, then write) was read by the watchdog in between. It is fixed at the source
+(atomic `os.replace` write; the watchdog re-reads an empty/partial file and falls back to its
+mtime), and the watchdog can now clear transient latches by itself:
+
+- `LIP_WD_AUTO_RECOVER=1` (code default off; on in watchdog.env.example). Only when every reason
+  seen during the latch is transient: `heartbeat_missing`, `heartbeat_stale`, `status_unreachable`,
+  `feed_no_frames`, `feed_stale`, `pmus_feed_stale`. Never when the watchdog's own config is armed live.
+- After `LIP_WD_AUTO_RECOVER_HEALTHY_S` (300) of clean checks: removes the kill file and runs
+  `LIP_WD_RESTART_CMD` (`systemctl restart lip-unattended`, needs the polkit rule above with the
+  `restart` verb). If the restart fails the kill file is rewritten and the latch stays.
+- Still failing `LIP_WD_AUTO_RESTART_AFTER_S` (600) after the trip: one engine restart (hung engine);
+  the latch stays until the checks are clean.
+- `LIP_WD_AUTO_RECOVER_GRACE_S` (180) after a watchdog restart, transient reasons are ignored.
+- At most `LIP_WD_AUTO_RECOVER_MAX_PER_DAY` (3) restarts per UTC day, then it stays latched for a human.
+- Status: `watchdog_health.json` -> `auto_recover`; alerts `auto_recover`, `auto_restart`,
+  `auto_recover_failed`, `auto_budget` in alerts.log.
+- Not covered: engine-internal kills (daily loss, disconnect >= LIP_DISCONNECT_KILL_S, state file)
+  are persisted in engine_state.json and need `python -m mm.unattended --reset-kill`.

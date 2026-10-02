@@ -14,7 +14,7 @@
 #        - carries KALSHI_PROD_READ_KEY_ID/PATH over from the old repo .env if the env
 #          file lacks them (the repo .env is no longer auto-loaded)
 #        - appends missing watchdog defaults (LIP_WD_LIVE_ARMED stays false)
-#        - installs the polkit rule for the watchdog's stop fallback
+#        - installs the polkit rule for the watchdog's stop fallback and auto-recover restart
 #   4. installs units + drop-ins, enables both services at boot, starts them
 #   5. verifies /status (paper, production books) and the watchdog health file;
 #      informational only: verify_ws_frames.py on the newest recording (if any)
@@ -190,11 +190,13 @@ chown -R lip:lip "$STATE"; chmod 0750 "$STATE"
 
 mkdir -p "$(dirname "$POLKIT")"
 cat > "$POLKIT" <<'EOF'
-// lip-watchdog may stop lip-unattended when it cannot write the kill file.
+// lip-watchdog may stop lip-unattended when it cannot write the kill file,
+// and restart it when auto-recovering a transient (heartbeat/feed) trip.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         action.lookup("unit") == "lip-unattended.service" &&
-        action.lookup("verb") == "stop" && subject.user == "lip") {
+        (action.lookup("verb") == "stop" || action.lookup("verb") == "restart") &&
+        subject.user == "lip") {
         return polkit.Result.YES;
     }
 });
@@ -203,6 +205,16 @@ chmod 0644 "$POLKIT"
 
 # 4. Units ---------------------------------------------------------------------
 log "installing units"
+LIVE_POLICY="$UNITS/lip-unattended.service.d/policy.conf"
+if [[ -f "$LIVE_POLICY" ]] && ! cmp -s "$LIVE_POLICY" "$APP/deploy/apex/lip-unattended.service.d/policy.conf"; then
+  # The live drop-in is about to be replaced by the repo copy. Operator edits
+  # that were never committed are lost unless re-applied (copy is in $BACKUP/units).
+  log "WARNING: live policy.conf differs from the repo copy; these live lines are being replaced:"
+  diff <(grep '^Environment=' "$LIVE_POLICY" | sort) \
+       <(grep '^Environment=' "$APP/deploy/apex/lip-unattended.service.d/policy.conf" | sort) \
+       | sed -n 's/^< /  - /p' || true
+  log "  (previous file: $BACKUP/units/lip-unattended.service.d/policy.conf)"
+fi
 install -m 0644 "$APP/deploy/lip-unattended.service" "$UNITS/lip-unattended.service"
 install -d -m 0755 "$UNITS/lip-unattended.service.d"
 install -m 0644 "$APP"/deploy/apex/lip-unattended.service.d/*.conf "$UNITS/lip-unattended.service.d/"
