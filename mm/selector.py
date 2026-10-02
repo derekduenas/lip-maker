@@ -322,15 +322,22 @@ def side_rungs(market: KalshiMarket, size: float, *, fallback_touch: bool = True
             touch(market.no_bids) if no_ref is None else no_ref)
 
 
-def maker_fee_usd(market: KalshiMarket, price_cents: int) -> float:
-    """Per-contract maker fee (negative = rebate) for one fill.
+def maker_fee_usd(market: KalshiMarket, price_cents: int, fill_size: float = 1.0) -> float:
+    """Per-contract maker fee (negative = rebate) for one fill of ``fill_size``.
 
-    PM US: maker REBATE 0.0125 x C x p x (1-p), paid at the trade, banker's
-    rounded per fill (https://docs.polymarket.us/fees, effective 10 AM ET
-    2026-10-01). Kalshi: the series fee schedule (kalshi_fee_usd)."""
+    PM US: maker REBATE 0.0125 x C x p x (1-p), banker's rounded to $0.01 PER
+    FILL (https://docs.polymarket.us/fees; the rebate is effective 12 AM ET
+    25 Sept 2026 - the 10 AM ET 1 Oct 2026 change is the combo taker fee).
+    The rounded fill rebate (mm.accounting.pm_us_maker_rebate_usd) is spread
+    over the fill's contracts, so small fills earn nothing (1 contract at 50c
+    rounds $0.003125 to $0.00). Kalshi: the series fee schedule
+    (kalshi_fee_usd), whose ceil-to-$0.000001 rounding is per contract here."""
     if market.venue == "pmus":
-        p = int(price_cents) / 100.0
-        return -0.0125 * p * (1.0 - p) if 0 < p < 1 else 0.0
+        size = float(fill_size)
+        if size <= 0:
+            return 0.0
+        from mm.accounting import pm_us_maker_rebate_usd
+        return -float(pm_us_maker_rebate_usd(int(price_cents), size)) / size
     from decimal import Decimal as _D
     mult = _D(str(market.fee_multiplier if market.fee_multiplier is not None else 1))
     try:
@@ -434,8 +441,11 @@ def quote_economics(market: KalshiMarket, size: float, *,
     # rank_penalty_per_day (subtracted by RunLoop) adds only the
     # volume/time/news increment on top of this, never the prior again.
     as_cost = -(mo / 100.0) * (fills_side * 2.0)
-    fee = maker_fee_usd(market, yes_cents) * fills_side
-    fee += maker_fee_usd(market, no_cents) * fills_side
+    # PM US rebate is rounded per fill: expected fill = one side's expected
+    # daily fill volume (fills_side), never more than our resting size.
+    fill_size = min(float(size), fills_side) if fills_side > 0 else 0.0
+    fee = maker_fee_usd(market, yes_cents, fill_size) * fills_side
+    fee += maker_fee_usd(market, no_cents, fill_size) * fills_side
     days = market.days_to_settle or 0.0
     cheap = family in ("commodity", "crypto") or market.has_reference or (
         family == "weather" and market.has_observation)

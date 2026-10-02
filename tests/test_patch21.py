@@ -110,7 +110,9 @@ def test_pmus_economics_rebate_and_daily_floor():
                      yes_bids=[(40, 3000)], no_bids=[(55, 3000)], days_to_settle=20, venue="pmus")
     net, cap, share, yc, nc = quote_economics(m, 100)
     assert (yc, nc) == (41, 56) and share > 0 and abs(cap - 97.0) < 1e-9
-    assert maker_fee_usd(m, 50) == pytest.approx(-0.0125 * 0.25)
+    # rebate is banker's rounded to $0.01 per fill: 1 lot @50c -> $0, 100 lots -> $0.31
+    assert maker_fee_usd(m, 50) == 0.0
+    assert maker_fee_usd(m, 50, fill_size=100) == pytest.approx(-0.31 / 100)
     m2 = KalshiMarket(market="PMUS:a-c", series="PMUS:a-c", period_reward_usd=5, period_seconds=10 * 86400,
                       seconds_left=10 * 86400, discount_factor=0.5, target_size=1000,
                       yes_bids=[(40, 3000)], no_bids=[(55, 3000)], days_to_settle=20, venue="pmus")

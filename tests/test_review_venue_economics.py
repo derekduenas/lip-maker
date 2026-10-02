@@ -118,3 +118,25 @@ def test_series_fees_flat_is_maker_charged():
     assert flat.fee_usd(50, 10) == std.fee_usd(50, 10) > D(0)
     assert flat.fee_usd(50, 10, is_taker=True) == std.fee_usd(50, 10, is_taker=True)
     assert "flat" in flat.describe()["fee_type"] and "unverified" in flat.source
+
+
+# ------------------------------------------------------------------ item 8
+def test_pmus_rebate_is_bankers_rounded_per_fill():
+    km = _km(market="PMUS:x", series="PMUS:x", venue="pmus")
+    # 1 contract @50c: 0.0125 x 0.25 = $0.003125 -> $0.00 after rounding to the cent
+    assert SEL.maker_fee_usd(km, 50, fill_size=1) == 0.0
+    # 4 contracts @50c: $0.0125 -> $0.01 (half-even), i.e. -$0.0025/contract
+    assert SEL.maker_fee_usd(km, 50, fill_size=4) == pytest.approx(-0.0025)
+    # 100 @50c: $0.3125 -> $0.31
+    assert SEL.maker_fee_usd(km, 50, fill_size=100) == pytest.approx(-0.0031)
+
+
+def test_pmus_quote_economics_uses_rounded_rebate_at_expected_fill():
+    km = _km(market="PMUS:x", series="PMUS:x", venue="pmus", target_size=100,
+             yes_bids=[(40, 500)], no_bids=[(55, 500)])
+    net, _c, share, y, n = SEL.quote_economics(km, 10)
+    fills_side = 10 * SEL.FILL_FRACTION_PER_DAY["event"]  # 1.5 contracts/day/side
+    reward = SEL.reward_per_day(share, km)
+    as_cost = 2 * fills_side * abs(SEL.markout_cents(km)) / 100
+    # 1.5 contracts at ~40c/55c rounds to a $0.00 rebate: no rebate credit
+    assert net == pytest.approx(reward - as_cost)
