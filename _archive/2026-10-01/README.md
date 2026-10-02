@@ -42,3 +42,8 @@ unrealized-pnl), root `series-auto-prune.*`, `vpin-gate.*`, and
 - `engine/share_drift.py`, `engine/maker_rebate_scorer.py` — no importers anywhere.
 - `config/macro_calendar.py` + `tools/macro_blackout_sync.py` — every date was before
   Oct 2026 and the June 2026 FOMC was wrong (real: Jun 16-17, 2026).
+
+## Added during the same pass
+- `cross_venue/capital_reaper.py` — cancelled real Kalshi and PM orders by default
+  (dry-run was opt-in), via subprocesses into `/root/lip-maker` and
+  `/root/polymarket-maker`. No importers; `cross_venue/requote_queue.py` stays.
