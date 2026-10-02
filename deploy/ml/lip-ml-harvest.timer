@@ -1,0 +1,9 @@
+[Unit]
+Description=Harvest live paper fills every 10 minutes (lip.log rotates in ~3 h)
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+
+[Install]
+WantedBy=timers.target

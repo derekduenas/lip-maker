@@ -1,0 +1,19 @@
+[Unit]
+Description=lip-maker: copy live paper fills into the durable ML journal (read-only on the engine)
+
+[Service]
+Type=oneshot
+User=lip
+Group=lip
+WorkingDirectory=/opt/lip-ml-src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/lip-ml-venv/bin/python -m mm.ml.harvest --out-dir /var/lib/lip-maker/ml
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=300M
+TimeoutStartSec=5min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lip-maker/ml
+PrivateTmp=yes

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly lip-maker fill-toxicity pipeline (03:30 PT)
+
+[Timer]
+OnCalendar=*-*-* 10:30:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=lip-maker offline fill-toxicity dataset + readiness + bake-off (paper, offline)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=lip
+Group=lip
+WorkingDirectory=/opt/lip-ml-src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/var/lib/lip-maker/ml/home
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+ExecStartPre=/bin/mkdir -p /var/lib/lip-maker/ml/home
+ExecStart=/opt/lip-ml-src/deploy/ml/lip-ml-nightly.sh
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+CPUQuota=100%
+MemoryMax=2G
+TimeoutStartSec=3h
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/lip-maker/ml
+PrivateTmp=yes
