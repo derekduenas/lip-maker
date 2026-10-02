@@ -2237,8 +2237,14 @@ class RunLoop:
         max_reward, plus rolled-over periods) + PM US rebates - Kalshi maker
         fees. ``premium_paid_usd`` is what paper fills cost."""
         parts = self.pnl_parts()
-        rewards = sum(float(v.get("capped_raw_usd", v["raw_usd"])) for v in (accrual or {}).values())
-        rewards += sum(self.closed_periods.values())
+        by_venue = {"kalshi": 0.0, "pmus": 0.0}
+        for market, v in (accrual or {}).items():
+            vn = self._venue_of(market)
+            by_venue[vn] = by_venue.get(vn, 0.0) + float(v.get("capped_raw_usd", v["raw_usd"]))
+        for market, usd in self.closed_periods.items():
+            vn = self._venue_of(market)
+            by_venue[vn] = by_venue.get(vn, 0.0) + float(usd)
+        rewards = sum(by_venue.values())
         pnl = parts["markout_usd"] + rewards + parts["rebates_usd"] - parts["fees_usd"]
         return {
             "pnl_usd": format(Decimal(str(round(pnl, 6))), "f"),
@@ -2253,7 +2259,41 @@ class RunLoop:
             "daily_mtm_pnl_usd": format(self.daily_pnl_usd(), "f"),
             "unsettled_positions": parts["unsettled"][:50],
             "unmarked_positions": parts["unmarked"][:50],
+            "pnl_attribution": self.pnl_attribution(parts, by_venue, pnl),
         }
+
+    def pnl_attribution(self, parts: dict, rewards_by_venue: dict, pnl: float) -> dict:
+        """Split the estimated ``pnl_usd`` into parts that sum to it.
+
+        spread_capture_usd    sum of count x (side mark at fill - fill price)
+        adverse_selection_usd sum of count x (side mark 10 min after the fill
+                              - side mark at fill), fills whose 10 min check
+                              was measured on time (mm/unattended/markouts.py)
+        inventory_mtm_usd     the rest of the position markout: later mark
+                              moves and settlement, plus fills with no mark at
+                              fill or no on-time 10 min check
+        est_rewards_*_usd     estimated LIP rewards (Kalshi) / PM US liquidity
+                              rewards, current windows capped + rolled periods
+        rebates_usd           PM US maker rebates
+        fees_usd              Kalshi maker fees, as a negative number
+        Every figure is an ESTIMATE from paper fills and modelled rewards."""
+        spread = float(self.markouts.spread_usd)
+        adverse = float(self.markouts.adverse_usd)
+        out = {
+            "label": "estimate (paper): attribution of pnl_usd from simulated fills and "
+                     "estimated (unpaid) rewards; components sum to total_usd",
+            "spread_capture_usd": round(spread, 6),
+            "adverse_selection_usd": round(adverse, 6),
+            "inventory_mtm_usd": round(parts["markout_usd"] - spread - adverse, 6),
+            "est_rewards_kalshi_usd": round(float(rewards_by_venue.get("kalshi", 0.0)), 6),
+            "est_rewards_pmus_usd": round(float(rewards_by_venue.get("pmus", 0.0)), 6),
+            "rebates_usd": round(parts["rebates_usd"], 6),
+            "fees_usd": round(-parts["fees_usd"], 6),
+            "total_usd": round(pnl, 6),
+            "spread_unmeasured_fills": self.markouts.spread_unmeasured,
+            "adverse_measured_fills": self.markouts.adverse_n,
+        }
+        return out
 
     def venue_report(self, est: dict | None = None, accrual: dict | None = None) -> dict:
         """Patch 21: per-venue programs, resting, capital, est rewards, fills. Read-only."""
