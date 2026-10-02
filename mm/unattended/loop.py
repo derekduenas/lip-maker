@@ -160,9 +160,12 @@ class _Program:
     venue: str = "kalshi"
     max_spread_usd: float | None = None
     sports_single: bool = False
-    fee_type: str = "quadratic"
+    # A missing fee_type is charged as the standard maker fee (fail conservative).
+    fee_type: str = "quadratic_with_maker_fees"
     fee_multiplier: float = 1.0
     program_id: str = ""
+    # max_reward_per_account in dollars (None: the program sets no account cap).
+    max_reward_usd: float | None = None
 
 
 VENUES = ("kalshi", "pmus")
@@ -262,8 +265,38 @@ class RunLoop:
         self.quotes_total = 0
         self.cancels_total = 0
         self.pm_rebate_usd = 0.0
+        # Rolled-over program periods: market -> raw reward USD (capped at
+        # max_reward per period) of windows that ended while we were running.
         self.closed_periods: dict[str, float] = {}
+        self.closed_periods_n = 0
         self.refeeds_n = 0
+        # Review fixes: fill aggregates (self.fills is a bounded list), MTM
+        # marks, fees, settlement, inventory on the risk engine, feed state.
+        self.fills_total = 0
+        self.fills_by_venue: dict[str, int] = {}
+        self.premium_usd_total = 0.0
+        self.fees_usd_total = 0.0
+        self.bucket_pos: dict[str, dict] = {}
+        self.last_mid: dict[str, float] = {}
+        self.settled: dict[str, dict] = {}
+        self.inv_committed: dict[str, Decimal] = {}
+        self.connected = True
+        self.disconnected_at: float | None = None
+        self.disconnects_n = 0
+        self.last_reconnect: dict | None = None
+        self._reselect_pending = False
+        self.alerts: list[dict] = []
+        self.skew_n = 0
+        self.cap_trims_n = 0
+        self.programs_pruned_n = 0
+        self._pnl_day: dict | None = None
+        self.state_path: str | None = None
+        self.state_error: str | None = None
+        self._state_dirty = False
+        self._state_saved_at = 0.0
+        # Frame thread and the service's 1 s timer thread both take this.
+        import threading as _threading
+        self.lock = _threading.RLock()
 
     def add_program(self, row: dict) -> None:
         market = str(row["market"])
@@ -297,9 +330,10 @@ class RunLoop:
             venue=str(row.get("venue") or "kalshi"),
             max_spread_usd=None if row.get("max_spread_usd") is None else float(row["max_spread_usd"]),
             sports_single=bool(row.get("sports_single")),
-            fee_type=str(row.get("fee_type") or "quadratic"),
+            fee_type=str(row.get("fee_type") or "quadratic_with_maker_fees"),
             fee_multiplier=float(row.get("fee_multiplier") if row.get("fee_multiplier") is not None else 1.0),
             program_id=str(row.get("program_id") or market),
+            max_reward_usd=None if row.get("max_reward_usd") is None else float(row["max_reward_usd"]),
         )
         if prog.venue not in VENUES:
             raise ValueError(f"unknown venue {prog.venue!r}")
@@ -309,8 +343,10 @@ class RunLoop:
                 prog.program_id, prog.start_ts, prog.end_ts, prog.period_reward_usd,
                 prog.target_size, prog.discount_factor, prog.max_spread_usd):
             # Same program window re-fed (e.g. refreshed metadata): keep the
-            # accrual and book, update the descriptive fields only.
+            # accrual and book, update the descriptive fields and the cap.
             self.programs[market] = prog
+            old_acc.max_reward_usd = (None if prog.max_reward_usd is None
+                                      else Decimal(str(prog.max_reward_usd)))
             return
         self.programs[market] = prog
         params = ProgramParams(
@@ -325,17 +361,18 @@ class RunLoop:
             rules="pmus" if prog.venue == "pmus" else "kalshi",
             max_spread_usd=prog.max_spread_usd if prog.venue == "pmus" else None,
         )
-        acc = SecondAccrual(params, series=prog.series)
+        acc = SecondAccrual(params, series=prog.series,
+                            max_reward_usd=(None if prog.max_reward_usd is None
+                                            else Decimal(str(prog.max_reward_usd))))
         if old_acc is not None:
             # Patch 21: a new program window for a known market (period
             # roll-over). Keep the live book (the WS sends a snapshot only on
-            # subscribe) and our resting orders; archive the old raw accrual.
+            # subscribe) and our resting orders; archive the old raw accrual
+            # (capped at that window's max_reward) so status totals do not
+            # reset at the roll.
             acc.book = old_acc.book
             acc.resting = list(old_acc.resting)
-            try:
-                self.closed_periods[market] = self.closed_periods.get(market, 0.0) + float(old_acc.raw_usd())
-            except Exception:
-                pass
+            self._archive_period(market, old_acc)
             self.refeeds_n += 1
         self.accruals[market] = acc
         self.open_seconds.setdefault(market, None)
@@ -362,6 +399,15 @@ class RunLoop:
             return
         if kind == "cash":
             self.cash = row
+            return
+        if kind == "disconnect":
+            self.note_disconnect(str(row.get("reason") or "disconnect"))
+            return
+        if kind == "reconnect":
+            self.note_reconnect(float(row.get("stale_s") or 0.0))
+            return
+        if kind == "settlement":
+            self.settle(str(row.get("market") or ""), str(row.get("result") or ""))
             return
         ts = float(row.get("ts") if row.get("ts") is not None else self.now)
         self.now = ts
@@ -401,7 +447,10 @@ class RunLoop:
                     else:
                         accrual.score_second(open_s)
                 self.open_seconds[market] = None
-            if (self.carry_forward and market in self.resting and accrual._next is not None
+            # Carry forward only while the feed is connected: a quiet book
+            # means "unchanged" only when messages could have arrived.
+            if (self.carry_forward and self.connected and market in self.resting
+                    and accrual._next is not None
                     and 0 < second - accrual._next <= CARRY_FORWARD_MAX_S
                     and accrual.book.book.is_usable() and self._book_fresh(market, second)):
                 while accrual._next < second:
@@ -425,6 +474,141 @@ class RunLoop:
         accrual.on_message(row, ts)
         self.open_seconds[market] = int(ts)
         self._book_ts[market] = ts
+        self._note_mark(market)
+
+    # ------------------------------------------------------------ feed state
+    def note_disconnect(self, reason: str = "disconnect") -> None:
+        """The websocket dropped (transient error, sequence gap, clean close).
+
+        Seconds up to the last frame are closed against the book as it was.
+        Then every book is marked disconnected (stale until its own next
+        snapshot) and resting quotes are pulled (paper cannot see the trades
+        that would have filled them while the feed is down), so outage
+        seconds are never carried forward or scored: they are unknown (stale
+        book) or idle (no quote)."""
+        if self.connected and self.now:
+            self._close_elapsed(int(self.now) + 1)
+        for accrual in self.accruals.values():
+            accrual.book.note_disconnect()
+        if self.connected:
+            self.disconnects_n += 1
+            self.disconnected_at = self.now or None
+            logging.getLogger("lip.risk").warning(
+                "feed disconnected (%s): books marked stale, quotes pulled", reason)
+        self.connected = False
+        self._cancel_all(f"disconnect:{reason}")
+        self._state_dirty = True
+
+    def note_reconnect(self, stale_s: float) -> None:
+        """The feed is back after ``stale_s`` seconds without data. Books stay
+        stale until their own snapshot arrives; a fresh selection runs once
+        enough books are usable again."""
+        self.connected = True
+        self.last_reconnect = {"ts": self.now, "stale_s": round(float(stale_s), 1)}
+        self._reselect_pending = True
+        self._state_dirty = True
+
+    def settle(self, market: str, result: str) -> None:
+        """Book settlement of a held position (YES pays 100c on "yes", NO on
+        "no"). The live feed
+        has no settlement channel today; unsettled positions are marked at
+        their last mark and listed in status."""
+        result = str(result).lower()
+        if result not in ("yes", "no") or market in self.settled:
+            return
+        self.settled[market] = {"result": result, "ts": self.now}
+        self.last_mid[market] = 100.0 if result == "yes" else 0.0
+        self._cancel(market, "settled")
+        self._state_dirty = True
+
+    def _archive_period(self, market: str, acc: SecondAccrual) -> None:
+        try:
+            raw = acc.raw_usd()
+            if acc.max_reward_usd is not None:
+                raw = min(raw, acc.max_reward_usd)
+        except Exception:
+            logging.getLogger("lip.risk").exception("archiving accrual for %s failed", market)
+            return
+        self.closed_periods[market] = self.closed_periods.get(market, 0.0) + float(raw)
+        self.closed_periods_n += 1
+        self._state_dirty = True
+
+    # ------------------------------------------------------------ marks / P&L
+    def _note_mark(self, market: str) -> None:
+        """Remember the market's YES mark (cents) from a usable book: the mid
+        when both sides quote, else the remaining side (YES bid, or 100 - NO
+        bid). An empty or stale book keeps the previous mark."""
+        acc = self.accruals.get(market)
+        if acc is None or market in self.settled:
+            return
+        book = acc.book.book
+        if not book.is_usable():
+            return
+        yb = max((lvl.price_cents for lvl in book.yes_bids), default=None)
+        nb = max((lvl.price_cents for lvl in book.no_bids), default=None)
+        if yb is not None and nb is not None:
+            self.last_mid[market] = (yb + (100 - nb)) / 2.0
+        elif yb is not None:
+            self.last_mid[market] = float(yb)
+        elif nb is not None:
+            self.last_mid[market] = float(100 - nb)
+
+    def _yes_mark(self, market: str):
+        """(YES mark cents or None, source): settlement value, else the
+        live/last-known mark."""
+        if market in self.settled:
+            return (100.0 if self.settled[market]["result"] == "yes" else 0.0), "settled"
+        self._note_mark(market)
+        mark = self.last_mid.get(market)
+        return mark, ("mark" if mark is not None else "none")
+
+    def _fill_fee_usd(self, market: str, price_cents: float, count: float) -> float:
+        """Kalshi maker fee for one paper fill (mm.accounting.kalshi_fee_usd)
+        with the program's fee_type and multiplier; a missing or unknown
+        fee_type is charged as the standard maker fee. PM US makers pay no fee
+        (their rebate is booked separately)."""
+        if self._venue(market) != "kalshi" or count <= 0:
+            return 0.0
+        from mm.accounting import kalshi_fee_usd
+        prog = self.programs.get(market)
+        fee_type = (prog.fee_type if prog is not None else "") or "quadratic_with_maker_fees"
+        mult = Decimal(str(prog.fee_multiplier if prog is not None else 1.0))
+        try:
+            fee = kalshi_fee_usd(int(round(price_cents)), count, fee_type=fee_type, multiplier=mult)
+        except ValueError:
+            fee = kalshi_fee_usd(int(round(price_cents)), count,
+                                 fee_type="quadratic_with_maker_fees", multiplier=mult)
+        return float(fee)
+
+    def pnl_parts(self) -> dict:
+        """Session P&L parts from held positions (USD).
+
+        markout_usd = MTM value of every position at its mark (book mid,
+        remaining side of a one-sided book, last known mark, or settlement)
+        minus its cost. A position that never had a mark is valued at 0
+        (worst case) and listed in ``unmarked``."""
+        markout = 0.0
+        unmarked, unsettled = [], []
+        for market, pos in self.position.items():
+            mark, source = self._yes_mark(market)
+            cost = float(pos["yes_cost"]) + float(pos["no_cost"])
+            if mark is None:
+                value = 0.0
+                unmarked.append(market)
+            else:
+                value = (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+            markout += value - cost
+            prog = self.programs.get(market)
+            close = None if prog is None else prog.close_ts
+            if source != "settled" and (prog is None or (close is not None and self.now and self.now >= close)):
+                unsettled.append(market)
+        return {"markout_usd": markout, "fees_usd": self.fees_usd_total,
+                "rebates_usd": self.pm_rebate_usd, "unmarked": unmarked, "unsettled": unsettled}
+
+    def session_mtm_usd(self) -> float:
+        parts = self.pnl_parts()
+        return parts["markout_usd"] - parts["fees_usd"] + parts["rebates_usd"]
+
 
     # ------------------------------------------------------------ patch 21
     def _venue(self, market: str) -> str:
@@ -479,14 +663,25 @@ class RunLoop:
         if not trade.get("trade_id"):
             return
         for fill in self.sim.apply_trades([trade]):
-            self.fills.append(fill)
-            self._reduce_resting(fill)
-            self._note_fill(fill, ts)
-            decision = self.risk.record_fill(1, now=ts)
-            if not decision.allowed:
-                self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
-                             "paper": self.mode == "paper"}
-                self._cancel_all(decision.reason)
+            self._record_fill(fill, ts)
+
+    def _record_fill(self, fill: dict, ts: float) -> bool:
+        """One paper fill: history + exact aggregates, fees, the
+        fills-per-minute clock. False when the fill latched a kill."""
+        self.fills.append(fill)
+        self.fills_total += 1
+        venue = self._venue(str(fill.get("market_ticker")))
+        self.fills_by_venue[venue] = self.fills_by_venue.get(venue, 0) + 1
+        self.premium_usd_total += float(fill.get("count") or 0) * float(fill.get("price_cents") or 0) / 100.0
+        self._reduce_resting(fill)
+        self._note_fill(fill, ts)
+        decision = self.risk.record_fill(1, now=ts)
+        if not decision.allowed:
+            self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
+                         "paper": self.mode == "paper"}
+            self._cancel_all(decision.reason)
+            return False
+        return True
 
     # ------------------------------------------------------------ patch 15
     def _note_fill(self, fill: dict, ts: float) -> None:
@@ -495,16 +690,33 @@ class RunLoop:
         side = str(fill.get("side"))
         count = float(fill.get("count") or 0)
         price = float(fill.get("price_cents") or 0)
-        pos = self.position.setdefault(market, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0})
+        venue = self._venue(market)
+        pos = self.position.setdefault(market, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0,
+                                                "fees": 0.0, "venue": venue})
+        pos.setdefault("fees", 0.0)
+        pos.setdefault("venue", venue)
+        bucket = (getattr(self, "bucket_of", {}) or {}).get(market) or "short"
+        bpos = self.bucket_pos.setdefault(bucket, {}).setdefault(
+            market, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0, "fees": 0.0, "fills_n": 0.0})
+        fee = self._fill_fee_usd(market, price, count) if side in ("yes", "no") else 0.0
         if side in ("yes", "no"):
             pos[side] += count
             pos[f"{side}_cost"] += count * price / 100.0
+            pos["fees"] += fee
+            bpos[side] += count
+            bpos[f"{side}_cost"] += count * price / 100.0
+            bpos["fees"] += fee
+            self.fees_usd_total += fee
+        bpos["fills_n"] += 1
+        self._state_dirty = True
         mid = self._side_mid_cents(market, side)
         if self._venue(market) == "pmus" and count > 0:
             # PM US maker rebate 0.0125 x C x p x (1-p), per fill, banker's
             # rounded to the cent (https://docs.polymarket.us/fees).
             from mm.accounting import pm_us_maker_rebate_usd
-            self.pm_rebate_usd += float(pm_us_maker_rebate_usd(int(round(price)), count))
+            rebate = float(pm_us_maker_rebate_usd(int(round(price)), count))
+            self.pm_rebate_usd += rebate
+            bpos["rebates"] = bpos.get("rebates", 0.0) + rebate
         self.fill_marks.append({
             "market": market, "side": side, "price_cents": price, "count": count, "ts": ts,
             "mid0": mid, "venue": self._venue(market), "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
@@ -603,7 +815,7 @@ class RunLoop:
 
     def _unpaired(self, market: str, side: str) -> float:
         pos = self.position.get(market)
-        if not pos:
+        if not pos or market in self.settled:
             return 0.0
         other = "no" if side == "yes" else "yes"
         return float(pos[side]) - float(pos[other])
@@ -790,14 +1002,7 @@ class RunLoop:
             count = min(size, depth)
             fill = {"market_ticker": market, "side": side, "price_cents": price, "count": count,
                     "ts": ts, "source": "paper_cross", "trade_id": f"cross:{market}:{side}:{ts:.3f}"}
-            self.fills.append(fill)
-            self._reduce_resting(fill)
-            self._note_fill(fill, ts)
-            decision = self.risk.record_fill(1, now=ts)
-            if not decision.allowed:
-                self.kill = {"reason": decision.reason, "cancel_all": decision.cancel_all,
-                             "paper": self.mode == "paper"}
-                self._cancel_all(decision.reason)
+            if not self._record_fill(fill, ts):
                 return
             quote = self.resting.get(market) or quote
 
@@ -871,12 +1076,18 @@ class RunLoop:
         have = 0
         for market in self.programs:
             book = self.accruals[market].book.book
-            if book.yes_bids or book.no_bids:
+            if (book.yes_bids or book.no_bids) and book.is_usable():
                 have += 1
         return have >= self.books_ready_fraction * len(self.programs)
 
     def _maybe_select(self, ts: float) -> None:
         if not self.programs:
+            return
+        if self._reselect_pending and self.connected and self._books_ready():
+            # Quotes were pulled for a disconnect: re-select as soon as books
+            # are usable again instead of waiting for the next period.
+            self._reselect_pending = False
+            self._select(ts)
             return
         if self.last_select_ts is None and self.first_select_warmup_s > 0:
             if self._first_frame_ts is None:
@@ -1400,11 +1611,6 @@ class RunLoop:
         elapsed = None
         if session_start_ts is not None and self.now:
             elapsed = max(0.0, float(self.now) - float(session_start_ts))
-        premium = sum(
-            (Decimal(str(fill["count"])) * Decimal(int(fill["price_cents"])) / Decimal(100)
-             for fill in self.fills),
-            Decimal(0),
-        )
         selected = []
         for market, quote in self.resting.items():
             prog = self.programs.get(market)
@@ -1496,7 +1702,7 @@ class RunLoop:
             "quotes_n": self.quotes_total or len(self.quotes),
             "cancels_n": self.cancels_total or len(self.cancels),
             "venues": self.venue_report(est, accrual),
-            "fills_n": len(self.fills),
+            "fills_n": self.fills_total,
             "excluded_n": len(self.excluded),
             "excluded_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
             "programs_shard_unknown": shard_unknown_n,
@@ -1528,9 +1734,36 @@ class RunLoop:
             "session_elapsed_s": None if elapsed is None else round(elapsed, 1),
             "last_frame_ts": self.now or None,
             "kill": self.kill,
-            "pnl_usd": format(-premium, "f"),
+            **self.pnl_report(accrual),
             "rewards_usd": "0",
+            "closed_periods_n": self.closed_periods_n,
+            "closed_periods_raw_usd": round(sum(self.closed_periods.values()), 6),
+            "feed": {"connected": self.connected, "disconnects_n": self.disconnects_n,
+                     "last_reconnect": self.last_reconnect},
             "day": day,
+        }
+
+    def pnl_report(self, accrual: dict | None = None) -> dict:
+        """Status P&L fields. ``pnl_usd`` is an ESTIMATE: MTM markout of held
+        positions + estimated LIP rewards (current windows capped at
+        max_reward, plus rolled-over periods) + PM US rebates - Kalshi maker
+        fees. ``premium_paid_usd`` is what paper fills cost."""
+        parts = self.pnl_parts()
+        rewards = sum(float(v.get("capped_raw_usd", v["raw_usd"])) for v in (accrual or {}).values())
+        rewards += sum(self.closed_periods.values())
+        pnl = parts["markout_usd"] + rewards + parts["rebates_usd"] - parts["fees_usd"]
+        return {
+            "pnl_usd": format(Decimal(str(round(pnl, 6))), "f"),
+            "pnl_usd_note": ("ESTIMATE: markout (MTM at mid / one-sided / last mark / settlement) "
+                             "+ estimated raw LIP rewards (not paid) + PM US rebates - Kalshi maker fees"),
+            "pnl_parts": {"markout_usd": round(parts["markout_usd"], 6),
+                          "est_rewards_usd": round(rewards, 6),
+                          "rebates_usd": round(parts["rebates_usd"], 6),
+                          "fees_usd": round(parts["fees_usd"], 6),
+                          "rewards_partial": accrual is None},
+            "premium_paid_usd": format(Decimal(str(round(self.premium_usd_total, 6))), "f"),
+            "unsettled_positions": parts["unsettled"][:50],
+            "unmarked_positions": parts["unmarked"][:50],
         }
 
     def venue_report(self, est: dict | None = None, accrual: dict | None = None) -> dict:
@@ -1548,7 +1781,7 @@ class RunLoop:
                 "est_usd": format(sum(((est or {}).get(m, Decimal(0)) for m in mk), Decimal(0)), "f"),
                 "est_raw_usd": (None if accrual is None else round(sum(
                     float(v["raw_usd"]) for m, v in accrual.items() if self._venue(m) == vn), 6)),
-                "fills_n": sum(1 for f in self.fills if self._venue(str(f.get("market_ticker"))) == vn),
+                "fills_n": int(self.fills_by_venue.get(vn, 0)),
                 "plan_net_usd_per_day": round(sum(float((self.last_plan.get(m) or {}).get("value_per_day") or 0.0)
                                                   for m in mk), 4),
             }
@@ -1559,24 +1792,29 @@ class RunLoop:
         return out
 
     def _side_mid_cents(self, market: str, side: str):
-        accrual = self.accruals.get(market)
-        if accrual is None:
+        """Mark of one side in cents: book mid, the remaining side of a
+        one-sided book, the last known mark, or the settlement value."""
+        yes_mark, _src = self._yes_mark(market)
+        if yes_mark is None:
             return None
-        book = accrual.book.book
-        yb = max((lvl.price_cents for lvl in book.yes_bids), default=None)
-        nb = max((lvl.price_cents for lvl in book.no_bids), default=None)
-        if yb is None or nb is None:
-            return None
-        yes_mid = (yb + (100 - nb)) / 2.0
-        return yes_mid if side == "yes" else 100.0 - yes_mid
+        return yes_mark if side == "yes" else 100.0 - yes_mark
 
     def bucket_report(self, accrual: dict | None = None) -> dict:
-        """Per-bucket capital, raw est rewards, fills, premium, markout (MTM vs
-        current mid) and pnl = markout + raw rewards. Read-only."""
+        """Per-bucket capital, est rewards, fills, premium, markout, fees, pnl.
+        Read-only apart from refreshing marks.
+
+        Fills are attributed to the bucket the market had when it filled.
+        markout_usd = MTM of the bucket's positions at their marks (mid,
+        remaining side of a one-sided book, last known mark, or settlement)
+        minus cost. raw_est_usd = estimated raw rewards of current windows
+        (capped at max_reward) plus rolled-over periods. fees_usd = Kalshi
+        maker fees charged on paper fills. pnl_usd = markout + raw_est + PM US
+        rebates - fees (an estimate: rewards are not paid figures)."""
         tags = getattr(self, "bucket_of", {}) or {}
         out = {b: {"budget_usd": round(float((getattr(self, "bucket_budget", None) or {}).get(b, 0.0)), 2),
                    "selected_n": 0, "selected": [], "capital_usd": 0.0, "raw_est_usd": 0.0,
-                   "fills_n": 0, "premium_usd": 0.0, "markout_usd": 0.0, "pnl_usd": 0.0}
+                   "fills_n": 0, "premium_usd": 0.0, "markout_usd": 0.0, "fees_usd": 0.0,
+                   "rebates_usd": 0.0, "pnl_usd": 0.0}
                for b in ("durable", "short")}
         for market in self.resting:
             b = tags.get(market, "short")
@@ -1586,20 +1824,27 @@ class RunLoop:
         for market, info in (accrual or {}).items():
             b = tags.get(market)
             if b in out:
-                out[b]["raw_est_usd"] += float(info["raw_usd"])
-        for fill in self.fills:
-            market = fill.get("market_ticker")
-            b = tags.get(market, "short")
-            count = float(fill.get("count") or 0)
-            price = float(fill.get("price_cents") or 0)
-            out[b]["fills_n"] += 1
-            out[b]["premium_usd"] += count * price / 100.0
-            mid = self._side_mid_cents(market, str(fill.get("side")))
-            if mid is not None:
-                out[b]["markout_usd"] += count * (mid - price) / 100.0
+                out[b]["raw_est_usd"] += float(info.get("capped_raw_usd", info["raw_usd"]))
+        for market, usd in self.closed_periods.items():
+            b = tags.get(market)
+            if b in out:
+                out[b]["raw_est_usd"] += float(usd)
+        for b, rows in self.bucket_pos.items():
+            if b not in out:
+                continue
+            for market, pos in rows.items():
+                cost = float(pos["yes_cost"]) + float(pos["no_cost"])
+                mark, _src = self._yes_mark(market)
+                value = 0.0 if mark is None else (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+                out[b]["fills_n"] += int(pos.get("fills_n", 0))
+                out[b]["premium_usd"] += cost
+                out[b]["markout_usd"] += value - cost
+                out[b]["fees_usd"] += float(pos.get("fees", 0.0))
+                out[b]["rebates_usd"] += float(pos.get("rebates", 0.0))
         for b in out.values():
-            b["pnl_usd"] = b["markout_usd"] + b["raw_est_usd"]
-            for k in ("capital_usd", "raw_est_usd", "premium_usd", "markout_usd", "pnl_usd"):
+            b["pnl_usd"] = b["markout_usd"] + b["raw_est_usd"] + b["rebates_usd"] - b["fees_usd"]
+            for k in ("capital_usd", "raw_est_usd", "premium_usd", "markout_usd", "fees_usd",
+                      "rebates_usd", "pnl_usd"):
                 b[k] = round(b[k], 6)
         return out
 
@@ -1618,7 +1863,10 @@ class RunLoop:
             agg = acc.__dict__.get("_compacted") or {"status": {}}
             idle = sum(1 for mk in acc.marks if mk.status == "idle") + int(agg["status"].get("idle", 0))
             last = next((mk for mk in reversed(acc.marks) if mk.counted), None)
-            out[market] = {"raw_usd": Decimal(est.raw_usd), "known": est.known_seconds,
+            raw = Decimal(est.raw_usd)
+            out[market] = {"raw_usd": raw,
+                           "capped_raw_usd": raw if acc.max_reward_usd is None else min(raw, acc.max_reward_usd),
+                           "known": est.known_seconds,
                            "unknown": est.unknown_seconds, "forfeited": est.forfeited_seconds,
                            "idle": idle, "share": None if last is None else last.share}
         return out
@@ -1685,11 +1933,7 @@ class RunLoop:
             samples, equity=self.bankroll, peak=self.bankroll, fraction=0.25, min_sample=5,
         )
         estimated = sum(estimates.values(), Decimal(0))
-        premium = sum(
-            (Decimal(str(fill["count"])) * Decimal(int(fill["price_cents"])) / Decimal(100)
-             for fill in self.fills),
-            Decimal(0),
-        )
+        all_accrual = self.live_accrual()
         rewards = Decimal(inferred["residual_usd"])
         if rewards < 0:
             rewards = Decimal(0)
@@ -1710,7 +1954,7 @@ class RunLoop:
             "resting": list(self.resting),
             "cancelled": self.cancels,
             "fills": self.fills,
-            "fills_n": len(self.fills),
+            "fills_n": self.fills_total,
             "estimated_usd": format(estimated, "f"),
             "estimates": {market: format(amount, "f") for market, amount in estimates.items()},
             "inferred": inferred,
@@ -1723,7 +1967,8 @@ class RunLoop:
             "next_usd": next_usd,
             "risk": self.risk_rows,
             "kill": self.kill,
-            "pnl_usd": format(-premium, "f"),
+            **self.pnl_report(all_accrual),
+            "buckets": self.bucket_report(all_accrual),
             "rewards_usd": format(rewards, "f"),
             "day": day,
             "data_source": books["flag"],
@@ -1779,6 +2024,7 @@ def fetch_demo_programs(host: str) -> list[dict]:
             "end_ts": end,
             "close_ts": end,
             "days_to_settle": max(0.0, (end - now) / 86400.0),
+            "max_reward_usd": parsed.get("max_reward_usd"),
         })
     return frames
 
@@ -1962,24 +2208,44 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
            "lock": threading.Lock()}
     backoff = READONLY_BACKOFF_START_S
     attempts = 0
+    last_wall = None
+    down_since = None
     try:
         while True:
             attempts += 1
             state = {"frames": False}
+            if down_since is not None:
+                # Same RunLoop across reconnects; the risk engine sees how long
+                # the feed was blind (since the last frame, or the drop).
+                now = time.time()
+                on_frame({"kind": "reconnect", "ts": now,
+                          "stale_s": now - (last_wall if last_wall is not None else down_since)})
             try:
                 await _readonly_books_session(source, key, session, on_frame, state, ctx=ctx)
+                exc = None
+                reason = "clean_close"
+            except transient as err:
+                exc = err
+                reason = type(err).__name__
+            if state.get("last_wall") is not None:
+                last_wall = state["last_wall"]
+            if state["frames"]:
+                backoff = READONLY_BACKOFF_START_S
+            # Transient error, sequence gap, or a clean close (1000/1001 ends
+            # ``async for`` without an error): mark every book disconnected
+            # in the SAME loop and reconnect. Never a fresh RunLoop.
+            down_since = time.time()
+            on_frame({"kind": "disconnect", "ts": down_since, "reason": reason})
+            log.warning(
+                "read-only books %s (%s); reconnect in %.0fs", reason,
+                "" if exc is None else str(exc)[:200], backoff,
+            )
+            if max_attempts is not None and attempts >= max_attempts:
+                if exc is not None:
+                    raise exc
                 return
-            except transient as exc:
-                if state["frames"]:
-                    backoff = READONLY_BACKOFF_START_S
-                log.warning(
-                    "read-only books transient error (%s: %s); retry in %.0fs",
-                    type(exc).__name__, str(exc)[:200], backoff,
-                )
-                if max_attempts is not None and attempts >= max_attempts:
-                    raise
-                await nap(backoff)
-                backoff = min(backoff * 2.0, READONLY_BACKOFF_MAX_S)
+            await nap(backoff)
+            backoff = min(backoff * 2.0, READONLY_BACKOFF_MAX_S)
     finally:
         session.close()
 
@@ -1987,7 +2253,8 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
 def _program_sig(frame: dict) -> tuple:
     return tuple(frame.get(k) for k in (
         "program_id", "start_ts", "end_ts", "period_reward_usd", "period_seconds", "target_size",
-        "discount_factor", "fee_type", "fee_multiplier", "category", "close_ts", "occurrence_ts"))
+        "discount_factor", "fee_type", "fee_multiplier", "category", "close_ts", "occurrence_ts",
+        "max_reward_usd"))
 
 
 def _feed_programs(frames: list[dict], fed: dict, on_frame: Callable[[dict], None],
@@ -2269,10 +2536,20 @@ async def _readonly_books_session(source: dict, key, session,
                 state["frames"] = True
                 msg = json.loads(raw)
                 msg.setdefault("ts", time.time())
+                state["last_wall"] = msg["ts"]
                 kind = str(msg.get("type") or "")
                 if kind == "trade":
                     body = msg.get("msg") or msg
                     on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
+                elif kind == "market_lifecycle_v2":
+                    # Only arrives once the read-only socket may subscribe the
+                    # lifecycle channel; a determined/settled result settles
+                    # paper inventory at 100/0.
+                    body = msg.get("msg") or {}
+                    result = str(body.get("result") or "").lower()
+                    if body.get("event_type") in ("determined", "settled") and result in ("yes", "no"):
+                        on_frame({"kind": "settlement", "ts": msg["ts"],
+                                  "market": body.get("market_ticker"), "result": result})
                 elif kind in ("orderbook_snapshot", "orderbook_delta"):
                     verdict = seqr.check(msg)
                     if verdict == "dup":
@@ -2323,6 +2600,7 @@ def _programs_from_incentive(payload: dict) -> list[dict]:
             "end_ts": end,
             "close_ts": end,
             "days_to_settle": max(0.0, (end - now) / 86400.0),
+            "max_reward_usd": parsed.get("max_reward_usd"),
         })
     return frames
 
@@ -2342,6 +2620,7 @@ def waiting_report(ws_url: str) -> dict:
         "fills_n": 0,
         "estimated_usd": "0",
         "pnl_usd": "0",
+        "premium_paid_usd": "0",
         "rewards_usd": "0",
         "day": datetime.now(timezone.utc).date().isoformat(),
         "kill": None,

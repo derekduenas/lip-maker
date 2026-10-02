@@ -17,6 +17,10 @@ LIVE_STATUS_FIELDS = (
     "estimated_raw_usd", "estimated_usd_note", "accrual_seconds",
     "buckets", "durable_reserve",
     "fills_detail", "markouts", "policy_skips", "pulls", "repegs_n", "skew", "recorder", "pmus", "venues", "fair_value", "select_ms", "size_ladder",
+    # Review fixes: honest P&L, rolled-over periods, feed state.
+    "premium_paid_usd", "pnl_usd_note", "pnl_parts",
+    "unsettled_positions", "unmarked_positions",
+    "closed_periods_n", "closed_periods_raw_usd", "feed",
 )
 
 

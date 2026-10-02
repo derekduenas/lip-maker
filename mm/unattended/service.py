@@ -158,6 +158,8 @@ def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
             rewards_usd=float(report.get("rewards_usd") or 0),
             data_source=str(report.get("data_source") or "") or None,
             buckets=report.get("buckets"),
+            premium_paid_usd=(None if report.get("premium_paid_usd") is None
+                              else float(report["premium_paid_usd"])),
         ), encoding="utf-8")
     if args.report:
         dest = Path(args.report)
