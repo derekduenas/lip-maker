@@ -1,5 +1,13 @@
 # Phase 1 / Phase 2 deploy guide — paper data collection
 
+> **OBSOLETE (2026-10-01). Do not follow.** This guide targets the retired
+> `/root/lip-maker` install and `lip-maker.service`, which were archived to
+> `_archive/2026-10-01/` together with the timers it installs,
+> `tools/hedge_effectiveness.py`, `cross_venue/hedger.py` and
+> `monitor/ramp_controller.py`. The running system is APEX
+> (`deploy/lip-unattended.service` + `deploy/apex/`, paper only); see
+> `README.md` and `deploy/apex/README.md`. Kept for history.
+
 After merging `claude/fix-lip-adverse-selection-gl6nt` (or pulling on the
 prod DigitalOcean box), run these steps in order.
 
@@ -84,8 +92,7 @@ These tables stay empty in paper because there are no real fills:
   observations
 
 For paper-mode data flow on the toxicity/hedge stack, you'd need to:
-- Flip `LIP_PAPER=false` AND deposit at least a small live balance, OR
-- Wait for the next live re-entry (gated by `go_live_check.py`)
+- (obsolete: this used to suggest flipping `LIP_PAPER=false`; not supported)
 
 ## 7. Health-monitoring queries
 
@@ -108,26 +115,17 @@ python tools/hedge_effectiveness.py --days 7
 python tools/go_live_check.py --days 14
 # exit 2 = insufficient data (expected until ≥14d live)
 # exit 1 = some gate failed; check journal for details
-# exit 0 = safe to flip live
+# exit 0 = all gates pass (advisory; arms nothing)
 ```
 
-## 8. Re-going-live procedure (when go_live_check exits 0)
+## 8. Re-going-live procedure — REMOVED
 
-1. Backup db: `cp data/lip_maker.db data/lip_maker.$(date +%Y%m%d).db`
-2. Set the live caps via env in lip-maker.service:
-   ```
-   Environment=LIP_PAPER=false
-   Environment=LIP_RAMP_PHASE=1
-   ```
-3. Verify the ramp_controller will start at 30% of paper cap (see
-   `monitor/ramp_controller.py:228`).
-4. `sudo systemctl restart lip-maker.service`
-5. Watch `journalctl -fu lip-maker.service` for `[LIVE] PLACED` lines
-   and immediate `daily_pnl` numbers.
-6. After 24h of positive net PnL, flip `AUTO_HEDGE_ENABLED=true` to
-   start placing hedges (still dry_run until `AUTO_HEDGE_CME=true`).
-7. With IBKR Gateway running on port 7497 and a successful manual test
-   order, flip `AUTO_HEDGE_CME=true`.
+The former recipe (set `LIP_PAPER=false` in `lip-maker.service`, rely on
+`monitor/ramp_controller.py`, restart and watch for `[LIVE] PLACED`) is no
+longer valid: those units and tools are archived, the legacy
+`QuoteManager` refuses live orders outright, and `go_live_check.py` is an
+advisory report that arms nothing. There is no supported live path in
+this repository outside mm.unattended's own gates.
 
 ## 9. Rollback
 

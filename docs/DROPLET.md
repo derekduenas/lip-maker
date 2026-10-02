@@ -1,6 +1,6 @@
 # DigitalOcean droplet (Ubuntu 24.04)
 
-Paper first. The unit forces `LIP_PAPER=true` and the demo websocket `wss://demo-api.kalshi.co/trade-api/ws/v2`. It does not set a production host.
+Paper first. The unit sets `LIP_PAPER=true` and the demo websocket `wss://demo-api.kalshi.co/trade-api/ws/v2`. It does not set a production host. Note that the unit's `Environment=LIP_PAPER=true` does NOT override the env file: per systemd.exec(5), variables read from `EnvironmentFile=` override those set with `Environment=`, whatever their order in the unit. An env file containing `LIP_PAPER=false` therefore wins. Paper is enforced in code by `LIP_FORCE_PAPER` (being added on the fix/loop branch), not by unit ordering.
 
 ## Install
 
@@ -62,7 +62,7 @@ That replay does not open a socket. `--cycle` remains the one-shot recording use
 
 ## Demo orders later
 
-`LIP_DEMO=true` together with `LIP_PAPER=false` sends post-only orders to a demo host only (`demo-api.kalshi.co` or `external-api.demo.kalshi.co`). The unit file sets `LIP_PAPER=true` after the env file, so the installed service stays on simulated fills even if the env file also sets `LIP_DEMO`. Demo mode applies the series go/no-go gate. It does not set `allow_production`, the maker-only acknowledgement, or `LIVE_ARMED`.
+`LIP_DEMO=true` together with `LIP_PAPER=false` sends post-only orders to a demo host only (`demo-api.kalshi.co` or `external-api.demo.kalshi.co`). The unit file's `Environment=LIP_PAPER=true` does not stop this: an `EnvironmentFile=` value overrides `Environment=` (systemd.exec(5)), so an env file with `LIP_PAPER=false` and `LIP_DEMO=true` would switch the service to demo orders. Keeping the service on simulated fills relies on the env file not setting those, and on the code-level `LIP_FORCE_PAPER` guard (fix/loop). Demo mode applies the series go/no-go gate. It does not set `allow_production`, the maker-only acknowledgement, or `LIVE_ARMED`.
 
 ## Arming live later
 
