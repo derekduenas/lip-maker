@@ -57,10 +57,11 @@ def test_readiness_fv_criterion_reads_the_engine_report_shape():
         cal.record(m, "KXHIGHNY", 1.0, 70.0, 0.9, 30.0, 50.0, float(i))
         cal.on_settle(m, "yes")
     rep = json.loads(json.dumps(cal.report()))
-    a = argparse.Namespace(min_fv_markets=3)
+    a = argparse.Namespace(min_fv_markets=3, min_fv_events=1)
     c = R.crit_fv({"fv_calibration": rep}, a)
-    assert c["value"] == {"n": 3.0, "model_brier": rep["overall"]["paired_brier_model"],
-                          "book_brier": rep["overall"]["paired_brier_book"]}
-    assert c["status"] == R.PASS          # 0.09 < 0.25
-    a.min_fv_markets = 200
-    assert R.crit_fv({"fv_calibration": rep}, a)["status"] == R.INSUFF
+    assert c["value"]["paired_markets"] == 3.0 and c["value"]["paired_events"] == 0.0
+    assert c["value"]["model_brier"] == rep["overall"]["paired_brier_model"]
+    assert c["value"]["book_brier"] == rep["overall"]["paired_brier_book"]
+    # a better paired Brier on 3 markets of no scored event is not a pass
+    # (the engine says insufficient_data): see test_review_r2_readiness_fv
+    assert c["status"] == R.INSUFF

@@ -56,13 +56,17 @@ Criteria (thresholds are flags):
                     or the state file shows a kill, or the watchdog is latched
                     now. INSUFFICIENT without a watchdog health file updated
                     in the last --health-max-age-s (600 s).
-  fv_calibration    only if status has ``fv_calibration``: model Brier < book
-                    Brier on >= --min-fv-markets (200) settled markets.
-                    Reads the engine's report (scored_markets,
-                    overall.paired_brier_model, overall.paired_brier_book);
-                    also accepts n_settled|settled_n|settled_markets|
-                    n_markets|n, model_brier|brier_model|model.brier,
-                    book_brier|brier_book|book.brier. Absent: N/A.
+  fv_calibration    only if status has ``fv_calibration`` (the engine's
+                    mm/unattended/fv_calib.py report): PASS only when
+                    ``paired_markets`` (distinct markets with a paired
+                    headline sample) >= --min-fv-markets (200) AND
+                    ``events.paired_events`` (distinct city-day events with a
+                    paired headline event sample) >= --min-fv-events (40),
+                    the engine's own ``verdict`` is model_better_than_book,
+                    and the paired model Brier and the paired event RPS are
+                    both below the book's. Short counts, a missing field or
+                    the engine's insufficient_data: INSUFFICIENT. Any other
+                    engine verdict or a worse model score: FAIL. Absent: N/A.
   daily_loss        the daily loss limit was not hit: no ``daily_loss`` kill
                     (engine alert) or watchdog ``daily_loss:`` trip timestamped
                     in the last --daily-loss-lookback-days (14, the paper-days
@@ -456,26 +460,37 @@ def crit_no_kills(status, state, health, health_err, wd_state, events, alert_rea
 
 
 def crit_fv(status, a):
-    title = f"model Brier < book Brier on >= {a.min_fv_markets} settled markets (if reported)"
+    title = (f"model beats book on >= {a.min_fv_markets} paired markets and >= {a.min_fv_events} "
+             "paired events, engine verdict model_better_than_book (if reported)")
     cal = (status or {}).get("fv_calibration") if isinstance(status, dict) else None
     if cal is None:
         return _crit("fv_calibration", title, NA, None, "status has no fv_calibration")
     if not isinstance(cal, dict):
         return _crit("fv_calibration", title, INSUFF, cal, "fv_calibration is not an object")
-    # RunLoop fv_calibration (mm/unattended/fv_calib.py report()): settled
-    # markets scored, and model/book Brier on the paired samples.
-    n = _num(_dig(cal, "scored_markets", "n_settled", "settled_n", "settled_markets", "n_markets",
-                  "markets", "n"))
-    mb = _num(_dig(cal, "overall.paired_brier_model", "model_brier", "brier_model", "model.brier",
-                   "fv_brier"))
-    bb = _num(_dig(cal, "overall.paired_brier_book", "book_brier", "brier_book", "book.brier",
-                   "market_brier"))
-    value = {"n": n, "model_brier": mb, "book_brier": bb}
-    if n is None or mb is None or bb is None:
-        return _crit("fv_calibration", title, INSUFF, value, "fv_calibration lacks n / model / book Brier")
-    if n < a.min_fv_markets:
-        return _crit("fv_calibration", title, INSUFF, value, f"only {int(n)} settled markets")
-    return _crit("fv_calibration", title, PASS if mb < bb else FAIL, value)
+    # RunLoop fv_calibration (mm/unattended/fv_calib.py report()).
+    pm = _num(_dig(cal, "paired_markets"))
+    pe = _num(_dig(cal, "events.paired_events"))
+    mb = _num(_dig(cal, "overall.paired_brier_model"))
+    bb = _num(_dig(cal, "overall.paired_brier_book"))
+    rm = _num(_dig(cal, "events.overall.paired_rps_model"))
+    rb = _num(_dig(cal, "events.overall.paired_rps_book"))
+    verdict = cal.get("verdict")
+    value = {"paired_markets": pm, "paired_events": pe, "verdict": verdict, "model_brier": mb,
+             "book_brier": bb, "model_rps": rm, "book_rps": rb,
+             "scored_markets": _num(cal.get("scored_markets"))}
+    if pm is None or pe is None or not isinstance(verdict, str):
+        return _crit("fv_calibration", title, INSUFF, value,
+                     "fv_calibration lacks paired_markets / events.paired_events / verdict")
+    if pm < a.min_fv_markets or pe < a.min_fv_events:
+        return _crit("fv_calibration", title, INSUFF, value,
+                     f"only {int(pm)} paired markets / {int(pe)} paired events")
+    if verdict == "insufficient_data":
+        return _crit("fv_calibration", title, INSUFF, value, "engine verdict insufficient_data")
+    if None in (mb, bb, rm, rb):
+        return _crit("fv_calibration", title, INSUFF, value, "fv_calibration lacks paired Brier / RPS")
+    if verdict != "model_better_than_book" or not (mb < bb and rm < rb):
+        return _crit("fv_calibration", title, FAIL, value, f"engine verdict {verdict}")
+    return _crit("fv_calibration", title, PASS, value)
 
 
 def crit_daily_loss(status, events, alert_read, a, now=None):
@@ -544,7 +559,10 @@ def parse_args(argv=None):
     ap.add_argument("--kill-lookback-days", type=float, default=7.0)
     ap.add_argument("--operator-test-regex", default=r"(?i)operator[ _-]?test")
     ap.add_argument("--health-max-age-s", type=float, default=600.0)
-    ap.add_argument("--min-fv-markets", type=int, default=200)
+    ap.add_argument("--min-fv-markets", type=int, default=200,
+                    help="fv_calibration: distinct markets with a paired sample (default 200)")
+    ap.add_argument("--min-fv-events", type=int, default=40,
+                    help="fv_calibration: distinct city-day events with a paired event sample (default 40)")
     ap.add_argument("--daily-loss-lookback-days", type=float, default=14.0,
                     help="daily-loss events count only this many days back (default 14, the paper-days window)")
     ap.add_argument("--since", default=None,

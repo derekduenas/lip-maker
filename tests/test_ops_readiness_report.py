@@ -249,15 +249,13 @@ def test_daily_loss(tmp_path):
 
 
 def test_fv_calibration(tmp_path):
+    # Detailed grading (paired markets AND events, the engine's verdict) is in
+    # test_review_r2_readiness_fv; formats without them are INSUFFICIENT.
     d = _write_fixture(tmp_path)
     c = _run(d)[1]["fv_calibration"]
     assert c["status"] == "N/A"
-    good = _status(fv_calibration={"n_settled": 250, "model_brier": 0.18, "book_brier": 0.21})
-    assert _run(_write_fixture(tmp_path / "a", status=good))[1]["fv_calibration"]["status"] == "PASS"
-    bad = _status(fv_calibration={"n_settled": 250, "model_brier": 0.22, "book_brier": 0.21})
-    assert _run(_write_fixture(tmp_path / "b", status=bad))[1]["fv_calibration"]["status"] == "FAIL"
-    few = _status(fv_calibration={"settled_markets": 50, "model": {"brier": 0.1}, "book": {"brier": 0.2}})
-    assert _run(_write_fixture(tmp_path / "c", status=few))[1]["fv_calibration"]["status"] == "INSUFFICIENT"
+    old_shape = _status(fv_calibration={"n_settled": 250, "model_brier": 0.18, "book_brier": 0.21})
+    assert _run(_write_fixture(tmp_path / "a", status=old_shape))[1]["fv_calibration"]["status"] == "INSUFFICIENT"
     junk = _status(fv_calibration={"something": 1})
     assert _run(_write_fixture(tmp_path / "e", status=junk))[1]["fv_calibration"]["status"] == "INSUFFICIENT"
 
