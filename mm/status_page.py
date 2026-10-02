@@ -26,6 +26,8 @@ LIVE_STATUS_FIELDS = (
     "budget_warning",
     # Review fixes: program pruning, engine state file.
     "programs_pruned_n", "state",
+    # Integration: per-market positions (watchdog inventory), synthetic fills.
+    "positions", "fills_synthetic_n",
 )
 
 

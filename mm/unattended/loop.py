@@ -42,6 +42,7 @@ from mm.session_gates import (
 )
 from mm.unattended.feed import DEMO_WS_URL
 from mm.unattended.optimize import optimize_sizes
+from mm.unattended.screen import RANK_PENALTY_UNIT
 from mm.unattended.service import UnattendedRefused
 from mm.venues.kalshi_rest import DEMO_HOSTS, PRODUCTION_HOSTS
 
@@ -187,7 +188,10 @@ LIST_CAP = 20000
 
 
 def rank_live_score(net_per_day: float, penalty_per_day: float, capital_usd: float) -> float:
-    """Final allocation rank: (plan net $/day - markout penalty $/day) / $ capital."""
+    """Final allocation rank: (plan net $/day - markout penalty $/day) / $ capital.
+
+    ``penalty_per_day`` must already be at the size ``net_per_day`` was
+    evaluated at (the program's rank_penalty_per_day is per 100 contracts)."""
     if not capital_usd:
         return 0.0
     return (float(net_per_day) - float(penalty_per_day)) / float(capital_usd)
@@ -294,6 +298,10 @@ class RunLoop:
         # marks, fees, settlement, inventory on the risk engine, feed state.
         self.fills_total = 0
         self.fills_by_venue: dict[str, int] = {}
+        # Synthetic (model-inferred, low-fidelity) paper fills per venue: PM
+        # US prints inferred from two book polls and cross-fills on polled
+        # books. Included in fills_by_venue too.
+        self.fills_synthetic_by_venue: dict[str, int] = {}
         self.premium_usd_total = 0.0
         self.fees_usd_total = 0.0
         self.bucket_pos: dict[str, dict] = {}
@@ -492,7 +500,12 @@ class RunLoop:
             return
         accrual.on_message(row, ts)
         self.open_seconds[market] = int(ts)
-        self._book_ts[market] = ts
+        # PM US books are polled through a cache: ``data_ts`` is the data
+        # time the poller derived (older than the receive time), and
+        # drain_external clamps ``ts`` to the loop clock, so the book's age
+        # for _book_fresh comes from ``data_ts``, never later than ``ts``.
+        data_ts = row.get("data_ts") if self._venue(market) == "pmus" else None
+        self._book_ts[market] = ts if data_ts is None else min(ts, float(data_ts))
         self._note_mark(market)
         # exchange_ts is the venue send time (Kalshi ``sending_ts_ms``, set by
         # the read-only session). The frame is applied either way so the book
@@ -828,6 +841,7 @@ class RunLoop:
             "bucket_of": {m: b for m, b in (getattr(self, "bucket_of", {}) or {}).items() if m in self.position},
             "last_mid": {m: v for m, v in self.last_mid.items() if m in self.position},
             "settled": self.settled, "fills_total": self.fills_total, "fills_by_venue": self.fills_by_venue,
+            "fills_synthetic_by_venue": self.fills_synthetic_by_venue,
             "premium_usd_total": self.premium_usd_total, "fees_usd_total": self.fees_usd_total,
             "pm_rebate_usd": self.pm_rebate_usd, "closed_periods": self.closed_periods,
             "closed_periods_n": self.closed_periods_n,
@@ -885,6 +899,8 @@ class RunLoop:
         self.bucket_of.update({str(m): str(b) for m, b in dict(data.get("bucket_of") or {}).items()})
         self.fills_total = int(data.get("fills_total") or 0)
         self.fills_by_venue = {str(k): int(v) for k, v in dict(data.get("fills_by_venue") or {}).items()}
+        self.fills_synthetic_by_venue = {str(k): int(v) for k, v in
+                                         dict(data.get("fills_synthetic_by_venue") or {}).items()}
         self.premium_usd_total = float(data.get("premium_usd_total") or 0.0)
         self.fees_usd_total = float(data.get("fees_usd_total") or 0.0)
         self.pm_rebate_usd = float(data.get("pm_rebate_usd") or 0.0)
@@ -992,6 +1008,8 @@ class RunLoop:
         self.fills_total += 1
         venue = self._venue(str(fill.get("market_ticker")))
         self.fills_by_venue[venue] = self.fills_by_venue.get(venue, 0) + 1
+        if fill.get("synthetic"):
+            self.fills_synthetic_by_venue[venue] = self.fills_synthetic_by_venue.get(venue, 0) + 1
         self.premium_usd_total += float(fill.get("count") or 0) * float(fill.get("price_cents") or 0) / 100.0
         if len(self.fills) > LIST_CAP:
             del self.fills[: len(self.fills) - LIST_CAP // 2]
@@ -1028,6 +1046,8 @@ class RunLoop:
             bpos["fees"] += fee
             self.fees_usd_total += fee
         bpos["fills_n"] += 1
+        if fill.get("synthetic"):
+            bpos["synthetic_n"] = bpos.get("synthetic_n", 0.0) + 1
         self._sync_inventory(market)
         self._state_dirty = True
         mid = self._side_mid_cents(market, side)
@@ -1042,6 +1062,7 @@ class RunLoop:
             "market": market, "side": side, "price_cents": price, "count": count, "ts": ts,
             "mid0": mid, "venue": self._venue(market), "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
             "markout_60s": None, "markout_300s": None, "markout_1800s": None,
+            "synthetic": bool(fill.get("synthetic")),
         })
         if len(self.fill_marks) > 2000:
             self.fill_marks = self.fill_marks[-2000:]
@@ -1314,7 +1335,10 @@ class RunLoop:
         real order would have traded with us. Paper used to only pull here,
         which silently dropped exactly the adverse fills. Fill our crossed
         side(s) at our price for min(our size, crossing depth), then the
-        caller pulls as before. Orders still in flight (latency) do not fill."""
+        caller pulls as before. Orders still in flight (latency) do not fill.
+        On a PM US (polled) book the cross is inferred from two REST
+        snapshots, not seen trading, so the fill is tagged ``synthetic``
+        (low fidelity) like the poller's synthetic prints."""
         book = self.accruals[market].book.book
         for side, opp_levels in (("yes", book.no_bids), ("no", book.yes_bids)):
             size = float(quote.get(side) or 0)
@@ -1328,6 +1352,8 @@ class RunLoop:
             count = min(size, depth)
             fill = {"market_ticker": market, "side": side, "price_cents": price, "count": count,
                     "ts": ts, "source": "paper_cross", "trade_id": f"cross:{market}:{side}:{ts:.3f}"}
+            if self._venue(market) == "pmus":
+                fill["synthetic"] = True
             if not self._record_fill(fill, ts):
                 return
             quote = self.resting.get(market) or quote
@@ -1384,7 +1410,7 @@ class RunLoop:
                 break
             if capital > per_market + 1e-9:
                 break
-            value = net - penalty_100 * float(size) / 100.0 * (len(sides_on) / 2.0)
+            value = net - penalty_100 * float(size) / RANK_PENALTY_UNIT * (len(sides_on) / 2.0)
             out.append((float(size), value, capital, int(yc), int(nc)))
             if float(size) not in [float(x) for x in ladder]:
                 break
@@ -1511,7 +1537,8 @@ class RunLoop:
         plan = {}
         for row in selection.taken:
             plan[row.market] = {"net_per_day": float(row.net_per_day),
-                                "capital_usd": float(row.capital_usd)}
+                                "capital_usd": float(row.capital_usd),
+                                "net_size": float(row.size)}
         for market, row in chosen.items():
             plan.setdefault(market, {})
             plan[market].update({"objective": float(row.objective), "share": float(row.share),
@@ -1529,8 +1556,12 @@ class RunLoop:
                 continue
             info = plan.get(market, {})
             cap = info.get("capital_usd") or info.get("sized_capital_usd") or 0.0
-            per_dollar = rank_live_score(info.get("net_per_day") or 0.0,
-                                         self.programs[market].rank_penalty_per_day, cap)
+            # rank_penalty_per_day is $/day per RANK_PENALTY_UNIT (100)
+            # contracts per side, both sides; net_per_day was evaluated at
+            # net_size contracts per side, so scale it the way _size_curve does.
+            penalty = (self.programs[market].rank_penalty_per_day
+                       * float(info.get("net_size") or self.chunk) / RANK_PENALTY_UNIT)
+            per_dollar = rank_live_score(info.get("net_per_day") or 0.0, penalty, cap)
             info["rank"] = per_dollar
             wanted.append((per_dollar, market, row))
         wanted.sort(key=lambda item: (-item[0], item[1]))
@@ -2098,6 +2129,8 @@ class RunLoop:
             "cancels_n": self.cancels_total or len(self.cancels),
             "venues": self.venue_report(est, accrual),
             "fills_n": self.fills_total,
+            "fills_synthetic_n": sum(self.fills_synthetic_by_venue.values()),
+            "positions": self.positions_report(),
             "excluded_n": len(self.excluded),
             "excluded_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
             "programs_shard_unknown": shard_unknown_n,
@@ -2145,6 +2178,14 @@ class RunLoop:
             "day": day,
         }
 
+    def positions_report(self) -> dict:
+        """Per-market held legs for /status (the watchdog's inventory
+        source): {market: {yes, no, yes_cost, no_cost}} in contracts and USD
+        cost. Settled markets are left out (their legs no longer carry
+        settlement risk)."""
+        return {m: {k: round(float(p[k]), 6) for k in ("yes", "no", "yes_cost", "no_cost")}
+                for m, p in self.position.items() if m not in self.settled}
+
     def pnl_report(self, accrual: dict | None = None) -> dict:
         """Status P&L fields. ``pnl_usd`` is an ESTIMATE: MTM markout of held
         positions + estimated LIP rewards (current windows capped at
@@ -2185,10 +2226,14 @@ class RunLoop:
                 "est_raw_usd": (None if accrual is None else round(sum(
                     float(v["raw_usd"]) for m, v in accrual.items() if self._venue(m) == vn), 6)),
                 "fills_n": int(self.fills_by_venue.get(vn, 0)),
+                "synthetic_fills_n": int(self.fills_synthetic_by_venue.get(vn, 0)),
                 "plan_net_usd_per_day": round(sum(float((self.last_plan.get(m) or {}).get("value_per_day") or 0.0)
                                                   for m in mk), 4),
             }
         out["pmus"]["rebates_usd"] = round(self.pm_rebate_usd, 4)
+        out["pmus"]["fill_fidelity"] = (
+            "low: no public PM US trade tape; paper fills come from prints inferred from two "
+            "book polls and from polled books crossing our price (synthetic_fills_n)")
         out["pmus"]["screen"] = getattr(self, "pmus_screen", None)
         out["ext_frames_n"] = self.ext_frames_n
         out["refeeds_n"] = self.refeeds_n
@@ -2216,7 +2261,8 @@ class RunLoop:
         tags = getattr(self, "bucket_of", {}) or {}
         out = {b: {"budget_usd": round(float((getattr(self, "bucket_budget", None) or {}).get(b, 0.0)), 2),
                    "selected_n": 0, "selected": [], "capital_usd": 0.0, "raw_est_usd": 0.0,
-                   "fills_n": 0, "premium_usd": 0.0, "markout_usd": 0.0, "fees_usd": 0.0,
+                   "fills_n": 0, "synthetic_fills_n": 0, "premium_usd": 0.0, "markout_usd": 0.0,
+                   "fees_usd": 0.0,
                    "rebates_usd": 0.0, "pnl_usd": 0.0}
                for b in ("durable", "short")}
         for market in self.resting:
@@ -2240,6 +2286,7 @@ class RunLoop:
                 mark, _src = self._yes_mark(market)
                 value = 0.0 if mark is None else (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
                 out[b]["fills_n"] += int(pos.get("fills_n", 0))
+                out[b]["synthetic_fills_n"] += int(pos.get("synthetic_n", 0))
                 out[b]["premium_usd"] += cost
                 out[b]["markout_usd"] += value - cost
                 out[b]["fees_usd"] += float(pos.get("fees", 0.0))
@@ -2361,7 +2408,10 @@ class RunLoop:
             "estimated_usd": format(estimated, "f"),
             "estimates": {market: format(amount, "f") for market, amount in estimates.items()},
             "inferred": inferred,
-            "calibration_inferred": any(obs.inferred for obs in observations),
+            # Balance-residual (inferred) credits are reported but never move
+            # a series factor (engine.lip_calibration.series_factors skips
+            # them): this counts the observations left out of ``factors``.
+            "inferred_credits_excluded_n": sum(1 for obs in observations if obs.inferred),
             "factors": factors,
             "reconcile": {
                 "matches": [row.ratio for row in matched["matches"]],

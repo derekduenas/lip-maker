@@ -147,7 +147,9 @@ def test_run_loop_on_a_recorded_stream(tmp_path, monkeypatch):
     assert report["inferred"]["source"] == INFERRED_SOURCE
     assert report["inferred"]["credits"][0]["inferred"] is True
     assert Decimal(report["inferred"]["credits"][0]["amount_usd"]) == Decimal("2")
-    assert report["calibration_inferred"] is True
+    # the inferred credit is reported, but it is not a calibration input
+    assert report["inferred_credits_excluded_n"] == 1
+    assert "calibration_inferred" not in report
     # inferred (balance-residual) credits carry no per-series information and
     # no longer move the series factor (engine.lip_calibration.series_factors)
     assert "KXBRENT" not in report["factors"]
