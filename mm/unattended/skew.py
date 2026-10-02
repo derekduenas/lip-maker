@@ -1,4 +1,4 @@
-"""Patch 18: inventory skew (Avellaneda-Stoikov style), paper only.
+"""Patch 18: inventory skew, paper only.
 
 Replaces "pause the filled side for 30 min" (LIP_FILL_COOLDOWN_S) when
 LIP_SKEW_ENABLE=1. Given the net unpaired inventory of a market (and its
@@ -9,21 +9,25 @@ event), both bids are shifted:
   but never at/through the opposite implied ask (no crossing);
 * the side that ADDS inventory is lowered by ``b`` ticks.
 
-A-S reservation price: r = s - q*gamma*sigma^2*(T-t). Here the unit of q is
-the fraction of the unpaired-$ cap used (max of market $ / LIP_MARKET_INV_CAP_USD
-and event $ / LIP_EVENT_INV_CAP_USD), so the shift is linear in inventory and
-reaches LIP_SKEW_MAX_TICKS at the cap. The caps themselves still block the
-adding side outright (unchanged).
+This is a LINEAR-IN-INVENTORY TICK HEURISTIC, not Avellaneda-Stoikov: there
+is no risk aversion (gamma), volatility (sigma) or horizon (T - t) term.
+q is the fraction of the unpaired-$ cap used (max of market $ /
+LIP_MARKET_INV_CAP_USD and event $ / LIP_EVENT_INV_CAP_USD), and
+a = ceil(q x LIP_SKEW_MAX_TICKS), b = ceil(q x LIP_SKEW_MAX_BACKOFF), both
+rounded UP so any inventory above LIP_SKEW_MIN_FRAC moves both sides by at
+least one tick, reaching the maxima at the cap. The caps themselves still
+block the adding side outright (unchanged).
 
 Reward cost (Kalshi LIP): an order at/above the reference price (level holding
 target/5) earns full credit; each tick below earns DF^ticks. So
 * raising the reducing side above the reference costs 0 reward (only capital
   and adverse selection);
 * backing off the adding side by b ticks below the reference costs
-  (1 - DF^b) of that side's credit. ``b`` is limited so this loss stays
-  <= LIP_SKEW_MAX_REWARD_LOSS (default 0.5 => 1 tick at DF 0.5). The side
-  stays in the book (in the reward zone at partial credit) instead of being
-  pulled, which kept 0% of that side's credit under the old cooldown.
+  (1 - DF^b) of that side's credit. ``b`` is reduced until this loss stays
+  <= LIP_SKEW_MAX_REWARD_LOSS (default 0.5 => 1 tick at DF 0.5, none at
+  DF 0.3). The side stays in the book (in the reward zone at partial
+  credit) instead of being pulled, which kept 0% of that side's credit
+  under the old cooldown.
 """
 from __future__ import annotations
 
@@ -94,8 +98,9 @@ def skew_prices(yes_c: int, no_c: int, *, net_yes: float, frac: float,
         new = max(new, px[red])  # never move the reducing side away because of the cap
         out["agg"] = new - px[red]
         px[red] = new
-    # Back-off side: floor, then limited by reward loss below the reference.
-    back = int(math.floor(f * p.max_backoff + 1e-9)) if p.max_backoff > 0 else 0
+    # Back-off side: ceil like the aggressive side (floor gave 0 for every
+    # frac < 1 at max_backoff 1), then limited by reward loss below the reference.
+    back = int(math.ceil(f * p.max_backoff - 1e-9)) if p.max_backoff > 0 else 0
     while back > 0:
         below = max(0, int(ref[add]) - (px[add] - back))
         loss = 1.0 - float(df) ** below if below > 0 else 0.0

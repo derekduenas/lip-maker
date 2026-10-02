@@ -55,3 +55,19 @@ def test_rank_penalty_is_the_incremental_part_per_100_contracts(monkeypatch):
     # the screen's own score still charges the full markout at its size S
     S_ = 50.0
     assert rk["penalty_full"] == pytest.approx(full_100 * S_ / 100)
+
+
+# ------------------------------------------------------------------ item 6
+def test_skew_backoff_starts_before_the_cap():
+    from mm.unattended.skew import SkewParams, skew_prices
+    p = SkewParams(max_ticks=2, max_backoff=1, max_reward_loss=0.5)
+    for frac in (0.01, 0.3, 0.5, 0.99):
+        o = skew_prices(40, 55, net_yes=+10, frac=frac, best_yes=40, best_no=55, df=0.5, params=p)
+        assert o["back"] == 1 and o["yes_cents"] == 39, frac
+    # still limited by the reward-loss bound (1 tick at DF 0.3 costs 70% > 50%)
+    o = skew_prices(40, 55, net_yes=+10, frac=0.3, best_yes=40, best_no=55, df=0.3, params=p)
+    assert o["back"] == 0 and o["yes_cents"] == 40
+    # min_frac still gates everything
+    q = SkewParams(max_ticks=2, max_backoff=1, max_reward_loss=0.5, min_frac=0.4)
+    o = skew_prices(40, 55, net_yes=+10, frac=0.3, best_yes=40, best_no=55, df=0.5, params=q)
+    assert o["back"] == 0 and o["agg"] == 0
