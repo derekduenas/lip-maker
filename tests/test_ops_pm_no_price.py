@@ -201,3 +201,13 @@ def test_live_test_tool_no_side_previews_yes_side_price(monkeypatch, tmp_path):
     _rc, client = _run_live_test(monkeypatch, tmp_path)
     req = client.orders.preview.call_args.args[0]["request"]
     assert req["intent"] == "ORDER_INTENT_BUY_SHORT" and req["price"]["value"] == "0.600"
+
+
+def test_live_test_tool_refuses_to_send(monkeypatch, tmp_path):
+    # mm.unattended is the only path to a live venue; this legacy tool now
+    # stops after the server preview even when the operator confirms.
+    rc, client = _run_live_test(monkeypatch, tmp_path)
+    assert rc != 0
+    client.orders.preview.assert_called_once()
+    client.orders.create.assert_not_called()
+    assert not (tmp_path / "live_orders.log").exists()
