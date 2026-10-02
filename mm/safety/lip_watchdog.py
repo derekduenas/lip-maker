@@ -12,7 +12,11 @@ Every ``LIP_WD_INTERVAL_S`` (30s) it checks:
   * daily P&L                     < -abs(LIP_WD_DAILY_LOSS) (50). P&L = sum of bucket markout_usd
                                   (MTM of fills, rewards excluded unless LIP_WD_PNL_INCLUDE_REWARDS=1),
                                   re-based at each UTC day and on engine restart.
-  * inventory                     held premium > LIP_WD_MAX_INVENTORY_USD (500)
+  * inventory                     worst-case settlement loss of unpaired legs (+ locked loss on
+                                  pairs costing > $1) > LIP_WD_MAX_INVENTORY_USD (500); paired
+                                  YES+NO is riskless and not counted. Source, most granular first:
+                                  status positions / fills / markouts.unpaired_usd, else gross
+                                  premium as an upper bound (see inventory_breakdown)
   * capital                       paper_capital_usd > LIP_WD_MAX_CAPITAL_USD (1500)
   * resting orders                resting_n > LIP_WD_MAX_RESTING (200)
   * engine-reported kill          status.kill set (alert only, not a trip by default)
@@ -184,12 +188,90 @@ def session_pnl(status: dict, include_rewards: bool = False):
     return None
 
 
+def _market_worst_case(yes, no, yes_cost, no_cost):
+    """(unpaired_usd, paired_locked_usd, paired_locked_loss_usd) for one market.
+
+    ``paired`` = min(yes, no) contracts pay exactly $1 per pair at settlement
+    whichever side wins, so they are riskless apart from a locked loss when
+    the pair cost more than $1. The unpaired leg loses its whole cost if it
+    settles against us. Costs are split at each leg's average price.
+    """
+    paired = min(yes, no)
+    avg_y = yes_cost / yes if yes > 0 else 0.0
+    avg_n = no_cost / no if no > 0 else 0.0
+    locked = paired * (avg_y + avg_n)
+    locked_loss = max(0.0, locked - paired)
+    unpaired = (yes - paired) * avg_y + (no - paired) * avg_n
+    return unpaired, locked, locked_loss
+
+
+def inventory_breakdown(status: dict):
+    """Worst-case settlement loss of held inventory, most granular source first.
+
+    1. ``positions`` {market: {yes, no, yes_cost, no_cost}} (per-market legs);
+    2. ``fills`` (full fill list; buys, cost = count * price_cents / 100);
+    3. ``markouts.unpaired_usd`` -- the engine's own per-market unpaired
+       contracts x that leg's average cost (same definition, computed from
+       its full position; paired capital is not reported there);
+    4. otherwise gross premium of every fill (``premium_paid_usd``, bucket
+       ``premium_usd``, or legacy ``-pnl_usd`` from engines before
+       premium_paid_usd existed): an upper bound that ignores pairing.
+
+    ``inventory_usd`` = unpaired leg cost + locked loss on pairs bought for
+    more than $1 (a locked gain is never netted against it).
+    """
+    if not isinstance(status, dict):
+        return None
+    pos = status.get("positions")
+    legs = None
+    basis = None
+    if isinstance(pos, dict) and pos:
+        legs, basis = {}, "positions"
+        for m, r in pos.items():
+            if isinstance(r, dict):
+                legs[m] = [_f(r.get("yes")) or 0.0, _f(r.get("no")) or 0.0,
+                           _f(r.get("yes_cost")) or 0.0, _f(r.get("no_cost")) or 0.0]
+    elif isinstance(status.get("fills"), list):
+        legs, basis = {}, "fills"
+        for f in status["fills"]:
+            if not isinstance(f, dict) or f.get("side") not in ("yes", "no"):
+                continue
+            n = _f(f.get("count")) or 0.0
+            px = _f(f.get("price_cents")) or 0.0
+            leg = legs.setdefault(str(f.get("market_ticker") or f.get("market") or ""), [0.0, 0.0, 0.0, 0.0])
+            i = 0 if f["side"] == "yes" else 1
+            leg[i] += n
+            leg[2 + i] += n * px / 100.0
+    if legs is not None:
+        unpaired = locked = locked_loss = 0.0
+        for y, n, yc, nc in legs.values():
+            u, lk, ll = _market_worst_case(y, n, yc, nc)
+            unpaired += u; locked += lk; locked_loss += ll
+        return {"basis": basis, "inventory_usd": round(unpaired + locked_loss, 6),
+                "unpaired_usd": round(unpaired, 6), "paired_locked_usd": round(locked, 6),
+                "paired_locked_loss_usd": round(locked_loss, 6)}
+    mk = status.get("markouts")
+    up = _f(mk.get("unpaired_usd")) if isinstance(mk, dict) else None
+    if up is not None:
+        return {"basis": "engine_unpaired_usd", "inventory_usd": up, "unpaired_usd": up,
+                "paired_locked_usd": None, "paired_locked_loss_usd": None}
+    gross = _f(status.get("premium_paid_usd"))
+    if gross is None:
+        b = status.get("buckets")
+        if isinstance(b, dict) and b:
+            gross = sum((_f(r.get("premium_usd")) or 0.0) for r in b.values() if isinstance(r, dict))
+    if gross is None and "premium_paid_usd" not in status:
+        p = _f(status.get("pnl_usd"))  # pre-rename engines: pnl_usd was -premium paid for fills
+        gross = abs(p) if p is not None else None
+    if gross is None:
+        return None
+    return {"basis": "gross_premium_upper_bound", "inventory_usd": abs(gross), "unpaired_usd": None,
+            "paired_locked_usd": None, "paired_locked_loss_usd": None}
+
+
 def inventory_usd(status: dict):
-    b = status.get("buckets")
-    if isinstance(b, dict) and b:
-        return sum((_f(r.get("premium_usd")) or 0.0) for r in b.values() if isinstance(r, dict))
-    p = _f(status.get("pnl_usd"))  # engine pnl_usd is -premium paid for fills
-    return abs(p) if p is not None else None
+    inv = inventory_breakdown(status)
+    return None if inv is None else inv["inventory_usd"]
 
 
 def daily_pnl(cfg: Config, state: dict, status: dict, now: float):
@@ -262,8 +344,10 @@ def evaluate(cfg: Config, state: dict, now: float, status, status_err, hb_ts):
     if d is not None and d < cfg.daily_loss:
         reasons.append(f"daily_loss:{d:.2f}<{cfg.daily_loss:.2f}")
     # inventory / capital / resting
-    inv = inventory_usd(status)
+    invb = inventory_breakdown(status)
+    inv = None if invb is None else invb["inventory_usd"]
     info["inventory_usd"] = inv
+    info["inventory"] = invb
     if inv is not None and inv > cfg.max_inventory:
         reasons.append(f"inventory:{inv:.2f}>{cfg.max_inventory:.2f}")
     cap = _f(status.get("paper_capital_usd"))
