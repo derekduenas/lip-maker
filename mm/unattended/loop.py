@@ -1532,13 +1532,18 @@ class RunLoop:
         every market in the calibration watch until its close, also after
         its program left the loop (then without a book: mid None, a
         model-only sample). Values below LIP_FV_MIN_CONF are recorded too
-        (their conf is kept). Quoting does not read any of this."""
+        (their conf is kept; fv_calib keeps them out of the headline). The
+        markets of one city-day event priced at this tick are also recorded
+        as one bucket distribution (``fv_calib.record_event``). Quoting
+        reads only the verdict (``fv_calib.passed``, selection credit)."""
         if self.fv is None or ts - self._fv_calib_at < _env_num("LIP_FV_CALIB_EVERY_S", 30.0):
             return
         self._fv_calib_at = ts
         from mm.unattended.fairvalue import fv_quote_active
+        from mm.unattended.fv_calib import event_of
         from mm.unattended.fv_weather import SOURCE
         self._fv_calib_watch_expire(ts)
+        by_event: dict = {}
         for market in sorted(self._fv_wanted | set(self.fv_calib_watch)):
             prog = self.programs.get(market)
             if prog is not None:
@@ -1564,12 +1569,24 @@ class RunLoop:
             lead_h = (max(0.0, (float(window[1]) - time.time()) / 3600.0)
                       if isinstance(window, (list, tuple)) and len(window) == 2
                       else float(row.get("lead_h") or 0.0))
+            rng = row.get("range")
             try:
                 if self.fv_calib.record(market, series.upper(), ts, float(row["fv_cents"]),
-                                        float(row.get("conf") or 0.0), lead_h, mid, float(row.get("ts") or 0.0)):
+                                        float(row.get("conf") or 0.0), lead_h, mid, float(row.get("ts") or 0.0),
+                                        rng=rng if isinstance(rng, (list, tuple)) else None,
+                                        ens=row.get("ens") if isinstance(row.get("ens"), dict) else None):
                     self._state_dirty = True
             except (TypeError, ValueError):
                 continue
+            if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                ev = by_event.setdefault(event_of(market), {"station": series.upper(), "lead_h": lead_h,
+                                                            "entries": []})
+                ev["entries"].append({"market": market, "range": list(rng), "fv": float(row["fv_cents"]),
+                                      "conf": float(row.get("conf") or 0.0), "mid": mid})
+        for event, ev in by_event.items():
+            if len(ev["entries"]) >= 2 and self.fv_calib.record_event(event, ev["station"], ts, ev["lead_h"],
+                                                                      ev["entries"]):
+                self._state_dirty = True
 
     def _book_fresh(self, market: str, ts: float) -> bool:
         """Kalshi books are WS-maintained (quiet = unchanged). PM US books are

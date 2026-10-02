@@ -185,6 +185,41 @@ class LiveStatusRefresher:
         return self.publish(self.build())
 
 
+def fv_samples_path() -> str:
+    """LIP_FV_CALIB_SAMPLES_FILE: settled model fair-value samples (JSON
+    lines, appended; read by tools/fit_fv_weather.py)."""
+    return os.environ.get("LIP_FV_CALIB_SAMPLES_FILE", "/var/lib/lip-maker/fv_calib_samples.jsonl")
+
+
+def _take_fv_samples(loop) -> list:
+    """Settled calibration samples queued by the loop (call under loop.lock)."""
+    cal = getattr(loop, "fv_calib", None)
+    return cal.take_outbox() if cal is not None and hasattr(cal, "take_outbox") else []
+
+
+def flush_fv_samples(loop, rows: list) -> bool:
+    """Append ``rows`` to ``fv_samples_path()`` (outside loop.lock). On a
+    write error the rows go back to the front of the loop's queue (bounded)
+    for the next tick, and the error is logged."""
+    if not rows:
+        return True
+    path = Path(fv_samples_path())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r, default=str, sort_keys=True) + "\n" for r in rows))
+        return True
+    except Exception:
+        logging.getLogger("lip.status").exception("fv calibration samples write failed (%s)", path)
+        from mm.unattended.fv_calib import OUTBOX_MAX
+        with loop.lock:
+            cal = loop.fv_calib
+            keep = (list(rows) + cal.outbox)[-OUTBOX_MAX:]
+            cal.outbox_dropped += len(rows) + len(cal.outbox) - len(keep)
+            cal.outbox = keep
+        return False
+
+
 class EngineTimer:
     """Once a second, independent of market-data frames: honor the kill file,
     write the heartbeat, refresh the status page and persist engine state.
@@ -213,7 +248,9 @@ class EngineTimer:
             _honor_kill_file(loop, self.kill_path)
             report = self.refresher.build() if self.refresher is not None else None
             body = loop.state_snapshot(every_s=5.0)
+            samples = _take_fv_samples(loop)
         write_heartbeat(self.heartbeat)
+        flush_fv_samples(loop, samples)
         if report is not None:
             self.refresher.publish(report)
         if body is not None:
@@ -338,6 +375,12 @@ class _Engine:
 
     def stop(self) -> None:
         self.timer.stop()
+        try:
+            with self.loop.lock:
+                samples = _take_fv_samples(self.loop)
+            flush_fv_samples(self.loop, samples)
+        except Exception:
+            logging.getLogger("lip.status").exception("final fv samples flush failed")
         for bg in (getattr(self.loop, "pmus", None), getattr(self.loop, "fv", None), self.rec):
             try:
                 if bg is not None and hasattr(bg, "stop"):

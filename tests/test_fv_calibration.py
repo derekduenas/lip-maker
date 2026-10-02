@@ -41,13 +41,14 @@ def test_unpaired_samples_and_no_result_and_verdict(monkeypatch):
     o = c.report()["overall"]
     assert o["n"] == 1 and o["paired_n"] == 0 and o["skill_vs_book"] is None
     assert c.on_settle("missing", "yes") == 0
-    monkeypatch.setenv("LIP_FV_CALIB_MIN_N", "1")
+    # The verdict needs scored EVENTS (whole bucket distributions), not only
+    # correlated per-market samples: see test_review_r2_fv_calib.
+    monkeypatch.setenv("LIP_FV_CALIB_MIN_MARKETS", "1")
+    monkeypatch.setenv("LIP_FV_CALIB_MIN_EVENTS", "1")
     c.record("B", "KXHIGHCHI", T0, 10.0, 0.7, 20.0, 50.0, fv_ts=1.0)
     c.on_settle("B", "no")
-    assert c.report()["verdict"] == "model_better_than_book"
-    c.record("D", "KXHIGHCHI", T0, 99.0, 0.7, 20.0, 50.0, fv_ts=1.0)
-    c.on_settle("D", "no")
-    assert c.report()["verdict"] == "book_better_or_equal"
+    assert c.report()["paired_markets"] == 1
+    assert c.report()["verdict"] == "insufficient_data"
 
 
 def test_state_roundtrip_and_validation():
