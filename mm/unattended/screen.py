@@ -33,15 +33,32 @@ def news_categories() -> set[str]:
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
+# Units of ``rank_penalty_per_day``: $/day for this many contracts per side,
+# both sides quoted. RunLoop scales it by size / RANK_PENALTY_UNIT.
+RANK_PENALTY_UNIT = 100.0
+
+
 def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | None,
                size: float = 100.0) -> dict:
     """Expected net $/day per $ of capital at our size, from market metadata only.
 
-    reward  = pool/day x share, share = 2S / (2S + touch depth on both sides)
-    penalty = S x 2 sides x fill fraction/day x adverse cents, scaled up as
+    reward  = pool/day x share, share = 2S / (2S + touch depth on both sides),
+              S = min(target, ``size``)
+    markout = per contract per day: 2 sides x fill fraction/day x adverse
+              cents (the family MARKOUT_PRIOR_CENTS), with the fill fraction
+              scaled by 24 h volume, and the whole charge scaled up as
               days-to-close shrinks (1 + LIP_RANK_SHORT_K / days) and for
               news-driven categories (x LIP_RANK_NEWS_MULT).
-    score   = (reward - penalty) / capital, capital = S x (yes bid + no bid).
+    score   = (reward - S x markout) / capital, capital = S x (yes bid + no bid).
+
+    Returned ``penalty`` (stored as the frame's ``rank_penalty_per_day``) is
+    NOT the full markout: selector.quote_economics already subtracts the
+    base markout prior (2 x fill fraction x |prior|) from ``net``, and RunLoop
+    subtracts this penalty from that net. So ``penalty`` is only the
+    increment the volume / time / news multipliers add on top of the base
+    prior, in $/day per RANK_PENALTY_UNIT (100) contracts per side. net -
+    penalty then charges the markout prior exactly once.
+    ``penalty_full`` is the full charge at S used in ``score``.
     """
     from mm.fair_value import family_for_series
     from mm.selector import FILL_FRACTION_PER_DAY, MARKOUT_PRIOR_CENTS
@@ -55,16 +72,20 @@ def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | N
     share = (2.0 * S) / (2.0 * S + depth)
     reward = pool_per_day(frame) * share
     family = family_for_series(str(frame.get("series") or ""))
-    fill = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
+    base_fill = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     vol = float(meta.get("volume_24h") or 0.0)
-    fill *= min(3.0, 1.0 + vol / 5000.0)
+    vol_mult = min(3.0, 1.0 + vol / 5000.0)
     adverse = abs(MARKOUT_PRIOR_CENTS.get(family, MARKOUT_PRIOR_CENTS["event"]))
     mult = 1.0 + _env_float("LIP_RANK_SHORT_K", 3.0) / max(0.5, float(days if days is not None else 0.5))
     news = bool(category and category.strip().lower() in news_categories())
     if news:
         mult *= _env_float("LIP_RANK_NEWS_MULT", 2.0)
-    penalty = S * 2.0 * fill * adverse / 100.0 * mult
-    return {"score": (reward - penalty) / capital, "reward": reward, "penalty": penalty,
+    base_per_contract = 2.0 * base_fill * adverse / 100.0          # already in quote_economics net
+    full_per_contract = base_per_contract * vol_mult * mult
+    penalty_full = S * full_per_contract
+    incremental = RANK_PENALTY_UNIT * max(0.0, full_per_contract - base_per_contract)
+    return {"score": (reward - penalty_full) / capital, "reward": reward, "penalty": incremental,
+            "penalty_full": penalty_full, "penalty_unit_contracts": int(RANK_PENALTY_UNIT),
             "capital": capital, "share": share, "news": news}
 
 

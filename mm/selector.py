@@ -430,6 +430,9 @@ def quote_economics(market: KalshiMarket, size: float, *,
     fraction = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     fills_side = size * fraction
     mo = markout_cents(market)
+    # The ONE base adverse-selection charge. screen.rank_score's
+    # rank_penalty_per_day (subtracted by RunLoop) adds only the
+    # volume/time/news increment on top of this, never the prior again.
     as_cost = -(mo / 100.0) * (fills_side * 2.0)
     fee = maker_fee_usd(market, yes_cents) * fills_side
     fee += maker_fee_usd(market, no_cents) * fills_side
@@ -441,7 +444,7 @@ def quote_economics(market: KalshiMarket, size: float, *,
         if holding_model() == "carry":
             # Capital carry: each day's fills lock their premium until close,
             # charged at LIP_CARRY_APR. Markout/adverse selection is the
-            # separate as_cost term (and the screen's days-shrinking penalty).
+            # separate as_cost term (plus the screen's multiplier increment).
             locked = fills_side * (yes_cents + no_cents) / 100.0
             holding = carry_apr() / 365.0 * (days - 1.0) * locked
         else:
