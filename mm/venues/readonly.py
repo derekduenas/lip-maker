@@ -8,7 +8,14 @@ and the quote manager refuse it before any socket opens.
 
 Allowed: GET markets, events, series, order books, trades,
 incentive programs, and exchange status. The websocket may subscribe to
-``orderbook_delta``, ``ticker``, and ``trade``.
+``orderbook_delta``, ``ticker`` and ``trade`` for named tickers, and to
+``market_lifecycle_v2`` (market-level lifecycle events, all markets, no
+ticker filter). Every Kalshi websocket connection is authenticated with the
+key's signed headers, private channels included, so the read-only key opens
+the same socket; what keeps it read-only is that only these market-data
+channels are ever subscribed. It may also remove tickers from, or end,
+subscriptions it opened itself (``update_subscription`` with
+``delete_markets``, ``unsubscribe``).
 
 Anything else logs and exits. No POST, PUT, DELETE, PATCH, portfolio
 route, or private channel is sent.
@@ -36,7 +43,13 @@ DEMO_WS = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 DEMO_BOOKS_FLAG = "demo-books: results not representative"
 PROD_BOOKS_FLAG = "production-books"
 
-PUBLIC_WS_CHANNELS = frozenset({"orderbook_delta", "ticker", "trade"})
+# Per-ticker market data channels.
+TICKER_WS_CHANNELS = frozenset({"orderbook_delta", "ticker", "trade"})
+# Market/event lifecycle (created, determined, settled, ...). Market data, not
+# account data; it takes no market filter ("market_ticker filters are not
+# supported", docs.kalshi.com/websockets/market-&-event-lifecycle).
+LIFECYCLE_WS_CHANNEL = "market_lifecycle_v2"
+PUBLIC_WS_CHANNELS = TICKER_WS_CHANNELS | {LIFECYCLE_WS_CHANNEL}
 
 _FORBIDDEN_SNIPPETS = (
     "/portfolio",
@@ -303,7 +316,12 @@ class ReadOnlyKalshiTransport(MarketDataReader):
 
 
 class ReadOnlyMarketSocket(MarketDataReader):
-    """Production websocket. Subscribe list is the three public channels."""
+    """Production websocket. Subscribes only PUBLIC_WS_CHANNELS.
+
+    Each command gets its own ``id``; the ``subscribed`` replies
+    (``note_response``) map each subscription id (sid) to its channel and
+    tickers, so ``unsubscribe_markets`` can remove tickers from the
+    subscriptions this socket opened (and only those)."""
 
     def __init__(self, *, api_key: str, private_key, url: str = PROD_WS) -> None:
         host = _host(url)
@@ -314,20 +332,83 @@ class ReadOnlyMarketSocket(MarketDataReader):
         self._private_key = private_key
         self._ws = None
         self.connects = 0
+        self._next_id = 0
+        self._pending: dict[int, list[str]] = {}   # subscribe id -> tickers
+        self.sids: dict[int, dict] = {}            # sid -> {"channel", "tickers": set}
+
+    def _cmd_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
 
     def command(self, channels: list[str], tickers: list[str] | None = None) -> dict:
         names = [str(channel) for channel in channels]
         bad = [name for name in names if name not in PUBLIC_WS_CHANNELS]
         if not names or bad:
             _refuse("ws channel " + ",".join(bad or ["empty"]))
+        if LIFECYCLE_WS_CHANNEL in names:
+            # no ticker filter on this channel: subscribe it alone, unfiltered
+            if len(names) != 1 or tickers:
+                _refuse(f"ws channel {LIFECYCLE_WS_CHANNEL} is subscribed alone, without tickers")
+            return {"id": self._cmd_id(), "cmd": "subscribe", "params": {"channels": names}}
+        cid = self._cmd_id()
+        self._pending[cid] = list(tickers or [])
+        while len(self._pending) > 1000:
+            self._pending.pop(next(iter(self._pending)))
         return {
-            "id": 1,
+            "id": cid,
             "cmd": "subscribe",
             "params": {
                 "channels": names,
                 "market_tickers": list(tickers or []),
             },
         }
+
+    def note_response(self, msg: dict) -> None:
+        """Track sids from ``subscribed`` / ``unsubscribed`` replies."""
+        kind = msg.get("type")
+        if kind == "subscribed":
+            body = msg.get("msg") or {}
+            sid = body.get("sid")
+            if sid is None:
+                return
+            row = self.sids.setdefault(int(sid), {"channel": str(body.get("channel") or ""),
+                                                  "tickers": set()})
+            row["tickers"].update(self._pending.get(msg.get("id"), []))
+        elif kind == "unsubscribed" and msg.get("sid") is not None:
+            self.sids.pop(int(msg["sid"]), None)
+
+    async def unsubscribe_markets(self, tickers) -> list[dict]:
+        """Remove ``tickers`` from every per-ticker subscription this socket
+        opened: ``update_subscription`` / ``delete_markets`` per sid, or
+        ``unsubscribe`` for a sid that would be left with no ticker. The
+        lifecycle subscription is never touched. Returns the commands sent."""
+        drop = {str(t) for t in tickers or ()}
+        if not drop:
+            return []
+        if self._ws is None:
+            _refuse("websocket is not connected")
+        sent, empty = [], []
+        for sid, row in sorted(self.sids.items()):
+            if row["channel"] not in TICKER_WS_CHANNELS:
+                continue
+            hit = sorted(row["tickers"] & drop)
+            if not hit:
+                continue
+            row["tickers"] -= drop
+            if not row["tickers"]:
+                empty.append(sid)
+                continue
+            cmd = {"id": self._cmd_id(), "cmd": "update_subscription",
+                   "params": {"sids": [sid], "market_tickers": hit, "action": "delete_markets"}}
+            await self._ws.send(json.dumps(cmd))
+            sent.append(cmd)
+        if empty:
+            cmd = {"id": self._cmd_id(), "cmd": "unsubscribe", "params": {"sids": empty}}
+            await self._ws.send(json.dumps(cmd))
+            sent.append(cmd)
+            for sid in empty:
+                self.sids.pop(sid, None)
+        return sent
 
     def auth_headers(self) -> dict:
         ts = str(int(__import__("time").time() * 1000))

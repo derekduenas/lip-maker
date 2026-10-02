@@ -596,11 +596,16 @@ class RunLoop:
 
     def settle(self, market: str, result: str) -> None:
         """Book settlement of a held position (YES pays 100c on "yes", NO on
-        "no") and release its locked capital on the risk engine. The live feed
-        has no settlement channel today; unsettled positions are marked at
-        their last mark and listed in status."""
+        "no") and release its locked capital on the risk engine. Fed by the
+        read-only socket's market_lifecycle_v2 channel (determined/settled
+        events). That channel carries every Kalshi market, so a market with
+        neither a position nor a program here is ignored (nothing to settle,
+        and nothing is stored for it). A position whose result never arrives
+        stays marked at its last mark and is listed in status."""
         result = str(result).lower()
         if result not in ("yes", "no") or market in self.settled:
+            return
+        if market not in self.position and market not in self.programs:
             return
         self.settled[market] = {"result": result, "ts": self.now}
         self.last_mid[market] = 100.0 if result == "yes" else 0.0
@@ -2782,8 +2787,9 @@ def _prune_fed(candidates: list[dict], ctx: dict, on_frame: Callable[[dict], Non
     among the current candidates (a roll-over re-feed keeps them): send the
     loop a ``program_end`` frame and forget them here, so a reconnect does not
     resubscribe them and a later return is fed (and subscribed) as new. The
-    read-only socket has no unsubscribe; live streams for pruned tickers stop
-    at the next reconnect and the loop ignores their frames meanwhile."""
+    pruned tickers are queued in ``ctx["unsubscribe_pending"]``; the
+    background refresh removes them from the live subscription
+    (``_flush_unsubscribes``), and the loop ignores their frames meanwhile."""
     now = time.time() if now is None else float(now)
     ends = ctx.setdefault("ends", {})
     current = set()
@@ -2799,6 +2805,10 @@ def _prune_fed(candidates: list[dict], ctx: dict, on_frame: Callable[[dict], Non
         ctx["fed"].pop(market, None)
         ctx.get("sigs", {}).pop(market, None)
         ends.pop(market, None)
+    if gone:
+        pending = ctx.setdefault("unsubscribe_pending", [])
+        pending.extend(gone)
+        del pending[:-5000]
     return gone
 
 
@@ -2982,12 +2992,64 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
 
 
 async def _subscribe(sock, tickers) -> None:
-    from mm.venues.readonly import PUBLIC_WS_CHANNELS
+    from mm.venues.readonly import TICKER_WS_CHANNELS
     names = sorted(tickers)
     if not names:  # an empty ticker list must never become a subscribe-to-everything
         return
     for i in range(0, len(names), 100):
-        await sock.subscribe(sorted(PUBLIC_WS_CHANNELS), names[i:i + 100])
+        await sock.subscribe(sorted(TICKER_WS_CHANNELS), names[i:i + 100])
+
+
+async def _subscribe_lifecycle(sock) -> None:
+    """market_lifecycle_v2 (all markets; no ticker filter exists) so
+    determined/settled results reach RunLoop.settle. Once per connection."""
+    from mm.venues.readonly import LIFECYCLE_WS_CHANNEL
+    await sock.subscribe([LIFECYCLE_WS_CHANNEL])
+
+
+async def _flush_unsubscribes(sock, ctx: dict) -> None:
+    """Remove pruned tickers (``_prune_fed``) from the live subscription."""
+    pending = ctx.get("unsubscribe_pending") or []
+    if not pending:
+        return
+    names = sorted(set(pending))
+    ctx["unsubscribe_pending"] = []
+    unsub = getattr(sock, "unsubscribe_markets", None)
+    if unsub is not None:
+        await unsub(names)
+
+
+def _dispatch_ws_message(msg: dict, on_frame: Callable[[dict], None], seqr: "SidSequencer",
+                         sock) -> None:
+    """Route one decoded read-only websocket message. Raises SequenceGap on a
+    real book sequence gap."""
+    kind = str(msg.get("type") or "")
+    if kind == "trade":
+        body = msg.get("msg") or msg
+        on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
+    elif kind == "market_lifecycle_v2":
+        # A determined/settled result settles paper inventory at 100/0
+        # (RunLoop.settle ignores markets it holds nothing in).
+        body = msg.get("msg") or {}
+        result = str(body.get("result") or "").lower()
+        if body.get("event_type") in ("determined", "settled") and result in ("yes", "no"):
+            on_frame({"kind": "settlement", "ts": msg["ts"],
+                      "market": body.get("market_ticker"), "result": result})
+    elif kind in ("orderbook_snapshot", "orderbook_delta"):
+        verdict = seqr.check(msg)
+        if verdict == "dup":
+            return
+        if verdict == "gap":
+            raise SequenceGap(f"sid {msg.get('sid')} sequence gap at {msg.get('seq')}")
+        msg["seq"] = None
+        on_frame(msg)
+    elif kind in ("subscribed", "unsubscribed", "ok"):
+        if sock is not None and hasattr(sock, "note_response"):
+            sock.note_response(msg)
+        if kind != "subscribed":
+            # update_subscription / unsubscribe acks carry the subscription's
+            # seq; record it so the next book message is not seen as a gap.
+            seqr.check(msg)
 
 
 async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
@@ -3007,6 +3069,7 @@ async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
             new = _screen_and_feed(ctx, on_frame)
             if new:
                 await _subscribe(sock, new)
+            await _flush_unsubscribes(sock, ctx)
             log.info("background refresh %.1fs; subscribed %d new", time.time() - t0, len(new))
         except asyncio.CancelledError:
             raise
@@ -3041,7 +3104,10 @@ async def _readonly_books_session(source: dict, key, session,
     task = None
     try:
         await sock.connect()
+        # a fresh connection subscribes only what is fed now
+        ctx["unsubscribe_pending"] = []
         await _subscribe(sock, ctx["fed"])
+        await _subscribe_lifecycle(sock)
         task = asyncio.create_task(_background(reader, ctx, on_frame, sock, state))
         seqr = SidSequencer()
         try:
@@ -3053,27 +3119,7 @@ async def _readonly_books_session(source: dict, key, session,
                 ets = _exchange_ts(msg)
                 if ets is not None:
                     msg["exchange_ts"] = ets
-                kind = str(msg.get("type") or "")
-                if kind == "trade":
-                    body = msg.get("msg") or msg
-                    on_frame({"type": "trade", "ts": msg["ts"], "trade": body})
-                elif kind == "market_lifecycle_v2":
-                    # Only arrives once the read-only socket may subscribe the
-                    # lifecycle channel; a determined/settled result settles
-                    # paper inventory at 100/0.
-                    body = msg.get("msg") or {}
-                    result = str(body.get("result") or "").lower()
-                    if body.get("event_type") in ("determined", "settled") and result in ("yes", "no"):
-                        on_frame({"kind": "settlement", "ts": msg["ts"],
-                                  "market": body.get("market_ticker"), "result": result})
-                elif kind in ("orderbook_snapshot", "orderbook_delta"):
-                    verdict = seqr.check(msg)
-                    if verdict == "dup":
-                        continue
-                    if verdict == "gap":
-                        raise SequenceGap(f"sid {msg.get('sid')} sequence gap at {msg.get('seq')}")
-                    msg["seq"] = None
-                    on_frame(msg)
+                _dispatch_ws_message(msg, on_frame, seqr, sock)
         except BaseException:
             if state.get("fatal") is not None:
                 raise state["fatal"]
