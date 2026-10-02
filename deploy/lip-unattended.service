@@ -15,7 +15,11 @@ EnvironmentFile=-/etc/lip-maker/lip-maker.env
 Environment=LIP_PAPER=true
 Environment=LIP_KALSHI_WS_URL=wss://demo-api.kalshi.co/trade-api/ws/v2
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -m mm.unattended --run --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel --status-port 8765 --log-file /var/lib/lip-maker/lip.log --summary /var/lib/lip-maker/daily-summary
+Environment=LIP_FORCE_PAPER=1
+# EnvironmentFile= overrides Environment=, so paper is also forced on the
+# command line (env(1) runs after systemd's environment and cannot be
+# overridden by the env file). resolve_mode() refuses non-paper with it set.
+ExecStart=/usr/bin/env LIP_FORCE_PAPER=1 LIP_PAPER=true /usr/bin/python3 -m mm.unattended --run --heartbeat /var/lib/lip-maker/heartbeat --cancel-log /var/lib/lip-maker/startup-cancel --status-port 8765 --log-file /var/lib/lip-maker/lip.log --summary /var/lib/lip-maker/daily-summary
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=300
