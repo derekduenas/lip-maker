@@ -24,6 +24,8 @@ LIVE_STATUS_FIELDS = (
     # Review fixes: inventory risk, daily MTM, engine alerts, capital check.
     "daily_mtm_pnl_usd", "inventory_locked_usd", "engine_alerts", "cap_trims_n",
     "budget_warning",
+    # Review fixes: program pruning, engine state file.
+    "programs_pruned_n", "state",
 )
 
 

@@ -53,9 +53,20 @@ def _flag(env: dict, name: str, default: str) -> bool:
 
 
 def resolve_mode(environ: dict | None = None) -> str:
-    """Paper, else demo, else refuse. Live arming flags are not consulted."""
+    """Paper, else demo, else refuse. Live arming flags are not consulted.
+
+    ``LIP_FORCE_PAPER`` (truthy) allows paper only: with it set, a false
+    ``LIP_PAPER`` is refused instead of falling through to demo. systemd's
+    EnvironmentFile= overrides the unit's Environment=, so ``LIP_PAPER=false``
+    in /etc/lip-maker/lip-maker.env would otherwise silently change the mode.
+    """
     env = os.environ if environ is None else environ
-    if _flag(env, "LIP_PAPER", "true"):
+    paper = _flag(env, "LIP_PAPER", "true")
+    if _flag(env, "LIP_FORCE_PAPER", "false"):
+        if not paper:
+            raise UnattendedRefused("LIP_FORCE_PAPER is set and LIP_PAPER is not true: paper only")
+        return "paper"
+    if paper:
         return "paper"
     if _flag(env, "LIP_DEMO", "false"):
         return "demo"
@@ -170,6 +181,7 @@ class _Program:
 
 
 VENUES = ("kalshi", "pmus")
+STATE_VERSION = 1
 # Bounded history for the long-running live loop (counts stay exact).
 LIST_CAP = 20000
 
@@ -414,6 +426,9 @@ class RunLoop:
         if kind == "reconnect":
             self.note_reconnect(float(row.get("stale_s") or 0.0))
             return
+        if kind == "program_end":
+            self.end_program(str(row.get("market") or ""), str(row.get("reason") or "program_end"))
+            return
         if kind == "settlement":
             self.settle(str(row.get("market") or ""), str(row.get("result") or ""))
             return
@@ -532,6 +547,39 @@ class RunLoop:
                 self._cancel_all(decision.reason)
         self._reselect_pending = True
         self._state_dirty = True
+
+    def end_program(self, market: str, reason: str = "program_end") -> None:
+        """Forget an ended program: archive its accrual, cancel its quote, drop
+        its book and per-market state. A held position and its last mark stay
+        (inventory is only released by settlement)."""
+        if market not in self.programs:
+            return
+        self._cancel(market, reason)
+        acc = self.accruals.pop(market, None)
+        if acc is not None:
+            self._archive_period(market, acc)
+        self.programs.pop(market, None)
+        for table in (self.open_seconds, self._book_ts, self.last_plan, self._repeg_at, self._fv_state):
+            table.pop(market, None)
+        self._fv_wanted.discard(market)
+        self.quoted_ever.discard(market)
+        for key in [k for k in self.cooldown if k[0] == market]:
+            del self.cooldown[key]
+        if market not in self.position:
+            self.last_mid.pop(market, None)
+            (getattr(self, "bucket_of", None) or {}).pop(market, None)
+        self.programs_pruned_n += 1
+
+    def prune_ended(self, ts: float) -> int:
+        """End programs whose window closed more than LIP_PROGRAM_PRUNE_S
+        (6 h) ago and were not re-fed with a new window. Bounds memory for
+        feeds that never send ``program_end`` (replay, PM US)."""
+        grace = _env_num("LIP_PROGRAM_PRUNE_S", 6 * 3600.0)
+        gone = [m for m, p in self.programs.items() if p.end_ts + grace < ts]
+        for market in gone:
+            self.end_program(market, "program_ended")
+        self._fv_wanted &= set(self.programs)
+        return len(gone)
 
     def settle(self, market: str, result: str) -> None:
         """Book settlement of a held position (YES pays 100c on "yes", NO on
@@ -766,6 +814,121 @@ class RunLoop:
         except Exception:
             logging.getLogger("lip.risk").exception("alert delivery failed")
 
+    # ------------------------------------------------------------ persistence
+    def state_dict(self) -> dict:
+        """Positions, fill/fee aggregates, rolled periods, cooldowns and an
+        internal kill latch. An external (kill-file) kill is not saved: the
+        kill file itself is the source of truth for it."""
+        kill = self.kill
+        if kill is not None and str(kill.get("reason", "")).startswith("external_kill:"):
+            kill = kill.get("prev")
+        return {
+            "version": STATE_VERSION, "saved_ts": time.time(), "now": self.now, "mode": self.mode,
+            "position": self.position, "bucket_pos": self.bucket_pos,
+            "bucket_of": {m: b for m, b in (getattr(self, "bucket_of", {}) or {}).items() if m in self.position},
+            "last_mid": {m: v for m, v in self.last_mid.items() if m in self.position},
+            "settled": self.settled, "fills_total": self.fills_total, "fills_by_venue": self.fills_by_venue,
+            "premium_usd_total": self.premium_usd_total, "fees_usd_total": self.fees_usd_total,
+            "pm_rebate_usd": self.pm_rebate_usd, "closed_periods": self.closed_periods,
+            "closed_periods_n": self.closed_periods_n,
+            "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
+            "kill": kill, "pnl_day": self._pnl_day,
+        }
+
+    def attach_state(self, path: str) -> None:
+        """Load ``path`` when it exists and persist there from now on.
+
+        A file that exists but cannot be read or validated is never ignored
+        and never overwritten: the engine latches a kill (no quoting) until the
+        operator moves the file aside and restarts."""
+        self.state_path = str(path)
+        p = Path(path)
+        if not p.exists():
+            logging.getLogger("lip.risk").info("no engine state at %s: starting flat", path)
+            return
+        try:
+            self._restore_state(json.loads(p.read_text(encoding="utf-8")))
+        except Exception as exc:
+            self.state_error = f"{type(exc).__name__}: {exc}"[:300]
+            self._latch_kill(f"state_file_unreadable: {path} ({self.state_error}); "
+                             "move it aside and restart to reset", cancel_all=True)
+            return
+        logging.getLogger("lip.risk").info(
+            "engine state restored from %s: %d positions, %d fills", path, len(self.position), self.fills_total)
+
+    def _restore_state(self, data: dict) -> None:
+        if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            raise ValueError(f"unsupported state version {data.get('version') if isinstance(data, dict) else None!r}")
+        position = {}
+        for market, pos in dict(data.get("position") or {}).items():
+            row = {k: float(pos[k]) for k in ("yes", "no", "yes_cost", "no_cost")}
+            row["fees"] = float(pos.get("fees", 0.0))
+            row["venue"] = str(pos.get("venue") or "kalshi")
+            position[str(market)] = row
+        bucket_pos = {}
+        for bucket, rows in dict(data.get("bucket_pos") or {}).items():
+            bucket_pos[str(bucket)] = {str(m): {k: float(v) for k, v in dict(r).items()}
+                                       for m, r in dict(rows).items()}
+        settled = {str(m): {"result": str(v["result"]), "ts": v.get("ts")}
+                   for m, v in dict(data.get("settled") or {}).items()}
+        cooldown = {(str(m), str(sd)): float(until) for m, sd, until in list(data.get("cooldown") or [])}
+        kill = data.get("kill")
+        if kill is not None and not isinstance(kill, dict):
+            raise ValueError("kill must be an object")
+        # validated: apply
+        self.position = position
+        self.bucket_pos = bucket_pos
+        self.settled = settled
+        self.last_mid.update({str(m): float(v) for m, v in dict(data.get("last_mid") or {}).items()})
+        if not hasattr(self, "bucket_of"):
+            self.bucket_of = {}
+        self.bucket_of.update({str(m): str(b) for m, b in dict(data.get("bucket_of") or {}).items()})
+        self.fills_total = int(data.get("fills_total") or 0)
+        self.fills_by_venue = {str(k): int(v) for k, v in dict(data.get("fills_by_venue") or {}).items()}
+        self.premium_usd_total = float(data.get("premium_usd_total") or 0.0)
+        self.fees_usd_total = float(data.get("fees_usd_total") or 0.0)
+        self.pm_rebate_usd = float(data.get("pm_rebate_usd") or 0.0)
+        self.closed_periods = {str(m): float(v) for m, v in dict(data.get("closed_periods") or {}).items()}
+        self.closed_periods_n = int(data.get("closed_periods_n") or 0)
+        self.cooldown.update(cooldown)
+        self._pnl_day = data.get("pnl_day") if isinstance(data.get("pnl_day"), dict) else None
+        for market in self.position:
+            self._sync_inventory(market)
+        if kill is not None:
+            self.kill = dict(kill)
+            self._alert("CRITICAL", f"engine kill restored from state file: {kill.get('reason')}")
+
+    def save_state(self, *, force: bool = False) -> bool:
+        """Atomic write (tmp + fsync + rename). Never writes over a state file
+        that failed to load."""
+        if not self.state_path or self.state_error is not None:
+            return False
+        if not force and not self._state_dirty:
+            return False
+        path = Path(self.state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        body = json.dumps(self.state_dict(), default=str)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        self._state_dirty = False
+        self._state_saved_at = time.time()
+        self._state_save_failed = False
+        return True
+
+    def maybe_save_state(self, every_s: float = 5.0) -> bool:
+        if not self._state_dirty or time.time() - self._state_saved_at < every_s:
+            return False
+        try:
+            return self.save_state()
+        except Exception as exc:
+            if not getattr(self, "_state_save_failed", False):
+                self._alert("CRITICAL", f"engine state save failed: {type(exc).__name__}: {exc}")
+            self._state_save_failed = True
+            return False
 
     # ------------------------------------------------------------ patch 21
     def _venue(self, market: str) -> str:
@@ -823,13 +986,15 @@ class RunLoop:
             self._record_fill(fill, ts)
 
     def _record_fill(self, fill: dict, ts: float) -> bool:
-        """One paper fill: history + exact aggregates, inventory, fees, the
-        fills-per-minute clock. False when the fill latched a kill."""
+        """One paper fill: bounded history + exact aggregates, inventory,
+        fees, the fills-per-minute clock. False when the fill latched a kill."""
         self.fills.append(fill)
         self.fills_total += 1
         venue = self._venue(str(fill.get("market_ticker")))
         self.fills_by_venue[venue] = self.fills_by_venue.get(venue, 0) + 1
         self.premium_usd_total += float(fill.get("count") or 0) * float(fill.get("price_cents") or 0) / 100.0
+        if len(self.fills) > LIST_CAP:
+            del self.fills[: len(self.fills) - LIST_CAP // 2]
         self._reduce_resting(fill)
         self._note_fill(fill, ts)
         decision = self.risk.record_fill(1, now=ts)
@@ -897,6 +1062,7 @@ class RunLoop:
                 self._drop_side(market, side, "fill_cooldown")
         # Inventory caps act on resting size now, for every market in the event.
         self._recheck_event_caps(market, ts)
+        self.maybe_save_state(every_s=0.0)
 
     # ------------------------------------------------------------ patch 18
     def _inv_frac(self, market: str) -> float:
@@ -1301,6 +1467,7 @@ class RunLoop:
 
     def _select(self, ts: float) -> None:
         self._select_t0 = time.time()
+        self.prune_ended(ts)
         self.selection_count += 1
         self.last_select_ts = ts
         markets = self._markets()
@@ -1971,6 +2138,9 @@ class RunLoop:
             "feed": {"connected": self.connected, "disconnects_n": self.disconnects_n,
                      "last_reconnect": self.last_reconnect, "clock_skew_n": self.skew_n},
             "cap_trims_n": self.cap_trims_n,
+            "programs_pruned_n": self.programs_pruned_n,
+            "state": {"path": self.state_path, "error": self.state_error,
+                      "saved_ts": self._state_saved_at or None},
             "budget_warning": getattr(self, "budget_warning", None),
             "day": day,
         }
@@ -2553,6 +2723,35 @@ def _feed_programs(frames: list[dict], fed: dict, on_frame: Callable[[dict], Non
     return new
 
 
+PRUNE_GRACE_S = 3600.0
+
+
+def _prune_fed(candidates: list[dict], ctx: dict, on_frame: Callable[[dict], None],
+               now: float | None = None) -> list[str]:
+    """Drop fed programs that ended more than PRUNE_GRACE_S ago and are not
+    among the current candidates (a roll-over re-feed keeps them): send the
+    loop a ``program_end`` frame and forget them here, so a reconnect does not
+    resubscribe them and a later return is fed (and subscribed) as new. The
+    read-only socket has no unsubscribe; live streams for pruned tickers stop
+    at the next reconnect and the loop ignores their frames meanwhile."""
+    now = time.time() if now is None else float(now)
+    ends = ctx.setdefault("ends", {})
+    current = set()
+    for frame in candidates:
+        market = frame.get("market")
+        current.add(market)
+        if frame.get("end_ts") is not None:
+            ends[market] = float(frame["end_ts"])
+    gone = [m for m in list(ctx["fed"]) if m not in current
+            and ends.get(m) is not None and ends[m] + PRUNE_GRACE_S < now]
+    for market in gone:
+        on_frame({"kind": "program_end", "market": market, "ts": now, "reason": "program_ended"})
+        ctx["fed"].pop(market, None)
+        ctx.get("sigs", {}).pop(market, None)
+        ends.pop(market, None)
+    return gone
+
+
 class SequenceGap(ConnectionError):
     """A real gap in one websocket subscription's sequence. Reconnect to resync."""
 
@@ -2718,6 +2917,7 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
     finally:
         ctx["lock"].release()
     new = _feed_programs(candidates, ctx["fed"], on_frame, ctx.setdefault("sigs", {}))
+    stats["pruned"] = len(_prune_fed(candidates, ctx, on_frame))
     stats["fed"] = len(ctx["fed"])
     stats["new"] = len(new)
     on_frame({"kind": "screen", "stats": stats})

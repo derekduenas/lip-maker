@@ -141,6 +141,171 @@ class LiveStatusRefresher:
             return False
 
 
+class EngineTimer:
+    """Once a second, independent of market-data frames: honor the kill file,
+    write the heartbeat, refresh the status page and persist engine state.
+
+    Holds ``loop.lock`` for each tick, the same lock the frame callback
+    holds, so a kill-file cancel never races a frame. If the frame thread
+    wedges while holding the lock, ticks stop and the heartbeat goes stale
+    (the watchdog notices)."""
+
+    def __init__(self, loop, *, heartbeat: str, kill_path: str, refresher=None,
+                 every_s: float = 1.0) -> None:
+        self.loop = loop
+        self.heartbeat = heartbeat
+        self.kill_path = kill_path
+        self.refresher = refresher
+        self.every_s = float(every_s)
+        self._stop = threading.Event()
+        self._thread = None
+        self.ticks = 0
+
+    def tick(self) -> None:
+        with self.loop.lock:
+            _honor_kill_file(self.loop, self.kill_path)
+            write_heartbeat(self.heartbeat)
+            if self.refresher is not None:
+                self.refresher.maybe_refresh()
+            self.loop.maybe_save_state()
+        self.ticks += 1
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception:
+                logging.getLogger("lip.status").exception("engine timer tick failed")
+            self._stop.wait(self.every_s)
+
+    def start(self) -> "EngineTimer":
+        self._thread = threading.Thread(target=self._run, name="lip-engine-timer", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
+class _Engine:
+    """The one RunLoop of a ``--run`` process plus its background helpers."""
+
+    def __init__(self, args, mode: str, books: dict, plan: dict, started: list) -> None:
+        from mm.bankroll import capital_usd
+        from mm.unattended.loop import RunLoop
+        self.args = args
+        self.books = books
+        self.plan = plan
+        self.started = started
+        loop = RunLoop(
+            mode=mode, select_every=args.select_every,
+            bankroll=float(capital_usd()),
+            first_select_warmup_s=float(os.environ.get("LIP_FIRST_SELECT_WARMUP_S", "60")),
+            carry_forward=True,
+        )
+        loop.socket_opened = True
+        loop.check_watchdog_capital()
+        loop.attach_state(os.environ.get("LIP_STATE_FILE", "/var/lib/lip-maker/engine_state.json"))
+        self.loop = loop
+        from mm.unattended.fairvalue import FairValueCache, enabled as _fv_enabled
+        if _fv_enabled():  # Patch 16: external fair value, background refresh only
+            loop.fv = FairValueCache()
+            loop.fv.start(lambda loop=loop: {m for m in (set(loop.resting.copy()) | loop._fv_wanted.copy())
+                                             if not m.startswith("PMUS:")})
+        from mm.unattended import bookrec as _bookrec
+        self.rec = None
+        if _bookrec.enabled():  # Patch 19: bounded compressed frame recorder
+            try:
+                self.rec = _bookrec.FrameRecorder().start()
+                loop.recorder = self.rec
+            except Exception:
+                logging.getLogger("lip.recorder").exception("recorder start failed")
+                self.rec = None
+        if getattr(loop, "pmus", None) is None:  # Patch 21: PM US feed into this RunLoop
+            try:
+                from mm.unattended import pmus_paper as _pmp
+                if _pmp.enabled() and mode == "paper":
+                    loop.pmus = _pmp.PMUSFeed(loop).start()
+            except Exception:
+                logging.getLogger("lip.pmus").exception("pmus feed start failed")
+        self.refresher = LiveStatusRefresher(
+            loop, lambda rep: _write_run_outputs(args, rep, started),
+            data_source=books["flag"], ws_url=plan["url"],
+        )
+        self.timer = EngineTimer(
+            loop, heartbeat=args.heartbeat,
+            kill_path=os.environ.get("LIP_KILL_FILE", "/var/lib/lip-maker/KILL"),
+            refresher=self.refresher,
+        )
+        self.timer.tick()  # kill file + heartbeat before the first frame
+        self.timer.start()
+
+    def on_frame(self, msg: dict) -> None:
+        loop = self.loop
+        with loop.lock:
+            if self.rec is not None:
+                self.rec.record(msg)
+            loop.on_frame(msg)
+            if getattr(loop, "pmus", None) is not None:
+                loop.drain_external()  # Patch 21: PM US frames, same thread
+            self.refresher.maybe_refresh()
+
+    def mark_down(self, reason: str) -> None:
+        self.down_since = time.time()
+        self.on_frame({"kind": "disconnect", "ts": self.down_since, "reason": reason})
+
+    def reconnect_if_down(self) -> None:
+        """A new driver session after the previous one ended: the risk engine
+        sees the gap (the read-only driver reports its own reconnects)."""
+        if getattr(self, "down_since", None) is None:
+            return
+        now = time.time()
+        self.on_frame({"kind": "reconnect", "ts": now, "stale_s": now - self.down_since})
+        self.down_since = None
+
+    def write_final(self) -> None:
+        with self.loop.lock:
+            report = self.loop.finish()
+            report["socket_opened"] = True
+            report["ws_url"] = self.plan["url"]
+            report["data_source"] = self.books["flag"]
+            _write_run_outputs(self.args, report, self.started)
+
+    def stop(self) -> None:
+        self.timer.stop()
+        for bg in (getattr(self.loop, "pmus", None), getattr(self.loop, "fv", None), self.rec):
+            try:
+                if bg is not None and hasattr(bg, "stop"):
+                    bg.stop()
+            except Exception:
+                logging.getLogger("lip.status").exception("background stop failed")
+        try:
+            with self.loop.lock:
+                self.loop.save_state(force=True)
+        except Exception:
+            logging.getLogger("lip.status").exception("final engine state save failed")
+
+
+def reset_state_kill(path: str) -> int:
+    """Operator reset of a kill latch persisted in the engine state file.
+    Positions and aggregates are kept. An unreadable file is not touched
+    (move it aside to start flat)."""
+    p = Path(path)
+    if not p.exists():
+        print(f"no engine state at {path}; nothing to reset")
+        return 0
+    data = json.loads(p.read_text(encoding="utf-8"))
+    prev = data.get("kill")
+    data["kill"] = None
+    tmp = p.with_name(p.name + ".tmp.reset")
+    tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
+    os.replace(tmp, p)
+    print(f"cleared engine kill latch in {path} (was: {prev!r})")
+    return 0
+
+
 def _paper_env() -> bool:
     return os.environ.get("LIP_PAPER", "true").strip().lower() in ("1", "true", "yes", "on")
 
@@ -199,7 +364,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status-port", type=int, default=0, help="loopback status port")
     parser.add_argument("--select-every", type=float, default=600.0)
     parser.add_argument("--log-file", default="", help="rotating log file")
+    parser.add_argument("--reset-kill", action="store_true",
+                        help="clear the engine kill latch saved in LIP_STATE_FILE (positions kept), then exit")
     args = parser.parse_args(argv)
+    if args.reset_kill:
+        return reset_state_kill(os.environ.get("LIP_STATE_FILE", "/var/lib/lip-maker/engine_state.json"))
     if args.replay:
         args.run = True
     paper = _paper_env()
@@ -221,7 +390,10 @@ def main(argv: list[str] | None = None) -> int:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write("cancel_all\n")
-    write_heartbeat(args.heartbeat)
+    if not args.run:
+        # --run writes its first heartbeat only after resolve_mode() and the
+        # host checks pass: a refused start must not look alive.
+        write_heartbeat(args.heartbeat)
     if args.cycle and not args.run:
         from mm.cycle import run_recording
         report = run_recording(args.cycle)
@@ -243,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
             from mm.unattended.loop import assert_demo_host
             assert_demo_host(url)
             books = book_source(force_demo=True)
+        write_heartbeat(args.heartbeat)
         started: list = []
         if args.replay:
             report = run_recorded(
@@ -252,96 +425,46 @@ def main(argv: list[str] | None = None) -> int:
             report["data_source"] = books["flag"]
             _write_run_outputs(args, report, started)
             return 0
-        while True:
-            if books["reader"]:
-                plan = {"socket": True, "url": books["ws_url"], "stage": "connect", "reader": True}
-            else:
-                plan = socket_plan(url)
-                plan["reader"] = False
-            report = waiting_report(plan["url"])
-            report["stage"] = plan["stage"]
-            report["mode"] = mode
-            report["paper"] = mode == "paper"
-            report["demo"] = mode == "demo"
-            report["data_source"] = books["flag"]
-            _write_run_outputs(args, report, started)
-            if plan["socket"]:
-                from mm.unattended.loop import RunLoop, drive_readonly_books, drive_socket
-                from mm.bankroll import capital_usd
-                loop = RunLoop(
-                    mode=mode, select_every=args.select_every,
-                    bankroll=float(capital_usd()),
-                    first_select_warmup_s=float(os.environ.get("LIP_FIRST_SELECT_WARMUP_S", "60")),
-                    carry_forward=True,
-                )
-                loop.socket_opened = True
-                from mm.unattended.fairvalue import FairValueCache, enabled as _fv_enabled
-                if _fv_enabled():  # Patch 16: external fair value, background refresh only
-                    loop.fv = FairValueCache()
-                    loop.fv.start(lambda loop=loop: {m for m in (set(loop.resting.copy()) | loop._fv_wanted.copy())
-                                                     if not m.startswith("PMUS:")})
-
-                from mm.unattended import bookrec as _bookrec
-                _rec = None
-                if _bookrec.enabled():  # Patch 19: bounded compressed frame recorder
+        engine = None
+        try:
+            while True:
+                if books["reader"]:
+                    plan = {"socket": True, "url": books["ws_url"], "stage": "connect", "reader": True}
+                else:
+                    plan = socket_plan(url)
+                    plan["reader"] = False
+                if engine is None:
+                    report = waiting_report(plan["url"])
+                    report["stage"] = plan["stage"]
+                    report["mode"] = mode
+                    report["paper"] = mode == "paper"
+                    report["demo"] = mode == "demo"
+                    report["data_source"] = books["flag"]
+                    _write_run_outputs(args, report, started)
+                if plan["socket"]:
+                    if engine is None:
+                        # One RunLoop for the life of the process: reconnects
+                        # (including a clean 1000/1001 close) keep positions,
+                        # cooldowns and the kill latch.
+                        engine = _Engine(args, mode, books, plan, started)
+                    import asyncio
+                    from mm.unattended.loop import drive_readonly_books, drive_socket
+                    engine.reconnect_if_down()
                     try:
-                        _rec = _bookrec.FrameRecorder().start()
-                        loop.recorder = _rec
-                    except Exception:
-                        logging.getLogger("lip.recorder").exception("recorder start failed")
-                        _rec = None
-                if getattr(loop, "pmus", None) is None:  # Patch 21: PM US feed into this RunLoop
-                    try:
-                        from mm.unattended import pmus_paper as _pmp
-                        if _pmp.enabled() and mode == "paper":
-                            loop.pmus = _pmp.PMUSFeed(loop).start()
-                    except Exception:
-                        logging.getLogger("lip.pmus").exception("pmus feed start failed")
-
-                refresher = LiveStatusRefresher(
-                    loop, lambda rep: _write_run_outputs(args, rep, started),
-                    data_source=books["flag"], ws_url=plan["url"],
-                )
-
-                _hb = {"sec": None}
-                _kill_path = os.environ.get("LIP_KILL_FILE", "/var/lib/lip-maker/KILL")
-
-                def _on_frame(msg, loop=loop, refresher=refresher, rec=_rec):
-                    if rec is not None:
-                        rec.record(msg)
-                    loop.on_frame(msg)
-                    if getattr(loop, "pmus", None) is not None:
-                        loop.drain_external()  # Patch 21: PM US frames, same thread
-                    sec = int(time.time())
-                    if _hb["sec"] != sec:  # heartbeat file write once per second
-                        _hb["sec"] = sec
-                        write_heartbeat(args.heartbeat)
-                        _honor_kill_file(loop, _kill_path)
-                    refresher.maybe_refresh()
-
-                import asyncio
-                try:
-                    if plan.get("reader"):
-                        asyncio.run(drive_readonly_books(books, _on_frame))
-                    else:
-                        asyncio.run(drive_socket(plan["url"], _on_frame))
-                finally:
-                    # Patch 21 (audit): background threads of this session must
-                    # not outlive it (a new RunLoop starts its own).
-                    for _bg in (getattr(loop, "pmus", None), getattr(loop, "fv", None), _rec):
-                        try:
-                            if _bg is not None and hasattr(_bg, "stop"):
-                                _bg.stop()
-                        except Exception:
-                            logging.getLogger("lip.status").exception("background stop failed")
-                report = loop.finish()
-                report["socket_opened"] = True
-                report["ws_url"] = plan["url"]
-                report["data_source"] = books["flag"]
-                _write_run_outputs(args, report, started)
-            if args.once:
-                return 0
-            time.sleep(args.interval)
+                        if plan.get("reader"):
+                            asyncio.run(drive_readonly_books(books, engine.on_frame))
+                        else:
+                            asyncio.run(drive_socket(plan["url"], engine.on_frame))
+                    finally:
+                        engine.mark_down("session_end")
+                    if args.once:
+                        engine.write_final()
+                if args.once:
+                    return 0
+                time.sleep(args.interval)
+        finally:
+            if engine is not None:
+                engine.stop()
     if args.once:
         return 0
     while True:
