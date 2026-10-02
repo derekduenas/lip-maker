@@ -76,7 +76,7 @@ def test_pmus_periods_filter_and_unknown_period_rejected(monkeypatch):
     frames, stats, _ = P.records_to_programs(recs, {r["marketSlug"]: _meta() for r in recs}, now=NOW)
     assert [f["market"] for f in frames] == ["PMUS:rtc-bb-2026-10-01-a"]
     assert stats["reasons"].get("period_not_allowed") == 1
-    assert stats["periods"] == ["daily_event", "pre_day"]
+    assert stats["periods"] == ["daily_event", "pre_day", "daily"]  # "daily" follows daily_event
 
 
 def test_unknown_period_record_is_not_fed(monkeypatch):

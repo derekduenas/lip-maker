@@ -49,16 +49,26 @@ Reward rules used (https://docs.polymarket.us/incentives/liquidity):
   settlement; daily_event midnight-to-midnight ET.
 - rewardPool = "Total reward pool for this period in USD" on each market's
   TimePeriod (https://docs.polymarket.us/api-reference/incentives/overview).
-  The docs do not say whether that pool is per market; the changelog quotes
-  budgets "per game" / "per event", and live one programId repeats an
-  identical pool across 9-41 (up to thousands of) markets. ASSUMPTION
-  (conservative, pending reconciliation against GET /v1/incentives/earnings):
-  the pool is DIVIDED across the distinct active member markets carrying the
-  same (programId, period) - LIP_PMUS_POOL_SPLIT=members, the default. The
-  rule lives in polymarket/engine/pm_us_lip_scorer.py (count_pool_members /
-  split_pool_usd) and is shared with that scorer. LIP_PMUS_POOL_SPLIT=market
-  opts in to the optimistic whole-pool-per-market reading.
-- Period types: early, pre_day, pre_game, day_of, live, daily_event. Any
+  SHARED across the program's markets (verified 2026-10-02 against
+  https://polymarket.us/rewards, the live schedule the docs point to):
+  "Reward pool: The total amount paid out for a time period, shared across
+  the program's markets - never summed per market" and "Reward pool, discount
+  factor and target size are set per program (per time period) and apply to
+  every market in it - they are not summed across markets"; that page lists
+  each program with its market count (e.g. mlb_postseason_futures_20260929
+  $100, 513 markets), which equals count_pool_members on the API records.
+  So the pool is DIVIDED across the distinct active member markets carrying
+  the same (programId, period) - LIP_PMUS_POOL_SPLIT=members, the default.
+  The rule lives in polymarket/engine/pm_us_lip_scorer.py (count_pool_members
+  / split_pool_usd) and is shared with that scorer. LIP_PMUS_POOL_SPLIT=market
+  (whole pool per market) contradicts that page; kept only for comparison.
+- $1 minimum payout ("Rewards under $1.00 are not paid out"): a market whose
+  split pool cannot reach $1 per ET day (or per period, if shorter) even at
+  100% share is screened out as below_min_payout before ranking and before
+  any metadata fetch (max_payable_usd), so it never takes a candidate slot.
+- Period types: early, pre_day, pre_game, day_of, live, daily_event, daily
+  ("Daily" on polymarket.us/rewards; same per-day ET window as daily_event,
+  accepted wherever daily_event is). Any
   other period type is rejected (no window is guessed for it).
   LIP_PMUS_PERIODS (comma list) restricts accepted period types further.
 - daily_event with no `end` ("Ongoing programs omit end"): window = the
@@ -130,7 +140,12 @@ _ALLOWED = (
     re.compile(r"^/v1/market/slug/[A-Za-z0-9_.\-]+$"),
 )
 DAY_OF_S = 6 * 3600.0
-KNOWN_PERIODS = ("daily_event", "early", "pre_day", "pre_game", "day_of", "live")
+KNOWN_PERIODS = ("daily_event", "daily", "early", "pre_day", "pre_game", "day_of", "live")
+# "daily" (polymarket.us/rewards label "Daily", e.g. crypto_20260924,
+# soccer_futures_20260924) is a per-day pool like "daily_event" ("Daily (per
+# event)"); it shares that window and is accepted wherever daily_event is.
+DAILY_PERIODS = ("daily_event", "daily")
+MIN_PAYOUT_USD = 1.0  # "Rewards under $1.00 are not paid out" (docs.polymarket.us/incentives/liquidity)
 SPORTS_CATEGORIES = {"spr", "sports", "sport", "esports"}
 
 
@@ -237,11 +252,22 @@ def allowed_periods() -> tuple:
     if raw is None or not raw.strip():
         return KNOWN_PERIODS
     want = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    if "daily_event" in want and "daily" not in want:
+        want.append("daily")
     return tuple(p for p in want if p in KNOWN_PERIODS)
 
 
 def period_allowed(period: str) -> bool:
     return str(period or "") in allowed_periods()
+
+
+def max_payable_usd(pool_usd: float, pool_seconds: float) -> float:
+    """Upper bound on what one market can pay per payout unit: its whole
+    (split) pool per ET day for windows longer than a day, else the whole
+    period pool. Mirrors the $1 floor in mm.selector.reward_per_day."""
+    if pool_usd <= 0 or pool_seconds <= 0:
+        return 0.0
+    return float(pool_usd) * min(1.0, 86400.0 / float(pool_seconds))
 
 
 def program_window(tp: dict, event_ts: float | None, close_ts: float | None,
@@ -251,7 +277,7 @@ def program_window(tp: dict, event_ts: float | None, close_ts: float | None,
     if not period_allowed(period):
         return None
     start, end = _ts(tp.get("start")), _ts(tp.get("end"))
-    if period == "daily_event":
+    if period in DAILY_PERIODS:
         d0, d1 = et_day_bounds(now)
         ws = max(d0, start) if start is not None else d0
         we = min(d1, end) if end is not None else d1
@@ -447,7 +473,7 @@ def records_to_programs(records: list, meta: dict, *, now: float) -> tuple[list,
             if best is None or rate > best[0]:
                 best = (rate, tp, win, pool, df, target)
         if best is None:
-            if m is None and any(str(tp.get("period")) not in ("daily_event",) for tp in active):
+            if m is None and any(str(tp.get("period")) not in DAILY_PERIODS for tp in active):
                 need.append(slug)  # window may depend on endDate
                 bump("pending_meta")
             else:
@@ -457,6 +483,12 @@ def records_to_programs(records: list, meta: dict, *, now: float) -> tuple[list,
         period = str(tp.get("period"))
         if period in ("day_of", "live"):
             bump("sports_match" if (cat in SPORTS_CATEGORIES or not cat) else "event_window")
+            continue
+        if max_payable_usd(pool, pool_s) < MIN_PAYOUT_USD:
+            # Even 100% of this market's (split) pool for a full day / period
+            # is under PM US's $1 minimum payout: it can never pay, so it must
+            # not take a candidate slot (selector.reward_per_day zeroes it).
+            bump("below_min_payout")
             continue
         if m is None:
             need.append(slug)
