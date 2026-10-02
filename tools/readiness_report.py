@@ -76,6 +76,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -202,6 +203,21 @@ def read_alerts(paths) -> tuple[list, list, list]:
                 events.append({"ts": _ts(parts[0]), "origin": "engine", "level": parts[1].strip(),
                                "key": parts[2].strip(), "message": parts[3], "file": p})
     return events, read, errors
+
+
+def default_alert_logs() -> list:
+    """The watchdog's JSON-lines log, the engine's text log (monitor.alerts:
+    /var/lib/lip-maker/alerts-engine.log, or LIP_ENGINE_ALERT_LOG), and the
+    engine's older in-tree location (<repo>/logs/alerts.log, plus
+    <repo>.prev/... which deploy.sh leaves behind) for history written
+    before the move."""
+    out = [str(VAR / "alerts.log"), str(VAR / "alerts-engine.log")]
+    env = os.environ.get("LIP_ENGINE_ALERT_LOG")
+    if env and env not in out:
+        out.append(env)
+    out += [str(ROOT / "logs" / "alerts.log"),
+            str(ROOT.parent / (ROOT.name + ".prev") / "logs" / "alerts.log")]
+    return out
 
 
 # ---------------------------------------------------------------- helpers
@@ -471,8 +487,9 @@ def parse_args(argv=None):
     ap.add_argument("--watchdog-health", default=str(VAR / "watchdog_health.json"))
     ap.add_argument("--watchdog-state", default=str(VAR / "watchdog_state.json"))
     ap.add_argument("--alerts", action="append", default=None,
-                    help="alert log (repeatable; default /var/lib/lip-maker/alerts.log, "
-                         "<repo>/logs/alerts.log and <repo>.prev/logs/alerts.log)")
+                    help="alert log (repeatable; default /var/lib/lip-maker/alerts.log (watchdog), "
+                         "/var/lib/lip-maker/alerts-engine.log (engine; or LIP_ENGINE_ALERT_LOG), "
+                         "and the engine's older <repo>/logs/alerts.log and <repo>.prev/logs/alerts.log)")
     ap.add_argument("--min-days", type=int, default=14)
     ap.add_argument("--min-kalshi-fills", type=int, default=300)
     ap.add_argument("--min-settled", type=int, default=100)
@@ -507,10 +524,7 @@ def build_report(a) -> dict:
     state, state_err = _read_json(a.state)
     health, health_err = _read_json(a.watchdog_health)
     wd_state, _ = _read_json(a.watchdog_state)
-    # The engine's alerts (monitor.alerts) go to <repo>/logs/alerts.log, and
-    # deploy.sh moves the previous tree to <repo>.prev: read that copy too.
-    alerts = a.alerts or [str(VAR / "alerts.log"), str(ROOT / "logs" / "alerts.log"),
-                          str(ROOT.parent / (ROOT.name + ".prev") / "logs" / "alerts.log")]
+    alerts = a.alerts or default_alert_logs()
     events, alert_read, alert_err = read_alerts(_expand(alerts))
 
     criteria = [
