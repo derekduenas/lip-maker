@@ -23,6 +23,11 @@ TKR = "KXTEST-HARNESS"
 def _db(tmp_path):
     path = str(tmp_path / "harness.db")
     init_db(path)
+    # risk/sentinel.py now fails closed when daily_pnl_log is unreadable
+    # (2026-10-01); it used to treat the missing table as $0 P&L.
+    from tools.daily_pnl_snapshot import SCHEMA
+    with sqlite3.connect(path) as conn:
+        conn.executescript(SCHEMA)
     return path
 
 
