@@ -38,3 +38,16 @@ def test_dockerfile_python_matches_requirements_pins():
     reqs = (ROOT / "requirements.txt").read_text()
     assert "FROM python:3.13-slim" in docker
     assert "Python 3.13" in reqs
+
+
+def test_apex_readme_documents_operator_knobs():
+    text = (ROOT / "deploy/apex/README.md").read_text()
+    for needle in ("LIP_LOAD_DOTENV=1", "LIP_FORCE_PAPER", "LIP_STATE_FILE",
+                   "python -m mm.unattended --reset-kill"):
+        assert needle in text
+
+
+def test_session_gates_docstring_claims_no_unbacked_figures():
+    import mm.session_gates as g
+    for figure in ("7,035", "$924", "$238"):
+        assert figure not in g.__doc__

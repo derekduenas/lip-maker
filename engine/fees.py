@@ -14,7 +14,11 @@ headline metric:
     engine/maker_rebate_scorer.py:44  0.07 — sourced to GEMINI's docs, not
                                     Kalshi, despite the identical number
 
-Worse, `dislocation/spread.py:63-66` carries the comment
+(dislocation/ and engine/maker_rebate_scorer.py now live under
+_archive/2026-10-01/; the line numbers refer to those archived copies.)
+
+Worse, `dislocation/spread.py:63-66` (now _archive/2026-10-01/dislocation/)
+carries the comment
 
     fee = ceil(0.07 x C x P x (1-P)) cents per side
 

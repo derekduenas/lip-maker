@@ -326,7 +326,10 @@ def main() -> int:
     a = p.parse_args()
 
     # AUDIT FIX: chdir at main() start (was module-level — would mutate cwd
-    # of any future importer). KalshiClient .env loader needs cwd here.
+    # of any future importer). Relative paths below resolve from the repo
+    # root. The repo .env is not read from cwd: KalshiClient credentials come
+    # from the environment, or from the repo .env (absolute path) only when
+    # LIP_LOAD_DOTENV=1 (execution/kalshi_auth.maybe_load_repo_dotenv).
     os.chdir(str(Path(__file__).resolve().parent.parent))
 
     k = _kalshi_state()

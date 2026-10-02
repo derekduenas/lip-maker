@@ -7,7 +7,8 @@ metric: tools/net_yield_logger.py set `fees = 0.0` with the uncited comment
 used $0.01/$0.02 per contract and dislocation/config.py used 7% of value.
 Separately, dislocation/spread.py documented a per-fill ceiling to the next
 whole cent that was implemented nowhere — and for small maker fills that
-ceiling is the dominant term.
+ceiling is the dominant term. (dislocation/ has since been archived to
+_archive/2026-10-01/dislocation/.)
 """
 from __future__ import annotations
 
