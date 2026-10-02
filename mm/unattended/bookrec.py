@@ -19,6 +19,9 @@ file under LIP_RECORD_DIR (default /var/lib/lip-maker/recordings).
   filesystem has < LIP_RECORD_MIN_FREE_GB (10) free.
 * gzip is flushed (Z_SYNC_FLUSH) every LIP_RECORD_FLUSH_S (5 s): a crash
   loses at most a few seconds; readers tolerate a truncated tail.
+* ``stop(timeout)`` (default 5 s) writes the frames still queued before the
+  writer exits, for at most ``timeout`` seconds; what is left after that is
+  counted in ``dropped``. A SIGKILL / crash skips this (see above).
 """
 from __future__ import annotations
 
@@ -113,6 +116,7 @@ class FrameRecorder:
         self._last_flush = 0.0
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._drain_until = 0.0
 
     # caller thread -------------------------------------------------------
     def record(self, frame: dict) -> None:
@@ -138,9 +142,22 @@ class FrameRecorder:
         return self
 
     def stop(self, timeout: float = 5.0) -> None:
+        """Stop the writer after it has written the queued frames, waiting
+        at most ``timeout`` seconds for that; frames still queued then are
+        counted as dropped. The file is closed by the writer thread (or here
+        when no writer is running)."""
+        self._drain_until = time.time() + max(0.0, float(timeout))
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout)
+            self._thread.join(max(0.0, float(timeout)) + 1.0)
+            if self._thread.is_alive():
+                # Writer stuck (disk I/O): never close its file under it.
+                _log.warning("recorder writer did not stop within %.1fs; %d frames left queued",
+                             timeout, self.q.qsize())
+                return
+        left = self.q.qsize()
+        if left:
+            self.stats["dropped"] += left
         self._close()
 
     # writer thread -------------------------------------------------------
@@ -182,9 +199,11 @@ class FrameRecorder:
             return False
 
     def _run(self) -> None:
-        while not self._stop.is_set():
+        while True:
+            if self._stop.is_set() and (self.q.empty() or time.time() >= self._drain_until):
+                break
             try:
-                line = self.q.get(timeout=1.0)
+                line = self.q.get(timeout=0.05 if self._stop.is_set() else 1.0)
             except queue.Empty:
                 line = None
             now = time.time()

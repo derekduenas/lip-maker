@@ -36,8 +36,8 @@ class _Sock:
 
 
 def _drain_stop(rec, n_expected=None):
-    # FrameRecorder.stop() ends the writer loop without draining the queue;
-    # wait for the writer to take every queued line first.
+    # FrameRecorder.stop() drains the queue (bounded); waiting here as well
+    # keeps these tests independent of that bound.
     deadline = time.time() + 5
     while time.time() < deadline and (rec.q.qsize() or (
             n_expected is not None and rec.stats["frames"] < n_expected)):
