@@ -22,6 +22,8 @@ from mm.safety.supervisor import write_heartbeat
 from mm.unattended.health import render_daily_summary
 from mm.venues.kalshi_rest import PRODUCTION_HOSTS
 
+WS_RAW_TYPE = "ws_raw"   # mm.unattended.loop.WS_RAW_TYPE (the loop module is imported lazily here)
+
 
 class UnattendedRefused(RuntimeError):
     """This process will not start against production or with paper off."""
@@ -335,6 +337,12 @@ class _Engine:
 
     def on_frame(self, msg: dict) -> None:
         loop = self.loop
+        if str(msg.get("type") or "") == WS_RAW_TYPE:
+            # Raw websocket evidence (RunLoop ignores it): filtered to the
+            # markets this engine follows and serialised off loop.lock.
+            if self.rec is not None and loop.ws_raw_wanted(msg):
+                self.rec.record(msg)
+            return
         with loop.lock:
             if self.rec is not None:
                 self.rec.record(msg)

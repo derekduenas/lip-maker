@@ -465,6 +465,21 @@ class RunLoop:
         self.accruals[market] = acc
         self.open_seconds.setdefault(market, None)
 
+    def ws_raw_wanted(self, row: dict) -> bool:
+        """Keep a raw websocket evidence row (``_ws_raw_row``) in the frame
+        recording? Replies and seq_gap rows always. market_lifecycle_v2 (all
+        Kalshi markets, no ticker filter exists) only for a market with a
+        program, a position, a calibration watch or pending calibration
+        samples here, all its events included (determined/settled too).
+        Membership reads only: callable off loop.lock from the frame thread."""
+        if row.get("channel") != "market_lifecycle_v2":
+            return True
+        inner = row.get("msg") if isinstance(row.get("msg"), dict) else {}
+        body = inner.get("msg") if isinstance(inner.get("msg"), dict) else {}
+        m = str(body.get("market_ticker") or "")
+        return bool(m) and (m in self.programs or m in self.position or m in self.fv_calib_view
+                            or m in self.fv_calib.pending)
+
     def on_frame(self, row: dict) -> None:
         kind = str(row.get("kind") or row.get("type") or "")
         if kind == WS_RAW_TYPE:
