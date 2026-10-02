@@ -16,13 +16,19 @@ Every ``LIP_WD_INTERVAL_S`` (30s) it checks:
   * capital                       paper_capital_usd > LIP_WD_MAX_CAPITAL_USD (1500)
   * resting orders                resting_n > LIP_WD_MAX_RESTING (200)
   * engine-reported kill          status.kill set (alert only, not a trip by default)
+  * live mismatch                 status says live_armed (or mode live) but this watchdog's own
+                                  config is not armed -> TRIP + loud alert (it could not cancel)
 
 On trip (latched until ``--reset``):
   1. write the kill file (LIP_KILL_FILE, /var/lib/lip-maker/KILL); the engine
      checks it once per second and cancels all quotes / stops quoting;
-  2. cancel-all resting orders via the Kalshi API -- ONLY when live is armed
-     (LIP_WD_LIVE_ARMED=true and LIP_PAPER!=true and status.live_armed true).
-     Otherwise logged as a no-op. Idempotent; retried every tick until the
+  2. cancel-all resting orders via the Kalshi API -- ONLY when the watchdog's
+     own config is armed (LIP_WD_LIVE_ARMED=true and LIP_PAPER!=true in its
+     env) AND one of: status says live_armed, the persisted
+     ``engine_seen_live`` flag is set (any earlier status showed live; cleared
+     only by --reset; a corrupt state file counts as set), or /status is
+     unreachable (dead/hung engine). Config paper/unarmed -> never a real API
+     write, logged as a no-op. Idempotent; retried every tick until the
      API shows zero resting orders (fail-closed: latch stays, alerts repeat);
   3. alert (alerts.log + alert JSON; optional ntfy push), rate-limited.
 
@@ -92,6 +98,9 @@ class Config:
         self.alert_max_per_hour = int(_num(env, "LIP_WD_ALERT_MAX_PER_HOUR", 12))
         self.ntfy_topic = (env.get("LIP_WD_NTFY_TOPIC") or "").strip()
         self.ntfy_server = env.get("LIP_WD_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+        # The watchdog's OWN arming config. LIP_PAPER here comes from the
+        # watchdog's env file, not the engine's unit drop-in: the two can
+        # disagree, which evaluate() trips on (engine_live_watchdog_unarmed).
         self.live_flag = _truthy(env.get("LIP_WD_LIVE_ARMED"))
         self.paper_env = _truthy(env.get("LIP_PAPER", "true"))
         self.kalshi_rest = env.get("LIP_WD_KALSHI_REST", PROD_REST).rstrip("/")
@@ -113,8 +122,10 @@ def load_state(cfg: Config) -> dict:
     except FileNotFoundError:
         return {}
     except Exception:
-        # Corrupt state: fail closed -- treat as latched so a human looks.
-        return {"latched": True, "reasons": ["watchdog_state_corrupt"], "tripped_at": time.time()}
+        # Corrupt state: fail closed -- treat as latched so a human looks, and
+        # assume the engine may have been live (the persisted flag is lost).
+        return {"latched": True, "reasons": ["watchdog_state_corrupt"], "tripped_at": time.time(),
+                "engine_seen_live": "unknown:state_corrupt"}
 
 
 def save_state(cfg: Config, state: dict) -> None:
@@ -189,8 +200,14 @@ def daily_pnl(cfg: Config, state: dict, status: dict, now: float):
     return daily
 
 
+def engine_reports_live(status) -> bool:
+    """Engine /status says it is trading live (``live_armed`` true or ``mode`` live)."""
+    return isinstance(status, dict) and (status.get("live_armed") is True or status.get("mode") == "live")
+
+
 def evaluate(cfg: Config, state: dict, now: float, status, status_err, hb_ts):
-    """Return (reasons:list[str], info:dict). Pure apart from mutating state counters."""
+    """Return (reasons:list[str], info:dict). Pure apart from mutating state
+    counters and the persisted ``engine_seen_live`` flag."""
     reasons, info = [], {}
     # heartbeat
     if hb_ts is None:
@@ -262,6 +279,13 @@ def evaluate(cfg: Config, state: dict, now: float, status, status_err, hb_ts):
         if cfg.trip_on_engine_kill:
             reasons.append("engine_kill")
     info["live_armed_status"] = bool(status.get("live_armed"))
+    if engine_reports_live(status):
+        # Persisted until --reset: a later dead/hung engine keeps cancel-all armed.
+        state["engine_seen_live"] = state.get("engine_seen_live") or now
+        if not config_armed(cfg):
+            # Engine got LIP_PAPER=false from its own unit drop-in while the
+            # watchdog's env says paper/unarmed: the watchdog could not cancel.
+            reasons.append("engine_live_watchdog_unarmed")
     return reasons, info
 
 
@@ -308,10 +332,25 @@ def write_kill_file(cfg: Config, reasons, now) -> None:
          "by": "lip-watchdog"}, indent=1))
 
 
-def live_armed(cfg: Config, status) -> bool:
-    """All three must agree before any real API write."""
-    return bool(cfg.live_flag and not cfg.paper_env and isinstance(status, dict)
-                and status.get("live_armed") is True)
+def config_armed(cfg: Config) -> bool:
+    """The watchdog's own config allows real API writes (LIP_WD_LIVE_ARMED and not LIP_PAPER)."""
+    return bool(cfg.live_flag and not cfg.paper_env)
+
+
+def live_armed(cfg: Config, status, state=None) -> bool:
+    """Perform a real cancel-all?
+
+    Never unless the watchdog's own config is armed. Given that, yes when
+    the engine says it is live now, OR the persisted ``engine_seen_live``
+    flag is set (cleared only by --reset), OR /status is unreachable (a
+    dead or hung engine is exactly the case the watchdog exists for).
+    A reachable engine that reports paper and was never seen live: no.
+    """
+    if not config_armed(cfg):
+        return False
+    if not isinstance(status, dict):
+        return True
+    return engine_reports_live(status) or bool((state or {}).get("engine_seen_live"))
 
 
 class KalshiCanceller:
@@ -375,7 +414,7 @@ class KalshiCanceller:
 
 
 def cancel_all_action(cfg: Config, state: dict, status, now, canceller=None) -> dict:
-    if not live_armed(cfg, status):
+    if not live_armed(cfg, status, state):
         res = {"mode": "paper/noop", "ok": True, "note": "live not armed: cancel-all logged only", "ts": now}
         if not state.get("cancel_noop_logged"):
             log.warning("cancel-all: live not armed -> no-op (logged only)")
@@ -409,13 +448,22 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None) -> dict:
         alert(cfg, state, "trip", "TRIP", "lip-watchdog TRIPPED: " + "; ".join(reasons),
               {"reasons": reasons, "info": info}, now, force=True)
         state.setdefault("alert_last", {})["latched"] = now  # reminder starts after min interval
+    if "engine_live_watchdog_unarmed" in reasons:
+        if "engine_live_watchdog_unarmed" not in (state.get("reasons") or []):
+            state["reasons"] = list(state.get("reasons") or []) + ["engine_live_watchdog_unarmed"]
+        alert(cfg, state, "live_mismatch", "TRIP",
+              "ENGINE LIVE BUT WATCHDOG UNARMED: engine /status reports live_armed, but this watchdog "
+              f"has LIP_WD_LIVE_ARMED={cfg.live_flag} LIP_PAPER={cfg.paper_env} and cannot cancel orders. "
+              "Kill file written; fix the watchdog env (or stop the engine) now.",
+              {"info": info}, now, force=not state.get("live_mismatch_alerted"))
+        state["live_mismatch_alerted"] = True
     if state.get("latched"):
         try:
             if not cfg.kill_file.exists():
                 write_kill_file(cfg, state.get("reasons") or ["latched"], now)
         except Exception as exc:
             alert(cfg, state, "kill_file_failed", "TRIP", f"cannot write kill file: {exc}", None, now)
-        if not (state.get("cancel") or {}).get("ok") or live_armed(cfg, status):
+        if not (state.get("cancel") or {}).get("ok") or live_armed(cfg, status, state):
             cancel_all_action(cfg, state, status, now, canceller)
         alert(cfg, state, "latched", "LATCHED",
               "lip-watchdog still latched: " + "; ".join(state.get("reasons") or [])
@@ -427,7 +475,8 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None) -> dict:
     health = {"ts": now, "ok": not state.get("latched"), "latched": bool(state.get("latched")),
               "reasons_now": reasons, "trip_reasons": state.get("reasons") if state.get("latched") else [],
               "info": info, "cancel": state.get("cancel"), "kill_file": str(cfg.kill_file),
-              "kill_file_present": cfg.kill_file.exists(), "live_armed": live_armed(cfg, status),
+              "kill_file_present": cfg.kill_file.exists(), "live_armed": live_armed(cfg, status, state),
+              "config_armed": config_armed(cfg), "engine_seen_live": state.get("engine_seen_live"),
               "limits": {"heartbeat_stale_s": cfg.hb_stale_s, "feed_stale_s": cfg.feed_stale_s,
                          "daily_loss_usd": cfg.daily_loss, "max_inventory_usd": cfg.max_inventory,
                          "max_capital_usd": cfg.max_capital, "max_resting": cfg.max_resting},
