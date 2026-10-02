@@ -16,10 +16,12 @@ So for ~99% of series the global schedule charges a maker fee that does
 not exist (1.75c/contract at 50c), which makes the economic layer refuse
 markets for the wrong reason.
 
-Rates: taker 0.07 × M and maker 0.0175 × M come from third-party fee
-trackers (the official PDF sits behind a bot-check from this box), so they
-stay `verified=False`. The *fee_type* split is from the venue API and is the
-part this module relies on. Rounding: ceil to $0.000001 per fill (verified,
+Rates: taker 0.07 × M and maker 0.0175 × M (combo 0.035 × M) per the
+Kalshi fee schedule PDF effective 7 July 2026 (also quoted in
+mm/accounting.py). Schedules stay `verified=False` because the PDF could not
+be fetched from this box directly. The *fee_type* split is from the venue
+API. The 4th type, "flat" (Specific Trading Fees Table), is priced as a
+maker-fee series until its formula is verified (see FLAT_FEE_TYPE). Rounding: ceil to $0.000001 per fill (verified,
 docs.kalshi.com/getting_started/fee_rounding).
 
 Default OFF (settings.SERIES_FEES_ENABLED) because it makes paper economics
@@ -44,7 +46,16 @@ TAKER_BASE = Decimal("0.07")
 # 0.07 × 0.25 = 0.0175; 0.07 × 0.50 = 0.035.
 MAKER_BASE = Decimal("0.0175")
 MAKER_COMBO_BASE = Decimal("0.035")
-MAKER_FEE_TYPES = frozenset({"quadratic_with_maker_fees", "quadratic_with_combo_maker_fees"})
+# "flat": the 4th fee_type on GET /series ("'flat' is described by the
+# Specific Trading Fees Table", docs.kalshi.com get-series, fetched
+# 2026-10-01). That table could not be read from this box (the PDF is
+# blocked; a summary of the 7.7.26 PDF did not show it), so its formula is
+# NOT confirmed. ASSUMPTION (conservative): price "flat" series like
+# quadratic_with_maker_fees (maker 0.0175 x M, taker 0.07 x M), i.e. maker
+# fills are charged. Replace once the table is verified.
+FLAT_FEE_TYPE = "flat"
+MAKER_FEE_TYPES = frozenset({"quadratic_with_maker_fees", "quadratic_with_combo_maker_fees",
+                             FLAT_FEE_TYPE})
 KNOWN_FEE_TYPES = MAKER_FEE_TYPES | {"quadratic"}
 
 
@@ -63,8 +74,12 @@ class SeriesFeeSchedule:
 
     @property
     def source(self) -> str:
-        return ("fee_type/fee_multiplier from Kalshi /series API; base rates "
-                "0.07 taker / 0.0175 maker from trackers (unverified)")
+        src = ("fee_type/fee_multiplier from Kalshi /series API; base rates "
+               "0.07 taker / 0.0175 maker from the fee schedule PDF (7.7.26)")
+        if self.fee_type == FLAT_FEE_TYPE:
+            src += ("; 'flat' (Specific Trading Fees Table) formula unverified, "
+                    "priced as quadratic_with_maker_fees")
+        return src
 
     @property
     def maker_charged(self) -> bool:
@@ -73,7 +88,7 @@ class SeriesFeeSchedule:
     def _maker_base(self) -> Decimal:
         if self.fee_type == "quadratic_with_combo_maker_fees":
             return MAKER_COMBO_BASE
-        if self.fee_type == "quadratic_with_maker_fees":
+        if self.fee_type in ("quadratic_with_maker_fees", FLAT_FEE_TYPE):
             return MAKER_BASE
         return Decimal("0")
 

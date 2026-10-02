@@ -120,8 +120,29 @@ def _relative(path: str) -> str:
     return bare
 
 
+# Percent-encodings of '/', '\\', '.' and of '%' itself (double encoding).
+_ENCODED_UNSAFE = ("%2f", "%5c", "%2e", "%25")
+
+
+def path_has_traversal(path: str) -> bool:
+    """True when the PATH part (before '?'/'#') could escape an allowlisted
+    prefix once a server or proxy normalises it: a '.' or '..' segment, a
+    backslash, or a percent-encoded '/', '\\', '.' or '%'. The query string
+    is not inspected (it cannot change the route, and page tokens there are
+    legitimately percent-encoded)."""
+    bare = str(path or "").split("#", 1)[0].split("?", 1)[0]
+    if "\\" in bare:
+        return True
+    low = bare.lower()
+    if any(enc in low for enc in _ENCODED_UNSAFE):
+        return True
+    return any(seg in (".", "..") for seg in bare.split("/"))
+
+
 def get_allowed(path: str) -> bool:
-    """True only for the public market-data GETs."""
+    """True only for the public market-data GETs (never a traversal path)."""
+    if path_has_traversal(path):
+        return False
     rel = _relative(path).lower()
     if any(snippet in rel for snippet in _FORBIDDEN_SNIPPETS):
         return False

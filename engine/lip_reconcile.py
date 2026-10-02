@@ -199,6 +199,11 @@ def infer_reward_credits(*, balance_delta_usd, fills_cash_usd=0,
     A residual at or below zero is not a reward. A positive residual is
     split by ``shares`` (per-market estimated dollars) and marked inferred.
     ``INFERRED_SOURCE`` is not a member of ``PAID_SOURCES``.
+
+    The split is pro-rata to OUR estimates, so every market gets the same
+    paid/estimate ratio: the credits carry no per-series information and
+    are marked ``calibration_eligible: False``
+    (engine.lip_calibration.series_factors drops inferred rows).
     """
     if INFERRED_SOURCE in PAID_SOURCES:
         raise RuntimeError("inferred rewards must stay out of PAID_SOURCES")
@@ -211,6 +216,7 @@ def infer_reward_credits(*, balance_delta_usd, fills_cash_usd=0,
         "residual_usd": format(residual, "f"),
         "credits": [],
         "unattributed_usd": "0",
+        "calibration_eligible": False,
     }
     if residual <= 0:
         return out
@@ -235,6 +241,7 @@ def infer_reward_credits(*, balance_delta_usd, fills_cash_usd=0,
             "amount_usd": format(amount, "f"),
             "source": INFERRED_SOURCE,
             "inferred": True,
+            "calibration_eligible": False,
             "kind": "inferred_reward",
         })
     out["credits"] = credits

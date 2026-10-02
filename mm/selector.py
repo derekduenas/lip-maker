@@ -7,8 +7,12 @@ floor are ``kalshi_period_payout``. A caller may pass a per-series
 multiplier from matched paid/estimate ratios. The default multiplier is 1.
 This module does not fit a factor to April or May 2026 payouts.
 
-Polymarket US ranking waits. A caller that asks for it is told so and
-is not scored with the repeated reward-pool figure.
+Polymarket US markets (``venue="pmus"``) ARE scored here, by the same
+``quote_economics`` path: PM US reward rules (``ProgramParams.rules ==
+"pmus"``), reward-optimal rungs (``pmus_side_rung``) and the maker rebate.
+Their pool is the per-member split decided by
+polymarket/engine/pm_us_lip_scorer.split_pool_usd (applied upstream in
+mm/unattended/pmus_paper.records_to_programs).
 
 Our size is merged into the book before the share is computed, and the
 same size is passed as our quotes. The quote price is the LIP reference
@@ -123,7 +127,7 @@ class KalshiMarket:
     target_size: float
     yes_bids: list[tuple[int, float]] = field(default_factory=list)
     no_bids: list[tuple[int, float]] = field(default_factory=list)
-    fee_type: str = "quadratic"
+    fee_type: str = "quadratic_with_maker_fees"
     fee_multiplier: float = 1.0
     days_to_settle: float | None = 1.0
     has_reference: bool = False
@@ -179,7 +183,8 @@ class Selection:
 
 
 def defer_polymarket(market: str) -> tuple[str, str]:
-    """PM US selection is a later round. Do not score the repeated pool."""
+    """Legacy (pre-Patch 21) marker, kept for old callers/tests. The unattended
+    loop scores PM US through ``quote_economics``; nothing live calls this."""
     return market, "pm_us_deferred"
 
 
@@ -317,15 +322,22 @@ def side_rungs(market: KalshiMarket, size: float, *, fallback_touch: bool = True
             touch(market.no_bids) if no_ref is None else no_ref)
 
 
-def maker_fee_usd(market: KalshiMarket, price_cents: int) -> float:
-    """Per-contract maker fee (negative = rebate) for one fill.
+def maker_fee_usd(market: KalshiMarket, price_cents: int, fill_size: float = 1.0) -> float:
+    """Per-contract maker fee (negative = rebate) for one fill of ``fill_size``.
 
-    PM US: maker REBATE 0.0125 x C x p x (1-p), paid at the trade, banker's
-    rounded per fill (https://docs.polymarket.us/fees, effective 10 AM ET
-    2026-10-01). Kalshi: the series fee schedule (kalshi_fee_usd)."""
+    PM US: maker REBATE 0.0125 x C x p x (1-p), banker's rounded to $0.01 PER
+    FILL (https://docs.polymarket.us/fees; the rebate is effective 12 AM ET
+    25 Sept 2026 - the 10 AM ET 1 Oct 2026 change is the combo taker fee).
+    The rounded fill rebate (mm.accounting.pm_us_maker_rebate_usd) is spread
+    over the fill's contracts, so small fills earn nothing (1 contract at 50c
+    rounds $0.003125 to $0.00). Kalshi: the series fee schedule
+    (kalshi_fee_usd), whose ceil-to-$0.000001 rounding is per contract here."""
     if market.venue == "pmus":
-        p = int(price_cents) / 100.0
-        return -0.0125 * p * (1.0 - p) if 0 < p < 1 else 0.0
+        size = float(fill_size)
+        if size <= 0:
+            return 0.0
+        from mm.accounting import pm_us_maker_rebate_usd
+        return -float(pm_us_maker_rebate_usd(int(price_cents), size)) / size
     from decimal import Decimal as _D
     mult = _D(str(market.fee_multiplier if market.fee_multiplier is not None else 1))
     try:
@@ -425,9 +437,15 @@ def quote_economics(market: KalshiMarket, size: float, *,
     fraction = FILL_FRACTION_PER_DAY.get(family, FILL_FRACTION_PER_DAY["event"])
     fills_side = size * fraction
     mo = markout_cents(market)
+    # The ONE base adverse-selection charge. screen.rank_score's
+    # rank_penalty_per_day (subtracted by RunLoop) adds only the
+    # volume/time/news increment on top of this, never the prior again.
     as_cost = -(mo / 100.0) * (fills_side * 2.0)
-    fee = maker_fee_usd(market, yes_cents) * fills_side
-    fee += maker_fee_usd(market, no_cents) * fills_side
+    # PM US rebate is rounded per fill: expected fill = one side's expected
+    # daily fill volume (fills_side), never more than our resting size.
+    fill_size = min(float(size), fills_side) if fills_side > 0 else 0.0
+    fee = maker_fee_usd(market, yes_cents, fill_size) * fills_side
+    fee += maker_fee_usd(market, no_cents, fill_size) * fills_side
     days = market.days_to_settle or 0.0
     cheap = family in ("commodity", "crypto") or market.has_reference or (
         family == "weather" and market.has_observation)
@@ -436,7 +454,7 @@ def quote_economics(market: KalshiMarket, size: float, *,
         if holding_model() == "carry":
             # Capital carry: each day's fills lock their premium until close,
             # charged at LIP_CARRY_APR. Markout/adverse selection is the
-            # separate as_cost term (and the screen's days-shrinking penalty).
+            # separate as_cost term (plus the screen's multiplier increment).
             locked = fills_side * (yes_cents + no_cents) / 100.0
             holding = carry_apr() / 365.0 * (days - 1.0) * locked
         else:
@@ -812,9 +830,15 @@ def demo_selection() -> Selection:
                     per_market_usd=100, per_series_usd=200, per_category_usd=300)
 
 
+# ---------------------------------------------------------------------------
+# NOT USED BY THE LIVE/PAPER LOOP. ``PMQuote`` / ``pm_quote_economics`` /
+# ``rank_cross_venue`` are a research/test-only side path (tests/test_compound_pm,
+# tests/test_audit_fixes). The paper loop scores PM US through
+# ``quote_economics`` above. Both use the same pool rule
+# (pm_us_lip_scorer.split_pool_usd, LIP_PMUS_POOL_SPLIT).
 @dataclass
 class PMQuote:
-    """One PM US market scored with the shared program pool.
+    """One PM US market scored with the shared program pool (test/research only).
 
     ``reward_pool_usd`` is the figure the gateway repeats. ``n_markets`` is
     the member count that figure is divided by. Fills are expected contracts
@@ -842,12 +866,14 @@ class PMQuote:
 def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, float]:
     """Return net $/day, capital, $/day per $, reward $/day, rebate $/day.
 
-    Presence is the whole period at the current snapshot share. The pool
-    is the effective (shared) pool. ``payable`` is not applied: the $1
-    unit on PM US is not verified.
+    Test/research only (see the note above ``PMQuote``). Presence is the
+    whole period at the current snapshot share. The pool follows
+    ``split_pool_usd`` (default: divided by ``n_markets``), the same rule as
+    the paper feed. ``payable`` is not applied: the $1 unit on PM US is not
+    verified.
     """
     from polymarket.engine.pm_us_lip_scorer import (
-        Order, effective_reward_pool_usd, score_snapshot,
+        Order, score_snapshot, split_pool_usd,
     )
     from mm.accounting import pm_us_maker_rebate_usd
 
@@ -859,7 +885,7 @@ def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, floa
         bids, asks, tick=quote.tick, discount_factor=quote.discount_factor,
         target_size=quote.target_size, max_spread_usd=quote.max_spread_usd,
     )
-    effective = effective_reward_pool_usd(quote.reward_pool_usd, quote.n_markets)
+    effective = split_pool_usd(quote.reward_pool_usd, quote.n_markets)
     days = quote.period_seconds / 86400.0
     reward = (effective * snap.our_share / days) if days > 0 else 0.0
     rebate = float(pm_us_maker_rebate_usd(quote.fill_price_cents, quote.fill_contracts))
@@ -872,7 +898,7 @@ def pm_quote_economics(quote: PMQuote) -> tuple[float, float, float, float, floa
 def rank_cross_venue(kalshi: list[KalshiMarket], pm: list[PMQuote], *,
                      kalshi_size: float = 100.0,
                      series_factors: dict[str, float] | None = None) -> list[tuple[str, str, float]]:
-    """Kalshi and PM US together, best net $/day per $ first.
+    """Kalshi and PM US together, best net $/day per $ first (test/research only).
 
     Kalshi uses ``quote_economics``. PM uses the shared pool and the
     per-fill maker rebate. Fees on Kalshi come from the series fee type

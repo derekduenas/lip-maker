@@ -18,9 +18,11 @@ def test_long_yes_raises_no_and_backs_off_yes():
     assert out["reward_loss"] == 0.5
 
 
-def test_small_inventory_only_moves_reducing_side():
+def test_small_inventory_moves_both_sides_one_tick():
+    # ceil on both sides: any inventory backs the adding side off one tick
+    # (floor used to leave it untouched until the cap).
     out = S.skew_prices(40, 55, net_yes=-5, frac=0.2, best_yes=40, best_no=55, df=0.5, params=P)
-    assert out["yes_cents"] == 41 and out["no_cents"] == 55 and out["back"] == 0
+    assert out["yes_cents"] == 41 and out["no_cents"] == 54 and out["back"] == 1
 
 
 def test_never_crosses_the_book():
@@ -53,9 +55,9 @@ def test_fill_requotes_with_skew_instead_of_cooldown(monkeypatch):
     loop._note_fill({"market_ticker": "KXA-26DEC-T1", "side": "yes", "count": 20, "price_cents": 40},
                     T0 + 5)
     q = loop.resting["KXA-26DEC-T1"]
-    # $8 of $25 cap => frac .32: NO +1 tick, YES kept (no back-off below 1.0 frac)
+    # $8 of $25 cap => frac .32: NO +1 tick, YES backed off 1 tick (ceil)
     assert q["yes"] > 0 and q["no"] > 0
-    assert q["no_cents"] == 56 and q["yes_cents"] == 40
+    assert q["no_cents"] == 56 and q["yes_cents"] == 39
     assert loop._side_blocked("KXA-26DEC-T1", "yes", T0 + 100) == ""
     assert loop.skew_stats["requotes"] == 1
     assert loop._skew_status()["skewed_now"] == 1

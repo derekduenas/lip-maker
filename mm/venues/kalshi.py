@@ -49,7 +49,23 @@ CREATE_TOKENS = 10.0
 
 
 def _to_cents(price) -> int:
-    return dollars_to_cents(price) if float(price) <= 1.5 else int(price)
+    """Order-row price -> cents, by TYPE, not magnitude.
+
+    int (legacy ``yes_price`` / ``no_price``) is already cents, so 1 is 1c
+    (a magnitude test read it as $1 = 100c). A float, or a str/Decimal with
+    a decimal point or exponent (``*_dollars`` fixed-point), is dollars and
+    must lie in [0, 1]. An integer string is cents. Anything else raises."""
+    if isinstance(price, bool):
+        raise TypeError("price must not be a bool")
+    if isinstance(price, int):
+        return int(price)
+    txt = str(price).strip()
+    if isinstance(price, float) or "." in txt or "e" in txt.lower():
+        value = float(txt)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"dollar price out of range: {price!r}")
+        return dollars_to_cents(value)
+    return int(txt)
 
 
 def _fp(value, default: float = 0.0) -> float:
