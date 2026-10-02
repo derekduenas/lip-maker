@@ -96,8 +96,9 @@ last-change time is unverified, and the latter would make every quiet book
 look stale. LIP_PMUS_TS_SOURCE=local ignores the headers.
 
 ORDER ENDPOINTS ARE HARD-DISABLED: the only HTTP client here is GET-only
-with a path allowlist (incentives, market book/bbo, market by slug) and any
-path containing "order" is refused (PMUSOrderBlocked). No API key is loaded.
+with a path allowlist (incentives, market book/bbo, market by slug); any
+path containing "order", a "."/".." segment, a backslash or a
+percent-encoded "/", "\\", "." or "%" is refused (PMUSOrderBlocked). No API key is loaded.
 RunLoop additionally refuses any non-paper action on a pmus market.
 """
 from __future__ import annotations
@@ -140,9 +141,10 @@ def enabled() -> bool:
 
 
 def check_request(method: str, path: str) -> None:
+    from mm.venues.readonly import path_has_traversal
     if str(method).upper() != "GET":
         raise PMUSOrderBlocked(f"pmus paper: {method} refused (read-only)")
-    if "order" in path.lower() or not any(rx.match(path) for rx in _ALLOWED):
+    if "order" in path.lower() or path_has_traversal(path) or not any(rx.match(path) for rx in _ALLOWED):
         raise PMUSOrderBlocked(f"pmus paper: path not allowlisted: {path[:80]}")
 
 

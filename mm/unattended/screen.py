@@ -220,11 +220,17 @@ class MetaCache:
                           or now - float(self.series[s].get("fetched") or 0) > SERIES_TTL_S)]
 
     def fetch_series(self, reader, names) -> int:
-        from mm.venues.readonly import ReadOnlyHTTPError
+        from mm.venues.readonly import ReadOnlyHTTPError, path_has_traversal
         got = 0
         for s in names:
+            path = f"/series/{quote(s, safe='')}"
+            if path_has_traversal(path):
+                # the read-only transport would refuse (and exit); skip the name
+                self.failures += 1
+                _log.warning("series name not fetchable read-only: %r", s[:40])
+                continue
             try:
-                payload = reader.get(f"/series/{quote(s, safe='')}")
+                payload = reader.get(path)
             except ReadOnlyHTTPError as exc:
                 self.failures += 1
                 if exc.status == 404:

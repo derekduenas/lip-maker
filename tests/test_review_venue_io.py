@@ -90,3 +90,51 @@ def test_paper_fills_seen_trades_is_bounded():
     sim.apply_trades(trades[-10:])  # recent ids still de-duplicated
     assert sim.trades_observed == 500
     assert PF.PaperFillSimulator().seen_trades_max == PF.SEEN_TRADES_MAX
+
+
+# ------------------------------------------------------------------ item 13
+@pytest.mark.parametrize("path", [
+    "/markets/../portfolio/balance", "/markets/..", "/series/./x", "/markets/%2e%2e/orders",
+    "/markets/KX%2FA", "/markets/KX%2fA/orderbook", "/markets/KX%5CA", "/markets/KX\\A",
+    "/events/%2E%2E", "/markets/KX%252FA", "/trade-api/v2/markets/../exchange/status",
+])
+def test_readonly_allowlist_rejects_traversal(path):
+    from mm.venues.readonly import get_allowed
+    assert get_allowed(path) is False
+
+
+def test_readonly_allowlist_still_accepts_public_routes():
+    from mm.venues.readonly import get_allowed
+    for path in ("/markets", "/markets/KXA-26DEC-T1", "/markets/KXA-26DEC-T1/orderbook",
+                 "/series/KXA", "/events/KXA-26DEC", "/incentive_programs", "/exchange/status",
+                 "/markets?tickers=A,B&limit=1000", "/trade-api/v2/markets/trades"):
+        assert get_allowed(path) is True, path
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/markets/../book", "/v1/markets/./book", "/v1/market/slug/..",
+    "/v1/markets/a%2Fb/book", "/v1/markets/a\\b/book",
+])
+def test_pmus_allowlist_rejects_traversal(path):
+    from mm.unattended import pmus_paper as P
+    with pytest.raises(P.PMUSOrderBlocked):
+        P.check_request("GET", path)
+
+
+def test_pmus_allowlist_keeps_encoded_page_tokens():
+    from mm.unattended import pmus_paper as P
+    P.check_request("GET", "/v1/incentives?page_size=100&statuses=active&page_token=ab%2Fcd%3D%3D")
+    P.check_request("GET", "/v1/markets/rtc-x-2026-10-01-abc/book")
+
+
+def test_screen_skips_series_names_the_reader_would_refuse():
+    from mm.unattended.screen import MetaCache
+    calls = []
+
+    class _Reader:
+        def get(self, path, params=None):
+            calls.append(path)
+            return {"series": {"category": "Economics", "fee_type": "quadratic"}}
+    c = MetaCache(path="/nonexistent/x.json", sleep=lambda s: None)
+    assert c.fetch_series(_Reader(), ["..", "a/b", "KXOK"]) == 1
+    assert calls == ["/series/KXOK"] and c.failures == 2
