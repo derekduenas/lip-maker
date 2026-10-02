@@ -382,7 +382,7 @@ def test_cache_prices_kxhigh_even_when_polymarket_fails(monkeypatch):
     with pytest.raises(RuntimeError):
         cache.refresh([MKT, "KXHIGHNY-26OCT01-T73", "KXHIGHLAX-26OCT01-B72.5"])
     row = cache.values[MKT]
-    assert row["source"] == W.SOURCE and 60 < row["fv_cents"] < 75
+    assert row["source"] == W.SOURCE and 35 < row["fv_cents"] < 75   # kernel sd default 1.75 F
     # no hint for the threshold market: strike fields came from the public market fetch
     assert cache.values["KXHIGHNY-26OCT01-T73"]["fv_cents"] < 50
     assert "KXHIGHLAX-26OCT01-B72.5" not in cache.values

@@ -103,10 +103,10 @@ def test_bias_inflation_and_threshold_complement():
 def test_observation_floor_moves_mass_up():
     vals = [70.0] * 10
     assert W.bucket_prob(vals, None, 71, sd=1.0) > 0.8
-    floored = W.bucket_prob(vals, None, 71, sd=1.0, floor_f=74.6)
+    # observed 74.6 F prints as 75 in the CLI: the floor is that whole degree
+    floored = W.bucket_prob(vals, None, 71, sd=1.0, floor_f=W.cli_round_f(74.6))
     assert floored == 0.0
-    # the floor value itself rounds into its bucket: 74.6 -> 75
-    assert W.bucket_prob(vals, 74, 75, sd=1.0, floor_f=74.6) == pytest.approx(1.0)
+    assert W.bucket_prob(vals, 74, 75, sd=1.0, floor_f=75) == pytest.approx(1.0)
 
 
 def test_clip_and_bad_inputs():
@@ -210,12 +210,13 @@ def test_model_prices_bucket_and_documents_request():
     now = _utc(2026, 9, 30, 15)
     row = m.fv_for("KXHIGHNY-26OCT01-B72.5", META_B, now=now)
     assert row["source"] == W.SOURCE and row["members"] == 30
-    assert row["fv_cents"] == pytest.approx(round(math.erf(1 / math.sqrt(2)) * 100, 2))
+    # unfitted default kernel sd 1.75 F (identical members: inflation has no effect)
+    assert row["fv_cents"] == pytest.approx(round(math.erf(1 / 1.75 / math.sqrt(2)) * 100, 2))
     assert row["lead_h"] == pytest.approx(38.0) and 0 < row["conf"] < 1
     url, params, _h, timeout = http.calls[0]
     assert url == "https://ensemble-api.open-meteo.com/v1/ensemble"
     assert params == {"latitude": "40.7833", "longitude": "-73.9667", "hourly": "temperature_2m",
-                      "models": "gfs_seamless,ecmwf_ifs025", "temperature_unit": "fahrenheit",
+                      "models": "gfs025,ecmwf_ifs025", "temperature_unit": "fahrenheit",
                       "timezone": "GMT", "start_date": "2026-10-01", "end_date": "2026-10-02"}
     assert timeout == 15.0
     # cached: a second call in the TTL does not refetch
@@ -247,17 +248,13 @@ def test_model_uses_observation_floor_and_user_agent():
     assert obs_call[2]["User-Agent"]
 
 
-def test_model_obs_failure_lowers_confidence_no_floor():
+def test_model_obs_failure_on_a_started_day_prices_nothing():
+    # The remaining-hours member max alone would ignore the hours already past.
     http = _Http(ens=_ens([70.0] * 30), raise_obs=True)
     m = W.WeatherHighModel(http)
     now = _utc(2026, 10, 1, 20)
-    row = m.fv_for("KXHIGHNY-26OCT01-T71", {"strike_type": "less", "cap_strike": 71}, now=now)
-    assert row["obs_status"] == "failed" and row["fv_cents"] > 50
-    ok = W.WeatherHighModel(_Http(ens=_ens([70.0] * 30), obs={"features": [
-        {"properties": {"timestamp": "2026-10-01T10:00:00+00:00",
-                        "temperature": {"value": 20.0, "unitCode": "wmoUnit:degC"}}}]}))
-    assert row["conf"] == pytest.approx(ok.fv_for("KXHIGHNY-26OCT01-T71", {"strike_type": "less", "cap_strike": 71},
-                                                 now=now)["conf"] * 0.5, abs=1e-3)
+    assert m.fv_for("KXHIGHNY-26OCT01-T71", {"strike_type": "less", "cap_strike": 71}, now=now) is None
+    assert m.stats["no_obs"] == 1
 
 
 @pytest.mark.parametrize("market,meta", [
@@ -291,8 +288,9 @@ def test_model_after_window_uses_observed_max_only():
     m = W.WeatherHighModel(http)
     row = m.fv_for("KXHIGHNY-26OCT01-B75.5", {"strike_type": "between", "floor_strike": 75, "cap_strike": 76},
                    now=_utc(2026, 10, 2, 6))
-    # observed 75.92F floors at 75.42; kernel sd 1 above it: P(74.5 <= T < 76.5) = Phi(0.58)
-    assert row["fv_cents"] == pytest.approx(100 * 0.5 * (1 + math.erf(0.58 / math.sqrt(2))), abs=0.01)
+    # observed 75.92F prints as 76: mass below 75.5 goes to 76 (0.9) and 75
+    # (0.1), both in 75-76; kernel sd 1.75 above: P = Phi((76.5 - 75.92) / 1.75)
+    assert row["fv_cents"] == pytest.approx(100 * 0.5 * (1 + math.erf(0.58 / 1.75 / math.sqrt(2))), abs=0.01)
     assert row["lead_h"] == 0
     low = m.fv_for("KXHIGHNY-26OCT01-T75", {"strike_type": "less", "cap_strike": 75}, now=_utc(2026, 10, 2, 6))
     assert low["fv_cents"] == 1.0

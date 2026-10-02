@@ -43,31 +43,55 @@ Model
 -----
 1. Open-Meteo Ensemble API (free, no key; https://open-meteo.com/en/docs/ensemble-api):
    GET https://ensemble-api.open-meteo.com/v1/ensemble?latitude=40.7833&longitude=-73.9667
-       &hourly=temperature_2m&models=gfs_seamless,ecmwf_ifs025
+       &hourly=temperature_2m&models=gfs025,ecmwf_ifs025
        &temperature_unit=fahrenheit&timezone=GMT&start_date=2026-10-01&end_date=2026-10-02
+   Model identifiers (``LIP_FV_WX_MODELS``, default ``gfs025,ecmwf_ifs025``)
+   are the ones the ensemble docs list (checked 2026-10-01: "GFS Ensemble
+   0.25°" gfs025, 31 members, 3-hourly; "IFS 0.25°" ecmwf_ifs025, 51
+   members, 3-hourly). The docs state "all data is interpolated to a
+   1-hourly time-step resolution"; no ensemble-API parameter for native
+   3-hourly output is documented, so hourly values between the native
+   3-hourly steps are interpolated and each member's max UNDER-READS the
+   afternoon peak. That warm bias is what the per-station ``bias_f`` is for:
+   it is NOT set here (default 0) and must be fitted from settled samples
+   (tools/fit_fv_weather.py). Free-tier terms (https://open-meteo.com/en/terms):
+   non-commercial use only; review before any live use.
    Every ``temperature_2m`` / ``temperature_2m_memberNN`` series (suffixed
    with the model name when several models are asked for) is one member.
    Each member's value is its max over the hourly values inside the
    settlement window (or, once the day has started, over the remaining
-   hours; see 2). Hourly instants under-read the true max between hours:
-   that is what the per-station ``bias_f`` is for (default 0, to be fitted).
+   hours; see 2).
 2. Same-day observations, once the window has started:
    GET https://api.weather.gov/stations/KNYC/observations?start=2026-10-01T05:00:00Z
    (User-Agent required: https://weather.gov/documentation/services-web-api).
-   The max observed so far minus ``LIP_FV_WX_OBS_MARGIN_F`` (0.5 F: hourly
-   METAR values converted from Celsius can round above the CLI value) floors
-   the distribution: probability mass below it is moved onto it.
+   Values usually come in degC with 0.1 precision; they are converted to F
+   and rounded to 0.01 F (float noise) before ``cli_round_f`` rounds the max
+   so far to the whole degree the CLI would print (half up: 75.92 F -> 76).
+   The day's CLI max is at least that value, so forecast mass below it is
+   placed ON it, except a small explicit share ``LIP_FV_WX_OBS_SLIP`` (0.1,
+   at most 0.5) placed one degree lower: the CLI max comes from the ASOS
+   1-minute record and can differ from the converted hourly/5-minute value
+   by that much (rounding of the 0.1 degC value, sensor/report differences).
+   Once the window has started and NO valid observation is available (fetch
+   failure or none in the window yet) the market gets no fair value (fail
+   closed): the remaining-hours member max alone would ignore the part of
+   the day already past.
 3. Members -> probability: mean-preserving spread inflation, bias shift,
-   Gaussian kernel (sd ``kernel_sd_f``, default 1.0 F) around each member,
-   integer rounding exactly as the CLI reports (whole F: the market's integer
-   range [lo, hi] is the continuous interval [lo - 0.5, hi + 0.5)), averaged
-   over members and clipped to [0.01, 0.99].
-4. Confidence in [0, 1]: lower for long lead times, few members, and a
-   failed observation fetch on a started day (``confidence``).
+   Gaussian kernel (sd ``kernel_sd_f``) around each member, integer
+   rounding exactly as the CLI reports (whole F: the market's integer range
+   [lo, hi] is the continuous interval [lo - 0.5, hi + 0.5)), averaged over
+   members and clipped to [0.01, 0.99].
+4. Confidence in [0, 1]: lower for long lead times and few members
+   (``confidence``).
 
+Unfitted defaults are deliberately wide: inflation 1.4, kernel sd 1.75 F
+(``LIP_FV_WX_KERNEL_SD``), bias 0 (not a fitted number: to be fitted).
 Per-station parameters come from the JSON file ``LIP_FV_WX_PARAMS_FILE``
-({"KXHIGHNY": {"bias_f": 0.0, "inflation": 1.0, "kernel_sd_f": 1.0}}), so
-they can be fitted later; an unreadable file means no weather fair value.
+({"KXHIGHNY": {"bias_f": 0.0, "inflation": 1.4, "kernel_sd_f": 1.75}},
+written by tools/fit_fv_weather.py); a path that is set but unreadable means
+no weather fair value; no path means the defaults. Every row carries
+``ens`` (mean, sd and count of the member maxes, the observation floor
+used) and ``params`` so the calibration samples can be refitted later.
 """
 from __future__ import annotations
 
@@ -85,7 +109,7 @@ log = logging.getLogger("lip.fairvalue")
 SOURCE = "open_meteo_ensemble_high"
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 NWS_OBS_URL = "https://api.weather.gov/stations/{station}/observations"
-DEFAULT_MODELS = "gfs_seamless,ecmwf_ifs025"
+DEFAULT_MODELS = "gfs025,ecmwf_ifs025"   # ids listed on open-meteo.com/en/docs/ensemble-api
 DEFAULT_USER_AGENT = "(lip-maker paper fair value, github.com/derekduenas/lip-maker)"
 P_MIN, P_MAX = 0.01, 0.99
 
@@ -250,29 +274,63 @@ def _phi(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def cli_round_f(x: float) -> int:
+    """The whole degree F the CLI prints for a value: rounded to 0.01 F first
+    (degC -> F conversion leaves float noise, 24.4 C -> 75.91999...), then
+    half up (75.5 -> 76)."""
+    return int(math.floor(round(float(x), 2) + 0.5))
+
+
+def obs_slip() -> float:
+    """LIP_FV_WX_OBS_SLIP (0.1, clamped to [0, 0.5]): share of the mass below
+    the observed CLI value placed one degree lower (ASOS -> CLI difference)."""
+    return min(0.5, max(0.0, _env("LIP_FV_WX_OBS_SLIP", 0.1)))
+
+
 def bucket_prob(values: list[float], lo: int | None, hi: int | None, *, sd: float = 1.0,
-                bias: float = 0.0, inflation: float = 1.0, floor_f: float | None = None) -> float:
+                bias: float = 0.0, inflation: float = 1.0, floor_f: int | None = None,
+                floor_slip: float = 0.0) -> float:
     """P(lo <= CLI max <= hi), unclipped. Each member v is shifted to
     mean + inflation x (v - mean) + bias and smoothed with N(., sd); the CLI
-    integer k collects [k - 0.5, k + 0.5). Mass below ``floor_f`` is moved
-    onto ``floor_f`` (the observed max so far)."""
+    integer k collects [k - 0.5, k + 0.5).
+
+    ``floor_f``: the observed max so far as the whole degree the CLI would
+    print (``cli_round_f``). The CLI max cannot be below it, so a member's
+    mass below floor_f - 0.5 is placed on floor_f, except the share
+    ``floor_slip`` placed on floor_f - 1 (ASOS -> CLI difference)."""
     if not values:
         raise ValueError("no members")
     if not sd > 0:
         raise ValueError("kernel sd must be > 0")
+    if floor_f is not None and float(floor_f) != math.floor(float(floor_f)):
+        raise ValueError("floor_f must be a whole degree (cli_round_f)")
     mean = sum(values) / len(values)
+    lo_x = -math.inf if lo is None else lo - 0.5
+    hi_x = math.inf if hi is None else hi + 0.5
+
+    def inside(k: int) -> bool:
+        return (lo is None or k >= lo) and (hi is None or k <= hi)
 
     def cdf(x: float, mu: float) -> float:
-        if floor_f is not None and x <= floor_f:
+        if x == math.inf:
+            return 1.0
+        if x == -math.inf:
             return 0.0
         return _phi((x - mu) / sd)
 
     total = 0.0
     for v in values:
         mu = mean + inflation * (v - mean) + bias
-        upper = 1.0 if hi is None else cdf(hi + 0.5, mu)
-        lower = 0.0 if lo is None else cdf(lo - 0.5, mu)
-        total += max(0.0, upper - lower)
+        if floor_f is None:
+            total += max(0.0, cdf(hi_x, mu) - cdf(lo_x, mu))
+            continue
+        cut = float(floor_f) - 0.5
+        below = cdf(cut, mu)
+        total += max(0.0, cdf(hi_x, mu) - cdf(max(lo_x, cut), mu)) if hi_x > cut else 0.0
+        if inside(int(floor_f)):
+            total += (1.0 - floor_slip) * below
+        if inside(int(floor_f) - 1):
+            total += floor_slip * below
     return total / len(values)
 
 
@@ -368,7 +426,11 @@ def obs_max_f(payload: dict, start: float, now: float) -> float | None:
     return best
 
 
-DEFAULT_PARAMS = {"bias_f": 0.0, "inflation": 1.0}
+# Unfitted, deliberately wide defaults (see the module docstring). bias_f 0
+# is not an estimate: hourly-interpolated members under-read the peak, and
+# the bias is to be fitted per station (tools/fit_fv_weather.py).
+DEFAULT_PARAMS = {"bias_f": 0.0, "inflation": 1.4}
+DEFAULT_KERNEL_SD_F = 1.75
 
 
 def load_params(path: str | None) -> dict:
@@ -391,7 +453,7 @@ def load_params(path: str | None) -> dict:
                 if not math.isfinite(v):
                     raise ValueError(f"{series}.{k} not finite")
                 clean[k] = v
-        if clean.get("kernel_sd_f", 1.0) <= 0 or clean.get("inflation", 1.0) <= 0:
+        if clean.get("kernel_sd_f", DEFAULT_KERNEL_SD_F) <= 0 or clean.get("inflation", 1.0) <= 0:
             raise ValueError(f"{series}: kernel_sd_f and inflation must be > 0")
         out[str(series).upper()] = clean
     return out
@@ -416,7 +478,7 @@ class WeatherHighModel:
         self.clock = clock
         self.ens_cache: dict = {}
         self.obs_cache: dict = {}
-        self.stats = {"priced": 0, "unsupported": 0, "no_strike": 0, "errors": 0,
+        self.stats = {"priced": 0, "unsupported": 0, "no_strike": 0, "errors": 0, "no_obs": 0,
                       "ens_fetches": 0, "obs_fetches": 0, "last_error": None}
 
     # -- fetches (background thread only)
@@ -482,22 +544,24 @@ class WeatherHighModel:
             return None
         if now > end + 36 * 3600.0:
             return None  # long past the window: nothing left to price
-        p = dict(DEFAULT_PARAMS, kernel_sd_f=_env("LIP_FV_WX_KERNEL_SD", 1.0))
+        p = dict(DEFAULT_PARAMS, kernel_sd_f=_env("LIP_FV_WX_KERNEL_SD", DEFAULT_KERNEL_SD_F))
         p.update((params or {}).get(series) or {})
+        slip = obs_slip()
         try:
             obs_status, floor_f, obs = "not_started", None, None
             if now >= start:
                 try:
                     obs = self.observed_max(st, start, now)
-                    obs_status = "ok" if obs is not None else "failed"
+                    obs_status = "ok" if obs is not None else "none"
                 except Exception as exc:
                     obs_status = "failed"
                     self.stats["last_error"] = f"obs {type(exc).__name__}"
-                if obs is not None:
-                    floor_f = obs - _env("LIP_FV_WX_OBS_MARGIN_F", 0.5)
-            if now >= end:
                 if obs is None:
+                    # Fail closed: the part of the day already past is unknown.
+                    self.stats["no_obs"] += 1
                     return None
+                floor_f = cli_round_f(obs)
+            if now >= end:
                 values, n = [obs], int(_env("LIP_FV_WX_FULL_MEMBERS", 40.0))
             else:
                 times, members = self.ensemble(st, d, start, end, now)
@@ -507,7 +571,7 @@ class WeatherHighModel:
                 if n < int(_env("LIP_FV_WX_MIN_MEMBERS", 10.0)):
                     return None
             prob = bucket_prob(values, rng[0], rng[1], sd=float(p["kernel_sd_f"]), bias=float(p["bias_f"]),
-                               inflation=float(p["inflation"]), floor_f=floor_f)
+                               inflation=float(p["inflation"]), floor_f=floor_f, floor_slip=slip)
         except Exception as exc:
             self.stats["errors"] += 1
             self.stats["last_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
@@ -516,8 +580,13 @@ class WeatherHighModel:
         fv = round(clip_prob(prob) * 100.0, 2)
         lo, hi = rng
         label = (f"{lo}F or above" if hi is None else f"{hi}F or below" if lo is None else f"{lo}F to {hi}F")
+        mean = sum(values) / len(values)
+        ens = {"mean": round(mean, 3),
+               "sd": round(math.sqrt(sum((v - mean) ** 2 for v in values) / len(values)), 3),
+               "n": len(values), "floor_f": floor_f, "slip": slip, "after_window": now >= end}
         return {"fv_cents": fv, "conf": confidence(lead_h, n, obs_status), "source": SOURCE,
                 "pm_question": f"{st.icao} CLI max {d.isoformat()} {label} ({n} members)",
                 "station": series, "lead_h": round(lead_h, 2), "members": n, "obs_status": obs_status,
                 "obs_max_f": None if obs is None else round(obs, 1), "range": [lo, hi],
-                "window": [start, end], "ts": now}
+                "window": [start, end], "ts": now, "ens": ens,
+                "params": {k: float(p[k]) for k in ("bias_f", "inflation", "kernel_sd_f")}}
