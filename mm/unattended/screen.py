@@ -29,7 +29,7 @@ BATCH = 100
 PAUSE_S = 0.12
 META_TTL_S = 6 * 3600.0
 SERIES_TTL_S = 7 * 86400.0
-CACHE_VERSION = 3  # 3: market rows carry tick_1c (older rows are refetched)
+CACHE_VERSION = 4  # 3: market rows carry tick_1c; 4: strike fields (older rows are refetched)
 DEFAULT_NEWS_CATEGORIES = "Politics,Elections,World,Entertainment,Sports,Esports,Social,Mentions,Culture"
 
 
@@ -175,6 +175,11 @@ def market_meta(row: dict, now: float | None = None) -> dict:
         "yes_ask_size": _num(row.get("yes_ask_size_fp")),
         "price_level_structure": row.get("price_level_structure"),
         "tick_1c": tick_is_one_cent(row),
+        # Bucket/threshold definition (docs.kalshi.com get-market: strike_type,
+        # floor_strike, cap_strike) for model fair value (fv_weather.strike_range).
+        "strike_type": row.get("strike_type"),
+        "floor_strike": _num(row.get("floor_strike")),
+        "cap_strike": _num(row.get("cap_strike")),
         "fetched": time.time() if now is None else float(now),
     }
 
@@ -319,6 +324,7 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
     reported as ``pending_meta`` / ``pending_category`` and left out.
     """
     from mm.selector import KalshiMarket, exclusion_reason
+    from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
     now = time.time() if now is None else float(now)
     top = candidate_top() if top is None else int(top)
     reasons: dict[str, int] = {}
@@ -367,6 +373,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
             target_size=float(frame.get("target_size") or 100),
             days_to_settle=days, exchange_index=meta.get("exchange_index"),
             category=category,
+            # FV-quoted family: fed under LIP_FV_MIN_HOURS_TO_CLOSE so the fair
+            # value can be computed; the loop quotes it only with a usable value.
+            fv_candidate=fv_quote_active(series) and fv_model_supports(series),
         )
         why = exclusion_reason(probe)
         if why:
@@ -390,6 +399,9 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         out["rank_penalty_per_day"] = round(rk["penalty"], 6)
         out["occurrence_ts"] = meta.get("occurrence_ts")
         out["event_ticker"] = meta.get("event_ticker")
+        for key in ("strike_type", "floor_strike", "cap_strike"):
+            if meta.get(key) is not None:
+                out[key] = meta[key]
         ok.append(out)
     ok.sort(key=lambda f: (-f["rank_score"], -pool_per_day(f)))
     chosen = ok[:top]
@@ -415,6 +427,7 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
 def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = None) -> list[str]:
     """Series still missing a category among programs that pass every non-category check."""
     from mm.selector import KalshiMarket, exclusion_reason
+    from mm.unattended.fairvalue import fv_model_supports, fv_quote_active
     now = time.time() if now is None else float(now)
     want = []
     for frame in frames:
@@ -431,6 +444,7 @@ def needs_series(frames: list[dict], cache: MetaCache, *, now: float | None = No
             market=market, series=series, period_reward_usd=1.0, period_seconds=86400,
             seconds_left=86400, discount_factor=0.5, target_size=100,
             days_to_settle=days, exchange_index=meta.get("exchange_index"), category=None,
+            fv_candidate=fv_quote_active(series) and fv_model_supports(series),
         )
         if not exclusion_reason(probe):
             want.append(series)

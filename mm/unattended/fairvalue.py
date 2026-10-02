@@ -7,6 +7,14 @@ engine only reads the cached dict (never network on the tick path).
 
 The value is used only to *withhold* quotes: if |fv - kalshi_mid| exceeds
 LIP_FV_DISAGREE_CENTS, the side that would be picked off is not rested.
+
+FV-driven quoting (paper only; LIP_FV_QUOTE_ENABLE, default off): for the
+families in LIP_FV_QUOTE_FAMILIES (default KXHIGH) the cache also prices a
+model fair value (mm/unattended/fv_weather.py, source
+``open_meteo_ensemble_high``) on the same background thread. RunLoop then
+uses it to drive quoting for those markets instead of the disagreement guard
+(``side_edge_cents`` / ``side_ev_usd_day`` below; RunLoop._fv_quote_row).
+Markets in every other family keep the defensive guard only.
 """
 from __future__ import annotations
 
@@ -46,6 +54,99 @@ def _env(name: str, default: float) -> float:
 
 def enabled() -> bool:
     return _env("LIP_FV_ENABLE", 0.0) > 0
+
+
+# ---------------------------------------------------------------- FV-driven quoting (paper)
+# Favourite-longshot bias on Kalshi: "low-price contracts win far less often
+# than required to break even" (Makers and Takers: The Economics of the Kalshi
+# Prediction Market, MPRA paper 126350, 2025,
+# https://ideas.repec.org/p/pra/mprapa/126350.html). LIP_FV_LONGSHOT_TILT
+# shades YES bids priced below this many cents by that many cents of edge.
+LONGSHOT_BELOW_CENTS = 15
+
+
+def fv_quote_enabled() -> bool:
+    """LIP_FV_QUOTE_ENABLE (default 0): model fair value drives paper quoting
+    for the LIP_FV_QUOTE_FAMILIES series. Needs LIP_FV_ENABLE for the cache."""
+    return _env("LIP_FV_QUOTE_ENABLE", 0.0) > 0
+
+
+def fv_quote_families() -> tuple:
+    """LIP_FV_QUOTE_FAMILIES: comma list of series prefixes (default KXHIGH)."""
+    raw = os.environ.get("LIP_FV_QUOTE_FAMILIES")
+    raw = "KXHIGH" if raw is None else raw
+    return tuple(p.strip().upper() for p in raw.split(",") if p.strip())
+
+
+def fv_quote_active(series: str) -> bool:
+    """FV-driven quoting is on and ``series`` is in one of its families."""
+    if not fv_quote_enabled():
+        return False
+    s = str(series or "").upper()
+    return any(s.startswith(p) for p in fv_quote_families())
+
+
+def fv_model_supports(series: str) -> bool:
+    """A model can price this series (fv_weather.STATIONS: verified daily-HIGH
+    settlement stations only)."""
+    from mm.unattended.fv_weather import station_for
+    return station_for(series) is not None
+
+
+def fv_min_conf() -> float:
+    """LIP_FV_MIN_CONF (0.6): minimum confidence for a fair value to be used."""
+    return _env("LIP_FV_MIN_CONF", 0.6)
+
+
+def fv_max_giveup_cents() -> float:
+    """LIP_FV_MAX_GIVEUP_CENTS (0): the most a resting side may pay above fair
+    value (negative edge) for LIP rewards. 0 = never pay up versus FV."""
+    return max(0.0, _env("LIP_FV_MAX_GIVEUP_CENTS", 0.0))
+
+
+def fv_longshot_tilt_cents() -> float:
+    """LIP_FV_LONGSHOT_TILT (0 = off): cents of edge removed from YES bids
+    below LONGSHOT_BELOW_CENTS."""
+    return max(0.0, _env("LIP_FV_LONGSHOT_TILT", 0.0))
+
+
+def fv_min_close_hours():
+    """LIP_FV_MIN_HOURS_TO_CLOSE: the selector's minimum hours to close for a
+    market of an FV-quoted family WITH a usable fair value (and for the screen
+    to feed such markets so a value can be computed). Unset = the global
+    minimum applies to them too."""
+    raw = os.environ.get("LIP_FV_MIN_HOURS_TO_CLOSE")
+    if raw in (None, ""):
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def side_edge_cents(fv_cents: float, side: str, price_cents: float) -> float:
+    """Expected cents per contract vs fair value for a resting bid at
+    ``price_cents``: YES bid FV - b, NO bid (100 - FV) - n; YES bids under
+    LONGSHOT_BELOW_CENTS lose LIP_FV_LONGSHOT_TILT more."""
+    if side == "yes":
+        edge = float(fv_cents) - float(price_cents)
+        if float(price_cents) < LONGSHOT_BELOW_CENTS:
+            edge -= fv_longshot_tilt_cents()
+        return edge
+    return (100.0 - float(fv_cents)) - float(price_cents)
+
+
+def side_ev_usd_day(edge_cents: float, fills_per_day: float, reward_usd_day: float,
+                    fee_usd_per_contract: float) -> float:
+    """$/day of one resting side: edge x expected fills/day (the selector's
+    fill model) + that side's expected LIP reward - maker fees on the fills."""
+    return (float(fills_per_day) * float(edge_cents) / 100.0 + float(reward_usd_day)
+            - float(fee_usd_per_contract) * float(fills_per_day))
+
+
+def fv_side_ok(edge_cents: float) -> bool:
+    """A side may rest only when it gives up at most LIP_FV_MAX_GIVEUP_CENTS."""
+    return float(edge_cents) >= -fv_max_giveup_cents()
 
 
 def tokens(text: str) -> tuple[set, set]:
@@ -160,6 +261,11 @@ class FairValueCache:
         self.sleep = sleep
         self.values: dict[str, dict] = {}
         self.titles: dict[str, str] = {}
+        # Strike metadata per market: ``hints`` set by RunLoop (from the
+        # screen's GET /markets rows), ``market_meta`` from our own public fetch.
+        self.hints: dict[str, dict] = {}
+        self.market_meta: dict[str, dict] = {}
+        self.wx = None  # fv_weather.WeatherHighModel, created on first use
         self.stats = {"refreshes": 0, "pm_markets": 0, "targets": 0, "matched": 0,
                       "errors": 0, "last_refresh_ts": None, "last_error": None}
         self._thread = None
@@ -173,9 +279,17 @@ class FairValueCache:
             return None
         return row
 
+    def note_market(self, market: str, meta: dict) -> None:
+        """Strike fields for ``market`` (called from the engine thread; a
+        single dict assignment, read by the refresh thread)."""
+        self.hints[market] = dict(meta)
+
     def summary(self) -> dict:
+        from mm.unattended.fv_weather import SOURCE as _WX
         vals = self.values
-        return dict(self.stats, enabled=enabled(), sources=["polymarket_gamma", "open_meteo_ensemble"],
+        return dict(self.stats, enabled=enabled(),
+                    sources=["polymarket_gamma", "open_meteo_ensemble", _WX],
+                    weather_high=(dict(self.wx.stats) if self.wx is not None else None),
                     matches=[{"market": k, "fv_cents": v["fv_cents"], "conf": round(v["conf"], 3),
                               "src": v.get("source", "polymarket"),
                               "pm": v["pm_question"][:90]} for k, v in sorted(vals.items())][:40])
@@ -191,6 +305,8 @@ class FairValueCache:
         m = r.json().get("market") or {}
         title = " ".join(x for x in (m.get("title"), m.get("yes_sub_title")) if x)
         self.titles[market] = title
+        self.market_meta[market] = {"strike_type": m.get("strike_type"), "floor_strike": m.get("floor_strike"),
+                                    "cap_strike": m.get("cap_strike"), "title": m.get("title")}
         self.sleep(0.2)
         return title
 
@@ -246,7 +362,13 @@ class FairValueCache:
         max_spread = _env("LIP_FV_MAX_PM_SPREAD", 0.06)
         min_liq = _env("LIP_FV_MIN_PM_LIQ", 1000)
         targets = sorted(set(targets))
-        pm = self._pm_rows()
+        pm_error = None
+        try:
+            pm = self._pm_rows()
+        except Exception as exc:
+            # Keep pricing the model families; earlier Polymarket rows keep
+            # their own ts and age out in get() (LIP_FV_MAX_AGE_S).
+            pm, pm_error = [], exc
         index: dict[str, list] = {}
         for i, m in enumerate(pm):
             for w in tokens(m["question"])[0]:
@@ -268,6 +390,10 @@ class FairValueCache:
                 continue
             out[market] = {"fv_cents": fv, "conf": conf, "pm_question": row["question"], "source": "polymarket",
                            "pm_slug": row.get("slug"), "kalshi_title": title, "ts": now}
+        if pm_error is not None:
+            out.update({k: v for k, v in self.values.items() if v.get("source") == "polymarket" and k in targets})
+        if fv_quote_enabled():
+            out.update(self._high_rows([m for m in targets if fv_quote_active(m.split("-", 1)[0])], now))
         if _env("LIP_FV_WEATHER", 1.0) > 0:
             for market in targets:
                 if market.startswith("KXRAINWKND") and market not in out:
@@ -281,12 +407,52 @@ class FairValueCache:
         self.stats.update(refreshes=self.stats["refreshes"] + 1, pm_markets=len(pm),
                           targets=len(targets), matched=len(out), last_refresh_ts=now,
                           matched_by_source={src: sum(1 for v in out.values() if v.get("source") == src)
-                                             for src in ("polymarket", "open_meteo_ensemble")})
+                                             for src in ("polymarket", "open_meteo_ensemble",
+                                                         "open_meteo_ensemble_high")})
         log.info("fair value refresh: %d targets, %d pm markets, %d matched",
                  len(targets), len(pm), len(out))
         for k, v in out.items():
             log.info("fv match %s fv=%.1fc conf=%.2f pm=%r", k, v["fv_cents"], v["conf"],
                      v["pm_question"][:80])
+        if pm_error is not None:
+            raise pm_error  # counted in stats["errors"] by the refresh thread
+
+    def _high_rows(self, markets: list, now: float) -> dict:
+        """Model fair value for FV-quoted daily-HIGH markets (fv_weather).
+        No parameters file, or an unreadable one, prices nothing."""
+        from mm.unattended import fv_weather as W
+        if not markets:
+            return {}
+        if self.wx is None:
+            self.wx = W.WeatherHighModel(self.http)
+        try:
+            params = W.load_params(os.environ.get("LIP_FV_WX_PARAMS_FILE"))
+        except Exception as exc:
+            self.wx.stats["last_error"] = f"params {type(exc).__name__}: {str(exc)[:120]}"
+            log.warning("weather fair value disabled: LIP_FV_WX_PARAMS_FILE unusable (%s)", type(exc).__name__)
+            return {}
+        out = {}
+        for market in markets:
+            if W.station_for(market.split("-", 1)[0]) is None:
+                self.wx.stats["unsupported"] += 1
+                continue
+            try:
+                meta = dict(self.hints.get(market) or {})
+                if meta.get("strike_type") is None:
+                    if market not in self.market_meta:
+                        self._kalshi_title(market)
+                    meta = dict(self.market_meta.get(market) or {})
+                elif market in self.market_meta:
+                    meta.setdefault("title", self.market_meta[market].get("title"))
+                row = self.wx.fv_for(market, meta, now=now, params=params)
+            except Exception as exc:
+                self.wx.stats["errors"] += 1
+                self.wx.stats["last_error"] = type(exc).__name__
+                row = None
+            if row is not None:
+                row["thr"] = _env("LIP_FV_WEATHER_DISAGREE_CENTS", 20)
+                out[market] = row
+        return out
 
     def stop(self) -> None:
         ev = getattr(self, "_stop_ev", None)
