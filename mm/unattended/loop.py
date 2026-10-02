@@ -278,6 +278,12 @@ class RunLoop:
         self._fv_wanted: set = set()
         self._fv_state: dict = {}
         self.fv_blocks: dict = {}
+        # FV-driven paper quoting (LIP_FV_QUOTE_ENABLE): strike hints per
+        # market, markets selected only because a fair value let them past the
+        # close-time gate (pulled when it goes away), and counters.
+        self._fv_hints: dict = {}
+        self._fv_admitted: set = set()
+        self.fv_quote_stats: dict = {}
         # Patch 18: inventory skew counters.
         self.skew_stats: dict = {}
         # Patch 21: external venue frames (PM US poller thread -> this loop).
@@ -395,6 +401,7 @@ class RunLoop:
         )
         if prog.venue not in VENUES:
             raise ValueError(f"unknown venue {prog.venue!r}")
+        self._fv_note_program(market, prog, row)
         if old_prog is not None and old_acc is not None and (
                 old_prog.program_id, old_prog.start_ts, old_prog.end_ts, old_prog.period_reward_usd,
                 old_prog.target_size, old_prog.discount_factor, old_prog.max_spread_usd) == (
@@ -654,6 +661,8 @@ class RunLoop:
         for table in (self.open_seconds, self._book_ts, self.last_plan, self._repeg_at, self._fv_state):
             table.pop(market, None)
         self._fv_wanted.discard(market)
+        self._fv_admitted.discard(market)
+        self._fv_hints.pop(market, None)
         self.quoted_ever.discard(market)
         for key in [k for k in self.cooldown if k[0] == market]:
             del self.cooldown[key]
@@ -1257,6 +1266,91 @@ class RunLoop:
         fv = float(row["fv_cents"])
         return fv if side == "yes" else 100.0 - fv
 
+    def _fv_note_program(self, market: str, prog: "_Program", row: dict) -> None:
+        """FV-driven quoting: ask the fair-value cache to price this market
+        (its targets include ``_fv_wanted``) and hand it the strike fields
+        from the screen's metadata."""
+        from mm.unattended.fairvalue import fv_quote_active
+        if prog.venue != "kalshi" or not fv_quote_active(prog.series):
+            return
+        self._fv_wanted.add(market)
+        hint = {k: row.get(k) for k in ("strike_type", "floor_strike", "cap_strike") if row.get(k) is not None}
+        if hint:
+            self._fv_hints[market] = hint
+            self._fv_push_hint(market)
+
+    def _fv_push_hint(self, market: str) -> None:
+        note = getattr(self.fv, "note_market", None)
+        hint = self._fv_hints.get(market)
+        if note is not None and hint and market not in (getattr(self.fv, "hints", None) or {}):
+            note(market, hint)
+
+    def _fv_quote_row(self, market: str):
+        """The usable model fair-value row that drives quoting for
+        ``market``, or None (fail closed: the defensive behaviour applies).
+        Usable = paper mode, LIP_FV_QUOTE_ENABLE, a Kalshi market of a
+        LIP_FV_QUOTE_FAMILIES series, a current row from the model source
+        (fv_weather) with confidence >= LIP_FV_MIN_CONF."""
+        from mm.unattended import fairvalue as fvm
+        from mm.unattended.fv_weather import SOURCE
+        if self.fv is None or self.mode != "paper" or not fvm.fv_quote_enabled():
+            return None
+        prog = self.programs.get(market)
+        if prog is None or prog.venue != "kalshi" or not fvm.fv_quote_active(prog.series):
+            return None
+        row = self.fv.get(market, now=time.time())
+        if row is None or row.get("source") != SOURCE or row.get("fv_cents") is None:
+            return None
+        try:
+            fv, conf = float(row["fv_cents"]), float(row.get("conf") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 < fv < 100.0) or conf < fvm.fv_min_conf():
+            return None
+        return row
+
+    def _fv_count(self, key: str, side: str | None = None) -> None:
+        k = key if side is None else f"{key}_{side}"
+        self.fv_quote_stats[k] = self.fv_quote_stats.get(k, 0) + 1
+
+    def _fv_gate_sides(self, market: str, row: dict, yes_cents: int, no_cents: int,
+                       sides: tuple, size: float | None) -> tuple:
+        """Sides allowed to rest under FV-driven quoting: edge >= -
+        LIP_FV_MAX_GIVEUP_CENTS and, when ``size`` is given, per-side EV > 0
+        (edge x fills/day + half the two-sided LIP reward - maker fees)."""
+        from mm.unattended.fairvalue import fv_side_ok, side_edge_cents, side_ev_usd_day
+        fv = float(row["fv_cents"])
+        keep = []
+        for sd in sides:
+            price = yes_cents if sd == "yes" else no_cents
+            edge = side_edge_cents(fv, sd, price)
+            if not fv_side_ok(edge):
+                self._fv_count("edge_withheld", sd)
+                continue
+            keep.append(sd)
+        if size is None or not keep:
+            return tuple(keep)
+        from mm.selector import fills_per_day, kalshi_share, maker_fee_usd, reward_per_day
+        km = self._km(market)
+        if km is None:
+            return ()
+        try:
+            reward_side = reward_per_day(kalshi_share(km, int(yes_cents), int(no_cents), float(size)), km) / 2.0
+        except Exception:
+            logging.getLogger("lip.risk").exception("fv reward estimate failed for %s", market)
+            return ()
+        fills = fills_per_day(km, float(size))
+        out = []
+        for sd in keep:
+            price = int(yes_cents if sd == "yes" else no_cents)
+            fee = maker_fee_usd(km, price, min(float(size), fills) if fills > 0 else 0.0)
+            ev = side_ev_usd_day(side_edge_cents(fv, sd, price), fills, reward_side, fee)
+            if ev > 0:
+                out.append(sd)
+            else:
+                self._fv_count("ev_withheld", sd)
+        return tuple(out)
+
     def _book_fresh(self, market: str, ts: float) -> bool:
         """Kalshi books are WS-maintained (quiet = unchanged). PM US books are
         polled snapshots: a book older than LIP_PMUS_STALE_S (30 s) is not
@@ -1620,7 +1714,27 @@ class RunLoop:
                         self._paper_cross_fill(market, quote, yb, nb, ts)
                     self._pull_one(market, "trade_through", ts, cool)
                     continue
-            fv_drop = self._fv_drop(market, ts)
+            if self._fv_fail_closed(market):
+                self._fv_count("unavailable")
+                self._pull_one(market, "fv_unavailable", ts, 0.0)
+                continue
+            fv_row = self._fv_quote_row(market)
+            if fv_row is not None:
+                # FV-driven quoting: a resting side whose edge vs the current
+                # fair value is below -LIP_FV_MAX_GIVEUP_CENTS comes out.
+                live = tuple(sd for sd in ("yes", "no") if on[sd])
+                ok = self._fv_gate_sides(market, fv_row, int(quote["yes_cents"]), int(quote["no_cents"]),
+                                         live, None)
+                if ok != live:
+                    if ok:
+                        self.pulls["fv_negative_edge"] = self.pulls.get("fv_negative_edge", 0) + 1
+                        size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
+                        self._quote(market, int(quote["yes_cents"]), int(quote["no_cents"]), size, ts,
+                                    sides=ok, skewed=True)
+                    else:
+                        self._pull_one(market, "fv_negative_edge", ts, 0.0)
+                    continue
+            fv_drop = () if fv_row is not None else self._fv_drop(market, ts)
             if any(on[sd] and sd in fv_drop for sd in ("yes", "no")):
                 keep = tuple(sd for sd in ("yes", "no") if on[sd] and sd not in fv_drop)
                 if keep:
@@ -1710,7 +1824,7 @@ class RunLoop:
     def _size_curve(self, km, ladder, sides_on: tuple, penalty_100: float) -> list:
         """[(size, value $/day, capital $, yes_c, no_c)] along the ladder, at the
         reference rungs. value = plan net/day - markout penalty (scaled by size)."""
-        from mm.selector import quote_economics, kalshi_one_sided_share, reward_per_day
+        from mm.selector import quote_economics
         from mm.session_gates import max_contracts_for_fill
         lim = self.risk.limits
         per_market = float(lim.per_market_usd) * alloc_cap_fraction()
@@ -1718,25 +1832,19 @@ class RunLoop:
             per_market = min(per_market, pmus_market_cap_usd())
         out = []
         for size in ladder:
-            net, capital, share2, yc, nc = quote_economics(km, float(size))
+            # sides_on prices one-sided quotes (quote_economics ``sides``).
+            net, capital, share2, yc, nc = quote_economics(km, float(size), sides=sides_on)
             if yc > 0 and nc > 0:
                 legal = min(max_contracts_for_fill(yc, self.fill_cap), max_contracts_for_fill(nc, self.fill_cap))
                 if 0 < legal < size:
                     # The last rung is the size the order clamp would rest
                     # (single-fill cap), valued at that size.
                     size = float(legal)
-                    net, capital, share2, yc, nc = quote_economics(km, size)
+                    net, capital, share2, yc, nc = quote_economics(km, size, sides=sides_on)
                     if out and size <= out[-1][0]:
                         break
             if yc <= 0 or nc <= 0:
                 break
-            if len(sides_on) == 1:
-                side = sides_on[0]
-                price = yc if side == "yes" else nc
-                cost2 = reward_per_day(share2, km) - net
-                share1 = kalshi_one_sided_share(km, side, price, float(size))
-                net = reward_per_day(share1, km) - cost2 / 2.0
-                capital = price / 100.0 * float(size)
             if size > max_contracts_for_fill(yc, self.fill_cap) or size > max_contracts_for_fill(nc, self.fill_cap):
                 break
             if capital > per_market + 1e-9:
@@ -1795,32 +1903,60 @@ class RunLoop:
         self._select(ts)
 
     def _markets(self) -> list[KalshiMarket]:
-        rows = []
-        for market, prog in self.programs.items():
-            book = self.accruals[market].book.book
-            rows.append(KalshiMarket(
-                market=market,
-                series=prog.series,
-                period_reward_usd=prog.period_reward_usd,
-                period_seconds=prog.period_seconds,
-                seconds_left=max(0.0, prog.end_ts - self.now),
-                discount_factor=prog.discount_factor,
-                target_size=prog.target_size,
-                yes_bids=_bids(book.yes_bids),
-                no_bids=_bids(book.no_bids),
-                days_to_settle=(max(0.0, (prog.close_ts - self.now) / 86400.0)
-                                if prog.days_from_close and prog.close_ts is not None and self.now
-                                else prog.days_to_settle),
-                exchange_index=prog.exchange_index,
-                shard_cash_usd=prog.shard_cash_usd,
-                category=prog.category,
-                venue=prog.venue,
-                max_spread_usd=prog.max_spread_usd,
-                sports_single=prog.sports_single,
-                fee_type=prog.fee_type,
-                fee_multiplier=prog.fee_multiplier,
-            ))
-        return rows
+        return [km for km in (self._km(market) for market in self.programs) if km is not None]
+
+    def _km(self, market: str) -> KalshiMarket | None:
+        """Selector view of one program: live book, close, fees, and the
+        usable model fair value when FV-driven quoting applies to it."""
+        prog = self.programs.get(market)
+        if prog is None or market not in self.accruals:
+            return None
+        book = self.accruals[market].book.book
+        row = self._fv_quote_row(market)
+        return KalshiMarket(
+            market=market,
+            series=prog.series,
+            period_reward_usd=prog.period_reward_usd,
+            period_seconds=prog.period_seconds,
+            seconds_left=max(0.0, prog.end_ts - self.now),
+            discount_factor=prog.discount_factor,
+            target_size=prog.target_size,
+            yes_bids=_bids(book.yes_bids),
+            no_bids=_bids(book.no_bids),
+            days_to_settle=(max(0.0, (prog.close_ts - self.now) / 86400.0)
+                            if prog.days_from_close and prog.close_ts is not None and self.now
+                            else prog.days_to_settle),
+            exchange_index=prog.exchange_index,
+            shard_cash_usd=prog.shard_cash_usd,
+            category=prog.category,
+            venue=prog.venue,
+            max_spread_usd=prog.max_spread_usd,
+            sports_single=prog.sports_single,
+            fee_type=prog.fee_type,
+            fee_multiplier=prog.fee_multiplier,
+            fv_cents=None if row is None else float(row["fv_cents"]),
+        )
+
+    def _fv_note_admitted(self, markets: list) -> None:
+        """Markets that pass the selector only because a usable fair value
+        applied LIP_FV_MIN_HOURS_TO_CLOSE. Without that value they must not
+        rest (``_fv_fail_closed``)."""
+        from dataclasses import replace
+        from mm.selector import exclusion_reason
+        admitted = set()
+        for km in markets:
+            if km.fv_cents is None:
+                continue
+            if exclusion_reason(replace(km, fv_cents=None, fv_candidate=False)):
+                admitted.add(km.market)
+        self._fv_admitted = admitted
+        for market in self._fv_hints:
+            self._fv_push_hint(market)
+
+    def _fv_fail_closed(self, market: str) -> bool:
+        """True when ``market`` was admitted on a fair value that is no
+        longer usable: it must not rest (cancel/pull ``fv_unavailable``)."""
+        return market in self._fv_admitted and self._fv_quote_row(market) is None
 
     def _select(self, ts: float) -> None:
         self._select_t0 = time.time()
@@ -1854,6 +1990,7 @@ class RunLoop:
                 single_fill_cap_usd=self.screen_fill_cap,
             )
         self.excluded = list(selection.excluded)
+        self._fv_note_admitted(markets)
         # per_event_usd=pool: optimize_sizes groups by series and would cut a
         # series by RAW objective before the markout-penalised rank pass. The
         # per-series cap is enforced below (alloc_series) in rank order.
@@ -1927,6 +2064,11 @@ class RunLoop:
         # and per-side inventory/fill blocks before any capital is assigned.
         self.policy_skips = []
         sides_of: dict[str, tuple] = {}
+        fv_rows = {}
+        for _per, market, _row in wanted:
+            fv_row = self._fv_quote_row(market)
+            if fv_row is not None:
+                fv_rows[market] = fv_row
         kept = []
         for item in wanted:
             market = item[1]
@@ -1938,6 +2080,16 @@ class RunLoop:
                     why = blocked["yes"] or blocked["no"]
                 else:
                     sides_of[market] = sides
+            if not why and market in fv_rows:
+                # FV-driven quoting: rest only sides that do not pay up
+                # versus fair value at the reference rungs.
+                row_o = item[2]
+                sides = self._fv_gate_sides(market, fv_rows[market], int(row_o.yes_cents),
+                                            int(row_o.no_cents), sides_of[market], None)
+                if sides:
+                    sides_of[market] = sides
+                else:
+                    why = "fv_negative_edge"
             if why:
                 self._cancel(market, why)
                 self.policy_skips.append((market, why))
@@ -2208,7 +2360,19 @@ class RunLoop:
             sides = tuple(sd for sd in sides
                           if not ((sd == "yes" and nb0 is not None and int(yes_cents) + nb0 >= 100)
                                   or (sd == "no" and yb0 is not None and int(no_cents) + yb0 >= 100)))
-        fv_drop = self._fv_drop(market, ts) if sides else ()
+        fv_row = self._fv_quote_row(market)
+        if fv_row is None and self._fv_fail_closed(market):
+            self._fv_count("unavailable")
+            self._cancel(market, "fv_unavailable")
+            return False
+        if fv_row is not None and sides:
+            # FV-driven paper quoting replaces the disagreement guard here.
+            kept = self._fv_gate_sides(market, fv_row, int(yes_cents), int(no_cents), sides, size)
+            if not kept:
+                self._cancel(market, "fv_no_positive_side")
+                return False
+            sides = kept
+        fv_drop = self._fv_drop(market, ts) if (sides and fv_row is None) else ()
         if fv_drop and any(sd in fv_drop for sd in sides):
             for sd in sides:
                 if sd in fv_drop:
@@ -2493,7 +2657,8 @@ class RunLoop:
             "pmus": (self.pmus.summary() if getattr(self, "pmus", None) is not None
                      else {"enabled": False}),
             "fair_value": (dict(self.fv.summary(), blocks=dict(self.fv_blocks),
-                                withheld=sorted(k for k, v in self._fv_state.items() if v))
+                                withheld=sorted(k for k, v in self._fv_state.items() if v),
+                                fv_quote=self.fv_quote_report())
                            if self.fv is not None else {"enabled": False}),
             "select_ms": getattr(self, "select_ms", None),
             "size_ladder": size_ladder(self.chunk),
@@ -2518,6 +2683,21 @@ class RunLoop:
             "budget_warning": getattr(self, "budget_warning", None),
             "day": day,
         }
+
+    def fv_quote_report(self) -> dict:
+        """Status of FV-driven paper quoting: flags, markets it drives now,
+        markets resting only on a fair value, withheld-side counters."""
+        from mm.unattended import fairvalue as fvm
+        driving = sorted(m for m in self.programs if self._fv_quote_row(m) is not None)
+        return {"enabled": fvm.fv_quote_enabled() and self.mode == "paper",
+                "families": list(fvm.fv_quote_families()), "min_conf": fvm.fv_min_conf(),
+                "max_giveup_cents": fvm.fv_max_giveup_cents(),
+                "longshot_tilt_cents": fvm.fv_longshot_tilt_cents(),
+                "min_hours_to_close": fvm.fv_min_close_hours(),
+                "driving_n": len(driving), "driving": driving[:20],
+                "resting_driven": sorted(m for m in self.resting if m in driving)[:20],
+                "admitted_on_fv": sorted(self._fv_admitted)[:20],
+                "counters": dict(self.fv_quote_stats)}
 
     def positions_report(self) -> dict:
         """Per-market held legs for /status (the watchdog's inventory
