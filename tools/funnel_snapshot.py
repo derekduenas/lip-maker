@@ -22,6 +22,10 @@ Layers (Kalshi-only first; PM added once unhalted):
 Drop-reason histograms recorded per layer where applicable.
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import json
 import logging
@@ -40,7 +44,7 @@ from config import settings
 
 _log = logging.getLogger(__name__)
 
-LOG_PATH = Path(settings.LOG_PATH) if hasattr(settings, "LOG_PATH") else Path("/root/lip-maker/logs/lip_maker.log")
+LOG_PATH = Path(settings.LOG_PATH) if hasattr(settings, "LOG_PATH") else Path((_LIP_HOME + "/logs/lip_maker.log"))
 
 
 # ── Schema ────────────────────────────────────────────────────────────────

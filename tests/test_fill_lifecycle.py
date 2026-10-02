@@ -98,7 +98,6 @@ def test_ws_first_consumers_replay_without_duplicate_effects(live_qm, db, monkey
     drain_fill_consumers(db)
     with sqlite3.connect(db) as conn:
         assert conn.execute('SELECT fill_size,status FROM quotes').fetchone() == (10.5, 'resting')
-        assert conn.execute('SELECT COUNT(*) FROM hedge_log').fetchone()[0] == 1
         assert not conn.execute("SELECT 1 FROM fill_consumer_receipts WHERE consumer='markout'").fetchone()
     compute.return_value = True
     drain_fill_consumers(db)
@@ -106,8 +105,8 @@ def test_ws_first_consumers_replay_without_duplicate_effects(live_qm, db, monkey
     assert compute.call_count == 2
     with sqlite3.connect(db) as conn:
         assert conn.execute('SELECT fill_size FROM quotes').fetchone()[0] == 10.5
-        assert conn.execute('SELECT COUNT(*) FROM hedge_log').fetchone()[0] == 1
-        assert conn.execute('SELECT COUNT(*) FROM fill_consumer_receipts').fetchone()[0] == 3
+        # quotes + markout (the hedge_diagnostic consumer was archived 2026-10-01)
+        assert conn.execute('SELECT COUNT(*) FROM fill_consumer_receipts').fetchone()[0] == 2
 
 
 def test_quote_row_arriving_after_fill_is_recovered(live_qm, db):
@@ -150,26 +149,6 @@ def test_quote_effect_and_receipt_rollback_together(live_qm, db):
     drain_fill_consumers(db)
     with sqlite3.connect(db) as conn:
         assert conn.execute('SELECT fill_size FROM quotes').fetchone()[0] == 10
-
-
-def test_hedge_diagnostic_replay_after_receipt_failure_never_executes(live_qm, db, monkeypatch):
-    from cross_venue import hedger
-    execute = MagicMock(side_effect=AssertionError('No live hedges from replay'))
-    monkeypatch.setattr(hedger, '_execute_if_enabled', execute)
-    ingest(live_qm)
-    drain_fill_consumers(db, trade_id='absent')
-    with sqlite3.connect(db) as conn:
-        conn.execute("""CREATE TRIGGER fail_hedge_receipt BEFORE INSERT ON fill_consumer_receipts
-            WHEN NEW.consumer='hedge_diagnostic' BEGIN SELECT RAISE(ABORT,'injected crash'); END""")
-    drain_fill_consumers(db)
-    with sqlite3.connect(db) as conn:
-        assert conn.execute('SELECT COUNT(*) FROM hedge_log').fetchone()[0] == 1
-        conn.execute('DROP TRIGGER fail_hedge_receipt')
-    drain_fill_consumers(db)
-    with sqlite3.connect(db) as conn:
-        assert conn.execute('SELECT COUNT(*) FROM hedge_log').fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM fill_consumer_receipts WHERE consumer='hedge_diagnostic'").fetchone()[0] == 1
-    execute.assert_not_called()
 
 
 def test_other_successful_fill_does_not_clear_failed_ingestion(live_qm, monkeypatch):

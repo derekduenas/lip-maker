@@ -1,7 +1,8 @@
 """Replayable consumers of durable fills, independent of REST/WS ingestion.
 
 Quote totals are recomputed, never incremented. Diagnostics have unique sink
-keys and separate completion receipts. No executable hedge path is called.
+keys and separate completion receipts. The former 'hedge_diagnostic' consumer
+(cross_venue.hedger) was archived 2026-10-01; no hedge path exists here.
 """
 import logging
 import sqlite3
@@ -22,7 +23,7 @@ def drain_fill_consumers(db_path: str, *, trade_id=None, limit=500):
             LEFT JOIN fill_consumer_attempts a USING(trade_id)
             WHERE (? IS NULL OR f.trade_id=?) AND
             (SELECT COUNT(*) FROM fill_consumer_receipts r
-             WHERE r.trade_id=f.trade_id AND r.consumer IN ('quotes','markout','hedge_diagnostic')) < 3
+             WHERE r.trade_id=f.trade_id AND r.consumer IN ('quotes','markout')) < 2
             ORDER BY a.attempted_at, f.created_at LIMIT ?""",
             (trade_id, trade_id, limit)).fetchall()
     quote_updates = 0
@@ -32,7 +33,7 @@ def drain_fill_consumers(db_path: str, *, trade_id=None, limit=500):
         with sqlite3.connect(db_path, timeout=5) as db:
             db.execute("INSERT OR REPLACE INTO fill_consumer_attempts VALUES (?,?)",
                        (tid, datetime.now(timezone.utc).isoformat()))
-        for consumer in ('quotes', 'markout', 'hedge_diagnostic'):
+        for consumer in ('quotes', 'markout'):
             with sqlite3.connect(db_path, timeout=5) as db:
                 if db.execute("SELECT 1 FROM fill_consumer_receipts WHERE trade_id=? AND consumer=?",
                               (tid, consumer)).fetchone():
@@ -65,20 +66,10 @@ def drain_fill_consumers(db_path: str, *, trade_id=None, limit=500):
                 ts = datetime.fromisoformat(f['created_at'].replace('Z', '+00:00')).timestamp()
                 args = dict(fill_id=tid, ticker=f['ticker'], side=side,
                             fill_price_c=price, fill_size=count, fill_ts=ts, db_path=db_path)
-                if consumer == 'markout':
-                    from monitor.markout_logger import ensure_schema, compute_markouts_for_fill
-                    ensure_schema(db_path)
-                    if not compute_markouts_for_fill(**args):
-                        continue
-                else:
-                    from cross_venue.hedger import ensure_schema, decide, persist
-                    ensure_schema(db_path)
-                    persist(decide(**args), db_path=db_path)
-                    # persist catches errors internally: confirm the effect exists.
-                    with sqlite3.connect(db_path) as db:
-                        if not db.execute('SELECT 1 FROM hedge_log WHERE fill_id=? AND kalshi_ticker=?',
-                                          (tid, f['ticker'])).fetchone():
-                            continue
+                from monitor.markout_logger import ensure_schema, compute_markouts_for_fill
+                ensure_schema(db_path)
+                if not compute_markouts_for_fill(**args):
+                    continue
                 with sqlite3.connect(db_path, timeout=5) as db:
                     db.execute("INSERT OR IGNORE INTO fill_consumer_receipts VALUES (?,?,?)",
                                (tid, consumer, datetime.now(timezone.utc).isoformat()))

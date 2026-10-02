@@ -1,0 +1,8 @@
+# Runtime dependencies of the APEX entrypoints (python -m mm.unattended,
+# python -m mm.safety.lip_watchdog, python -m mm.replay). Derived from the
+# third-party imports of every module import-reachable from those entrypoints;
+# pinned to the versions the test suite was run against on 2026-10-01.
+certifi==2026.7.22
+cryptography==50.0.1
+requests==2.34.2
+websockets==17.1

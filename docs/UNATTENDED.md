@@ -6,11 +6,17 @@ This process is for a small always-on VM in **us-east**, close to the venue, run
 
 ## What the process does on every start
 
-1. Append `cancel_all` and cancel every order it still knows about.
-2. Only then quote.
-3. Write the heartbeat file.
+1. Append the line `cancel_all` to the `--cancel-log` file. That is a log
+   line only: `mm/unattended/service.py:main()` does not call any venue
+   cancel at startup. In paper mode a fresh process has no resting orders,
+   so there is nothing to cancel; nothing here would clean up orders left
+   by an earlier process on a live venue.
+2. Write the heartbeat file.
+3. Quote.
 
-systemd `Restart=on-failure` starts that sequence again after a crash. A crash inside the quote loop does the same: the watchdog builds a new session, and that session cancels before it quotes.
+systemd `Restart=on-failure` reruns that sequence after a crash.
+`UnattendedSession` / `CrashWatchdog` in `mm/unattended/service.py`
+implement "cancel, then quote" but `main()` does not use them.
 
 ```bash
 sudo useradd --system --home /opt/lip-maker --shell /usr/sbin/nologin lip

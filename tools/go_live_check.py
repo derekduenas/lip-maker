@@ -1,21 +1,24 @@
-"""Phase 3 readiness gate — go/no-go for flipping live.
+"""Phase 3 readiness report — advisory go/no-go over a paper window.
 
-Synthesizes the five quantitative thresholds defined in the rebuild
-plan into a single pass/fail check:
+LEGACY (2026-10-01): reads the legacy run_paper.py tables. It arms
+nothing; tools/go_live.py was archived and mm.unattended is the only path
+to live. Gates, all evaluated over ONE trailing window of `--days`
+(default 14) — this is a window check, not "N consecutive passing days":
 
+    0. Reconciled (paid) reward payments > 0 within the window
     1. Median t+60s signed markout < 1.5c  (from fill_markouts)
-    2. Daily Sharpe (incl. simulated hedges) > 1.0  (settlement_log
-       net_outcome_usd + simulated hedge_pnl)
+    2. Daily Sharpe > 1.0 from settlement_log.net_outcome_usd, over every
+       calendar day in the window (days without settlements count as $0)
     3. Fill rate (filled / placed) > 18%  (quotes table)
-    4. Max paper drawdown < $400 over the window
-    5. Hedge basis residual |mean| < $25/day per active series
-       (hedge_residual_log)
-
-All five must hold for `--days` consecutive paper days (default 14).
+    4. Max paper drawdown < $400 over the window (equity starts at $0, so
+       a first-day loss counts)
+    5. Hedge basis residual mean(|residual|) < $25 per active series
+       (hedge_residual_log). Its writer, tools/hedge_effectiveness.py, was
+       archived 2026-10-01, so this gate reports insufficient data.
 
 EXIT CODES
 ----------
-    0 → all gates pass; safe to flip live (`tools/go_live.py`)
+    0 → all gates pass (advisory only; does not arm live)
     1 → at least one gate fails
     2 → insufficient data (not enough fills / markouts / hedges)
 
@@ -79,7 +82,25 @@ class Report:
 
 # ── Gate 0: reward evidence must be PAID, not modelled ────────────────────
 
-def _gate_paid_reward_evidence(db_path: str) -> GateResult:
+def _paid_total_since(db_path: str, cutoff_iso: str) -> float:
+    """Reconciled payments on settlements that closed inside the window.
+
+    Same provenance rule as engine.reward_provenance.paid_total, restricted
+    to the window the other gates use (2026-10-01: an old payment must not
+    vouch for the current window)."""
+    from engine.reward_provenance import PROV_PAID
+    conn = sqlite3.connect(db_path, timeout=3.0)
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(rebate_paid_usd), 0) FROM settlement_log "
+            "WHERE reward_provenance = ? AND close_time >= ?",
+            (PROV_PAID, cutoff_iso)).fetchone()
+    finally:
+        conn.close()
+    return float(row[0] or 0.0)
+
+
+def _gate_paid_reward_evidence(db_path: str, cutoff_iso: str) -> GateResult:
     """2026-09-21. The Sharpe and drawdown gates below sum
     settlement_log.net_outcome_usd. Until 2026-09-21 that column carried our
     own estimated rebate (settlement_reconciler wrote the model's output into
@@ -92,18 +113,17 @@ def _gate_paid_reward_evidence(db_path: str) -> GateResult:
     claim rests entirely on an unvalidated estimator.
     """
     try:
-        from engine.reward_provenance import paid_total
-        paid = paid_total(db_path)
+        paid = _paid_total_since(db_path, cutoff_iso)
     except Exception as e:
         return GateResult("paid_reward_evidence", False, None, 1.0,
                           f"could not read reward provenance: {e}",
                           insufficient_data=True)
     if paid > 0:
         return GateResult("paid_reward_evidence", True, paid, 0.0,
-                          f"${paid:.2f} of reconciled reward payments on record")
+                          f"${paid:.2f} of reconciled reward payments in the window")
     return GateResult(
         "paid_reward_evidence", False, 0.0, 0.0,
-        "no reconciled reward payment on record — every reward figure is a "
+        "no reconciled reward payment in the window — every reward figure is a "
         "model estimate. Record payments with tools/reward_payments.py before "
         "treating LIP income as real.",
         insufficient_data=True)
@@ -168,14 +188,31 @@ def _daily_pnl_series(db_path: str, cutoff_iso: str) -> list[tuple[str, float]]:
     return [(r[0], float(r[1])) for r in rows]
 
 
-def _gate_sharpe(daily_pnls: list[float]) -> GateResult:
+def _calendar_fill(daily: list[tuple[str, float]], start: datetime,
+                   end: datetime) -> list[float]:
+    """Every UTC calendar day from start to end inclusive; $0 where no
+    settlement closed. Dropping idle days overstated Sharpe (2026-10-01)."""
+    by_day = dict(daily)
+    out = []
+    d = start.date()
+    while d <= end.date():
+        out.append(by_day.get(d.isoformat(), 0.0))
+        d += timedelta(days=1)
+    return out
+
+
+def _gate_sharpe(daily_pnls: list[float],
+                 days_with_data: Optional[int] = None) -> GateResult:
+    """`daily_pnls` should be calendar-filled (see _calendar_fill);
+    `days_with_data` counts days that actually had settlements."""
     n = len(daily_pnls)
-    if n < 5:    # at least a working week
+    with_data = n if days_with_data is None else days_with_data
+    if with_data < 5:    # at least a working week
         return GateResult(
             name="daily_sharpe",
             passed=False, observed=None,
             threshold=GATE_DAILY_SHARPE_MIN,
-            detail=f"days_with_data={n} < 5",
+            detail=f"days_with_data={with_data} < 5",
             insufficient_data=True,
         )
     mean = sum(daily_pnls) / n
@@ -200,21 +237,24 @@ def _gate_sharpe(daily_pnls: list[float]) -> GateResult:
     )
 
 
-def _gate_max_dd(daily_pnls: list[float]) -> GateResult:
-    if len(daily_pnls) < 3:
+def _gate_max_dd(daily_pnls: list[float],
+                 days_with_data: Optional[int] = None) -> GateResult:
+    with_data = len(daily_pnls) if days_with_data is None else days_with_data
+    if with_data < 3:
         return GateResult(
             name="max_drawdown_usd",
             passed=False, observed=None, threshold=GATE_MAX_DD_USD,
-            detail=f"days={len(daily_pnls)} < 3",
+            detail=f"days_with_data={with_data} < 3",
             insufficient_data=True,
         )
-    # Equity curve = cumulative sum
+    # Equity curve = cumulative sum, starting from $0 before day one, so
+    # a first-day loss is drawdown (2026-10-01: peak used to start at eq[0]).
     eq = []
     cum = 0.0
     for p in daily_pnls:
         cum += p
         eq.append(cum)
-    peak = eq[0]
+    peak = 0.0
     max_dd = 0.0
     for v in eq:
         if v > peak:
@@ -295,14 +335,15 @@ def _gate_basis_residual(db_path: str, cutoff_iso: str) -> GateResult:
             detail="no hedge_residual_log rows",
             insufficient_data=True,
         )
-    # Compute average abs residual per series, then take the worst
+    # Mean of |residual| per series, then take the worst. (2026-10-01: was
+    # |mean residual|, which let +$900 and -$900 days cancel to $0.)
     by_series: dict[str, list[float]] = {}
     for prefix, res, n_fills in rows:
         by_series.setdefault(prefix, []).append(float(res))
     worst_series = ""
     worst_mean = 0.0
     for prefix, vals in by_series.items():
-        mean_abs = abs(sum(vals) / len(vals))
+        mean_abs = sum(abs(v) for v in vals) / len(vals)
         if mean_abs > worst_mean:
             worst_mean = mean_abs
             worst_series = prefix
@@ -312,7 +353,7 @@ def _gate_basis_residual(db_path: str, cutoff_iso: str) -> GateResult:
         observed=round(worst_mean, 2),
         threshold=GATE_BASIS_RESIDUAL_MEAN_MAX_USD,
         detail=f"worst series={worst_series}, "
-               f"|mean_residual|=${worst_mean:.2f}",
+               f"mean|residual|=${worst_mean:.2f}",
     )
 
 
@@ -323,12 +364,12 @@ def run_check(db_path: str = settings.DB_PATH, days: int = 14) -> Report:
     cutoff_ts = cutoff_dt.timestamp()
     cutoff_iso = cutoff_dt.isoformat()
     rep = Report(days=days)
-    rep.gates.append(_gate_paid_reward_evidence(db_path))
+    rep.gates.append(_gate_paid_reward_evidence(db_path, cutoff_iso))
     rep.gates.append(_gate_markout(db_path, cutoff_ts))
     daily = _daily_pnl_series(db_path, cutoff_iso)
-    daily_pnls = [v for _, v in daily]
-    rep.gates.append(_gate_sharpe(daily_pnls))
-    rep.gates.append(_gate_max_dd(daily_pnls))
+    daily_pnls = _calendar_fill(daily, cutoff_dt, datetime.now(timezone.utc))
+    rep.gates.append(_gate_sharpe(daily_pnls, days_with_data=len(daily)))
+    rep.gates.append(_gate_max_dd(daily_pnls, days_with_data=len(daily)))
     rep.gates.append(_gate_fill_rate(db_path, cutoff_iso))
     rep.gates.append(_gate_basis_residual(db_path, cutoff_iso))
     return rep
@@ -345,8 +386,8 @@ def emit_table(report: Report) -> None:
     if report.insufficient:
         print(f"\n⏳ INSUFFICIENT DATA — keep collecting in paper.")
     elif report.overall_pass:
-        print(f"\n✅ ALL GATES PASS — safe to run `python tools/go_live.py` "
-              f"(or your renamed flip script).")
+        print(f"\n✅ ALL GATES PASS (advisory). This arms nothing; live is "
+              f"only reachable through mm.unattended's own gates.")
     else:
         print(f"\n❌ GATES FAILED — do not flip live.")
 

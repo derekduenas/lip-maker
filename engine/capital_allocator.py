@@ -161,7 +161,12 @@ def _optimal_size(target_size: int, competition: float) -> int:
 def _kelly_position_mult(edge_proxy: float, confidence: str,
                          fraction: float = 0.25,
                          lo: float = 0.5, hi: float = 1.5) -> float:
-    """Quarter-Kelly-style size multiplier.
+    """Piecewise-linear size multiplier on an edge proxy. NOT Kelly.
+
+    Despite the name, no Kelly fraction is computed: there is no win
+    probability or payoff odds, and `fraction` (KELLY_FRACTION) is accepted
+    but UNUSED. The result is a linear clamp of the edge proxy into
+    [lo, hi]. (Name kept for callers and settings compatibility.)
 
     edge_proxy = series_priority × series_calibration² × setup_mult.
     Typical range: 0.05 (crushed loser) to 4.0+ (proven winner).
@@ -327,7 +332,8 @@ def select_optimal_portfolio(
             setup_mult = 1.0
             setup_score = {"score": 1.0, "neighbors": 0, "confidence": "error"}
 
-        # === Sprint 4 #1: Kelly fractional sizing ===
+        # === Sprint 4 #1: "Kelly" sizing — actually a linear clamp of an
+        # edge proxy; KELLY_FRACTION is passed but unused (see helper). ===
         pre_kelly_size = optimal_size
         kelly_mult = 1.0
         if getattr(settings, "KELLY_SIZING_ENABLED", False):

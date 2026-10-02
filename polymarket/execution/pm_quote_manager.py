@@ -2,7 +2,15 @@
 
 Tracks intended quotes per market, reconciles against live state via SDK.
 Paper mode uses orders.preview (server validates, no money moves).
-Live mode uses orders.create (real orders).
+Live mode is REFUSED (2026-10-01 review): constructing with paper=False
+raises RuntimeError. mm.unattended is the only path to a live venue. The
+live branches below are kept for history and are unreachable.
+
+Unverified-but-likely bug (why live must stay off here): the NO side is
+sent as ORDER_INTENT_BUY_SHORT at the NO price (target.no_price), but the
+Polymarket US docs say an order's price always refers to the YES (long)
+side. If so, a BUY_SHORT should carry 1 - no_price; as written it would
+rest at the wrong level. Not checked against the live API.
 
 Key methods:
   reconcile(slug, target_yes, target_no)  — bring resting to match target
@@ -58,6 +66,10 @@ class PMQuoteManager:
     """Order lifecycle for Polymarket markets."""
 
     def __init__(self, client: PolymarketUS, paper: bool = True):
+        if not paper:
+            raise RuntimeError(
+                "legacy PMQuoteManager is paper-only (PM_PAPER=false refused); "
+                "use mm.unattended")
         self.client = client
         self.paper = paper
         # ticker → list of resting orders (max 1 yes + 1 no per market)
@@ -303,6 +315,9 @@ class PMQuoteManager:
                 if existing_no:
                     if self._cancel_order(existing_no):
                         actions["cancelled"] += 1
+                # NOTE (unverified-but-likely bug): PM US prices refer to the
+                # YES side; sending the NO price on BUY_SHORT is probably wrong.
+                # Harmless in paper (preview only); see the module docstring.
                 if self._place_order(target.slug, "ORDER_INTENT_BUY_SHORT",
                                      target.no_price, no_qty,
                                      ws_bid=target.ws_bid, ws_ask=target.ws_ask,

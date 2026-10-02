@@ -284,7 +284,9 @@ class TestRestFillOrdering:
         live_qm.resting[TKR] = [o]
         live_qm.client = _FakeClient([])
         live_qm.client.delete = MagicMock()
+        live_qm.paper = True        # 2026-10-01: live cancel raises; tombstone path is shared
         live_qm._cancel_order(o)
+        live_qm.paper = False
         live_qm.client = _FakeClient([_venue("o1", remaining="10.00")])
         live_qm.periodic_resync()
         assert TKR not in live_qm.resting

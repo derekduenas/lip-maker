@@ -15,7 +15,8 @@ Combines:
   market_blacklist                    — exclude blocked markets
 
 Used by:
-  - edge_hunter (Brain) state snapshot — auto-injected each cycle
+  - engine/lip_discovery.top_n_to_quote (legacy run_paper path)
+  - brain_summary() was injected by tools/edge_hunter.py, archived 2026-10-01
   - Human via CLI: `python tools/attack_targets.py [--top 30] [--json]`
 """
 from __future__ import annotations

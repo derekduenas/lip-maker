@@ -54,33 +54,29 @@ def _live_qm(tmp_path, acct):
     return qm
 
 
-# ── 1. unknown submission outcome ─────────────────────────────────────────
+# ── 1. live submission (2026-10-01: refused outright) ────────────────────
+# The legacy QuoteManager is paper-only; a live place raises before any
+# capital is reserved or any request is built. The unknown-outcome
+# reservation behaviour above is still exercised through reconciliation
+# (below), with the unknown submission recorded directly.
 
-def test_unknown_submission_keeps_the_reservation(tmp_path, acct, allow_live):
+def test_live_submission_is_refused_and_reserves_nothing(tmp_path, acct, allow_live):
     qm = _live_qm(tmp_path, acct)
-    qm.client.post.side_effect = TimeoutError("read timeout after send")
-    assert qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49) is None
-    # The order may well be resting on the venue. The money stays held.
-    assert acct.state().reserved_usd > D(0), \
-        "an unknown outcome released capital — the account can now double-spend"
-    assert qm.submit_unknown == 1
-    assert TKR in qm.uncertain_markets
-
-
-def test_unknown_submission_is_recorded_for_reconciliation(tmp_path, acct, allow_live):
-    qm = _live_qm(tmp_path, acct)
-    qm.client.post.side_effect = ConnectionResetError("reset")
-    qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
-    assert len(qm._unknown_submissions) == 1
-
-
-def test_deterministic_refusal_still_releases_immediately(tmp_path, acct, allow_live):
-    """A crossing order never leaves the process, so holding its capital
-    would be a leak, not caution."""
-    qm = _live_qm(tmp_path, acct)
-    assert qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=50) is None
-    assert acct.state().reserved_usd == D(0)
+    with pytest.raises(RuntimeError, match="paper-only"):
+        qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
     qm.client.post.assert_not_called()
+    assert acct.state().reserved_usd == D(0)
+    assert qm._unknown_submissions == {}
+
+
+def _unknown_submission(qm, acct, coid="LIP-unknown"):
+    """State a timed-out live POST used to leave behind: capital held and
+    the coid recorded for reconciliation."""
+    import time
+    acct.reserve(coid, market=TKR, program_id=TKR, price_cents=50, quantity=10)
+    qm._unknown_submissions[coid] = (TKR, time.time())
+    qm.uncertain_markets.add(TKR)
+    return coid
 
 
 # ── 2. reconciliation is the authoritative release ────────────────────────
@@ -88,8 +84,7 @@ def test_deterministic_refusal_still_releases_immediately(tmp_path, acct, allow_
 def test_reconciliation_releases_an_unknown_submission_the_venue_never_saw(
         tmp_path, acct, allow_live):
     qm = _live_qm(tmp_path, acct)
-    qm.client.post.side_effect = TimeoutError("timeout")
-    qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
+    _unknown_submission(qm, acct)
     held = acct.state().reserved_usd
     assert held > D(0)
     # Venue view: no such order. That is authoritative.
@@ -102,9 +97,7 @@ def test_reconciliation_releases_an_unknown_submission_the_venue_never_saw(
 def test_reconciliation_retains_capital_when_the_order_does_exist(
         tmp_path, acct, allow_live):
     qm = _live_qm(tmp_path, acct)
-    qm.client.post.side_effect = TimeoutError("timeout")
-    qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
-    coid = next(iter(qm._unknown_submissions))
+    coid = _unknown_submission(qm, acct)
     held = acct.state().reserved_usd
     live = {"venue-1": RestingOrder(
         order_id="venue-1", market_ticker=TKR, side="yes", price_cents=50,
@@ -119,8 +112,9 @@ def test_phantom_order_releases_its_capital(tmp_path, acct, allow_live):
     """A local order absent from the venue view is gone; its hold must go
     with it or the shared account starves."""
     qm = _live_qm(tmp_path, acct)
-    qm.client.post.return_value = {"order": {"order_id": "venue-9"}}
+    qm.paper = True                     # placement is paper-only now
     r = qm._place_order(TKR, "yes", 50, 10, best_opposing_bid_cents=49)
+    qm.paper = False
     assert r is not None and acct.state().reserved_usd > D(0)
     qm._merge_live_orders({})           # venue says: no orders
     assert acct.state().reserved_usd == D(0)
@@ -130,7 +124,7 @@ def test_phantom_order_releases_its_capital(tmp_path, acct, allow_live):
 
 def test_all_markets_compete_for_the_same_account(tmp_path, acct, allow_live):
     qm = _live_qm(tmp_path, acct)
-    qm.client.post.return_value = {"order": {"order_id": "v"}}
+    qm.paper = True                     # placement is paper-only now
     before = acct.available_usd()
     qm._place_order("KXA-1", "yes", 50, 10, best_opposing_bid_cents=49)
     qm._place_order("KXB-2", "yes", 50, 10, best_opposing_bid_cents=49)

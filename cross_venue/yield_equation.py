@@ -1,7 +1,16 @@
-"""Unified Maker Yield Equation — single source of truth (cross_venue/).
+"""Unified Maker Yield Equation (cross_venue/) — LEGACY heuristic.
 
-Used by BOTH Kalshi and Polymarket scorers. Mirrors the official
-liquidity incentive program math from both venues' docs.
+LEGACY (2026-10-01): this is NOT the live ranking. APEX (mm.unattended)
+ranks and sizes in mm/ and scores rewards with engine/lip_scorer.py and
+polymarket/engine/pm_us_lip_scorer.py. Here, engine/lip_discovery.py only
+fills an audit column (unified_rebate) and the legacy run_paper /
+capital_allocator path ranks with it.
+
+It does NOT reproduce either venue's official incentive formula. It is a
+hand-built model: share = our_size / (book + our_size) (optionally blended
+with an observed share), a logistic qualification curve around the target
+size, exp(-days/90) time decay, a sqrt-time adverse-cost term, and a
+calibration multiplier. None of these terms is taken from venue docs.
 
 ⚠️  THIS IS THE CANONICAL COPY. The shims at:
     - engine/yield_equation.py            (Kalshi side)
@@ -16,10 +25,14 @@ PHYSICS:
                           × Calibration       (REQUIRED — no default)
                         - AdverseCost
 
-CALIBRATION (empirical):
-    Kalshi: ~0.25 (theoretical / actual paid)
-    PM:     ~0.10 (theoretical / actual paid)
-    Caller MUST pass venue-specific value. No default = no silent divergence.
+CALIBRATION (unmeasured priors):
+    Kalshi: 0.25, PM: 0.10 — intended as actual_paid / theoretical, i.e. the
+    multiplier that turns this model's output into paid rewards. Neither
+    value has been measured against reconciled payments; treat both as
+    guesses. Caller MUST pass the venue-specific value.
+
+CAPITAL: capital_at_risk is the collateral of BOTH resting bids,
+our_size * (p_yes + p_no) with p_yes = midpoint, p_no = 1 - midpoint.
 """
 from __future__ import annotations
 
@@ -28,7 +41,8 @@ from dataclasses import dataclass
 
 
 # Convenience constants for callers — venue-specific calibration.
-# These are PRIORS; per-market EWMA-learned values are served by
+# These are unmeasured PRIORS (not fitted to paid rewards); per-market
+# EWMA-learned values are served by
 # `kalshi_calib_for(key)` / `pm_calib_for(key)` below, which fall back
 # to these constants on cold start or when PER_MARKET_CALIB_ENABLED is off.
 KALSHI_CALIB = 0.25
@@ -140,8 +154,12 @@ class MarketYield:
 
     @property
     def capital_at_risk(self) -> float:
-        worst_leg_price = max(self.midpoint, 1.0 - self.midpoint)
-        return max(0.01, self.our_size * worst_leg_price)
+        # 2026-10-01: a two-sided quote rests a YES bid (~midpoint) AND a NO
+        # bid (~1 - midpoint); both are fully collateralised. Was
+        # our_size * max(p, 1-p), i.e. one leg only.
+        p_yes = self.midpoint
+        p_no = 1.0 - self.midpoint
+        return max(0.01, self.our_size * (p_yes + p_no))
 
     @property
     def yield_pct_daily(self) -> float:

@@ -1,19 +1,19 @@
 """config/constitution.py — innait risk constitution.
 
-Hard limits enforced by risk/sentinel.py via Python (NOT LLM). Sentinel
-checks every proposed order against these constants and refuses to
-forward orders that would breach them. There is no runtime override
-path — to change a limit, edit this file + commit + redeploy.
+Plain Python constants (no LLM). What actually enforces them (2026-10-01):
 
-This is the "CRO unconditional veto" from the strategic plan. Section A
-of the constitution. No agent/LLM/operator can bypass at runtime; the
-only way to relax a limit is a code change that ships through git.
+  - risk/sentinel.py checks them for the LEGACY execution.quote_manager
+    path only (run_paper.py and tools). It does NOT wrap every order: the
+    APEX engine (mm.unattended) does not call Sentinel; its risk layer is
+    mm/risk.py, which reads several of these constants (fill-rate halt,
+    exposure percentages, daily-loss caps) alongside its own LIP_* limits.
+  - Sentinel skips all checks when PAPER_BYPASS is true and
+    settings.PAPER_MODE is true (see below).
 
-Rationale: institutional-grade trading firms separate risk policy from
-trading policy. Trading agents may want to take more risk; risk policy
-must be able to say no AT THE ORDER LAYER, deterministically. By making
-the limits hard-coded Python constants checked by a Sentinel that wraps
-EVERY order placement, we get that separation without trusting any LLM.
+"No runtime override" holds only in the narrow sense that there is no
+override flag: these are ordinary module attributes, so anything in the
+process can reassign them (the tests do). Changing a limit for a
+deployment still means editing this file and redeploying.
 
 Limits live in this file because Python imports give us:
   - Type-checked constants
@@ -68,12 +68,13 @@ MAX_FILLS_PER_MINUTE = 30            # if more, something is wrong; halt
 REQUIRE_HEDGE_FOR_UNBLOCKLIST = True
 
 # ── Behavioral gates ────────────────────────────────────────────────────────
-# Sentinel checks these only on LIVE mode (LIP_PAPER=false). Paper mode
-# bypasses since there's no real money at risk.
+# Sentinel skips ALL of its checks when this is True and settings.PAPER_MODE
+# is True (paper: no real money at risk). Before 2026-10-01 Sentinel read a
+# nonexistent settings.LIP_PAPER, so the bypass never actually fired.
 PAPER_BYPASS = True
 
 # ── Override discipline ─────────────────────────────────────────────────────
 # Strategic plan: 24-hour cooling-off + written justification to relax any
 # limit. Implemented operationally — Sentinel itself has no override flag.
 # Limit changes go through git commit → review → deploy.
-ALLOW_RUNTIME_OVERRIDE = False    # ABSOLUTE — Sentinel.approve cannot be bypassed
+ALLOW_RUNTIME_OVERRIDE = False    # informational; nothing reads it (PAPER_BYPASS above is a bypass)

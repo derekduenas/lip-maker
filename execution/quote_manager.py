@@ -99,6 +99,19 @@ def _exchange_index(raw: dict) -> Optional[int]:
         return None
 
 
+LEGACY_LIVE_REFUSED = "legacy QuoteManager is paper-only; use mm.unattended"
+
+
+def _refuse_live(action: str) -> None:
+    """2026-10-01 review: mm.unattended is the only path to a live venue.
+
+    Every live (non-paper) place / decrease / amend / cancel in this legacy
+    manager raises before touching capital, state or the client. The live
+    branches below it are kept for history only and are unreachable."""
+    _log.error(f"[LIVE] REFUSED {action}: {LEGACY_LIVE_REFUSED}")
+    raise RuntimeError(LEGACY_LIVE_REFUSED)
+
+
 def _reject_readonly_client(client) -> None:
     """The production book reader is not an order client."""
     if client is None:
@@ -166,7 +179,8 @@ class QuoteManager:
     """Stateful manager. One instance per engine run.
 
     Paper mode: logs intent to quotes table, never calls /portfolio/orders.
-    Live mode (when PAPER_MODE=False): places/cancels real orders.
+    Live mode: refused. Any live place/decrease/amend/cancel raises
+    RuntimeError (see _refuse_live); live reads (cold boot, resync) remain.
     """
 
     def __init__(self, *, paper: bool = True, db_path: Optional[str] = None,
@@ -963,6 +977,9 @@ class QuoteManager:
         side's bid; when it is unknown a LIVE order is refused rather than
         sent on faith.
         """
+        if not self.paper:
+            _reject_readonly_client(self.client)   # read-only reader: hard exit first
+            _refuse_live(f"place {market_ticker} {side}@{price_cents}c")
         coid = f"LIP-{uuid.uuid4().hex[:16]}"
         # 2026-04-30 audit fix: skip edge-priced orders (Kalshi rejects 0 and 100
         # cent prices as "invalid price"). Avoids ERROR-log spam + rate-limit hits.
@@ -1101,6 +1118,9 @@ class QuoteManager:
 
     def _decrease_order(self, order: RestingOrder, new_size: float) -> bool:
         """Same price, smaller size. Kalshi decrease keeps queue position."""
+        if not self.paper:
+            _reject_readonly_client(self.client)   # read-only reader: hard exit first
+            _refuse_live(f"decrease {order.order_id}")
         new_size = float(new_size)
         if new_size <= 0 or new_size >= order.size_contracts:
             return False
@@ -1161,6 +1181,9 @@ class QuoteManager:
         price change or size-up re-reserves capital before the order can
         rest at the new terms, and the order must not cross.
         """
+        if not self.paper:
+            _reject_readonly_client(self.client)   # read-only reader: hard exit first
+            _refuse_live(f"amend {order.order_id}")
         new_price = int(new_price)
         new_size_f = float(new_size)
         if new_price <= 0 or new_price >= 100:
@@ -1296,7 +1319,8 @@ class QuoteManager:
         if self.paper:
             _log.info(f"[PAPER] CANCEL {order.market_ticker} {order.side}@{order.price_cents}c")
         else:
-            _reject_readonly_client(self.client)
+            _reject_readonly_client(self.client)   # read-only reader: hard exit first
+            _refuse_live(f"cancel {order.order_id}")
             try:
                 from urllib.parse import urlencode
                 path = (f"{V2_CREATE_PATH}/{order.order_id}?"

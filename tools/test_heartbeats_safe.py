@@ -7,7 +7,7 @@ with requests.exceptions.InvalidHeader). Response error strings from
 the APIs are similarly reduced to a boolean ok/not-ok signal.
 
 USAGE
-  sudo /root/lip-maker/venv/bin/python /root/lip-maker/tools/test_heartbeats_safe.py
+  sudo $LIP_HOME/venv/bin/python $LIP_HOME/tools/test_heartbeats_safe.py
 """
 from __future__ import annotations
 

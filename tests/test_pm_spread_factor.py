@@ -8,11 +8,10 @@ import pytest
 from pathlib import Path
 
 # Load polymarket's rewards_schedule directly (avoid namespace clash with
-# Kalshi's engine/ which is also on sys.path). Try both layouts: monorepo
-# (/lip-maker/polymarket/...) and split-repo deploy (/polymarket-maker/...).
+# Kalshi's engine/ which is also on sys.path). Monorepo layout only; the
+# split-repo /root/polymarket-maker deploy was retired (2026-10-01).
 _CANDIDATE_PATHS = [
     Path(__file__).resolve().parent.parent / "polymarket" / "engine" / "rewards_schedule.py",
-    Path("/root/polymarket-maker/engine/rewards_schedule.py"),
 ]
 PM_RS_PATH = next((p for p in _CANDIDATE_PATHS if p.exists()), None)
 if PM_RS_PATH is None:

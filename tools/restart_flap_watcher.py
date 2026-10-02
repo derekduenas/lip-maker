@@ -9,12 +9,16 @@ If count >= THRESHOLD_COUNT, writes a CRITICAL line to alerts.log.
 Idempotent via a one-line state file. Exit-code agnostic.
 
 Schedule (operator adds):
-   */5 * * * * cd /root/lip-maker && PYTHONPATH=. venv/bin/python tools/restart_flap_watcher.py >> /root/lip-maker/logs/restart_flap.log 2>&1
+   */5 * * * * cd $LIP_HOME && PYTHONPATH=. venv/bin/python tools/restart_flap_watcher.py >> $LIP_HOME/logs/restart_flap.log 2>&1
 
 Env tuneables: LIP_FLAP_THRESHOLD_COUNT, LIP_FLAP_THRESHOLD_WINDOW_MIN,
 LIP_FLAP_UNIT, LIP_FLAP_STATE_FILE, LIP_FLAP_ALERTS_LOG.
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import json, os, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,8 +26,8 @@ from pathlib import Path
 THRESHOLD_COUNT = int(os.getenv("LIP_FLAP_THRESHOLD_COUNT", "5"))
 WINDOW_MIN      = int(os.getenv("LIP_FLAP_THRESHOLD_WINDOW_MIN", "10"))
 UNIT            = os.getenv("LIP_FLAP_UNIT", "lip-maker.service")
-STATE_FILE      = os.getenv("LIP_FLAP_STATE_FILE", "/root/lip-maker/data/restart_flap_state.json")
-ALERTS_LOG      = os.getenv("LIP_FLAP_ALERTS_LOG", "/root/lip-maker/logs/alerts.log")
+STATE_FILE      = os.getenv("LIP_FLAP_STATE_FILE", (_LIP_HOME + "/data/restart_flap_state.json"))
+ALERTS_LOG      = os.getenv("LIP_FLAP_ALERTS_LOG", (_LIP_HOME + "/logs/alerts.log"))
 
 
 def _count_starts(unit: str, window_min: int) -> int:

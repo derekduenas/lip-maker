@@ -33,8 +33,11 @@ Paper only, three independent interlocks:
 
 1. `PAPER_MODE` is on unless `LIVE_ARMED`; the command refuses to start otherwise.
 2. `LIP_LIVE_ACK` must equal `I_ACCEPT_LIVE_RISK` or `QuoteManager` forces paper.
+   Since 2026-10-01 the legacy `QuoteManager` refuses every live
+   place/amend/decrease/cancel outright (RuntimeError) even when armed.
 3. `require_live_execution_allowed()` refuses live transmission while
-   `MAKER_ONLY_ENFORCEMENT_VERIFIED` is False. Both live paths call it.
+   `KALSHI_MAKER_ONLY_ENFORCEMENT_VERIFIED` is False (for venue="kalshi").
+   Both live paths call it.
 
 No order reaches the exchange. Nothing here places, cancels or funds anything live.
 

@@ -7,12 +7,16 @@ Decomposes:
   3. Ratio = actual / projected (should be ~1.0; if 0.3, we're getting 30%)
   4. Where the gap is (calibration vs fill rate)
 """
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 import sqlite3, re, subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-DB = "/root/lip-maker/data/lip_maker.db"
-LOG = "/root/lip-maker/logs/lip-maker.log"
+DB = (_LIP_HOME + "/data/lip_maker.db")
+LOG = (_LIP_HOME + "/logs/lip-maker.log")
 
 # 1. Pull MONEY_PRINT history from log (last 14 days)
 print("=" * 80)

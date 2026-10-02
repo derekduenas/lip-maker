@@ -1,9 +1,14 @@
-"""Microprice — imbalance-weighted mid as a better fair-value anchor than (bid+ask)/2.
+"""Size-weighted mid ("weighted mid") as a fair-value anchor.
 
-Stoikov 2018 ("The Micro-Price: A High-Frequency Estimator of Future Prices",
-SSRN 2970694): the order-book imbalance predicts which side trades through next;
-weighting the mid by the imbalance gives a martingale-corrected fair value that
-beats arithmetic mid as a one-step-ahead estimator.
+What this computes is the classic size-weighted mid: the touch prices
+weighted by the OPPOSITE side's size. It is NOT Stoikov's micro-price
+(Stoikov 2018, "The Micro-Price", SSRN 2970694). Stoikov defines the
+micro-price as the limit of expected future mids conditional on the
+current imbalance and spread, estimated from data (a Markov model of
+imbalance/spread transitions), and shows the plain weighted mid is a
+noisy, non-martingale approximation to it. No such estimation happens
+here. Nothing in this repo has measured whether this weighted mid beats
+the arithmetic mid on Kalshi books.
 
 For a Kalshi binary book:
     yes_bid = best YES buy price        (people willing to pay this for YES)

@@ -361,7 +361,12 @@ class TestQuoteManagerAmendDeath:
         ]
         target = QuoteTarget(market_ticker="TEST-MKT", yes_bid_cents=38,
                              no_bid_cents=50, size_contracts=25)
-        actions = qm.reconcile(target)
-        assert actions["cancelled"] == 1
-        sides = [o.side for o in qm.resting.get("TEST-MKT", [])]
-        assert sides == ["no"]
+        # 2026-10-01: the legacy QuoteManager is paper-only, so the live amend
+        # is refused before any request; both quotes stay as they were. The
+        # amend-death rule itself lives in mm.venues.kalshi
+        # (amend_response_killed_quote), which mm.unattended uses.
+        import pytest
+        with pytest.raises(RuntimeError, match="paper-only"):
+            qm.reconcile(target)
+        sides = sorted(o.side for o in qm.resting.get("TEST-MKT", []))
+        assert sides == ["no", "yes"]

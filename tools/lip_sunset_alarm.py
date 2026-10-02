@@ -1,6 +1,7 @@
 """Kalshi LIP sunset alarm.
 
-Kalshi LIP program currently scheduled to end 2026-09-01. Fires escalating
+Kalshi LIP program currently scheduled to end 2027-01-01 (extended from
+2026-09-01; see the URL on SUNSET_DATE). Fires escalating
 alerts at T-60, T-30, T-14, T-7, T-3, T-1 days. Each fire writes to an
 alerts log AND prints to stdout (which the cron pipes to its log).
 
@@ -11,6 +12,10 @@ USAGE:
   python lip_sunset_alarm.py --json
 """
 from __future__ import annotations
+# 2026-10-01: paths were hard-coded to the retired /root install.
+import os as _lh_os
+from pathlib import Path as _LhPath
+_LIP_HOME = _lh_os.environ.get("LIP_HOME") or str(_LhPath(__file__).resolve().parents[1])
 
 import argparse
 import json
@@ -19,10 +24,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-LIP_ROOT = Path("/root/lip-maker")
+LIP_ROOT = Path(_LIP_HOME)
 DB = str(LIP_ROOT / "data" / "lip_maker.db")
 
-SUNSET_DATE = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+# LIP was extended to Jan 1, 2027 (previously Sept 1, 2026). Source:
+# https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program
+SUNSET_DATE = datetime(2027, 1, 1, 0, 0, tzinfo=timezone.utc)
 ALERT_DAYS_OUT = [60, 30, 14, 7, 3, 1]
 
 

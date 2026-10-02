@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.b64
+data/*.db
+data/*.db-*
+**/recordings
+recordings
+**/__pycache__
+*.pyc
+_archive
+archive

@@ -15,7 +15,7 @@ Output: decision list for `max_target_size` + explicit blacklist of toxic
 markets before going live.
 
 Run:
-    cd /root/lip-maker && PYTHONPATH=. venv/bin/python tools/market_quality_audit.py
+    cd $LIP_HOME && PYTHONPATH=. venv/bin/python tools/market_quality_audit.py
 """
 from __future__ import annotations
 
