@@ -26,7 +26,6 @@ def main() -> int:
         ("monitor.market_throttle",       "market_throttle (graduated A.3 ladder)"),
         ("monitor.unrealized_pnl",        "unrealized_pnl_snapshot (live MTM)"),
         ("engine.calibration_ewma",       "market_calibration (per-market EWMA)"),
-        ("cross_venue.hedger",            "hedge_log (cross-venue intentions/fills)"),
         ("cross_venue.kalshi_pm_map",     "kalshi_pm_manual_map (operator overrides)"),
         ("cross_venue.arb_scanner",       "cross_venue_arb_log (arbitrage opportunities)"),
         ("execution.ibkr_adapter",        "broker_health + broker_dry_run_log"),
@@ -40,14 +39,10 @@ def main() -> int:
             print(f"  ✗ {mod_name}: {e}")
             return 1
 
-    # hedge_residual_log lives in the effectiveness tool — keep it adjacent
-    try:
-        from tools.hedge_effectiveness import ensure_schema as eff_ensure
-        eff_ensure(db_path)
-        print(f"  ✓ tools.hedge_effectiveness  (hedge_residual_log)")
-    except Exception as e:
-        print(f"  ✗ tools.hedge_effectiveness: {e}")
-        return 1
+    # hedge_log / hedge_residual_log (cross_venue.hedger, tools/hedge_effectiveness)
+    # were archived 2026-10-01 to _archive/2026-10-01/: their live hedge/unwind
+    # path had no interlock. go_live_check's basis gate therefore stays
+    # insufficient-data (fail closed).
 
     print("done. tables ready for paper run.")
     return 0

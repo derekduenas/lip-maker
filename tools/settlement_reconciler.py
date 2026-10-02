@@ -418,21 +418,8 @@ def reconcile(db_path: str = settings.DB_PATH) -> dict:
             _log.debug(f"{tkr}: reward estimate ${rebate_estimate:.4f} recorded as "
                        f"ESTIMATE; calibration awaits a reconciled payment")
 
-        # B.6 (2026-05-16): unwind any open hedge legs for this settled
-        # ticker. Adapter respects AUTO_HEDGE_<venue> flags — paper/dry-run
-        # stays paper, live stays live. Idempotent: re-runs only touch
-        # hedges whose unwound_at IS NULL. Failures degrade gracefully
-        # (logged but don't block settlement_reconciler).
-        try:
-            from cross_venue.hedge_unwind import unwind_for_ticker as _hu
-            _res = _hu(tkr, db_path=db_path)
-            if _res["n_unwound"] > 0 or _res["n_skipped"] > 0:
-                _log.info(
-                    f"[B.6] {tkr}: unwound={_res['n_unwound']} "
-                    f"skipped={_res['n_skipped']}"
-                )
-        except Exception as _e:
-            _log.debug(f"hedge_unwind hook failed for {tkr}: {_e}")
+        # B.6 hedge unwind hook removed 2026-10-01: cross_venue/hedge_unwind.py
+        # (real orders, no interlock) is archived under _archive/2026-10-01/.
 
     conn.commit()
 
