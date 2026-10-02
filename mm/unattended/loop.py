@@ -715,9 +715,14 @@ class RunLoop:
         return parts["markout_usd"] - parts["fees_usd"] + parts["rebates_usd"]
 
     def daily_pnl_usd(self) -> Decimal:
-        """Today's (UTC) MTM P&L: session MTM minus its value when the day
-        started (0 for a session that started today). Rewards excluded.
-        Cached per loop second."""
+        """Today's (UTC, loop clock) MTM P&L: MTM of every held position
+        (restored from the state file across restarts) minus fees plus PM US
+        rebates, minus its value when the day started. Rewards excluded.
+        The day base is persisted (``pnl_day``), so a restart on the same day
+        keeps counting from the same base and a restart on a later day starts
+        that day at 0. With no base (first start: nothing held, base 0; a
+        restored state file without one: base = the restored MTM, which is
+        not today's). Cached per loop second."""
         key = (int(self.now or 0), self.fills_total, len(self.settled))
         cached = getattr(self, "_daily_cache", None)
         if cached is not None and cached[0] == key:
@@ -725,7 +730,10 @@ class RunLoop:
         cur = self.session_mtm_usd()
         day = datetime.fromtimestamp(self.now or time.time(), timezone.utc).date().isoformat()
         if self._pnl_day is None:
-            self._pnl_day = {"day": day, "base": 0.0}
+            base = cur if getattr(self, "_pnl_day_unknown", False) else 0.0
+            self._pnl_day = {"day": day, "base": base}
+            self._pnl_day_unknown = False
+            self._state_dirty = True
         elif self._pnl_day.get("day") != day:
             self._pnl_day = {"day": day, "base": cur}
             self._state_dirty = True
@@ -853,6 +861,7 @@ class RunLoop:
         kill = self.kill
         if kill is not None and str(kill.get("reason", "")).startswith("external_kill:"):
             kill = kill.get("prev")
+        self.daily_pnl_usd()  # the day base is saved even if no status was built yet
         return {
             "version": STATE_VERSION, "saved_ts": time.time(), "now": self.now, "mode": self.mode,
             "position": self.position, "bucket_pos": self.bucket_pos,
@@ -931,6 +940,9 @@ class RunLoop:
         self.closed_periods_n = int(data.get("closed_periods_n") or 0)
         self.cooldown.update(cooldown)
         self._pnl_day = data.get("pnl_day") if isinstance(data.get("pnl_day"), dict) else None
+        # No saved day base but restored positions: their MTM is not today's.
+        self._pnl_day_unknown = self._pnl_day is None and bool(self.position)
+        self._daily_cache = None
         self.markouts = markouts
         for market in self.position:
             self._sync_inventory(market)

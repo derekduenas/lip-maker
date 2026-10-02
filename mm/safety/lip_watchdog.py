@@ -9,11 +9,12 @@ Every ``LIP_WD_INTERVAL_S`` (30s) it checks:
   * /status unreachable           LIP_WD_STATUS_FAILS (2) consecutive failures
   * market-data feed stale        now - status.last_frame_ts > LIP_WD_FEED_STALE_S (120)
                                   (skipped for LIP_WD_GRACE_S (240) after an engine session starts)
-  * daily P&L                     < -abs(LIP_WD_DAILY_LOSS) (50). P&L = sum over buckets of
-                                  markout_usd - fees_usd + rebates_usd (MTM of fills net of Kalshi
-                                  maker fees and PM US rebates; rewards excluded unless
-                                  LIP_WD_PNL_INCLUDE_REWARDS=1),
-                                  re-based at each UTC day and on engine restart.
+  * daily P&L                     < -abs(LIP_WD_DAILY_LOSS) (50). The engine's restart-safe
+                                  status.daily_mtm_pnl_usd (UTC day, rewards excluded) when
+                                  reported; else sum over buckets of markout_usd - fees_usd +
+                                  rebates_usd (MTM of fills net of Kalshi maker fees and PM US
+                                  rebates; rewards excluded unless LIP_WD_PNL_INCLUDE_REWARDS=1),
+                                  re-based at each UTC day and carried across engine restarts.
   * inventory                     worst-case settlement loss of unpaired legs (+ locked loss on
                                   pairs costing > $1) > LIP_WD_MAX_INVENTORY_USD (500); paired
                                   YES+NO is riskless and not counted. Source, most granular first:
@@ -302,14 +303,32 @@ def inventory_usd(status: dict):
 
 
 def daily_pnl(cfg: Config, state: dict, status: dict, now: float):
-    """Today's (UTC) MTM P&L. Re-based at each UTC day; carried across engine restarts."""
+    """Today's (UTC) MTM P&L.
+
+    Preferred: the engine's ``daily_mtm_pnl_usd``. The engine restores its
+    positions, fees and bucket P&L from its state file and persists its own
+    UTC-day base, so that figure is already restart-safe (same day: same
+    base; later day: starts at 0). It excludes rewards whatever
+    LIP_WD_PNL_INCLUDE_REWARDS says (rewards are estimates; leaving them out
+    only makes the check stricter). The session baseline below is kept in
+    step with it so a fallback continues from the same figure.
+
+    Fallback (engines that do not report it): bucket session P&L re-based at
+    each UTC day and carried across engine restarts, for engines whose
+    session P&L restarts from 0."""
     cur = session_pnl(status, cfg.include_rewards)
-    if cur is None:
-        return None
     day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
     elapsed = _f(status.get("session_elapsed_s")) or 0.0
     ref = _f(status.get("last_frame_ts")) or now
     start = ref - elapsed
+    eng = _f(status.get("daily_mtm_pnl_usd"))
+    if eng is not None:
+        if cur is not None:
+            state["pnl_base"] = {"day": day, "session_start": start, "carry": 0.0,
+                                 "baseline": cur - eng, "last_daily": eng}
+        return eng
+    if cur is None:
+        return None
     base = state.get("pnl_base") or {}
     same_session = base.get("session_start") is not None and abs(base["session_start"] - start) < 120
     started_today = datetime.fromtimestamp(start, timezone.utc).date().isoformat() == day
