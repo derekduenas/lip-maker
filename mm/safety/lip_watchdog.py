@@ -25,7 +25,11 @@ Every ``LIP_WD_INTERVAL_S`` (30s) it checks:
 
 On trip (latched until ``--reset``):
   1. write the kill file (LIP_KILL_FILE, /var/lib/lip-maker/KILL); the engine
-     checks it once per second and cancels all quotes / stops quoting;
+     polls it (mm/unattended/service.py) and latches external_kill, cancelling
+     all quotes. If the kill file cannot be written, run LIP_WD_STOP_CMD
+     (default ``systemctl stop lip-unattended``; needs a polkit rule or
+     sudoers entry for user lip, see deploy/apex/README.md) every tick until
+     it can, with TRIP alerts on both outcomes -- never a silent continue;
   2. cancel-all resting orders via the Kalshi API -- ONLY when the watchdog's
      own config is armed (LIP_WD_LIVE_ARMED=true and LIP_PAPER!=true in its
      env) AND one of: status says live_armed, the persisted
@@ -40,7 +44,14 @@ On trip (latched until ``--reset``):
      (fail-closed: latch stays, alerts repeat);
   3. alert (alerts.log + alert JSON; optional ntfy push), rate-limited.
 
+Watchdog self-failure: a corrupt state file loads as latched (and as
+engine_seen_live). An exception in a tick alerts (WARN); LIP_WD_TICK_FAILS (3)
+consecutive failures latch the watchdog itself (watchdog_tick_failing) and run
+the same kill-file / stop / cancel-all actions. systemd restarts the process
+if it dies (Restart=always).
+
 Reset:  python -m mm.safety.lip_watchdog --reset   (then restart lip-unattended)
+        Clears the latch, kill file and the persisted engine_seen_live flag.
 """
 from __future__ import annotations
 
@@ -49,6 +60,8 @@ import base64
 import json
 import logging
 import os
+import shlex
+import subprocess
 import sys
 import time
 import urllib.error
@@ -126,6 +139,10 @@ class Config:
             log.warning("LIP_WD_CANCEL_SCOPE=%r invalid; using 'ours'", scope)
             scope = "ours"
         self.cancel_scope = scope
+        # Fallback when the kill file cannot be written. Needs privileges the
+        # `lip` user does not have by default: see deploy/apex/README.md.
+        self.stop_cmd = env.get("LIP_WD_STOP_CMD", "systemctl stop lip-unattended")
+        self.tick_fails = max(1, int(_num(env, "LIP_WD_TICK_FAILS", 3)))
 
 
 # ----------------------------------------------------------------- io helpers
@@ -432,6 +449,32 @@ def write_kill_file(cfg: Config, reasons, now) -> None:
          "by": "lip-watchdog"}, indent=1))
 
 
+def stop_engine(cfg: Config, state: dict, now, runner=None) -> dict:
+    """Stop the engine with LIP_WD_STOP_CMD (fallback when the kill file
+    cannot be written). Result recorded in state["engine_stop"]; failure is
+    a TRIP alert, never silent."""
+    try:
+        cmd = shlex.split(cfg.stop_cmd or "")
+        if not cmd:
+            raise RuntimeError("LIP_WD_STOP_CMD is empty")
+        r = (runner or subprocess.run)(cmd, capture_output=True, text=True, timeout=60)
+        res = {"ts": now, "cmd": cmd, "rc": r.returncode, "ok": r.returncode == 0,
+               "stderr": str(getattr(r, "stderr", "") or "")[-300:]}
+    except Exception as exc:
+        res = {"ts": now, "cmd": cfg.stop_cmd, "ok": False, "error": str(exc)[:300]}
+    state["engine_stop"] = res
+    if res["ok"]:
+        alert(cfg, state, "engine_stopped", "TRIP",
+              f"kill file unwritable -> engine stopped via `{cfg.stop_cmd}`", res, now)
+    else:
+        alert(cfg, state, "engine_stop_failed", "TRIP",
+              f"kill file unwritable AND engine stop failed (`{cfg.stop_cmd}`): {res}. "
+              "Engine may still be quoting -- stop it by hand.", res, now,
+              force=not state.get("engine_stop_failed_alerted"))
+        state["engine_stop_failed_alerted"] = True
+    return res
+
+
 def config_armed(cfg: Config) -> bool:
     """The watchdog's own config allows real API writes (LIP_WD_LIVE_ARMED and not LIP_PAPER)."""
     return bool(cfg.live_flag and not cfg.paper_env)
@@ -565,7 +608,7 @@ def cancel_all_action(cfg: Config, state: dict, status, now, canceller=None) -> 
 
 
 # ----------------------------------------------------------------- main tick
-def tick(cfg: Config, now=None, status_fn=None, canceller=None) -> dict:
+def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> dict:
     now = time.time() if now is None else now
     state = load_state(cfg)
     status, err = None, None
@@ -594,7 +637,11 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None) -> dict:
             if not cfg.kill_file.exists():
                 write_kill_file(cfg, state.get("reasons") or ["latched"], now)
         except Exception as exc:
-            alert(cfg, state, "kill_file_failed", "TRIP", f"cannot write kill file: {exc}", None, now)
+            alert(cfg, state, "kill_file_failed", "TRIP",
+                  f"cannot write kill file {cfg.kill_file}: {exc}; stopping engine via LIP_WD_STOP_CMD",
+                  None, now, force=not state.get("kill_file_failed_alerted"))
+            state["kill_file_failed_alerted"] = True
+            stop_engine(cfg, state, now, runner)   # every tick until the kill file lands
         if not (state.get("cancel") or {}).get("ok") or live_armed(cfg, status, state):
             cancel_all_action(cfg, state, status, now, canceller)
         alert(cfg, state, "latched", "LATCHED",
@@ -618,6 +665,45 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None) -> dict:
     except Exception as exc:
         log.error("health write failed: %s", exc)
     return health
+
+
+def tick_failed(cfg: Config, n: int, exc, now=None, runner=None, canceller=None) -> None:
+    """The main loop's tick raised ``n`` times in a row. Alert each time; at
+    LIP_WD_TICK_FAILS consecutive failures treat the watchdog itself as a
+    trip: latch, write the kill file (or stop the engine), cancel-all if
+    armed. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        state = load_state(cfg)
+    except Exception:
+        state = {}
+    msg = f"watchdog tick failed ({n}/{cfg.tick_fails}): {type(exc).__name__}: {exc}"[:500]
+    try:
+        if n < cfg.tick_fails:
+            alert(cfg, state, "tick_failed", "WARN", msg, None, now)
+        else:
+            reason = f"watchdog_tick_failing:{n}x"
+            if not state.get("latched"):
+                state.update({"latched": True, "reasons": [reason], "tripped_at": now})
+            elif reason.split(":")[0] not in ";".join(state.get("reasons") or []):
+                state["reasons"] = list(state.get("reasons") or []) + [reason]
+            alert(cfg, state, "tick_failing", "TRIP", "lip-watchdog TRIPPED: " + msg, None, now,
+                  force=not state.get("tick_failing_alerted"))
+            state["tick_failing_alerted"] = True
+            try:
+                if not cfg.kill_file.exists():
+                    write_kill_file(cfg, state.get("reasons") or [reason], now)
+            except Exception as kexc:
+                alert(cfg, state, "kill_file_failed", "TRIP", f"cannot write kill file: {kexc}", None, now)
+                stop_engine(cfg, state, now, runner)
+            if config_armed(cfg):
+                cancel_all_action(cfg, state, None, now, canceller)   # status unknown -> armed
+    except Exception as e2:
+        log.error("tick_failed handling failed: %s", e2)
+    try:
+        save_state(cfg, state)
+    except Exception as e3:
+        log.error("tick_failed state save failed: %s", e3)
 
 
 def reset(cfg: Config) -> None:
@@ -654,15 +740,19 @@ def main(argv=None) -> int:
         return 0
     log.info("lip-watchdog start: interval=%ss kill_file=%s ntfy=%s live_flag=%s paper_env=%s",
              cfg.interval_s, cfg.kill_file, bool(cfg.ntfy_topic), cfg.live_flag, cfg.paper_env)
+    fails = 0
     while True:
         try:
             h = tick(cfg)
+            fails = 0
             if h["reasons_now"] or h["latched"]:
                 log.warning("check: latched=%s now=%s", h["latched"], h["reasons_now"])
         except Exception as exc:
-            log.exception("tick failed: %s", exc)
+            fails += 1
+            log.exception("tick failed (%d consecutive): %s", fails, exc)
+            tick_failed(cfg, fails, exc)
         if args.once:
-            return 0
+            return 1 if fails else 0
         time.sleep(cfg.interval_s)
 
 
