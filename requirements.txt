@@ -1,7 +1,11 @@
 # Runtime dependencies of the APEX entrypoints (python -m mm.unattended,
 # python -m mm.safety.lip_watchdog, python -m mm.replay). Derived from the
 # third-party imports of every module import-reachable from those entrypoints;
-# pinned to the versions the test suite was run against on 2026-10-01.
+# pinned to the versions the test suite was run against on 2026-10-01
+# (Python 3.13; the Dockerfile uses python:3.13-slim). Every pin also ships a
+# Python 3.12 wheel (checked with pip download --python-version 3.12), which is
+# what deploy/droplet/setup.sh gets from Ubuntu 24.04's python3; the Python
+# version of the existing APEX venv is not recorded in this repo.
 certifi==2026.7.22
 cryptography==50.0.1
 requests==2.34.2
