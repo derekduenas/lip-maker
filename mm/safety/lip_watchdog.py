@@ -28,8 +28,12 @@ On trip (latched until ``--reset``):
      ``engine_seen_live`` flag is set (any earlier status showed live; cleared
      only by --reset; a corrupt state file counts as set), or /status is
      unreachable (dead/hung engine). Config paper/unarmed -> never a real API
-     write, logged as a no-op. Idempotent; retried every tick until the
-     API shows zero resting orders (fail-closed: latch stays, alerts repeat);
+     write, logged as a no-op. Scope LIP_WD_CANCEL_SCOPE=ours (default:
+     only client_order_id starting with LIP_WD_COID_PREFIX, "LIP-"; the
+     account is shared with the Weather engine) or all. Uses Cancel Order V2
+     with each order's market_ticker/exchange_index. Idempotent; retried
+     every tick until the API shows zero in-scope resting orders
+     (fail-closed: latch stays, alerts repeat);
   3. alert (alerts.log + alert JSON; optional ntfy push), rate-limited.
 
 Reset:  python -m mm.safety.lip_watchdog --reset   (then restart lip-unattended)
@@ -106,6 +110,18 @@ class Config:
         self.kalshi_rest = env.get("LIP_WD_KALSHI_REST", PROD_REST).rstrip("/")
         self.kalshi_key_id = env.get("LIP_WD_KALSHI_KEY_ID", "")
         self.kalshi_key_path = env.get("LIP_WD_KALSHI_KEY_PATH", "")
+        # The Kalshi key/account is shared with the Weather engine
+        # (execution/kalshi_auth.py). "ours" cancels only orders whose
+        # client_order_id starts with one of these prefixes (the engine's
+        # Kalshi adapter and quote manager use "LIP-"); "all" cancels
+        # every resting order on the account.
+        self.coid_prefixes = tuple(p.strip() for p in env.get("LIP_WD_COID_PREFIX", "LIP-").split(",")
+                                   if p.strip()) or ("LIP-",)
+        scope = str(env.get("LIP_WD_CANCEL_SCOPE", "ours")).strip().lower()
+        if scope not in ("ours", "all"):
+            log.warning("LIP_WD_CANCEL_SCOPE=%r invalid; using 'ours'", scope)
+            scope = "ours"
+        self.cancel_scope = scope
 
 
 # ----------------------------------------------------------------- io helpers
@@ -354,7 +370,18 @@ def live_armed(cfg: Config, status, state=None) -> bool:
 
 
 class KalshiCanceller:
-    """Cancel every resting order on the account. Idempotent: 404 == done."""
+    """Cancel resting orders in scope (ours by client_order_id prefix, or all).
+
+    Cancel uses Cancel Order V2, ``DELETE /portfolio/events/orders/{order_id}``
+    with ``market_ticker`` and ``exchange_index`` taken from the listed order
+    row (docs.kalshi.com/api-reference/orders/cancel-order-v2, fetched
+    2026-10-01). The legacy ``DELETE /portfolio/orders/{id}`` route is
+    rejected since June 2026 (mm/venues/kalshi.py), and a write without
+    ``market_ticker`` defaults to shard 0, so a row with no ticker is not
+    sent (counted as an error; fail closed). Listing uses
+    ``GET /portfolio/orders`` which covers all shards when ``exchange_index``
+    is omitted. Idempotent: 404 == already gone. Verified by re-listing.
+    """
 
     def __init__(self, cfg: Config, opener=None):
         self.cfg = cfg
@@ -383,34 +410,55 @@ class KalshiCanceller:
             body = r.read().decode("utf-8") or "{}"
             return json.loads(body)
 
-    def resting_ids(self):
-        ids, cursor = [], None
+    def resting_orders(self):
+        rows, cursor = [], None
         for _ in range(100):
             q = {"status": "resting", "limit": 200}
             if cursor:
                 q["cursor"] = cursor
             data = self._req("GET", "/portfolio/orders", q)
-            ids += [o["order_id"] for o in data.get("orders", []) if o.get("order_id")]
+            rows += [o for o in data.get("orders", []) if isinstance(o, dict) and o.get("order_id")]
             cursor = data.get("cursor")
             if not cursor:
                 break
-        return ids
+        return rows
+
+    def in_scope(self, row) -> bool:
+        if self.cfg.cancel_scope == "all":
+            return True
+        return str(row.get("client_order_id") or "").startswith(self.cfg.coid_prefixes)
+
+    def resting_ids(self):
+        return [o["order_id"] for o in self.resting_orders() if self.in_scope(o)]
+
+    def cancel_one(self, row) -> None:
+        ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+        if not ticker:
+            raise ValueError(f"order {row.get('order_id')} has no ticker; not cancelling on shard 0")
+        q = {"market_ticker": ticker}
+        if row.get("exchange_index") is not None:
+            q["exchange_index"] = int(row["exchange_index"])
+        if row.get("subaccount_number") not in (None, "", 0):
+            q["subaccount"] = int(row["subaccount_number"])
+        self._req("DELETE", f"/portfolio/events/orders/{urllib.parse.quote(str(row['order_id']))}", q)
 
     def cancel_all(self) -> dict:
         if not (self.cfg.kalshi_key_id and self.cfg.kalshi_key_path):
             raise RuntimeError("live cancel-all needs LIP_WD_KALSHI_KEY_ID/LIP_WD_KALSHI_KEY_PATH")
-        ids = self.resting_ids()
+        listed = self.resting_orders()
+        rows = [o for o in listed if self.in_scope(o)]
         errors = 0
-        for oid in ids:
+        for row in rows:
             try:
-                self._req("DELETE", f"/portfolio/orders/{urllib.parse.quote(oid)}")
+                self.cancel_one(row)
             except urllib.error.HTTPError as exc:
                 if exc.code != 404:      # 404: already gone -> fine (idempotent)
                     errors += 1
             except Exception:
                 errors += 1
-        left = self.resting_ids()        # verify; fail closed if anything remains
-        return {"found": len(ids), "errors": errors, "remaining": len(left), "ok": not left}
+        left = self.resting_ids()        # verify; fail closed if anything in scope remains
+        return {"found": len(rows), "errors": errors, "remaining": len(left), "ok": not left,
+                "scope": self.cfg.cancel_scope, "skipped_foreign": len(listed) - len(rows)}
 
 
 def cancel_all_action(cfg: Config, state: dict, status, now, canceller=None) -> dict:
