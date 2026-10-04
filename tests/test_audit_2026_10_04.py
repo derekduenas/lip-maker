@@ -541,3 +541,26 @@ def test_status_carries_the_series_gate(monkeypatch):
     _gate_env(monkeypatch)
     lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
     assert "series_gate" in status_payload(lp.live_snapshot())
+
+
+# ------------------------------------------------- 8. reliability
+def test_checkpoint_reports_skew_trips_as_well_as_quote_pulls(monkeypatch, tmp_path):
+    lp = _campaign(monkeypatch, tmp_path / "state.json")
+    cp = lp.checkpoint_report()
+    assert cp["clock_skew_pulls"]["trips"] == 1 and cp["clock_skew_pulls"]["session"] == 1
+
+
+def test_pm_us_frames_are_applied_without_any_kalshi_frame(monkeypatch, tmp_path):
+    """drain_external ran only inside the Kalshi frame callback: a quiet or
+    down Kalshi socket froze the Polymarket US books."""
+    from mm.unattended.service import EngineTimer
+    from tests.test_patch21 import _pm_book, _pm_prog
+    lp = L.RunLoop(mode="paper", bankroll=5000, carry_forward=True)
+    lp.pmus = object()                     # a PM US feed is attached (its thread only put()s frames)
+    _pm_prog(lp)
+    _pm_book(lp, "rtc-bb-2026-10-01-a", [(0.40, 3000)], [(0.45, 3000)], T0 + 1)
+    assert "PMUS:rtc-bb-2026-10-01-a" not in lp.programs or not lp.accruals["PMUS:rtc-bb-2026-10-01-a"].book.book.yes_bids
+    timer = EngineTimer(lp, heartbeat=str(tmp_path / "hb"), kill_path=str(tmp_path / "KILL"))
+    timer.tick()
+    m = "PMUS:rtc-bb-2026-10-01-a"
+    assert m in lp.programs and lp.accruals[m].book.book.yes_bids

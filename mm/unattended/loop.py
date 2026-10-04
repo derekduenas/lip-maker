@@ -2450,7 +2450,8 @@ class RunLoop:
             sample_fills=self.sample_fills_n,
             skew_pulls_24h=self.skew_pulls_24h(), skew_pulls_session=int(self.pulls.get("clock_skew", 0)),
             session_s=session_s, markout_5m_usd=usd, markout_5m_fills=len(done),
-            markout_5m_contracts=contracts, now=self.now or time.time())
+            markout_5m_contracts=contracts, now=self.now or time.time(),
+            skew_trips=self.skew_trips_n)
 
     def _best_queue(self, market: str) -> tuple:
         """Contracts resting at the best YES bid and the best NO bid."""

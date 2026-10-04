@@ -249,6 +249,11 @@ class EngineTimer:
         loop = self.loop
         with loop.lock:
             _honor_kill_file(loop, self.kill_path)
+            if getattr(loop, "pmus", None) is not None:
+                # PM US frames are applied here too: they used to be drained
+                # only inside the Kalshi frame callback, so a quiet or down
+                # Kalshi socket froze the Polymarket US books.
+                loop.drain_external()
             report = self.refresher.build() if self.refresher is not None else None
             body = loop.state_snapshot(every_s=5.0)
             samples = _take_fv_samples(loop)

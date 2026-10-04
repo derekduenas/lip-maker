@@ -65,7 +65,8 @@ def skew_pulls_per_day(*, pulls_24h: int, pulls_session: int, session_s: float) 
 def checkpoint_report(*, kalshi_fills_print: int, kalshi_fills_cross: int, kalshi_fills_synthetic: int,
                       kalshi_fills_total: int, sample_fills: int, skew_pulls_24h: int,
                       skew_pulls_session: int, session_s: float, markout_5m_usd: float,
-                      markout_5m_fills: int, markout_5m_contracts: float, now: float | None = None) -> dict:
+                      markout_5m_fills: int, markout_5m_contracts: float, now: float | None = None,
+                      skew_trips: int | None = None) -> dict:
     """Status ``checkpoint``: the Oct 6 numbers and their PASS/FAIL/PENDING."""
     cfg = gate_config()
     rate = skew_pulls_per_day(pulls_24h=skew_pulls_24h, pulls_session=skew_pulls_session, session_s=session_s)
@@ -95,7 +96,9 @@ def checkpoint_report(*, kalshi_fills_print: int, kalshi_fills_cross: int, kalsh
         "kalshi_fills": {"real_print": real, "paper_cross": int(kalshi_fills_cross),
                          "synthetic": int(kalshi_fills_synthetic), "total": int(kalshi_fills_total),
                          "from_sampling_group": int(sample_fills)},
+        # pulls = quotes pulled (one trip pulls every resting quote); trips = guard activations.
         "clock_skew_pulls": {"last_24h": int(skew_pulls_24h), "session": int(skew_pulls_session),
+                             "trips": None if skew_trips is None else int(skew_trips),
                              "session_hours": round(session_s / 3600.0, 2)},
         "markout_5m": {"fills": int(markout_5m_fills), "contracts": round(markout_5m_contracts, 4),
                        "usd": round(markout_5m_usd, 4),
