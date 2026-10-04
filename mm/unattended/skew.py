@@ -43,8 +43,14 @@ def _num(name: str, default: float) -> float:
         return float(default)
 
 
+def reservation_enabled() -> bool:
+    """LIP_RESERVATION_ENABLE (default off): Avellaneda-Stoikov reservation shift
+    (mm/reservation.py) instead of the linear tick heuristic."""
+    return _num("LIP_RESERVATION_ENABLE", 0.0) > 0
+
+
 def enabled() -> bool:
-    return _num("LIP_SKEW_ENABLE", 0.0) > 0
+    return _num("LIP_SKEW_ENABLE", 0.0) > 0 or reservation_enabled()
 
 
 @dataclass
@@ -105,6 +111,59 @@ def skew_prices(yes_c: int, no_c: int, *, net_yes: float, frac: float,
         below = max(0, int(ref[add]) - (px[add] - back))
         loss = 1.0 - float(df) ** below if below > 0 else 0.0
         if loss <= p.max_reward_loss + 1e-12 and px[add] - back >= 1:
+            out["reward_loss"] = round(loss, 6)
+            break
+        back -= 1
+    out["back"] = back
+    px[add] -= back
+    out["yes_cents"], out["no_cents"] = px["yes"], px["no"]
+    return out
+
+
+def reservation_prices(yes_c: int, no_c: int, *, net_yes: float, frac: float,
+                       best_yes: int | None, best_no: int | None, df: float,
+                       yes_ref: int | None = None, no_ref: int | None = None,
+                       fair_cents: float, sigma_cents: float, tau_hours: float,
+                       gamma: float = 0.04, max_skew: int = 3,
+                       max_reward_loss: float = 0.5) -> dict:
+    """Same output shape as ``skew_prices`` with the shift from the Avellaneda-Stoikov
+    reservation price (mm/reservation.py: r = s - q*gamma*sigma^2*tau, in binary
+    cents units, capped at ``max_skew``).
+
+    The reducing side is raised by the shift, never at/through the opposite
+    implied ask. The adding side backs off by the same amount, limited so the
+    reward credit given up stays <= ``max_reward_loss`` (as the linear skew).
+    ``suppress`` flags the Gueant bound at |q| >= 1 (the inventory caps already
+    block that side). Extra keys: model, skew_cents, suppress, reason."""
+    from mm.reservation import quote_reservation
+    out = {"yes_cents": int(yes_c), "no_cents": int(no_c), "agg": 0, "back": 0, "reduce": None,
+           "add": None, "reward_loss": 0.0, "frac": round(float(frac), 4), "model": "reservation",
+           "skew_cents": 0, "suppress": None, "reason": ""}
+    if not net_yes or frac <= 0:
+        return out
+    q = min(1.5, float(frac)) * (1.0 if net_yes > 0 else -1.0)
+    res = quote_reservation(float(fair_cents), q, 1.0, sigma_cents=float(sigma_cents),
+                            tau_hours=float(tau_hours), gamma=float(gamma), max_skew_cents=int(max_skew))
+    k = abs(int(res.skew_cents))
+    add = "yes" if net_yes > 0 else "no"
+    red = "no" if add == "yes" else "yes"
+    out.update({"add": add, "reduce": red, "skew_cents": int(res.skew_cents),
+                "suppress": res.suppress_side, "reason": res.reason})
+    if k == 0:
+        return out
+    px = {"yes": int(yes_c), "no": int(no_c)}
+    ref = {"yes": yes_ref if yes_ref is not None else int(yes_c),
+           "no": no_ref if no_ref is not None else int(no_c)}
+    best_opp = {"yes": best_no, "no": best_yes}
+    cap = 99 if best_opp[red] is None else 99 - int(best_opp[red])        # never cross
+    new = max(min(px[red] + k, cap, 99), px[red])
+    out["agg"] = new - px[red]
+    px[red] = new
+    back = k
+    while back > 0:
+        below = max(0, int(ref[add]) - (px[add] - back))
+        loss = 1.0 - float(df) ** below if below > 0 else 0.0
+        if loss <= float(max_reward_loss) + 1e-12 and px[add] - back >= 1:
             out["reward_loss"] = round(loss, 6)
             break
         back -= 1

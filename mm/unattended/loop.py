@@ -488,6 +488,11 @@ class RunLoop:
         # time-averaged competition ratio (mm/selector.py exit_reason).
         self.entry_state: dict[str, dict] = {}
         self.comp_ewma: dict[str, float] = {}
+        # Reservation model inputs (LIP_RESERVATION_ENABLE): YES mid samples per market
+        # (>= 30 s apart, last 2 h) for sigma; and when each market's unpaired
+        # inventory began (LIP_INV_MAX_AGE_H reduce-only exit). Persisted: inv_since.
+        self._mid_hist: dict[str, list] = {}
+        self.inv_since: dict[str, float] = {}
         self.param_history: list = []
         self._params_noted = False
         # Phase 4: multi-horizon fill markouts (measurement only).
@@ -1576,6 +1581,9 @@ class RunLoop:
         nb = max((lvl.price_cents for lvl in book.no_bids), default=None)
         if yb is not None and nb is not None:
             self.last_mid[market] = (yb + (100 - nb)) / 2.0
+            from mm.unattended import skew as _sk
+            if _sk.reservation_enabled():
+                self._note_mid(market, float(self.now or 0.0), self.last_mid[market])
         elif yb is not None:
             self.last_mid[market] = float(yb)
         elif nb is not None:
@@ -1820,6 +1828,7 @@ class RunLoop:
             "price_acc": self.price_acc, "price_event_acc": self.price_event_acc,
             "reward_ledger": self.ledger[-5000:], "period_estimates": self.period_estimates,
             "mk_ewma": self.mk_ewma, "entry_state": self.entry_state, "comp_ewma": self.comp_ewma,
+            "inv_since": self.inv_since,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1939,6 +1948,8 @@ class RunLoop:
                                              "markout_cents": float(v["markout_cents"]),
                                              "ts": float(v.get("ts") or 0.0)}
                                     for m, v in data["entry_state"].items()}
+            if isinstance(data.get("inv_since"), dict):
+                self.inv_since = {str(m): float(v) for m, v in data["inv_since"].items()}
         except (IndexError, KeyError, TypeError, ValueError):
             logging.getLogger("lip.risk").warning("guard/exit state unreadable: ignored")
         for attr, key in (("ledger", "reward_ledger"), ("period_estimates", "period_estimates")):
@@ -2535,6 +2546,7 @@ class RunLoop:
             acc["fills"] += 1
             acc["fees"] += fee
         self._sync_inventory(market)
+        self._note_inventory_age(market, ts)
         self._state_dirty = True
         mid = self._side_mid_cents(market, side)
         if self._venue(market) == "pmus" and count > 0:
@@ -2576,6 +2588,45 @@ class RunLoop:
         self._recheck_event_caps(market, ts)
 
     # ------------------------------------------------------------ patch 18
+    def _note_mid(self, market: str, ts: float, mid: float) -> None:
+        rows = self._mid_hist.setdefault(market, [])
+        if rows and ts - rows[-1][0] < 30.0:
+            return
+        rows.append((float(ts), float(mid)))
+        cut = ts - 7200.0
+        while rows and rows[0][0] < cut:
+            rows.pop(0)
+
+    def _sigma_cents(self, market: str, ts: float):
+        """Stdev of the YES mid per sqrt(hour), in cents, from our own samples
+        (>= 8 samples spanning >= 5 minutes), else None."""
+        rows = [r for r in self._mid_hist.get(market, ()) if r[0] >= ts - 7200.0]
+        if len(rows) < 8 or rows[-1][0] - rows[0][0] < 300.0:
+            return None
+        num = den = 0.0
+        for (t0, m0), (t1, m1) in zip(rows, rows[1:]):
+            dt = (t1 - t0) / 3600.0
+            if dt > 0:
+                num += (m1 - m0) ** 2
+                den += dt
+        return None if den <= 0 else (num / den) ** 0.5
+
+    def _note_inventory_age(self, market: str, ts: float) -> None:
+        pos = self.position.get(market)
+        net = 0.0 if (not pos or market in self.settled) else float(pos["yes"]) - float(pos["no"])
+        if abs(net) > 1e-9:
+            if market not in self.inv_since:
+                self.inv_since[market] = float(ts)
+                self._state_dirty = True
+        elif self.inv_since.pop(market, None) is not None:
+            self._state_dirty = True
+
+    def _inv_aged(self, market: str, ts: float) -> bool:
+        """Unpaired inventory older than LIP_INV_MAX_AGE_H (default 0 = off)."""
+        hours = _env_num("LIP_INV_MAX_AGE_H", 0.0)
+        since = self.inv_since.get(market)
+        return hours > 0 and since is not None and ts - since >= hours * 3600.0
+
     def _inv_frac(self, market: str) -> float:
         """Inventory as a fraction of the unpaired-$ caps (max of market, event)."""
         cap_m = _env_num("LIP_MARKET_INV_CAP_USD", 0.0) or _env_num("LIP_SKEW_REF_USD", 25.0)
@@ -2585,6 +2636,9 @@ class RunLoop:
             ev = self._event_of(market)
             held = sum(self._unpaired_usd(m) for m in self.position if self._event_of(m) == ev)
             frac = max(frac, held / cap_e) if self._unpaired_usd(market) > 0 else frac
+        if self._inv_aged(market, float(self.now or 0.0)):
+            # Aged inventory: push the reducing side to the maximum skew (passive exit).
+            frac = max(frac, _env_num("LIP_INV_AGED_FRAC", 1.0))
         return frac
 
     def _skew_target(self, market: str, yes_cents: int, no_cents: int) -> tuple:
@@ -2598,6 +2652,24 @@ class RunLoop:
             yr, nr = self._refs(market)
         except Exception:
             yr, nr = None, None
+        if _skew.reservation_enabled():
+            ts = float(self.now or 0.0)
+            sigma = self._sigma_cents(market, ts)
+            prog = self.programs[market]
+            hours = (_env_num("LIP_RES_HORIZON_H", 6.0) if prog.close_ts is None
+                     else min(_env_num("LIP_RES_HORIZON_H", 6.0), max(0.0, (prog.close_ts - ts) / 3600.0)))
+            fair = self.last_mid.get(market)
+            if fair is None:
+                fair = ((yb + 100 - nb) / 2.0) if (yb is not None and nb is not None) else float(yes_cents)
+            info = _skew.reservation_prices(
+                int(yes_cents), int(no_cents), net_yes=net, frac=self._inv_frac(market), best_yes=yb, best_no=nb,
+                df=prog.discount_factor, yes_ref=yr, no_ref=nr, fair_cents=float(fair),
+                sigma_cents=_env_num("LIP_RES_SIGMA_DEFAULT_CENTS", 5.0) if sigma is None else sigma,
+                tau_hours=hours, gamma=_env_num("LIP_RES_GAMMA", 0.04),
+                max_skew=int(_env_num("LIP_RES_MAX_SKEW", 3)),
+                max_reward_loss=_skew.SkewParams.from_env().max_reward_loss)
+            info["sigma_source"] = "default" if sigma is None else "history"
+            return info["yes_cents"], info["no_cents"], info
         info = _skew.skew_prices(int(yes_cents), int(no_cents), net_yes=net,
                                  frac=self._inv_frac(market), best_yes=yb, best_no=nb,
                                  df=self.programs[market].discount_factor,
@@ -2609,6 +2681,20 @@ class RunLoop:
         if not _skew.enabled():
             return {"enabled": False}
         out = dict(self.skew_stats, enabled=True)
+        out["reservation"] = {
+            "enabled": _skew.reservation_enabled(), "gamma": _env_num("LIP_RES_GAMMA", 0.04),
+            "horizon_h": _env_num("LIP_RES_HORIZON_H", 6.0), "max_skew_cents": int(_env_num("LIP_RES_MAX_SKEW", 3)),
+            "sigma_default_cents": _env_num("LIP_RES_SIGMA_DEFAULT_CENTS", 5.0),
+            "markets_with_sigma": sum(1 for m in self._mid_hist if self._sigma_cents(m, float(self.now or 0)) is not None),
+            # Fill intensity A, k are NOT fitted: too few paper fills; the default stands.
+            "a_k_fit": {"k": 1.5, "source": "default", "reason": "not enough fills to fit"}}
+        age_h = _env_num("LIP_INV_MAX_AGE_H", 0.0)
+        now = float(self.now or 0.0)
+        out["inventory_age"] = {
+            "max_age_h": age_h,
+            "aged": sorted(({"market": m, "age_h": round((now - t) / 3600.0, 2)}
+                            for m, t in self.inv_since.items() if age_h > 0 and now - t >= age_h * 3600.0),
+                           key=lambda r: -r["age_h"])[:20]}
         out["skewed_now"] = sum(1 for q in self.resting.values()
                                 if (q.get("skew") or {}).get("agg") or (q.get("skew") or {}).get("back"))
         return out
@@ -2675,6 +2761,8 @@ class RunLoop:
     def _side_blocked(self, market: str, side: str, ts: float) -> str:
         if self.cooldown.get((market, side), 0.0) > ts:
             return "fill_cooldown"
+        if self._inv_aged(market, ts) and self._unpaired(market, side) > 0:
+            return "inventory_age"      # aged inventory: reduce-only, never add risk
         cap_m = _env_num("LIP_MARKET_INV_CAP_USD", 0.0)
         if cap_m > 0 and self._unpaired(market, side) > 0 and self._unpaired_usd(market) >= cap_m:
             return "market_inventory"
