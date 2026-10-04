@@ -396,6 +396,17 @@ class RunLoop:
         # per-second buckets of (n, sum, max) for the last LAG_WINDOW_S.
         self._lag_buckets: dict[int, list] = {}
         self.lag_last_s: float | None = None
+        # Offset-aware skew guard (LIP_SKEW_OFFSET_AWARE, default off): per-minute
+        # minimum of the receive-minus-exchange lag. lag = latency + clock offset;
+        # the minimum over a long window bounds the offset, so a constant local
+        # clock offset is not mistaken for latency.
+        self._off_min: dict[int, float] = {}
+        self._off_first_ts: float | None = None
+        self._off_cache: tuple = (-1, None, None)   # (second, offset, shift)
+        self.lag_corrected_last_s: float | None = None
+        self.offset_shift_n = 0
+        self._shift_active = False
+        self.chrony = None
         # Fix 2026-10-04: subscriptions are capped (drive_readonly_books plans
         # them). A fed program whose book is not subscribed is ``inactive``:
         # left out of selection and books-ready until its next snapshot.
@@ -751,15 +762,48 @@ class RunLoop:
         b[2] = max(b[2], lag)
         self.lag_last_s = lag
 
+    def _offset_state(self, ts: float) -> tuple:
+        """(offset_s, shift_s) of the offset-aware guard, else (None, None).
+
+        offset = minimum lag over LIP_SKEW_OFFSET_WINDOW_S (3600 s) of
+        per-minute minimums, only after LIP_SKEW_OFFSET_WARMUP_S (600 s) of
+        frames: until then the raw rule applies. A window this long cannot
+        absorb a real latency problem that lasts minutes (the minimum stays
+        at the old, low value). shift = minimum of the last ~60 s minus the
+        offset: a persistent clock step or latency floor change."""
+        if _env_num("LIP_SKEW_OFFSET_AWARE", 0.0) <= 0 or self._off_first_ts is None:
+            return None, None
+        sec = int(ts)
+        if self._off_cache[0] == sec:
+            return self._off_cache[1], self._off_cache[2]
+        out = (None, None)
+        if ts - self._off_first_ts >= _env_num("LIP_SKEW_OFFSET_WARMUP_S", 600.0):
+            window = max(120.0, _env_num("LIP_SKEW_OFFSET_WINDOW_S", 3600.0))
+            lo = int((ts - window) // 60)
+            base = [v for k, v in self._off_min.items() if k >= lo]
+            now_min = int(ts // 60)
+            recent = [v for k, v in self._off_min.items() if k >= now_min - 1]
+            if base and recent:
+                out = (min(base), min(recent) - min(base))
+        self._off_cache = (sec, out[0], out[1])
+        return out
+
     def lag_report(self) -> dict:
         """Kalshi receive-minus-exchange lag over the last LAG_WINDOW_S."""
         now = int(self.now or time.time())
         rows = [b for k, b in list(self._lag_buckets.items()) if k > now - LAG_WINDOW_S]
         n = sum(b[0] for b in rows)
+        offset, shift = self._offset_state(float(self.now or time.time()))
         return {"window_s": LAG_WINDOW_S, "frames": n,
                 "mean_s": None if not n else round(sum(b[1] for b in rows) / n, 3),
                 "max_s": None if not n else round(max(b[2] for b in rows), 3),
-                "last_s": None if self.lag_last_s is None else round(self.lag_last_s, 3)}
+                "last_s": None if self.lag_last_s is None else round(self.lag_last_s, 3),
+                "offset_aware": _env_num("LIP_SKEW_OFFSET_AWARE", 0.0) > 0,
+                "offset_s": None if offset is None else round(offset, 3),
+                "offset_shift_s": None if shift is None else round(shift, 3),
+                "offset_shift_n": self.offset_shift_n,
+                "corrected_last_s": (None if self.lag_corrected_last_s is None
+                                     else round(self.lag_corrected_last_s, 3))}
 
     def _note_clock_skew(self, ts: float, exchange_ts: float) -> None:
         """Clock-skew guard on Kalshi book frames (snapshots and deltas).
@@ -786,9 +830,33 @@ class RunLoop:
         pulled and re-placed every quote every ~2.4 s (968k clock_skew pulls
         in 40 h), and each clear ran a full re-selection, which itself kept
         the process CPU-bound and the lag high. 0 restores the old rule."""
-        self._note_lag(ts, ts - exchange_ts)
+        raw_lag = ts - exchange_ts
+        self._note_lag(ts, raw_lag)
+        if _env_num("LIP_SKEW_OFFSET_AWARE", 0.0) > 0:
+            minute = int(ts // 60)
+            if self._off_first_ts is None:
+                self._off_first_ts = ts
+            cur = self._off_min.get(minute)
+            self._off_min[minute] = raw_lag if cur is None else min(cur, raw_lag)
+            if len(self._off_min) > 130:
+                for k in sorted(self._off_min)[: len(self._off_min) - 130]:
+                    del self._off_min[k]
+        offset, shift = self._offset_state(ts)
         limit = _env_num("LIP_CLOCK_SKEW_LIMIT_S", CLOCK_SKEW_LIMIT_S)
-        if not skew_is_excessive(ts, exchange_ts, limit_s=limit):
+        if shift is not None:
+            thr = _env_num("LIP_SKEW_SHIFT_S", 2.0)
+            if abs(shift) > thr and not self._shift_active:
+                self._shift_active = True
+                self.offset_shift_n += 1
+                self._alert("WARNING", f"clock/latency floor shifted {shift:+.1f}s vs the "
+                                       f"{offset:+.1f}s baseline (threshold {thr:.1f}s)")
+            elif abs(shift) < thr / 2.0:
+                self._shift_active = False
+        corrected = raw_lag - (offset or 0.0)
+        self.lag_corrected_last_s = corrected
+        # Offset-aware: judge the lag relative to the baseline (exchange_ts is
+        # shifted so the shared helper still decides).
+        if not skew_is_excessive(ts, ts - corrected, limit_s=limit):
             self._skew_streak = 0
             if self._skew_active:
                 hold = _env_num("LIP_CLOCK_SKEW_CLEAR_S", CLOCK_SKEW_CLEAR_S)
@@ -3731,6 +3799,7 @@ class RunLoop:
                      "clock_skew_trips_n": self.skew_trips_n,
                      "clock_skew_clears_n": self.skew_clears_n,
                      "kalshi_lag": self.lag_report(),
+                     "clock_sync": None if self.chrony is None else self.chrony.read(),
                      "inactive_n": len(self.inactive),
                      "subscriptions": self.subscription_stats or None},
             "cap_trims_n": self.cap_trims_n,

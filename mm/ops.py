@@ -28,6 +28,46 @@ def skew_is_excessive(local_ts: float, exchange_ts: float, *,
     return abs(clock_skew_seconds(local_ts, exchange_ts)) > float(limit_s)
 
 
+class ChronyProbe:
+    """Optional ``chronyc tracking`` reader for /status (never required, never raises).
+
+    ``offset_s`` is the system clock minus NTP time: positive = local clock
+    fast. Cached ``ttl_s`` so a status refresh never spawns a process per
+    second. ``runner(cmd, timeout)`` returns the command's stdout (injectable
+    for tests)."""
+
+    def __init__(self, runner=None, clock=None, ttl_s: float = 30.0) -> None:
+        import time as _time
+        self._runner = runner or self._run
+        self._clock = clock or _time.time
+        self.ttl_s = float(ttl_s)
+        self._at = None
+        self._last: dict = {"offset_s": None, "error": "not read yet", "ts": None}
+
+    @staticmethod
+    def _run(cmd, timeout):
+        import subprocess
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True).stdout
+
+    def read(self) -> dict:
+        import re
+        now = self._clock()
+        if self._at is not None and now - self._at < self.ttl_s:
+            return self._last
+        self._at = now
+        try:
+            text = self._runner(["chronyc", "tracking"], 3.0)
+            m = re.search(r"System time\s*:\s*([0-9.]+)\s+seconds\s+(fast|slow)", str(text))
+            if not m:
+                self._last = {"offset_s": None, "error": "unparsed chronyc output", "ts": now}
+            else:
+                val = float(m.group(1)) * (1.0 if m.group(2) == "fast" else -1.0)
+                self._last = {"offset_s": val, "error": None, "ts": now}
+        except Exception as exc:  # chronyc missing, timeout, non-zero exit
+            self._last = {"offset_s": None, "error": f"{type(exc).__name__}: {str(exc)[:80]}", "ts": now}
+        return self._last
+
+
 def redact(text: str) -> str:
     """Hide key material if it ever reaches a log formatter."""
     out = text

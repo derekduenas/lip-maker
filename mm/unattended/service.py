@@ -305,6 +305,9 @@ class _Engine:
             carry_forward=True,
         )
         loop.socket_opened = True
+        if str(os.environ.get("LIP_CHRONY_STATUS", "0")).strip().lower() in ("1", "true", "yes", "on"):
+            from mm.ops import ChronyProbe
+            loop.chrony = ChronyProbe()   # /status feed.clock_sync (optional, cached)
         loop.check_watchdog_capital()
         loop.attach_state(os.environ.get("LIP_STATE_FILE", "/var/lib/lip-maker/engine_state.json"))
         self.loop = loop
