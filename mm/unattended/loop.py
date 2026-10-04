@@ -2496,7 +2496,11 @@ class RunLoop:
             price = int(quote[f"{side}_cents"])
             depth = sum(float(l.size) for l in opp_levels if int(l.price_cents) + price >= 100)
             order = self.sim.orders.get(f"{market}:{side}")
-            if depth <= 0 or order is None or ts < float(getattr(order, "activation_ts", 0.0)):
+            # The book's own data time, not the loop clock: a polled (PM US)
+            # book can be tens of seconds older than the frame that carried
+            # it, and a book from before the order existed cannot have hit it.
+            seen = min(ts, self._book_ts.get(market, ts))
+            if depth <= 0 or order is None or seen < float(getattr(order, "activation_ts", 0.0)):
                 continue
             count = min(size, depth)
             fill = {"market_ticker": market, "side": side, "price_cents": price, "count": count,

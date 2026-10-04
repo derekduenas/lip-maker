@@ -388,3 +388,72 @@ def test_sampling_order_is_unchanged_when_queues_are_equal(monkeypatch):
     lp.on_frame({"type": "clock", "ts": T0 + 10})
     lp._select(T0 + 11)
     assert lp.sample_markets == {M}
+
+
+# ------------------------------------------------- 6. Polymarket US paper (audit)
+def _pm_loop(monkeypatch, latency_ms=250):
+    from tests.test_patch21 import _pm_book, _pm_prog
+    monkeypatch.delenv("LIP_DURABLE_RESERVE", raising=False)
+    monkeypatch.delenv("LIP_SIZE_LADDER", raising=False)
+    monkeypatch.delenv("LIP_SKEW_ENABLE", raising=False)
+    monkeypatch.setenv("LIP_CROSS_GUARD", "1")
+    lp = L.RunLoop(mode="paper", bankroll=5000, carry_forward=True, latency_ms=latency_ms)
+    slug, m = "rtc-bb-2026-10-01-a", "PMUS:rtc-bb-2026-10-01-a"
+    _pm_prog(lp)
+    _pm_book(lp, slug, [(0.40, 3000)], [(0.45, 3000)], T0 + 1)
+    lp.drain_external()
+    lp._select(T0 + 2)
+    assert m in lp.resting
+    return lp, slug, m
+
+
+def _crossing_frame(slug, data_ts):
+    from mm.unattended import pmus_paper as P
+    book = {"bids": [(0.30, 3000)], "offers": [(0.35, 100)], "state": "MARKET_STATE_OPEN",
+            "shares_traded": None, "last_px": None}
+    frame = P.book_frame(slug, book, T0 + 10)
+    frame["data_ts"] = data_ts
+    return frame
+
+
+def test_a_polled_book_older_than_our_order_cannot_fill_it(monkeypatch):
+    """The latency check used the loop clock; a cached book whose data time
+    predates the order showed an offer through our bid and produced a
+    'paper_cross' fill (and rebate) for an order that did not exist yet."""
+    lp, slug, m = _pm_loop(monkeypatch)
+    lp.ext_queue.put(_crossing_frame(slug, T0 + 0.5))
+    lp.drain_external()
+    lp._guard_resting(T0 + 10)
+    assert lp.fills == [] and lp.pm_rebate_usd == 0.0
+
+
+def test_a_polled_book_newer_than_our_order_still_cross_fills(monkeypatch):
+    lp, slug, m = _pm_loop(monkeypatch)
+    lp.ext_queue.put(_crossing_frame(slug, T0 + 9))
+    lp.drain_external()
+    lp._guard_resting(T0 + 10)
+    assert [f["source"] for f in lp.fills] == ["paper_cross"] and lp.fills[0]["synthetic"] is True
+
+
+def test_pmus_refresh_failure_is_retried_within_a_minute():
+    """next_refresh was advanced before refresh() ran: a gateway blip at start
+    left the feed with zero candidates for LIP_PMUS_REFRESH_S (900 s)."""
+    from mm.unattended import pmus_paper as P
+    t = [1000.0]
+    feed = P.PMUSFeed(L.RunLoop(mode="paper", bankroll=5000), fetch=lambda p: {},
+                      clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+    calls = []
+
+    def refresh():
+        calls.append(t[0])
+        if len(calls) == 1:
+            raise OSError("gateway down")
+        feed._stop.set()
+
+    feed.refresh = refresh
+    feed.poll_due = lambda: False
+    feed.poll_settlements = lambda: None
+    orig_sleep = feed._sleep
+    feed._sleep = lambda s: (orig_sleep(s), t[0] > 1400 and feed._stop.set())
+    feed._run()
+    assert len(calls) == 2 and calls[1] - calls[0] <= 60

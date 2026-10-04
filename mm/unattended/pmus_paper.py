@@ -791,7 +791,13 @@ class PMUSFeed:
             try:
                 if self.clock() >= next_refresh:
                     next_refresh = self.clock() + refresh_s
-                    self.refresh()
+                    try:
+                        self.refresh()
+                    except Exception:
+                        # A failed refresh (gateway blip at start) is retried
+                        # soon, not after a whole LIP_PMUS_REFRESH_S.
+                        next_refresh = self.clock() + min(refresh_s, max(5.0, _num("LIP_PMUS_REFRESH_RETRY_S", 30.0)))
+                        raise
                 elif self.clock() >= next_settle:
                     next_settle = self.clock() + 60.0
                     self.poll_settlements()
