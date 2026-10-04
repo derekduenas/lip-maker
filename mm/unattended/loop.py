@@ -405,6 +405,10 @@ class RunLoop:
         self.sample_reserve_usd = 0.0
         self.sample_fills_n = 0
         self.sample_stats: dict = {}
+        # Top-up between full selections (_top_up_sample): fresh trade counts
+        # (``activity``) set the flag; _sample_at throttles the scan.
+        self._sample_dirty = False
+        self._sample_at = 0.0
         # Paper fills per "venue:source" (print | paper_cross | synthetic).
         self.fills_by_source: dict[str, int] = {}
         # clock_skew pulls per hour bucket (checkpoint: pulls/day).
@@ -660,6 +664,7 @@ class RunLoop:
             if prog is not None and v is not None:
                 prog.volume_24h = float(v)
         self.activity_ts = float(row.get("ts") or self.now or time.time())
+        self._sample_dirty = True
 
     def trades_per_day(self, market: str) -> float:
         """max(REST 24 h trade count, trades seen on the socket in 24 h)."""
@@ -2125,22 +2130,27 @@ class RunLoop:
             return self._best(market)
         return self._refs(market)
 
-    def _pick_sample(self, markets: list, ts: float) -> list:
+    def _pick_sample(self, markets: list, ts: float, have=()) -> list:
         """Fill-sampling group (LIP_SAMPLE_ENABLE): up to LIP_SAMPLE_N (8,
         at most 10) Kalshi markets with >= LIP_SAMPLE_MIN_TRADES_DAY (20)
         public trades in 24 h, most traded first, at most
         LIP_SAMPLE_PER_EVENT (2) per event. They pass the same exclusions,
         exits, policy blocks and book checks as any market but skip the rank
         (no fill-fraction/adverse penalty): the point is real fills and
-        markouts. Paper only."""
+        markouts. Paper only.
+
+        ``have``: current group members (a top-up): they are not picked
+        again, count toward the group size and the per-event cap, and only
+        the new picks are returned."""
         cfg = sample_cfg()
         if not cfg["enabled"] or self.mode != "paper" or cfg["n"] <= 0:
             self.sample_stats = {"enabled": False}
             return []
         from mm.selector import exclusion_reason, exit_reason
+        have = set(have)
         rows = []
         for km in markets:
-            if km.venue != "kalshi" or km.market in self.inactive:
+            if km.venue != "kalshi" or km.market in self.inactive or km.market in have:
                 continue
             tpd = self.trades_per_day(km.market)
             if tpd < cfg["min_trades"]:
@@ -2159,18 +2169,55 @@ class RunLoop:
             rows.append((-tpd, km.market))
         rows.sort()
         out, per_event = [], {}
+        for market in have:
+            ev = self._event_of(market)
+            per_event[ev] = per_event.get(ev, 0) + 1
         for _neg, market in rows:
+            if len(have) + len(out) >= cfg["n"]:
+                break
             ev = self._event_of(market)
             if per_event.get(ev, 0) >= cfg["per_event"]:
                 continue
             per_event[ev] = per_event.get(ev, 0) + 1
             out.append(market)
-            if len(out) >= cfg["n"]:
-                break
-        self.sample_stats = {"enabled": True, "eligible": len(rows), "picked": len(out)}
+        self.sample_stats = {"enabled": True, "eligible": len(rows) + len(have),
+                             "picked": len(have) + len(out)}
         return out
 
-    def _quote_sample(self, ts: float) -> None:
+    def _top_up_sample(self, ts: float) -> None:
+        """Fill the fill-sampling group between full selections.
+
+        The group is picked inside ``_select`` (every LIP_SELECT_EVERY, 600 s)
+        from the public trade counts. After a restart those counts do not
+        exist yet (the REST probe runs behind the market-metadata refresh) and
+        the books of the most traded markets are not subscribed until it
+        has, so the first selection found nobody and the group stayed empty
+        until the next one, ~10 minutes later. Here an incomplete group is
+        topped up every LIP_SAMPLE_REFRESH_S (30 s; within 5 s of fresh
+        trade counts) from the books that are usable now, out of the budget
+        ``_select`` reserved. Members already resting are left alone (same
+        order, same queue position). Paper only."""
+        cfg = sample_cfg()
+        if (not cfg["enabled"] or self.mode != "paper" or cfg["n"] <= 0
+                or self.last_select_ts is None or not self.connected or self.kill is not None):
+            return
+        if len(self.sample_markets) >= cfg["n"] or self.sample_reserve_usd <= 0:
+            self._sample_dirty = False
+            return
+        wait = _env_num("LIP_SAMPLE_REFRESH_S", 30.0)
+        if self._sample_dirty:
+            wait = min(wait, 5.0)
+        if ts - self._sample_at < wait:
+            return
+        self._sample_at = ts
+        self._sample_dirty = False
+        picked = self._pick_sample(self._markets(), ts, have=self.sample_markets)
+        if not picked:
+            return
+        self.sample_markets |= set(picked)
+        self._quote_sample(ts, only=picked)
+
+    def _quote_sample(self, ts: float, only=None) -> None:
         """Quote the sampling group at best bid, LIP_SAMPLE_SIZE (10)
         contracts per side, inside the reserved budget; every quote still
         goes through _quote (skew, cross guard, fair value, inventory caps,
@@ -2178,8 +2225,11 @@ class RunLoop:
         if not self.sample_markets:
             return
         cfg = sample_cfg()
-        spent = 0.0
-        for market in sorted(self.sample_markets, key=lambda m: -self.trades_per_day(m)):
+        # ``only`` (a top-up): quote just those; the others already hold
+        # their share of the reserve.
+        todo = self.sample_markets if only is None else (set(only) & self.sample_markets)
+        spent = sum(float(self.committed.get(m, 0)) for m in self.sample_markets if m not in todo)
+        for market in sorted(todo, key=lambda m: -self.trades_per_day(m)):
             yb, nb = self._best(market)
             sides = tuple(sd for sd, p in (("yes", yb), ("no", nb))
                           if p is not None and cfg["min_cents"] <= p <= cfg["max_cents"]
@@ -2200,7 +2250,8 @@ class RunLoop:
             else:
                 self.sample_markets.discard(market)
         self.sample_stats["quoted"] = len([m for m in self.sample_markets if m in self.resting])
-        self.sample_stats["capital_usd"] = round(spent, 2)
+        self.sample_stats["capital_usd"] = round(
+            sum(float(self.committed.get(m, 0)) for m in self.sample_markets), 2)
 
     def skew_pulls_24h(self, ts: float | None = None) -> int:
         hr = int((self.now if ts is None else ts) // 3600)
@@ -2468,6 +2519,12 @@ class RunLoop:
     def _maybe_select(self, ts: float) -> None:
         if not self.programs or self._skew_active:
             return
+        n0 = self.selection_count
+        self._maybe_select_full(ts)
+        if self.selection_count == n0:
+            self._top_up_sample(ts)
+
+    def _maybe_select_full(self, ts: float) -> None:
         if self._reselect_pending and self.connected and self._books_ready():
             # Quotes were pulled for a disconnect: re-select as soon as books
             # are usable again instead of waiting for the next period.
@@ -2579,8 +2636,12 @@ class RunLoop:
         # ranked pass, out of a reserved slice of the Kalshi budget.
         self.sample_markets = set(self._pick_sample(markets, ts))
         self.sample_reserve_usd = 0.0
-        if self.sample_markets:
-            reserve = min(sample_cfg()["budget"], venue_budget.get("kalshi", 0.0))
+        self._sample_at = ts
+        scfg = sample_cfg()
+        # Reserved even while the group is empty: it forms later (trade
+        # counts arrive after the restart) and must find room in the caps.
+        if self.sample_markets or (scfg["enabled"] and self.mode == "paper" and scfg["n"] > 0):
+            reserve = min(scfg["budget"], venue_budget.get("kalshi", 0.0))
             venue_budget["kalshi"] = venue_budget.get("kalshi", 0.0) - reserve
             self.sample_reserve_usd = reserve
             budget = sum(venue_budget.values())
@@ -4611,6 +4672,18 @@ async def _readonly_books_session(source: dict, key, session,
         ctx["programs"] = await asyncio.to_thread(_fetch_programs, reader)
     if not ctx["fed"]:
         _screen_and_feed(ctx, on_frame)
+    if sub_limits()["max"] > 0:
+        # Count the public trades of the most traded candidates BEFORE the
+        # first subscription: their books are then in it, and the loop has
+        # trade counts for its first selection (the background refresh runs
+        # only after the market-metadata fetch, minutes after a restart).
+        # Throttled by LIP_ACTIVITY_REFRESH_S, so a reconnect does not repeat it.
+        try:
+            await _refresh_activity(reader, ctx, on_frame)
+        except readonly_transient_types() as exc:
+            logging.getLogger("lip.readonly").warning(
+                "startup activity probe failed (%s: %s); the background refresh retries",
+                type(exc).__name__, str(exc)[:200])
     sock = ReadOnlyMarketSocket(api_key=source["key_id"], private_key=key, url=source["ws_url"])
     task = None
     try:
