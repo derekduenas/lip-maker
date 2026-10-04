@@ -664,3 +664,46 @@ def test_screen_activity_floor_keeps_markets_with_unknown_volume(monkeypatch):
     """Unknown is not dead: only a KNOWN volume under the floor excludes."""
     chosen, _stats = _screen_two(None, monkeypatch, floor=20)
     assert len(chosen) == 2
+
+
+# ------------------------------------------------- review fixes (2026-10-04, Grok Bot)
+def test_top_up_never_takes_a_market_the_ranked_pass_is_quoting(monkeypatch):
+    """A top-up between selections must not re-quote a ranked-pass market at
+    best bid (that replaced its reward quote and double-spent its capital)."""
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M))                                   # ranked pass will quote it
+    _book(lp, M, T0, YES, NO)
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    assert lp.selection_count == 1 and M in lp.resting and not lp.sample_markets
+    main_quote = dict(lp.resting[M])
+    lp.on_frame(_activity(T0 + 20, {M: 400}))                 # now the most traded market
+    lp.on_frame({"type": "clock", "ts": T0 + 21})
+    assert lp.selection_count == 1
+    assert M not in lp.sample_markets
+    assert (lp.resting[M]["yes_cents"], lp.resting[M]["no_cents"]) == (main_quote["yes_cents"],
+                                                                      main_quote["no_cents"])
+
+
+def test_top_up_without_new_members_keeps_the_quoted_stats(monkeypatch):
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    _book(lp, M, T0, YES, NO)
+    lp.on_frame(_activity(T0, {M: 40}))
+    lp.on_frame({"type": "clock", "ts": T0 + 10})
+    assert lp.sample_markets == {M} and lp.sample_stats.get("quoted") == 1
+    lp.on_frame({"type": "clock", "ts": T0 + 50})             # top-up scan, nobody new
+    assert lp.sample_stats.get("quoted") == 1 and "capital_usd" in lp.sample_stats
+
+
+def test_series_gate_settled_fills_exclude_synthetic_fills(monkeypatch):
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
+    lp._record_fill({"market_ticker": M, "side": "yes", "price_cents": 44, "count": 5.0,
+                     "ts": T0 + 401, "source": "synthetic", "trade_id": "syn-1", "synthetic": True},
+                    T0 + 401)
+    lp.settle(M, "yes")
+    row = lp.series_gate_report(accrual=lp.live_accrual())["series"]["KXCPI"]
+    assert row["fills"] == 1
+    assert row["settled_fills"] == 1, "a synthetic fill must not count toward the 30 settled fills"

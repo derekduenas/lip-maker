@@ -1000,7 +1000,10 @@ class RunLoop:
         acc = self._series_acc(market)
         if acc is None or not pos or (float(pos.get("yes") or 0) <= 0 and float(pos.get("no") or 0) <= 0):
             return
-        acc["settled_fills"] += int(sum(rows[market].get("fills_n", 0)
+        # Real fills only: synthetic fills never count toward the go/no-go
+        # (acc["fills"] skips them too).
+        acc["settled_fills"] += int(sum(max(0.0, float(rows[market].get("fills_n", 0))
+                                            - float(rows[market].get("synthetic_n", 0)))
                                         for rows in self.bucket_pos.values() if market in rows))
         acc["settled_usd"] += self._settle_value_usd(pos, result)
         self._state_dirty = True
@@ -2302,7 +2305,7 @@ class RunLoop:
             return self._best(market)
         return self._refs(market)
 
-    def _pick_sample(self, markets: list, ts: float, have=()) -> list:
+    def _pick_sample(self, markets: list, ts: float, have=(), exclude=()) -> list:
         """Fill-sampling group (LIP_SAMPLE_ENABLE): up to LIP_SAMPLE_N (8,
         at most 10) Kalshi markets with >= LIP_SAMPLE_MIN_TRADES_DAY (20)
         public trades in 24 h, most traded first, at most
@@ -2313,16 +2316,19 @@ class RunLoop:
 
         ``have``: current group members (a top-up): they are not picked
         again, count toward the group size and the per-event cap, and only
-        the new picks are returned."""
+        the new picks are returned. ``exclude``: markets never picked (a
+        top-up skips markets the ranked pass is quoting)."""
         cfg = sample_cfg()
         if not cfg["enabled"] or self.mode != "paper" or cfg["n"] <= 0:
             self.sample_stats = {"enabled": False}
             return []
         from mm.selector import exclusion_reason, exit_reason
         have = set(have)
+        exclude = set(exclude)
         rows = []
         for km in markets:
-            if km.venue != "kalshi" or km.market in self.inactive or km.market in have:
+            if (km.venue != "kalshi" or km.market in self.inactive or km.market in have
+                    or km.market in exclude):
                 continue
             tpd = self.trades_per_day(km.market)
             if tpd < cfg["min_trades"]:
@@ -2389,7 +2395,15 @@ class RunLoop:
             return
         self._sample_at = ts
         self._sample_dirty = False
-        picked = self._pick_sample(self._markets(), ts, have=self.sample_markets)
+        # Markets the ranked pass quotes (resting or holding budget) stay
+        # with it: re-quoting one at best bid would replace its reward quote
+        # and spend the sample reserve on capital _select already committed.
+        busy = {m for m in set(self.resting) | set(self.committed) if m not in self.sample_markets}
+        prev = dict(self.sample_stats)
+        picked = self._pick_sample(self._markets(), ts, have=self.sample_markets, exclude=busy)
+        for key in ("quoted", "capital_usd"):
+            if key in prev:
+                self.sample_stats.setdefault(key, prev[key])
         if not picked:
             return
         self.sample_markets |= set(picked)
