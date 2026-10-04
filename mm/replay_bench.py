@@ -47,6 +47,22 @@ def parse_policy(path: str | None) -> dict:
     return out
 
 
+def queue_band_configs() -> list:
+    """Configs of the queue-model sensitivity band, most pessimistic first
+    (execution/paper_fills.py ``queue_model``)."""
+    out = [("q_risk_averse", {"LIP_SIM_QUEUE_MODEL": "risk_averse"}),
+           ("q_depletion", {"LIP_SIM_QUEUE_MODEL": "depletion"})]
+    for n in (3, 2, 1):      # larger n credits less depletion: pessimistic -> optimistic
+        out.append((f"q_prob_n{n}", {"LIP_SIM_QUEUE_MODEL": "prob_power", "LIP_SIM_QUEUE_POWER": str(n)}))
+    return out
+
+
+def band(values: dict) -> dict:
+    """{min, max} of a name -> number mapping (the sensitivity band)."""
+    nums = [v for v in values.values() if v is not None]
+    return {"min": min(nums), "max": max(nums)} if nums else {"min": None, "max": None}
+
+
 def parse_config(spec: str) -> tuple:
     name, _, body = spec.partition(":")
     env = {}
@@ -169,6 +185,9 @@ def main(argv: list | None = None) -> int:
                     help="systemd drop-in whose Environment= lines form the base config ('' = none)")
     ap.add_argument("--config", action="append", default=[],
                     help="NAME:KEY=VAL,KEY=VAL (repeatable). Default: one 'base' run")
+    ap.add_argument("--queue-band", action="store_true",
+                    help="also run the queue-model sensitivity band (risk_averse, depletion, prob_power n=3,2,1) "
+                         "and print the fills/net band: expected fills are a RANGE, not one number")
     ap.add_argument("--bankroll", type=float)
     ap.add_argument("--select-every", type=float)
     ap.add_argument("--warmup-s", type=float, default=60.0)
@@ -184,6 +203,8 @@ def main(argv: list | None = None) -> int:
         return 2
     base = parse_policy(args.policy)
     configs = [parse_config(c) for c in args.config] or [("base", {})]
+    if args.queue_band:
+        configs = configs + queue_band_configs()
     until = args.until_ts if args.until_ts is not None else time.time()
     out_until = until
     out = {"files": [str(p) for p in paths], "policy": args.policy, "results": {}}
@@ -195,6 +216,12 @@ def main(argv: list | None = None) -> int:
                                             warmup_s=args.warmup_s, fee_type=args.fee_type,
                                             until_ts=until),
                                     overrides=env)
+    if args.queue_band:
+        qs = {n: out["results"][n] for n, _e in queue_band_configs()}
+        out["queue_band"] = {"fills": band({n: r["fills"] for n, r in qs.items()}),
+                             "net_usd": band({n: r["net_usd"] for n, r in qs.items()}),
+                             "note": "same recordings, same selection; only the queue model differs. "
+                                     "Not a calibration: see docs/SIMULATOR_VALIDATION.md"}
     text = json.dumps(out, indent=2, default=str)
     if args.json:
         Path(args.json).write_text(text, encoding="utf-8")
@@ -203,6 +230,10 @@ def main(argv: list | None = None) -> int:
     print("config".ljust(14) + "".join(c[:16].rjust(17) for c in cols))
     for name, r in out["results"].items():
         print(name[:14].ljust(14) + "".join(str(r.get(c))[:16].rjust(17) for c in cols))
+    if args.queue_band:
+        qb = out["queue_band"]
+        print(f"\nqueue-model band: fills {qb['fills']['min']}..{qb['fills']['max']}, "
+              f"net ${qb['net_usd']['min']}..${qb['net_usd']['max']}")
     if not args.json:
         print(text)
     return 0

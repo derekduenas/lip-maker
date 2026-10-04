@@ -252,7 +252,17 @@ class RunLoop:
         # in _quote/_size_curve applies fill_cap.
         self.fill_cap = default_fill_cap_usd() if fill_cap is None else float(fill_cap)
         self.screen_fill_cap = single_fill_cap_usd() if fill_cap is None else float(fill_cap)
-        self.sim = PaperFillSimulator(latency_ms=latency_ms)
+        try:
+            self.sim = PaperFillSimulator(
+                latency_ms=latency_ms,
+                queue_model=os.environ.get("LIP_SIM_QUEUE_MODEL") or "depletion",
+                queue_power=_env_num("LIP_SIM_QUEUE_POWER", 1.0),
+                cancel_latency_ms=_env_num("LIP_SIM_CANCEL_LATENCY_MS", 0.0))
+        except ValueError:
+            # A typo in a sensitivity knob must not stop the service.
+            logging.getLogger("lip.risk").error("LIP_SIM_QUEUE_MODEL=%r unknown: using depletion",
+                                                os.environ.get("LIP_SIM_QUEUE_MODEL"))
+            self.sim = PaperFillSimulator(latency_ms=latency_ms)
         from config.settings import RAMP_PHASE
         self.risk = RiskEngine(
             limits=Limits.from_capital(Decimal(str(self.bankroll)), ramp=RAMP_PHASE),
@@ -2625,7 +2635,7 @@ class RunLoop:
         if quote is None:
             return
         quote[side] = 0.0
-        self.sim.untrack(f"{market}:{side}")
+        self.sim.untrack(f"{market}:{side}", now=self.now)
         other = "no" if side == "yes" else "yes"
         if float(quote.get(other) or 0) <= 0:
             self._cancel(market, reason)
@@ -3811,7 +3821,7 @@ class RunLoop:
                     # priority, so the paper order keeps its queue position.
                     self.sim.resize(oid, side_size[side])
                     continue
-                self.sim.untrack(oid)
+                self.sim.untrack(oid, now=ts)
                 if side not in sides:
                     continue
                 self.sim.track(
@@ -3876,7 +3886,7 @@ class RunLoop:
     def _cancel(self, market: str, reason: str) -> None:
         had = market in self.resting
         for side in ("yes", "no"):
-            self.sim.untrack(f"{market}:{side}")
+            self.sim.untrack(f"{market}:{side}", now=self.now)
         self.resting.pop(market, None)
         accrual = self.accruals.get(market)
         if accrual is not None:

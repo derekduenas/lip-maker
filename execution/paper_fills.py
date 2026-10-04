@@ -178,14 +178,41 @@ class SimOrder:
     # level shrank, not yet matched by a print at our price, and when.
     depleted_unmatched: float = 0.0
     depleted_ts: float = 0.0
+    # prob_power queue model: size resting behind us, and the level size last seen.
+    behind: float = 0.0
+    last_level: float = 0.0
 
 
 class PaperFillSimulator:
     """Tracks paper orders and fills them from observed public trades."""
 
+    QUEUE_MODELS = ("depletion", "risk_averse", "prob_power")
+
     def __init__(self, *, latency_ms: float = DEFAULT_LATENCY_MS,
                  capture_path: Optional[str] = None,
-                 seen_trades_max: int = SEEN_TRADES_MAX):
+                 seen_trades_max: int = SEEN_TRADES_MAX,
+                 queue_model: str = "depletion", queue_power: float = 1.0,
+                 cancel_latency_ms: float = 0.0):
+        """``queue_model`` (sensitivity analysis; see docs/SIMULATOR_VALIDATION.md):
+
+        * ``depletion`` (default, the long-standing rule): prints at/through our
+          price consume the queue ahead, and the queue is clipped to the size
+          still displayed at our level.
+        * ``risk_averse``: ONLY prints advance the queue; cancellations are
+          never assumed (the most pessimistic fill count).
+        * ``prob_power``: as depletion, but a decrease of the displayed level
+          is attributed ahead of us with probability a^n / (a^n + b^n)
+          (a = queue ahead, b = size behind us, n = ``queue_power``; larger n
+          credits less depletion), the hftbacktest probability-queue family.
+
+        ``cancel_latency_ms``: a cancelled/replaced paper order stays fillable
+        for this long (default 0), the picking-off of stale cancels."""
+        if queue_model not in self.QUEUE_MODELS:
+            raise ValueError(f"unknown queue_model {queue_model!r}; one of {self.QUEUE_MODELS}")
+        self.queue_model = queue_model
+        self.queue_power = max(0.0, float(queue_power))
+        self.cancel_latency_sec = max(0.0, float(cancel_latency_ms)) / 1000.0
+        self._cancelling: list = []     # [(SimOrder, fillable_until_ts)]
         self.latency_sec = latency_ms / 1000.0
         self.orders: dict[str, SimOrder] = {}
         self._ctx = _ctx()
@@ -208,11 +235,16 @@ class PaperFillSimulator:
                      queue_ahead=queue_ahead,
                      activation_ts=now + self.latency_sec,
                      program_id=program_id)
+        o.last_level = queue_ahead
         self.orders[order_id] = o
         return o
 
-    def untrack(self, order_id: str) -> None:
-        self.orders.pop(order_id, None)
+    def untrack(self, order_id: str, now: Optional[float] = None) -> None:
+        """Remove an order. With ``cancel_latency_ms`` > 0 and ``now`` given it
+        stays fillable until the cancel lands."""
+        o = self.orders.pop(order_id, None)
+        if o is not None and now is not None and self.cancel_latency_sec > 0 and o.remaining >= DUST_QTY:
+            self._cancelling.append((o, float(now) + self.cancel_latency_sec))
 
     def resize(self, order_id: str, size: float) -> bool:
         """Re-quote of a tracked order at the SAME price with the same or a
@@ -240,6 +272,11 @@ class PaperFillSimulator:
         trade message, apply_trades must not take the same contracts out of
         the queue a second time (that would fill us early)."""
         now = time.time() if now is None else float(now)
+        if self.queue_model == "risk_averse":
+            return
+        if self.queue_model == "prob_power":
+            self._prob_level(market_ticker, side, int(price_cents), float(level_size), now)
+            return
         for o in self.orders.values():
             if (o.market_ticker == market_ticker and o.side == side
                     and o.price_cents == int(price_cents)
@@ -250,6 +287,34 @@ class PaperFillSimulator:
                 o.depleted_unmatched += cut
                 o.depleted_ts = now
                 o.queue_ahead = max(0.0, float(level_size))
+
+    def _prob_level(self, market_ticker: str, side: str, price_cents: int, level_size: float, now: float) -> None:
+        for o in self.orders.values():
+            if o.market_ticker != market_ticker or o.side != side or o.price_cents != price_cents:
+                continue
+            lvl = max(0.0, level_size)
+            prev = o.last_level
+            o.last_level = lvl
+            if lvl >= prev:
+                o.behind += lvl - prev          # others joined behind us
+                continue
+            delta = prev - lvl
+            ahead, behind, n = o.queue_ahead, o.behind, self.queue_power
+            if behind <= 0:
+                p = 1.0
+            elif ahead <= 0:
+                p = 0.0
+            else:
+                fa, fb = ahead ** n, behind ** n
+                p = fa / (fa + fb)
+            cut = min(ahead, delta * p)
+            if cut > 0:
+                if now - o.depleted_ts > DEPLETION_MATCH_S:
+                    o.depleted_unmatched = 0.0
+                o.depleted_unmatched += cut
+                o.depleted_ts = now
+                o.queue_ahead = ahead - cut
+            o.behind = max(0.0, behind - (delta - cut))
 
     # ── trade ingestion ───────────────────────────────────────────────
     def fetch_trades(self, tickers: Iterable[str], *, limit: int = 200) -> list[dict]:
@@ -296,7 +361,10 @@ class PaperFillSimulator:
             no_c = _side_cents(tr, "no")
             taker = (tr.get("taker_side") or "").lower()
 
-            for o in list(self.orders.values()):
+            if self._cancelling:
+                self._cancelling = [(c, u) for c, u in self._cancelling if t_ts < u and c.remaining >= DUST_QTY]
+            live = list(self.orders.values()) + [c for c, u in self._cancelling if t_ts < u]
+            for o in live:
                 if o.market_ticker != ticker or o.remaining < DUST_QTY:
                     continue
                 if t_ts < o.activation_ts:
@@ -317,6 +385,7 @@ class PaperFillSimulator:
                     # price was cleared before this trade could happen.
                     o.queue_ahead = 0.0
                     o.depleted_unmatched = 0.0
+                    o.last_level = o.behind
                 elif o.depleted_unmatched > 0:
                     # Book delta of this print arrived first and already took
                     # these contracts out of our queue (on_book_level).
@@ -329,6 +398,8 @@ class PaperFillSimulator:
                     used = min(o.queue_ahead, vol)
                     o.queue_ahead -= used
                     vol -= used
+                    # its depth delta follows: do not count it a second time
+                    o.last_level = max(0.0, o.last_level - used)
                 if vol < DUST_QTY:
                     continue
                 got = min(vol, o.remaining)
@@ -350,6 +421,6 @@ class PaperFillSimulator:
                     fill["synthetic"] = True
                 self._record({"kind": "paper_fill", "fill": fill})
                 fills.append(fill)
-                if o.remaining <= 0:
+                if o.remaining <= 0 and self.orders.get(o.order_id) is o:
                     self.orders.pop(o.order_id, None)
         return fills
