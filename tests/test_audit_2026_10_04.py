@@ -357,3 +357,34 @@ def test_screen_orders_candidates_with_known_books_first():
                    close_ts=now + 30 * 86400) for m in cache.markets]
     chosen, _stats = screen(frames, cache, now=now, top=10)
     assert [f["market"] for f in chosen][0] == "KXCPI-26NOV30-A"
+
+
+# ------------------------------------------------- 5. sampling group: fill hazard, not trade count
+def test_sampling_group_prefers_the_market_we_can_actually_fill(monkeypatch):
+    """100 trades/day behind a 5,000-contract touch is a worse sample than
+    40 trades/day behind 20 contracts: queue ahead decides how long a fill
+    takes."""
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    monkeypatch.setenv("LIP_SAMPLE_N", "1")
+    lp = newloop(bankroll=1500.0)
+    for m in (M, M2):
+        lp.on_frame(program(m, rank_penalty_per_day=1e6))
+    lp.on_frame(_activity(T0, {M: 100, M2: 40}))
+    lp.on_frame(snap(M, T0, [(44, 5000), (40, 2000)], [(53, 5000), (50, 2000)]))
+    lp.on_frame(snap(M2, T0, [(44, 20), (40, 2000)], [(53, 20), (50, 2000)]))
+    lp.on_frame({"type": "clock", "ts": T0 + 10})
+    lp._select(T0 + 11)
+    assert lp.sample_markets == {M2}
+
+
+def test_sampling_order_is_unchanged_when_queues_are_equal(monkeypatch):
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    monkeypatch.setenv("LIP_SAMPLE_N", "1")
+    lp = newloop(bankroll=1500.0)
+    for m in (M, M2):
+        lp.on_frame(program(m, rank_penalty_per_day=1e6))
+        lp.on_frame(snap(m, T0, YES, NO))
+    lp.on_frame(_activity(T0, {M: 100, M2: 40}))
+    lp.on_frame({"type": "clock", "ts": T0 + 10})
+    lp._select(T0 + 11)
+    assert lp.sample_markets == {M}

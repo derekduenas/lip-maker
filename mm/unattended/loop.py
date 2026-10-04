@@ -2225,7 +2225,13 @@ class RunLoop:
             ok = [p for p in (yb, nb) if p is not None and cfg["min_cents"] <= p <= cfg["max_cents"]]
             if not ok:
                 continue
-            rows.append((-tpd, km.market))
+            # Fill hazard, not raw trade count: our order joins the back of
+            # the best-bid queue, so the time to a fill grows with the size
+            # already there. trades/day per contract of (queue + our size),
+            # averaged over the two sides we will quote.
+            qy, qn = self._best_queue(km.market)
+            ahead = (qy + qn) / 2.0 + cfg["size"]
+            rows.append((-tpd / ahead, km.market))
         rows.sort()
         out, per_event = [], {}
         for market in have:
@@ -2334,6 +2340,16 @@ class RunLoop:
             skew_pulls_24h=self.skew_pulls_24h(), skew_pulls_session=int(self.pulls.get("clock_skew", 0)),
             session_s=session_s, markout_5m_usd=usd, markout_5m_fills=len(done),
             markout_5m_contracts=contracts, now=self.now or time.time())
+
+    def _best_queue(self, market: str) -> tuple:
+        """Contracts resting at the best YES bid and the best NO bid."""
+        book = self.accruals[market].book.book
+        out = []
+        for levels in (book.yes_bids, book.no_bids):
+            best = max((lvl.price_cents for lvl in levels), default=None)
+            out.append(0.0 if best is None else
+                       float(sum(float(lvl.size) for lvl in levels if lvl.price_cents == best)))
+        return out[0], out[1]
 
     def _best(self, market: str):
         book = self.accruals[market].book.book
