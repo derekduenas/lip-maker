@@ -39,7 +39,7 @@ LIVE_STATUS_FIELDS = (
     # 2026-10-04 fill fix: Oct 6 checkpoint inputs, fill sources, sampling group.
     "checkpoint", "fills_by_source", "fill_sampling", "clock_skew_pulls_24h",
     # Oct 10 go/no-go per Kalshi series (mm.session_gates.series_go).
-    "series_gate", "rewards_reconciliation", "adverse_guard",
+    "series_gate", "rewards_reconciliation", "adverse_guard", "deadman", "build",
 )
 
 

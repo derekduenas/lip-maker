@@ -61,6 +61,25 @@ FILL_MARKS_KEEP = 500
 MARKOUT_GRACE_S = 30.0
 # Events kept in the persisted 5-minute markout accumulator (oldest dropped).
 EVENT_ACC_KEEP = 3000
+_BUILD: dict = {}
+
+
+def build_info() -> dict:
+    """Code version for /status (deploy verification): LIP_BUILD_COMMIT, else the checkout's
+    git HEAD (cached), else None. Read once per process."""
+    if not _BUILD:
+        commit = os.environ.get("LIP_BUILD_COMMIT") or None
+        if commit is None:
+            try:
+                import subprocess
+                commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parent),
+                                        capture_output=True, text=True, timeout=3, check=True).stdout.strip() or None
+            except Exception:
+                commit = None
+        _BUILD["commit"] = commit
+    return dict(_BUILD)
+
+
 PRICE_BUCKETS = ("<10", "10-30", "30-70", "70-90", ">=90")
 # Events kept per price bucket for the event-level markout confidence interval.
 PRICE_EVENT_KEEP = 500
@@ -426,6 +445,7 @@ class RunLoop:
         self.offset_shift_n = 0
         self._shift_active = False
         self.chrony = None
+        self.deadman = None     # mm.live_ops.deadman.DeadMansSwitch (set by the service when configured)
         # Fix 2026-10-04: subscriptions are capped (drive_readonly_books plans
         # them). A fed program whose book is not subscribed is ``inactive``:
         # left out of selection and books-ready until its next snapshot.
@@ -1534,6 +1554,20 @@ class RunLoop:
         except Exception:
             logging.getLogger("lip.risk").exception("period estimate for %s failed", market)
         self._state_dirty = True
+
+    def healthy_for_deadman(self) -> tuple:
+        """(ok, reason): the engine may ping the off-VM dead-man's switch only while it
+        is genuinely working: no kill latch, state file loaded, feed connected and recent."""
+        if self.kill is not None:
+            return False, "kill_latched"
+        if self.state_error is not None:
+            return False, "state_error"
+        if not self.connected:
+            return False, "feed_disconnected"
+        age = time.time() - float(self.now or 0.0) if self.now else None
+        if age is not None and age > _env_num("LIP_DEADMAN_MAX_FRAME_AGE_S", 180.0):
+            return False, "feed_stale"
+        return True, ""
 
     def maybe_load_credits(self, now: float, *, force: bool = False) -> None:
         """Read the operator credit file (LIP_REWARD_CREDITS_FILE) when it changed;
@@ -4147,6 +4181,8 @@ class RunLoop:
             "checkpoint": self.checkpoint_report(),
             "series_gate": self.series_gate_report(accrual),
             "rewards_reconciliation": self.rewards_reconciliation(),
+            "deadman": (self.deadman.status() if self.deadman is not None else {"configured": False}),
+            "build": build_info(),
             "adverse_guard": {"enabled": self._as_on(), "exits_enabled": self._exits_on(),
                               "backed_off": sorted(self._as_back),
                               "worst_markout_ewma": sorted(

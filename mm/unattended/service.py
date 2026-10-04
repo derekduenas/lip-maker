@@ -259,6 +259,9 @@ class EngineTimer:
             body = loop.state_snapshot(every_s=5.0)
             samples = _take_fv_samples(loop)
         write_heartbeat(self.heartbeat)
+        if getattr(loop, "deadman", None) is not None:
+            ok, _why = loop.healthy_for_deadman()
+            loop.deadman.ping(time.time(), healthy=ok)   # off-VM dead-man's switch (LIP_DEADMAN_URL)
         flush_fv_samples(loop, samples)
         if report is not None:
             self.refresher.publish(report)
@@ -306,6 +309,10 @@ class _Engine:
             carry_forward=True,
         )
         loop.socket_opened = True
+        from mm.live_ops.deadman import DeadMansSwitch
+        _dm = DeadMansSwitch.from_env()
+        if _dm.configured:
+            loop.deadman = _dm
         if str(os.environ.get("LIP_CHRONY_STATUS", "0")).strip().lower() in ("1", "true", "yes", "on"):
             from mm.ops import ChronyProbe
             loop.chrony = ChronyProbe()   # /status feed.clock_sync (optional, cached)

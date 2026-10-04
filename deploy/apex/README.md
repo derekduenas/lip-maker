@@ -141,3 +141,20 @@ Why: in 40 h after the Oct 2 restart there were 0 Kalshi paper fills and 968k qu
 ## Paper gates (COMMAND, 2026-10-04)
 - **Oct 6 2026 = checkpoint only** (diagnostic, not go/no-go): >= 30 real (non-synthetic, trade-print) Kalshi paper fills; clock_skew pulls < 100/day; 5-minute markout reported. Read it off `/status | jq .checkpoint` (overall PASS/FAIL/PENDING) or the daily-summary `checkpoint` line. Thresholds are in `mm/unattended/gates.py`.
 - **Oct 10 2026 = real go/no-go**: per series `mm.session_gates.series_go` (>= 5 days, >= 30 settled fills, net > 0, 5-min markout per fill < reward per fill, > 0 after a 50% reward haircut), plus `tools/readiness_report.py` (advisory). Going live remains an explicit human decision; nothing arms automatically.
+
+## Gold-standard gap work (2026-10-04, paper only; every knob below is OFF unless stated)
+None of this arms anything or changes `policy.conf`. Enable knobs one at a time in paper and watch `/status`.
+
+**Go/no-go and measurement (on by default, advisory):** `/status series_gate.go_no_go` = event-level 5-minute markout with a one-sided 90% lower bound, verdict GO / NO_GO / INSUFFICIENT (`LIP_GO_MIN_EVENTS` 30, `LIP_GO_TARGET_EDGE_CENTS` 0.5, `LIP_GO_REWARD_HAIRCUT` 0.5, `LIP_GO_MIN_FROZEN_DAYS` 3), `params_fingerprint`, `trials`, `frozen_days`, `markout_by_price_bucket`. `python -m tools.state_markout_report` prints the price-bucket table from the state file (recommendations are never applied). `/status rewards_reconciliation`: paid vs estimated, fed by `LIP_REWARD_CREDITS_FILE` (JSONL: `kind=liquidity_reward`, `source` in kalshi_statement|kalshi_api|operator_receipt, `market`, `program_id`, `amount_usd`, optional `period_start`). The go/no-go haircut follows the measured ratio only with >= 10 matched periods on >= 3 paid days (floor 0.2).
+
+**Selection (opt-in):** `LIP_ACTIVITY_MIN_VOL` (suggested 20: drop known-dead markets), `LIP_MIN_SIDE_PRICE_CENTS` (suggested 10 only if `state_markout_report` shows the <10 bucket adverse), `LIP_EXCLUDE_NEWS_CATEGORIES`, `LIP_CARRY_APY_OFFSET` (net the interest Kalshi pays on cash/collateral; verify the rate first).
+
+**Adverse selection and exits (opt-in):** `LIP_AS_GUARD_ENABLE` (+ `LIP_AS_MIN_OBS` 3, `LIP_AS_WIDEN_CENTS` 1, `LIP_AS_PULL_CENTS` 3, `LIP_AS_TOXIC_COOLDOWN_S` 600, `LIP_AS_BURST_*`, `LIP_AS_GUARD_SAMPLE` to include the sampling group, which is exempt by default). `LIP_EXITS_ENABLE` (+ `LIP_COMP_EWMA_ALPHA` 0.3, `LIP_EXIT_COMP_REL`, `LIP_EXIT_COOLDOWN_S` 3600). `/status adverse_guard`.
+
+**Inventory (opt-in):** `LIP_RESERVATION_ENABLE` (Avellaneda-Stoikov shift instead of the linear tick skew; `LIP_RES_GAMMA` 0.04, `LIP_RES_HORIZON_H` 6, `LIP_RES_MAX_SKEW` 3, `LIP_RES_SIGMA_DEFAULT_CENTS` 5; needs `LIP_SKEW_*` caps as before), `LIP_INV_MAX_AGE_H` (aged unpaired inventory becomes reduce-only; `LIP_INV_AGED_FRAC` 1.0). `/status skew.reservation`, `skew.inventory_age`.
+
+**Clock skew (opt-in):** `LIP_SKEW_OFFSET_AWARE` (baseline = 1 h minimum lag after a 10 min warm-up; `LIP_SKEW_OFFSET_WINDOW_S`, `LIP_SKEW_OFFSET_WARMUP_S`, `LIP_SKEW_SHIFT_S` 2), `LIP_CHRONY_STATUS` (cached `chronyc tracking` in `/status feed.clock_sync`).
+
+**Simulator band:** `LIP_SIM_QUEUE_MODEL` (depletion default | risk_averse | prob_power), `LIP_SIM_QUEUE_POWER`, `LIP_SIM_CANCEL_LATENCY_MS`; `python -m mm.replay bench --queue-band`. See `docs/SIMULATOR_VALIDATION.md`.
+
+**Operations:** `LIP_DEADMAN_URL` (secret; off-VM dead-man's switch, pinged only while the engine is healthy; `LIP_DEADMAN_INTERVAL_S` 60). `deploy/deploy_and_verify.sh [--dry-run]` fast-forwards, restarts, then `deploy/verify_deploy.py` checks paper mode, `live_armed` false, no kill, state loaded, feed live and the deployed commit (`/status build.commit`; set `LIP_BUILD_COMMIT` if the service has no git checkout). `mm/live_ops/` (client-order-id journal, rate budget, order-group model, reconciler) is unit-tested against fakes only and is NOT wired to any order path: it is the prerequisite checklist before any live order is considered.
