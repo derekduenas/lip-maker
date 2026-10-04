@@ -591,3 +591,41 @@ def test_loop_passes_the_account_cap_to_selection():
     lp.on_frame(program(M, max_reward_usd=5.0))
     lp.on_frame(snap(M, T0, YES, NO))
     assert lp._km(M).max_reward_usd == 5.0
+
+
+# ------------------------------------------------- 10. measured markout reaches selection
+def _with_series_markout(usd, contracts, n):
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M))
+    lp.on_frame(snap(M, T0, YES, NO))
+    lp.series_acc["KXCPI"] = {"fills": n, "fees": 0.0, "settled_fills": 0, "settled_usd": 0.0,
+                              "mk5_usd": usd, "mk5_contracts": contracts, "mk5_n": n}
+    return lp
+
+
+def test_measured_5m_markout_raises_the_adverse_selection_charge():
+    from mm.selector import EMPIRICAL_MIN_N, adverse_cost_per_contract_day
+    base = adverse_cost_per_contract_day(_with_series_markout(0, 0, 0)._km(M))
+    lp = _with_series_markout(-5.0, 100.0, 10)                 # -5c per contract over 10 fills
+    km = lp._km(M)
+    assert km.empirical_markout_cents == pytest.approx(-5.0) and km.empirical_n == 10 >= EMPIRICAL_MIN_N
+    assert adverse_cost_per_contract_day(km) > base
+
+
+def test_a_lucky_sample_never_turns_adverse_selection_into_a_reward():
+    from mm.selector import adverse_cost_per_contract_day
+    base = adverse_cost_per_contract_day(_with_series_markout(0, 0, 0)._km(M))
+    km = _with_series_markout(+8.0, 100.0, 10)._km(M)          # +8c: favourable
+    assert km.empirical_markout_cents == 0.0
+    assert adverse_cost_per_contract_day(km) > 0
+    assert adverse_cost_per_contract_day(km) <= base
+
+
+def test_markout_contracts_accumulate_and_persist(monkeypatch, tmp_path):
+    lp = _campaign(monkeypatch, tmp_path / "state.json")
+    acc = lp.series_acc["KXCPI"]
+    assert acc["mk5_n"] == 1 and acc["mk5_contracts"] == pytest.approx(10.0)
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(tmp_path / "state.json"))
+    assert lp2.series_acc["KXCPI"]["mk5_contracts"] == pytest.approx(10.0)

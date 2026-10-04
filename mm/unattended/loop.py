@@ -992,7 +992,8 @@ class RunLoop:
         prog = self.programs.get(market)
         series = (prog.series if prog is not None else market.split("-", 1)[0]).upper()
         return self.series_acc.setdefault(series, {"fills": 0, "fees": 0.0, "settled_fills": 0,
-                                                    "settled_usd": 0.0, "mk5_usd": 0.0, "mk5_n": 0})
+                                                    "settled_usd": 0.0, "mk5_usd": 0.0, "mk5_contracts": 0.0,
+                                                    "mk5_n": 0})
 
     def _series_settled(self, market: str, result: str) -> None:
         pos = self.position.get(market)
@@ -1506,7 +1507,8 @@ class RunLoop:
             try:
                 row = {"fills": int(a["fills"]), "fees": float(a["fees"]),
                        "settled_fills": int(a["settled_fills"]), "settled_usd": float(a["settled_usd"]),
-                       "mk5_usd": float(a["mk5_usd"]), "mk5_n": int(a["mk5_n"])}
+                       "mk5_usd": float(a["mk5_usd"]), "mk5_n": int(a["mk5_n"]),
+                       "mk5_contracts": float(a.get("mk5_contracts") or 0.0)}
                 if a.get("first_ts") is not None:
                     row["first_ts"] = float(a["first_ts"])
             except (KeyError, TypeError, ValueError):
@@ -2635,6 +2637,7 @@ class RunLoop:
                             acc = self._series_acc(str(mark["market"]))
                             if acc is not None:
                                 acc["mk5_usd"] += mark[key]
+                                acc["mk5_contracts"] += float(mark["count"])
                                 acc["mk5_n"] += 1
 
     def markout_summary(self) -> dict:
@@ -2750,6 +2753,16 @@ class RunLoop:
             return None
         book = self.accruals[market].book.book
         row = self._fv_quote_row(market)
+        emp_cents, emp_n = None, 0
+        acc = self.series_acc.get(prog.series.upper()) if prog.venue == "kalshi" else None
+        if acc and float(acc.get("mk5_contracts") or 0.0) > 0:
+            # Measured 5-minute markout of OUR paper fills in this series, in
+            # cents per contract (negative = adverse). Selection blends it
+            # with the family prior once EMPIRICAL_MIN_N fills exist. A
+            # favourable sample is clamped to 0: a few lucky paper fills must
+            # never make adverse selection look like income.
+            emp_cents = min(0.0, float(acc["mk5_usd"]) * 100.0 / float(acc["mk5_contracts"]))
+            emp_n = int(acc["mk5_n"])
         return KalshiMarket(
             market=market,
             series=prog.series,
@@ -2774,6 +2787,8 @@ class RunLoop:
             fee_multiplier=prog.fee_multiplier,
             fv_cents=None if row is None else float(row["fv_cents"]),
             fv_calibrated=row is not None and self.fv_calib.passed(),
+            empirical_markout_cents=emp_cents,
+            empirical_n=emp_n,
         )
 
     def _fv_note_admitted(self, markets: list) -> None:
