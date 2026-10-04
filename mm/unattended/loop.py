@@ -62,6 +62,8 @@ MARKOUT_GRACE_S = 30.0
 # Events kept in the persisted 5-minute markout accumulator (oldest dropped).
 EVENT_ACC_KEEP = 3000
 PRICE_BUCKETS = ("<10", "10-30", "30-70", "70-90", ">=90")
+# Events kept per price bucket for the event-level markout confidence interval.
+PRICE_EVENT_KEEP = 500
 
 
 def price_bucket(price_cents: float) -> str:
@@ -456,6 +458,9 @@ class RunLoop:
         # bucket -> [fills, contracts, usd]. Published studies find sub-10c
         # contracts lose most; this is OUR data for that question.
         self.price_acc: dict[str, list] = {}
+        # Same, per EVENT (the unit of independence): bucket -> event ->
+        # [fills, contracts, usd], capped at PRICE_EVENT_KEEP events per bucket.
+        self.price_event_acc: dict[str, dict] = {}
         self.param_history: list = []
         self._params_noted = False
         # Phase 4: multi-horizon fill markouts (measurement only).
@@ -1092,6 +1097,29 @@ class RunLoop:
                                                     "settled_usd": 0.0, "mk5_usd": 0.0, "mk5_contracts": 0.0,
                                                     "mk5_n": 0})
 
+    def _price_event_note(self, bucket: str, event: str, fills: float, contracts: float, usd: float) -> None:
+        rows = self.price_event_acc.setdefault(bucket, {})
+        row = rows.setdefault(event, [0, 0.0, 0.0])
+        row[0] += int(fills)
+        row[1] += float(contracts)
+        row[2] += float(usd)
+        if len(rows) > PRICE_EVENT_KEEP:
+            for k in list(rows)[: len(rows) - PRICE_EVENT_KEEP]:
+                del rows[k]
+
+    def _price_bucket_row(self, bucket: str) -> dict:
+        from mm.unattended import go_no_go
+        acc = self.price_acc.get(bucket, [0, 0.0, 0.0])
+        st = go_no_go.event_stats(self.price_event_acc.get(bucket, {}))
+        t = go_no_go.t_crit_90(st["events"] - 1) if st["events"] >= 2 else None
+        lo = st["lower_90_cents"]
+        hi = None if lo is None else st["mean_cents"] + t * st["se_cents"]
+        return {"fills": int(acc[0]), "contracts": round(float(acc[1]), 4),
+                "cents_per_contract": None if acc[1] <= 0 else round(acc[2] * 100.0 / acc[1], 4),
+                "events": st["events"],
+                "lower_90_cents": None if lo is None else round(lo, 4),
+                "upper_90_cents": None if hi is None else round(hi, 4)}
+
     def _series_settled(self, market: str, result: str) -> None:
         pos = self.position.get(market)
         acc = self._series_acc(market)
@@ -1190,12 +1218,7 @@ class RunLoop:
                                                          frozen_days=frozen),
                              "reward_cents_per_measured_contract": round(reward_cents, 4),
                              "markout_by_price_bucket": {
-                                 b: {"fills": int(self.price_acc.get(b, [0, 0.0, 0.0])[0]),
-                                     "contracts": round(float(self.price_acc.get(b, [0, 0.0, 0.0])[1]), 4),
-                                     "cents_per_contract": (
-                                         None if self.price_acc.get(b, [0, 0.0, 0.0])[1] <= 0 else round(
-                                             self.price_acc[b][2] * 100.0 / self.price_acc[b][1], 4))}
-                                 for b in PRICE_BUCKETS},
+                                 b: self._price_bucket_row(b) for b in PRICE_BUCKETS},
                              "trials": len(self.param_history), "params_fingerprint": fp,
                              "frozen_days": round(frozen, 3)}}
 
@@ -1592,7 +1615,7 @@ class RunLoop:
             "fill_marks": self.fill_marks[-FILL_MARKS_KEEP:],
             "series_acc": self.series_acc,
             "event_acc": self.event_acc, "param_history": self.param_history,
-            "price_acc": self.price_acc,
+            "price_acc": self.price_acc, "price_event_acc": self.price_event_acc,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1683,6 +1706,25 @@ class RunLoop:
                     row[0] += 1
                     row[1] += float(m["count"])
                     row[2] += float(m["markout_300s"])
+        pe = {}
+        raw_pe = data.get("price_event_acc")
+        for bucket, rows in (raw_pe.items() if isinstance(raw_pe, dict) else []):
+            try:
+                pe[str(bucket)] = {str(e): [int(r[0]), float(r[1]), float(r[2])] for e, r in dict(rows).items()}
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+        if "price_event_acc" in data:
+            self.price_event_acc = pe
+        else:
+            # State from before the per-event price table: rebuild it from the
+            # persisted fill marks with a measured 5-minute markout.
+            for m in self.fill_marks:
+                if m.get("markout_300s") is None or m.get("venue") != "kalshi" or m.get("synthetic"):
+                    continue
+                market = str(m["market"])
+                event = self._event_of(market) if market in self.programs else market.rsplit("-", 1)[0]
+                self._price_event_note(price_bucket(float(m["price_cents"])), event, 1,
+                                       float(m["count"]), float(m["markout_300s"]))
         hist = []
         raw_h = data.get("param_history")
         for h in (raw_h if isinstance(raw_h, list) else []):
@@ -2843,6 +2885,9 @@ class RunLoop:
                                 prow[0] += 1
                                 prow[1] += float(mark["count"])
                                 prow[2] += mark[key]
+                                self._price_event_note(price_bucket(float(mark["price_cents"])),
+                                                       self._event_of(str(mark["market"])), 1,
+                                                       float(mark["count"]), mark[key])
                                 if len(self.event_acc) > EVENT_ACC_KEEP:
                                     for k in list(self.event_acc)[: len(self.event_acc) - EVENT_ACC_KEEP]:
                                         del self.event_acc[k]

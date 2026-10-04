@@ -516,10 +516,18 @@ def holding_model() -> str:
 
 
 def carry_apr() -> float:
+    """Capital carry rate. ``LIP_CARRY_APY_OFFSET`` (default 0) nets the interest
+    Kalshi pays on cash/collateral (about 3.5% APY above $250 per its help
+    article; verify before setting), never below 0."""
     try:
-        return float(_os.environ.get("LIP_CARRY_APR", 0.10))
+        apr = float(_os.environ.get("LIP_CARRY_APR", 0.10))
     except (TypeError, ValueError):
-        return 0.10
+        apr = 0.10
+    try:
+        offset = float(_os.environ.get("LIP_CARRY_APY_OFFSET", 0.0))
+    except (TypeError, ValueError):
+        offset = 0.0
+    return max(0.0, apr - offset)
 
 
 def fills_per_day(market: KalshiMarket, size: float) -> float:
@@ -677,9 +685,27 @@ def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> s
         family == "weather" and market.has_observation)
     if market.days_to_settle > long_dated_event_days() and not referenced:
         return f"long_dated_event_{market.days_to_settle:.0f}d"
+    # Opt-in (default off) bias filters from published Kalshi evidence: the
+    # cheap side of a contract and single-name/news-driven markets lose most.
+    floor = _env_float_sel("LIP_MIN_SIDE_PRICE_CENTS", 0.0)
+    if floor > 0 and market.yes_bids and market.no_bids:
+        yes_mid = (max(p for p, _s in market.yes_bids) + 100 - max(p for p, _s in market.no_bids)) / 2.0
+        if min(yes_mid, 100.0 - yes_mid) < floor:
+            return f"side_price_below_{floor:g}c"
+    if (_env_float_sel("LIP_EXCLUDE_NEWS_CATEGORIES", 0.0) > 0 and market.category):
+        from mm.unattended.screen import news_categories
+        if market.category.strip().lower() in news_categories():
+            return "news_category"
     if market.exchange_index is None:
         return "shard_unknown"
     return ""
+
+
+def _env_float_sel(name: str, default: float) -> float:
+    try:
+        return float(_os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def exit_reason(market: KalshiMarket) -> str:
