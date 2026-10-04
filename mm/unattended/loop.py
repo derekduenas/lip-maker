@@ -2766,6 +2766,7 @@ class RunLoop:
             exchange_index=prog.exchange_index,
             shard_cash_usd=prog.shard_cash_usd,
             category=prog.category,
+            max_reward_usd=prog.max_reward_usd if prog.venue == "kalshi" else None,
             venue=prog.venue,
             max_spread_usd=prog.max_spread_usd,
             sports_single=prog.sports_single,

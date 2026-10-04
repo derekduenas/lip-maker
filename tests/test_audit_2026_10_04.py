@@ -564,3 +564,30 @@ def test_pm_us_frames_are_applied_without_any_kalshi_frame(monkeypatch, tmp_path
     timer.tick()
     m = "PMUS:rtc-bb-2026-10-01-a"
     assert m in lp.programs and lp.accruals[m].book.book.yes_bids
+
+
+# ------------------------------------------------- 9. per-account reward cap in selection
+def _km_pool(pool, cap=None):
+    from mm.selector import KalshiMarket
+    return KalshiMarket(market=M, series="KXCPI", period_reward_usd=pool, period_seconds=7 * 86400,
+                        seconds_left=7 * 86400, discount_factor=0.5, target_size=100,
+                        yes_bids=[(44, 10)], no_bids=[(53, 10)], max_reward_usd=cap)
+
+
+def test_reward_per_day_honours_max_reward_per_account():
+    """max_reward_per_account was applied to the accrual but not to selection,
+    so a capped pool ranked as if the whole pool were available."""
+    from mm.selector import kalshi_share, reward_per_day
+    share = kalshi_share(_km_pool(500.0), 44, 53, 100)
+    assert share > 0.5
+    uncapped = reward_per_day(share, _km_pool(500.0))
+    capped = reward_per_day(share, _km_pool(500.0, cap=7.0))
+    assert capped == pytest.approx(7.0 / 7.0) and uncapped > 10 * capped
+    assert reward_per_day(share, _km_pool(500.0, cap=10_000.0)) == pytest.approx(uncapped)
+
+
+def test_loop_passes_the_account_cap_to_selection():
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M, max_reward_usd=5.0))
+    lp.on_frame(snap(M, T0, YES, NO))
+    assert lp._km(M).max_reward_usd == 5.0

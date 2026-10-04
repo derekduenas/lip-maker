@@ -210,10 +210,14 @@ def test_max_reward_per_account_reaches_the_accrual():
 
 def test_estimated_rewards_in_pnl_are_capped_at_max_reward():
     lp = newloop()
-    lp.on_frame(program(M, max_reward_usd=0.000001))
+    lp.on_frame(program(M))
     lp.on_frame(snap(M, T0, [(40, 2000), (39, 2000)], [(55, 2000), (54, 2000)]))
     for i in range(1, 30):
         lp.on_frame({"type": "clock", "ts": T0 + i})
+    # The cap reaches the accrual on a same-window re-feed. (A program capped
+    # at ~$0 from the start is no longer selected at all: selection honours
+    # the cap, tests/test_audit_2026_10_04.py.)
+    lp.on_frame(program(M, max_reward_usd=0.000001))
     acc = lp.live_accrual([M])
     assert acc[M]["raw_usd"] > Decimal("0.000001")
     rep = lp.pnl_report(acc)

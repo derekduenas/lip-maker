@@ -142,6 +142,8 @@ class KalshiMarket:
     empirical_markout_cents: float | None = None
     empirical_n: int = 0
     category: str | None = None
+    # max_reward_per_account of the program in USD per period (None: no cap).
+    max_reward_usd: float | None = None
     # Patch 21: venue abstraction. "kalshi" or "pmus" (Polymarket US, mapped
     # to a Kalshi-shaped book: yes_bids = PM bids, no_bids = 100 - PM offers).
     venue: str = "kalshi"
@@ -455,6 +457,10 @@ def reward_per_day(share: float, market: KalshiMarket, *,
         return pmus_reward_per_day(share, market, reward_factor=reward_factor)
     uptime = _uptime(market)
     paid = kalshi_period_payout(share, market.period_reward_usd, uptime=uptime)
+    if market.max_reward_usd is not None and paid > 0:
+        # The program caps what one account can earn per period (the accrual
+        # already applies it): a capped pool is not worth its headline size.
+        paid = min(paid, max(0.0, float(market.max_reward_usd)))
     days = (market.period_seconds / 86400.0) * uptime
     if paid <= 0 or days <= 0 or reward_factor <= 0:
         return 0.0
