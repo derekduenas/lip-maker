@@ -419,6 +419,10 @@ class RunLoop:
         # First frame of the whole paper campaign (persisted): the Oct 6/10
         # gates span restarts, ``started_ts`` is this process only.
         self.campaign_start_ts: float | None = None
+        # Per Kalshi series, persisted: inputs of the Oct 10 go/no-go
+        # (series_gate_report): first fill, fills, fees, settled fills and
+        # settlement P&L, 5-minute markout sum.
+        self.series_acc: dict[str, dict] = {}
         # Phase 4: multi-horizon fill markouts (measurement only).
         from mm.unattended.markouts import MarkoutBook
         self.markouts = MarkoutBook()
@@ -960,6 +964,7 @@ class RunLoop:
             return
         self.unresolved.pop(market, None)
         self._count_settled(market, result)
+        self._series_settled(market, result)
         legs = [(str((self.position.get(market) or {}).get("venue") or self._venue_of(market)), b,
                  rows[market]["yes"], rows[market]["no"], rows[market]["yes_cost"], rows[market]["no_cost"],
                  rows[market].get("fills_n", 0))
@@ -977,6 +982,92 @@ class RunLoop:
         mark = 100.0 if result == "yes" else 0.0
         value = (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
         return value - float(pos["yes_cost"]) - float(pos["no_cost"])
+
+    # ------------------------------------------------------------ go/no-go
+    def _series_acc(self, market: str):
+        """The persisted per-series accumulator of a KALSHI market (created on
+        demand), else None."""
+        if self._venue(market) != "kalshi":
+            return None
+        prog = self.programs.get(market)
+        series = (prog.series if prog is not None else market.split("-", 1)[0]).upper()
+        return self.series_acc.setdefault(series, {"fills": 0, "fees": 0.0, "settled_fills": 0,
+                                                    "settled_usd": 0.0, "mk5_usd": 0.0, "mk5_n": 0})
+
+    def _series_settled(self, market: str, result: str) -> None:
+        pos = self.position.get(market)
+        acc = self._series_acc(market)
+        if acc is None or not pos or (float(pos.get("yes") or 0) <= 0 and float(pos.get("no") or 0) <= 0):
+            return
+        acc["settled_fills"] += int(sum(rows[market].get("fills_n", 0)
+                                        for rows in self.bucket_pos.values() if market in rows))
+        acc["settled_usd"] += self._settle_value_usd(pos, result)
+        self._state_dirty = True
+
+    def series_gate_report(self, accrual: dict | None = None) -> dict:
+        """Oct 10 go/no-go, per Kalshi series: ``mm.session_gates.series_go``
+        fed from the run (it had no producer: ``series_stats`` was always
+        empty).
+
+        net = settled payout - cost + MTM of held legs - maker fees + estimated
+        rewards (an estimate, never paid money). The gate asks that the
+        5-minute markout COST per fill stay under the reward per fill; the
+        markout book stores reference - fill price (negative = adverse), so
+        the cost is its negation (``markout_5m_cost_usd``, positive = bad).
+        A series with no measured 5-minute markout is not a go. Thresholds:
+        LIP_GO_MIN_DAYS (5), LIP_GO_MIN_FILLS (30)."""
+        from mm.session_gates import SeriesGateConfig, SeriesStats, series_go
+        cfg = SeriesGateConfig(min_days=_env_num("LIP_GO_MIN_DAYS", 5.0),
+                               min_settled_fills=int(_env_num("LIP_GO_MIN_FILLS", 30)))
+        now = float(self.now or time.time())
+
+        def series_of(market: str) -> str:
+            prog = self.programs.get(market)
+            return (prog.series if prog is not None else market.split("-", 1)[0]).upper()
+
+        mtm: dict[str, float] = {}
+        for market, pos in self.position.items():
+            if self._venue(market) != "kalshi" or market in self.settled or market in self.unresolved:
+                continue
+            mark, _src = self._yes_mark(market)
+            cost = float(pos["yes_cost"]) + float(pos["no_cost"])
+            value = 0.0 if mark is None else (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
+            mtm[series_of(market)] = mtm.get(series_of(market), 0.0) + value - cost
+        rewards: dict[str, float] = {}
+        for market, info in (accrual or {}).items():
+            if self._venue_of(market) == "kalshi":
+                rewards[series_of(market)] = rewards.get(series_of(market), 0.0) + float(
+                    info.get("capped_raw_usd", info["raw_usd"]))
+        for market, usd in self.closed_periods.items():
+            if self._venue_of(market) == "kalshi":
+                rewards[series_of(market)] = rewards.get(series_of(market), 0.0) + float(usd)
+        out, go = {}, []
+        for series, acc in sorted(self.series_acc.items()):
+            first = acc.get("first_ts")
+            days = 0.0 if first is None else max(0.0, (now - float(first)) / 86400.0)
+            reward = rewards.get(series, 0.0)
+            trading = float(acc["settled_usd"]) + mtm.get(series, 0.0)
+            net = trading - float(acc["fees"]) + reward
+            cost_usd = -float(acc["mk5_usd"])
+            n5 = int(acc["mk5_n"])
+            fills = int(acc["settled_fills"])
+            per_fill = cost_usd / n5 if n5 else 0.0
+            ok, why = series_go(SeriesStats(series, days, fills, net, reward, per_fill * fills), cfg)
+            if n5 == 0 and why in ("go", "reward", "markout", "haircut"):
+                # series_go cannot tell "no adverse markout" from "never
+                # measured" (both are 0): an unmeasured series is not a go.
+                ok, why = False, "markout_unmeasured"
+            if ok:
+                go.append(series)
+            out[series] = {"days": round(days, 3), "fills": int(acc["fills"]), "settled_fills": fills,
+                           "net_usd": round(net, 4), "trading_usd": round(trading, 4),
+                           "fees_usd": round(float(acc["fees"]), 4), "reward_usd": round(reward, 4),
+                           "markout_5m_cost_usd": round(cost_usd, 4), "markout_5m_fills": n5,
+                           "markout_5m_cost_per_fill_usd": round(per_fill, 5), "go": ok, "why": why}
+        return {"label": "estimate (paper): rewards are not paid money; Oct 10 go/no-go inputs",
+                "criteria": {"min_days": cfg.min_days, "min_settled_fills": cfg.min_settled_fills,
+                             "reward_haircut": cfg.reward_haircut},
+                "series": out, "go_series": go}
 
     def _count_settled(self, market: str, result: str) -> None:
         """Lifetime counters (``settled_lifetime``) for a held position that
@@ -1369,6 +1460,7 @@ class RunLoop:
             "skew_trips_n": self.skew_trips_n, "skew_clears_n": self.skew_clears_n,
             "campaign_start_ts": self.campaign_start_ts,
             "fill_marks": self.fill_marks[-FILL_MARKS_KEEP:],
+            "series_acc": self.series_acc,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1408,6 +1500,20 @@ class RunLoop:
             marks.append(row)
         if "fill_marks" in data:
             self.fill_marks = marks
+        acc = {}
+        raw_acc = data.get("series_acc")
+        for series, a in (raw_acc.items() if isinstance(raw_acc, dict) else []):
+            try:
+                row = {"fills": int(a["fills"]), "fees": float(a["fees"]),
+                       "settled_fills": int(a["settled_fills"]), "settled_usd": float(a["settled_usd"]),
+                       "mk5_usd": float(a["mk5_usd"]), "mk5_n": int(a["mk5_n"])}
+                if a.get("first_ts") is not None:
+                    row["first_ts"] = float(a["first_ts"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            acc[str(series)] = row
+        if "series_acc" in data:
+            self.series_acc = acc
 
     def attach_state(self, path: str) -> None:
         """Load ``path`` when it exists and persist there from now on.
@@ -1983,6 +2089,11 @@ class RunLoop:
         bpos["fills_n"] += 1
         if fill.get("synthetic"):
             bpos["synthetic_n"] = bpos.get("synthetic_n", 0.0) + 1
+        acc = self._series_acc(market)
+        if acc is not None and not fill.get("synthetic"):
+            acc.setdefault("first_ts", float(ts))
+            acc["fills"] += 1
+            acc["fees"] += fee
         self._sync_inventory(market)
         self._state_dirty = True
         mid = self._side_mid_cents(market, side)
@@ -2519,6 +2630,11 @@ class RunLoop:
                     mid = self._side_mid_cents(mark["market"], str(mark["side"]))
                     if mid is not None:
                         mark[key] = round(float(mark["count"]) * (mid - float(mark["price_cents"])) / 100.0, 4)
+                        if horizon == 300 and mark.get("venue") == "kalshi" and not mark.get("synthetic"):
+                            acc = self._series_acc(str(mark["market"]))
+                            if acc is not None:
+                                acc["mk5_usd"] += mark[key]
+                                acc["mk5_n"] += 1
 
     def markout_summary(self) -> dict:
         out = {"fills": len(self.fill_marks)}
@@ -3428,6 +3544,7 @@ class RunLoop:
                                   fills_n=self.sample_fills_n,
                                   trades_per_day={m: self.trades_per_day(m) for m in sorted(self.sample_markets)}),
             "checkpoint": self.checkpoint_report(),
+            "series_gate": self.series_gate_report(accrual),
             "repegs_n": self.repegs_n,
             "skew": self._skew_status(),
             "recorder": (self.recorder.summary() if getattr(self, "recorder", None) is not None

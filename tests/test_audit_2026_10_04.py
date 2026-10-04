@@ -457,3 +457,87 @@ def test_pmus_refresh_failure_is_retried_within_a_minute():
     feed._sleep = lambda s: (orig_sleep(s), t[0] > 1400 and feed._stop.set())
     feed._run()
     assert len(calls) == 2 and calls[1] - calls[0] <= 60
+
+
+# ------------------------------------------------- 7. Oct 10 go/no-go has a producer
+def _gate_env(monkeypatch, days=0, fills=1):
+    monkeypatch.setenv("LIP_GO_MIN_DAYS", str(days))
+    monkeypatch.setenv("LIP_GO_MIN_FILLS", str(fills))
+
+
+def _filled_and_marked(monkeypatch, mid_after_cents):
+    """One sampled fill of 10 YES @44, its 5-minute markout measured against a
+    YES mid of ``mid_after_cents``."""
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp.on_frame(_activity(T0, {M: 40}))
+    lp.on_frame(snap(M, T0, YES, NO))
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    lp.on_frame(snap(M, T0 + 2, [(40, 2000)], NO))
+    lp.on_frame(trade(M, T0 + 3, "t1", 44, 50, "no"))
+    assert lp.fills_total == 1
+    yes_bid, no_bid = mid_after_cents - 1, 100 - (mid_after_cents + 1)
+    lp.on_frame(snap(M, T0 + 100, [(yes_bid, 500)], [(no_bid, 500)]))
+    lp.on_frame({"type": "clock", "ts": T0 + 400})
+    return lp
+
+
+def test_series_gate_report_passes_a_series_that_earns_and_has_no_adverse_markout(monkeypatch):
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)        # +3c after 5 min
+    lp.settle(M, "yes")
+    rep = lp.series_gate_report(accrual=lp.live_accrual())
+    row = rep["series"]["KXCPI"]
+    assert row["settled_fills"] == 1 and row["fills"] == 1
+    assert row["markout_5m_cost_usd"] < 0                           # favourable = negative cost
+    assert row["trading_usd"] == pytest.approx(10 * (1.0 - 0.44))   # payout - cost
+    assert row["go"] is True and row["why"] == "go"
+    assert "KXCPI" in rep["go_series"]
+
+
+def test_series_gate_report_charges_adverse_markout_as_a_positive_cost(monkeypatch):
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=30)        # -14c after 5 min
+    lp.settle(M, "yes")
+    row = lp.series_gate_report(accrual=lp.live_accrual())["series"]["KXCPI"]
+    assert row["markout_5m_cost_usd"] > 0
+    assert row["go"] is False
+
+
+def test_series_gate_report_requires_days_fills_and_a_measured_markout(monkeypatch):
+    _gate_env(monkeypatch, days=5, fills=30)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
+    lp.settle(M, "yes")
+    row = lp.series_gate_report(accrual=lp.live_accrual())["series"]["KXCPI"]
+    assert row["go"] is False and row["why"] == "days"
+    _gate_env(monkeypatch)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.on_frame(program(M))
+    lp2.on_frame(snap(M, T0, YES, NO))
+    lp2._note_fill({"market_ticker": M, "side": "yes", "count": 10, "price_cents": 44, "ts": T0 + 1}, T0 + 1)
+    lp2.settle(M, "yes")
+    row2 = lp2.series_gate_report(accrual=lp2.live_accrual())["series"]["KXCPI"]
+    assert row2["go"] is False and row2["why"] == "markout_unmeasured"
+
+
+def test_series_gate_accumulators_survive_a_restart(monkeypatch, tmp_path):
+    _gate_env(monkeypatch)
+    path = tmp_path / "state.json"
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
+    lp.attach_state(str(path))
+    lp.settle(M, "yes")
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    lp2.on_frame({"type": "clock", "ts": T0 + 500})
+    row = lp2.series_gate_report()["series"]["KXCPI"]
+    assert row["settled_fills"] == 1 and row["markout_5m_fills"] == 1 and row["fills"] == 1
+
+
+def test_status_carries_the_series_gate(monkeypatch):
+    from mm.status_page import status_payload
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
+    assert "series_gate" in status_payload(lp.live_snapshot())
