@@ -407,6 +407,13 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
             continue
         eff = meta.get("effective_close_ts")
         days = None if eff is None else max(0.0, (float(eff) - now) / 86400.0)
+        floor = _env_float("LIP_ACTIVITY_MIN_VOL", 0.0)
+        vol_known = meta.get("volume_24h")
+        if floor > 0 and vol_known is not None and float(vol_known) < floor:
+            # Opt-in hard floor (default 0 = off): a market that KNOWN traded
+            # fewer contracts than this in 24 h cannot fill a paper quote.
+            _bump("below_min_activity", series)
+            continue
         cat_row = cache.series.get(series)
         category = None if cat_row is None else cat_row.get("category")
         probe = KalshiMarket(

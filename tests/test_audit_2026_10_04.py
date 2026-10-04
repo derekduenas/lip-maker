@@ -629,3 +629,38 @@ def test_markout_contracts_accumulate_and_persist(monkeypatch, tmp_path):
     lp2 = newloop(bankroll=1500.0)
     lp2.attach_state(str(tmp_path / "state.json"))
     assert lp2.series_acc["KXCPI"]["mk5_contracts"] == pytest.approx(10.0)
+
+
+# ------------------------------------------------- 11. optional hard activity floor in the screen
+def _screen_two(volume_dead, monkeypatch, floor=None):
+    from mm.unattended.screen import MetaCache, screen
+    if floor is None:
+        monkeypatch.delenv("LIP_ACTIVITY_MIN_VOL", raising=False)
+    else:
+        monkeypatch.setenv("LIP_ACTIVITY_MIN_VOL", str(floor))
+    cache = MetaCache()
+    cache.series["KXCPI"] = {"category": "Economics", "fee_type": "quadratic_with_maker_fees", "ts": 1e12}
+    now = 1_790_000_000.0
+    base = {"status": "active", "tick_1c": True, "exchange_index": 1, "effective_close_ts": now + 30 * 86400}
+    cache.markets["KXCPI-26NOV30-A"] = dict(base, **NORMAL_META)
+    cache.markets["KXCPI-26NOV30-B"] = dict(base, **dict(NORMAL_META, volume_24h=volume_dead))
+    frames = [dict(SCREEN_FRAME, market=m, program_id=m, start_ts=now - 3600, end_ts=now + 86400 * 7,
+                   close_ts=now + 30 * 86400) for m in cache.markets]
+    return screen(frames, cache, now=now, top=10)
+
+
+def test_screen_activity_floor_is_off_by_default(monkeypatch):
+    chosen, stats = _screen_two(0.0, monkeypatch)
+    assert {f["market"] for f in chosen} == {"KXCPI-26NOV30-A", "KXCPI-26NOV30-B"}
+
+
+def test_screen_activity_floor_drops_dead_markets_and_counts_them(monkeypatch):
+    chosen, stats = _screen_two(3.0, monkeypatch, floor=20)
+    assert [f["market"] for f in chosen] == ["KXCPI-26NOV30-A"]
+    assert stats["reasons"].get("below_min_activity") == 1
+
+
+def test_screen_activity_floor_keeps_markets_with_unknown_volume(monkeypatch):
+    """Unknown is not dead: only a KNOWN volume under the floor excludes."""
+    chosen, _stats = _screen_two(None, monkeypatch, floor=20)
+    assert len(chosen) == 2
