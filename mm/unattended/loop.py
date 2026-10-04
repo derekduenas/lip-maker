@@ -1597,6 +1597,24 @@ class RunLoop:
                 continue
         if "price_acc" in data:
             self.price_acc = pa
+        if "event_acc" not in data and "price_acc" not in data:
+            # A state file from before these accumulators: rebuild them from
+            # the persisted fill marks whose 5-minute markout was already
+            # measured (same filter as _update_markouts), so the campaign's
+            # earlier fills are not missing from the statistical bar.
+            for m in self.fill_marks:
+                if m.get("markout_300s") is None or m.get("venue") != "kalshi" or m.get("synthetic"):
+                    continue
+                market = str(m["market"])
+                # Programs are not loaded yet: the event is the ticker minus
+                # its last segment (what _event_of falls back to as well).
+                event = self._event_of(market) if market in self.programs else market.rsplit("-", 1)[0]
+                for table, key in ((self.event_acc, event),
+                                   (self.price_acc, price_bucket(float(m["price_cents"])))):
+                    row = table.setdefault(key, [0, 0.0, 0.0])
+                    row[0] += 1
+                    row[1] += float(m["count"])
+                    row[2] += float(m["markout_300s"])
         hist = []
         raw_h = data.get("param_history")
         for h in (raw_h if isinstance(raw_h, list) else []):

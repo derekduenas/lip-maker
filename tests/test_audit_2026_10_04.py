@@ -880,3 +880,30 @@ def test_t_critical_value_beyond_the_table_is_never_looser_than_exact():
     exact = {31: 1.309, 40: 1.303, 60: 1.296, 61: 1.296, 100: 1.290, 120: 1.289, 121: 1.289, 241: 1.285}
     for df, t in exact.items():
         assert G.t_crit_90(df) >= t - 1e-9, df
+
+
+def test_state_from_before_the_event_accumulators_backfills_them_from_measured_marks(monkeypatch, tmp_path):
+    """Deploying the statistical bar over a running campaign: the fills whose
+    5-minute markout was measured before the deploy must be in event_acc /
+    price_acc (they were silently missing, so the bar restarted at 0 events)."""
+    import json
+    path = tmp_path / "state.json"
+    lp = _campaign(monkeypatch, path)                       # one measured 10-lot fill at 44c
+    assert lp.save_state(force=True)
+    data = json.loads(path.read_text())
+    for key in ("event_acc", "price_acc", "param_history"):  # what the 4b1a712 build wrote
+        data.pop(key, None)
+    data["fill_marks"].append(dict(data["fill_marks"][0], market="KXCPI-26OCT30-T9", synthetic=True))
+    path.write_text(json.dumps(data))
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    ev = M.rsplit("-", 1)[0]
+    assert set(lp2.event_acc) == {ev}, "synthetic marks are not backfilled"
+    assert lp2.event_acc[ev][0] == 1 and lp2.event_acc[ev][1] == pytest.approx(10.0)
+    assert lp2.event_acc[ev][2] == pytest.approx(lp.event_acc[lp._event_of(M)][2])
+    assert lp2.price_acc["30-70"][0] == 1
+    # a file that already has the accumulators is taken as is (no double count)
+    assert lp2.save_state(force=True)
+    lp3 = newloop(bankroll=1500.0)
+    lp3.attach_state(str(path))
+    assert lp3.event_acc == lp2.event_acc and lp3.price_acc == lp2.price_acc
