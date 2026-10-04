@@ -316,3 +316,44 @@ def test_a_missing_or_future_exchange_time_falls_back_to_receive_time(monkeypatc
     lp2, _ = _resting_at_touch(monkeypatch)
     lp2.on_frame(_ws_trade(T0 + 12.0, "fut", 44, 5, "no", ts_ms=(T0 + 500) * 1000))  # bad clock
     assert [f["trade_id"] for f in lp2.fills] == ["fut"]
+
+
+# ------------------------------------------------- 4. screen rank: unknown/empty books
+SCREEN_FRAME = {"market": M, "series": "KXCPI", "target_size": 1000, "period_reward_usd": 500,
+                "period_seconds": 86400, "discount_factor": 0.5}
+NORMAL_META = {"yes_bid": 0.44, "yes_ask": 0.47, "yes_bid_size": 300, "yes_ask_size": 300,
+               "volume_24h": 3000}
+
+
+def _rank(meta):
+    from mm.unattended.screen import rank_score
+    return rank_score(SCREEN_FRAME, meta, category="Economics", days=30)
+
+
+@pytest.mark.parametrize("meta", [
+    {},                                                                    # no cached book at all
+    {"yes_bid": 0.0, "yes_ask": 1.0, "yes_bid_size": 0, "yes_ask_size": 0, "volume_24h": 0},
+    {"yes_bid": 0.44, "yes_ask": 0.47, "volume_24h": 3000},                # sizes unknown
+    {"yes_bid": 0.0, "yes_ask": 0.47, "yes_bid_size": 0, "yes_ask_size": 50},   # one-sided
+])
+def test_screen_never_ranks_an_unknown_or_one_sided_book_above_a_real_market(meta):
+    """An empty book scored share 1.0 on a $5 capital floor: ~80x a normal
+    market, so such markets took the top-ranked (core) websocket slots."""
+    dead, normal = _rank(meta), _rank(NORMAL_META)
+    assert dead["score"] < normal["score"]
+    assert dead["share"] == 0.0 and dead["book_known"] is False
+    assert normal["book_known"] is True and normal["share"] > 0
+
+
+def test_screen_orders_candidates_with_known_books_first():
+    from mm.unattended.screen import MetaCache, screen
+    cache = MetaCache()
+    cache.series["KXCPI"] = {"category": "Economics", "fee_type": "quadratic_with_maker_fees", "ts": 1e12}
+    now = 1_790_000_000.0
+    base = {"status": "active", "tick_1c": True, "exchange_index": 1, "effective_close_ts": now + 30 * 86400, "volume_24h": 500.0}
+    cache.markets["KXCPI-26NOV30-A"] = dict(base, **NORMAL_META)
+    cache.markets["KXCPI-26NOV30-B"] = dict(base)                         # never saw a book
+    frames = [dict(SCREEN_FRAME, market=m, program_id=m, start_ts=now - 3600, end_ts=now + 86400 * 7,
+                   close_ts=now + 30 * 86400) for m in cache.markets]
+    chosen, _stats = screen(frames, cache, now=now, top=10)
+    assert [f["market"] for f in chosen][0] == "KXCPI-26NOV30-A"

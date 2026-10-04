@@ -43,6 +43,12 @@ def news_categories() -> set[str]:
 RANK_PENALTY_UNIT = 100.0
 
 
+def ya_known(meta: dict) -> bool:
+    """The cached YES ask is a real quote (below $1.00)."""
+    ya = meta.get("yes_ask")
+    return ya is not None and 0.0 < float(ya) < 1.0
+
+
 def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | None,
                size: float = 100.0) -> dict:
     """Expected net $/day per $ of capital at our size, from market metadata only.
@@ -75,7 +81,15 @@ def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | N
     no_bid = 0.0 if ya is None else max(0.0, 1.0 - float(ya))
     capital = S * max(0.05, yb + no_bid)
     depth = float(meta.get("yes_bid_size") or 0.0) + float(meta.get("yes_ask_size") or 0.0)
-    share = (2.0 * S) / (2.0 * S + depth)
+    # A market whose cached touch is unknown or one-sided (no bid, no ask,
+    # sizes missing) is not "no competition": it is a market we know nothing
+    # about, and it may have no trading at all. It used to score share 1.0 on
+    # the $5 capital floor (~80x a normal market) and took the top-ranked
+    # websocket slots. It now ranks on the penalty alone (share 0).
+    book_known = (meta.get("yes_bid") is not None and meta.get("yes_ask") is not None
+                  and meta.get("yes_bid_size") is not None and meta.get("yes_ask_size") is not None
+                  and yb > 0.0 and ya_known(meta) and depth > 0.0)
+    share = (2.0 * S) / (2.0 * S + depth) if book_known else 0.0
     reward = pool_per_day(frame) * share
     vol = float(meta.get("volume_24h") or 0.0)
     vol_mult = min(3.0, 1.0 + vol / 5000.0)
@@ -94,7 +108,7 @@ def rank_score(frame: dict, meta: dict, *, category: str | None, days: float | N
     incremental = RANK_PENALTY_UNIT * max(0.0, full_per_contract - base_per_contract)
     return {"score": (reward - penalty_full) / capital, "reward": reward, "penalty": incremental,
             "penalty_full": penalty_full, "penalty_unit_contracts": int(RANK_PENALTY_UNIT),
-            "capital": capital, "share": share, "news": news}
+            "capital": capital, "share": share, "news": news, "book_known": book_known}
 
 
 def _env_float(name: str, default: float) -> float:
