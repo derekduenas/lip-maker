@@ -171,3 +171,148 @@ def test_session_seeds_trade_counts_before_the_first_subscription(monkeypatch):
     subs = [e for e in events if e[0] == "subscribe" and e[1] != []]
     assert any(f.get("kind") == "activity" for f in frames)
     assert subs and "C" in subs[0][1] and "A" in subs[0][1]   # core A + most traded C, first batch
+
+
+# ------------------------------------------------- 2. checkpoint survives restarts
+def _delta(ts, lag, market=M, price="0.3800", qty="0.00", side="yes"):
+    return {"type": "orderbook_delta", "ts": ts, "exchange_ts": ts - lag,
+            "msg": {"market_ticker": market, "price_dollars": price, "delta_fp": qty, "side": side}}
+
+
+def _campaign(monkeypatch, path):
+    """A loop with one real print fill from the sampling group, one clock-skew
+    trip that pulled a quote, and a fill whose 5-minute markout is measured."""
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.attach_state(str(path))
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp.on_frame(_activity(T0, {M: 40}))
+    lp.on_frame(snap(M, T0, YES, NO))
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    lp.on_frame(snap(M, T0 + 2, [(40, 2000)], NO))        # the queue ahead of us is gone
+    lp.on_frame(trade(M, T0 + 3, "t1", 44, 50, "no"))
+    assert lp.fills_by_source == {"kalshi:print": 1} and lp.sample_fills_n == 1
+    lp.on_frame({"type": "clock", "ts": T0 + 400})           # 300 s markout is due
+    assert lp.fill_marks[-1]["markout_300s"] is not None
+    for k in range(3):
+        lp.on_frame(_delta(T0 + 401 + 0.1 * k, 6.0))
+    assert lp.pulls.get("clock_skew") == 1
+    return lp
+
+
+def test_checkpoint_counters_survive_a_restart(monkeypatch, tmp_path):
+    path = tmp_path / "state.json"
+    lp = _campaign(monkeypatch, path)
+    assert lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    assert lp2.kill is None
+    lp2.on_frame({"type": "clock", "ts": T0 + 1000})
+    cp = lp2.checkpoint_report()
+    assert cp["kalshi_fills"]["real_print"] == 1 and cp["kalshi_fills"]["from_sampling_group"] == 1
+    assert cp["clock_skew_pulls"]["session"] == 1 and cp["clock_skew_pulls"]["last_24h"] == 1
+    assert cp["markout_5m"]["fills"] == 1
+    assert cp["clock_skew_pulls"]["session_hours"] == pytest.approx(1000 / 3600, abs=0.01)
+
+
+def test_restored_pending_markouts_complete_after_the_restart(monkeypatch, tmp_path):
+    path = tmp_path / "state.json"
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.attach_state(str(path))
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp.on_frame(_activity(T0, {M: 40}))
+    lp.on_frame(snap(M, T0, YES, NO))
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    lp.on_frame(snap(M, T0 + 2, [(40, 2000)], NO))
+    lp.on_frame(trade(M, T0 + 3, "t1", 44, 50, "no"))
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    lp2.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp2.on_frame(snap(M, T0 + 100, [(46, 50)], [(52, 50)]))
+    lp2.on_frame({"type": "clock", "ts": T0 + 400})
+    assert lp2.fill_marks[0]["markout_300s"] == pytest.approx(10 * (47.0 - 44) / 100.0)
+
+
+def test_unreadable_checkpoint_fields_never_latch_a_kill(monkeypatch, tmp_path):
+    import json
+    path = tmp_path / "state.json"
+    lp = _campaign(monkeypatch, path)
+    lp.save_state(force=True)
+    data = json.loads(path.read_text())
+    data.update({"fills_by_source": "oops", "pulls": [1], "skew_pull_hours": {"x": "y"},
+                 "fill_marks": [{"market": 3}, "junk"], "sample_fills_n": "n/a"})
+    path.write_text(json.dumps(data))
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    assert lp2.kill is None and lp2.state_error is None
+    assert lp2.fills_by_source == {} and lp2.fill_marks == []
+
+
+def test_state_files_from_before_the_fix_still_load(monkeypatch, tmp_path):
+    import json
+    path = tmp_path / "state.json"
+    lp = _campaign(monkeypatch, path)
+    lp.save_state(force=True)
+    data = json.loads(path.read_text())
+    for k in ("fills_by_source", "sample_fills_n", "pulls", "skew_pull_hours", "fill_marks",
+              "campaign_start_ts", "skew_trips_n", "skew_clears_n"):
+        data.pop(k, None)
+    path.write_text(json.dumps(data))
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    assert lp2.kill is None and lp2.fills_total == 1 and lp2.fills_by_source == {}
+
+
+# ------------------------------------------------- 3. trade time is the exchange's
+def _ws_trade(ts_recv, tid, yes_c, count, taker, *, ts_ms=None, ts_s=None, market=M):
+    body = {"trade_id": tid, "market_ticker": market, "count_fp": f"{count:.2f}",
+            "yes_price_dollars": f"{yes_c/100:.4f}", "no_price_dollars": f"{(100-yes_c)/100:.4f}",
+            "taker_side": taker}
+    if ts_ms is not None:
+        body["ts_ms"] = int(ts_ms)
+    if ts_s is not None:
+        body["ts"] = int(ts_s)
+    return {"type": "trade", "ts": ts_recv, "trade": body}
+
+
+def _resting_at_touch(monkeypatch):
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp.on_frame(_activity(T0, {M: 40}))
+    lp.on_frame(snap(M, T0, YES, NO))
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    o = lp.sim.orders[f"{M}:yes"]
+    # the order as if placed at T0 + 10 with nobody ahead of it
+    o.activation_ts, o.queue_ahead = T0 + 10.25, 0.0
+    assert o.price_cents == 44
+    return lp, o
+
+
+def test_a_print_that_happened_before_the_order_is_not_a_fill_even_if_it_arrives_late(monkeypatch):
+    """The websocket trade message has no created_time: the loop stamped it
+    with the RECEIVE time, so a print from before our order existed (lag of
+    a second or two) looked like it hit us."""
+    lp, o = _resting_at_touch(monkeypatch)
+    lp.on_frame(_ws_trade(T0 + 11.0, "late", 44, 5, "no", ts_ms=(T0 + 9.0) * 1000))
+    assert lp.fills == []
+
+
+def test_a_print_after_activation_still_fills_and_ts_seconds_is_understood(monkeypatch):
+    lp, _o = _resting_at_touch(monkeypatch)
+    lp.on_frame(_ws_trade(T0 + 12.0, "ok", 44, 5, "no", ts_ms=(T0 + 11.5) * 1000))
+    assert [f["trade_id"] for f in lp.fills] == ["ok"]
+    lp2, _ = _resting_at_touch(monkeypatch)
+    lp2.on_frame(_ws_trade(T0 + 12.0, "sec", 44, 5, "no", ts_s=int(T0 + 9)))
+    assert lp2.fills == []                                  # whole-second ts, before activation
+
+
+def test_a_missing_or_future_exchange_time_falls_back_to_receive_time(monkeypatch):
+    lp, _o = _resting_at_touch(monkeypatch)
+    lp.on_frame(_ws_trade(T0 + 12.0, "none", 44, 5, "no"))
+    assert [f["trade_id"] for f in lp.fills] == ["none"]
+    lp2, _ = _resting_at_touch(monkeypatch)
+    lp2.on_frame(_ws_trade(T0 + 12.0, "fut", 44, 5, "no", ts_ms=(T0 + 500) * 1000))  # bad clock
+    assert [f["trade_id"] for f in lp2.fills] == ["fut"]

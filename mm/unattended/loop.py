@@ -54,6 +54,8 @@ CLOCK_SKEW_LIMIT_S = 5.0
 CLOCK_SKEW_CLEAR_S = 15.0
 # Window of the Kalshi lag telemetry (RunLoop.lag_report).
 LAG_WINDOW_S = 60
+# Fill markout marks kept in memory and in the state file (the 5-min checkpoint).
+FILL_MARKS_KEEP = 500
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -414,6 +416,9 @@ class RunLoop:
         # clock_skew pulls per hour bucket (checkpoint: pulls/day).
         self._skew_pull_hours: dict[int, int] = {}
         self.started_ts: float | None = None
+        # First frame of the whole paper campaign (persisted): the Oct 6/10
+        # gates span restarts, ``started_ts`` is this process only.
+        self.campaign_start_ts: float | None = None
         # Phase 4: multi-horizon fill markouts (measurement only).
         from mm.unattended.markouts import MarkoutBook
         self.markouts = MarkoutBook()
@@ -577,6 +582,8 @@ class RunLoop:
         self.now = ts
         if self.started_ts is None and ts:
             self.started_ts = ts
+        if self.campaign_start_ts is None and ts:
+            self.campaign_start_ts = ts
         if kind in ("orderbook_snapshot", "orderbook_delta", "trade", "clock"):
             self._check_settlements(ts)
         if kind in ("orderbook_snapshot", "orderbook_delta"):
@@ -775,6 +782,7 @@ class RunLoop:
         if self._skew_streak >= need or (self._skew_streak >= 2 and ts - self._skew_since >= sustain):
             self._skew_active = True
             self.skew_trips_n += 1
+            self._state_dirty = True
             n = len(self.resting)
             if n:
                 self.pulls["clock_skew"] = self.pulls.get("clock_skew", 0) + n
@@ -1355,7 +1363,51 @@ class RunLoop:
             "unresolved": self.unresolved,
             "fv_calibration": self.fv_calib.state(),
             "fv_calib_watch": self.fv_calib_watch,
+            # Oct 6 checkpoint inputs: cumulative across restarts and deploys.
+            "fills_by_source": self.fills_by_source, "sample_fills_n": self.sample_fills_n,
+            "pulls": self.pulls, "skew_pull_hours": {str(h): n for h, n in self._skew_pull_hours.items()},
+            "skew_trips_n": self.skew_trips_n, "skew_clears_n": self.skew_clears_n,
+            "campaign_start_ts": self.campaign_start_ts,
+            "fill_marks": self.fill_marks[-FILL_MARKS_KEEP:],
         }
+
+    def _restore_checkpoint_counters(self, data: dict) -> None:
+        """Checkpoint counters from a state file. Each field is optional and
+        parsed on its own: an unreadable counter is dropped, it never latches
+        the engine kill (the position/P&L fields above stay strict)."""
+        def _ints(raw, key=str):
+            return {key(k): int(v) for k, v in dict(raw).items()}
+        for attr, field, conv in (
+                ("fills_by_source", "fills_by_source", _ints),
+                ("pulls", "pulls", _ints),
+                ("_skew_pull_hours", "skew_pull_hours", lambda raw: _ints(raw, key=int)),
+                ("sample_fills_n", "sample_fills_n", int),
+                ("skew_trips_n", "skew_trips_n", int),
+                ("skew_clears_n", "skew_clears_n", int),
+                ("campaign_start_ts", "campaign_start_ts", lambda v: None if v is None else float(v))):
+            if field not in data:
+                continue
+            try:
+                setattr(self, attr, conv(data[field]))
+            except (TypeError, ValueError):
+                logging.getLogger("lip.risk").warning("state field %s unreadable: ignored", field)
+        marks = []
+        raw_marks = data.get("fill_marks")
+        for m in (raw_marks if isinstance(raw_marks, list) else [])[-FILL_MARKS_KEEP:]:
+            try:
+                row = {"market": str(m["market"]), "side": str(m["side"]),
+                       "price_cents": float(m["price_cents"]), "count": float(m["count"]),
+                       "ts": float(m["ts"]), "venue": str(m.get("venue") or "kalshi"),
+                       "bucket": m.get("bucket"), "synthetic": bool(m.get("synthetic")),
+                       "mid0": None if m.get("mid0") is None else float(m["mid0"])}
+                for h in (60, 300, 1800):
+                    v = m.get(f"markout_{h}s")
+                    row[f"markout_{h}s"] = None if v is None else float(v)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            marks.append(row)
+        if "fill_marks" in data:
+            self.fill_marks = marks
 
     def attach_state(self, path: str) -> None:
         """Load ``path`` when it exists and persist there from now on.
@@ -1471,6 +1523,7 @@ class RunLoop:
         self.fv_calib = fv_calib
         self.fv_calib_watch = watch
         self.fv_calib_view = frozenset(watch)
+        self._restore_checkpoint_counters(data)
         for market in self.position:
             self._sync_inventory(market)
         if kill is not None:
@@ -1826,7 +1879,13 @@ class RunLoop:
 
     def _on_trade(self, row: dict, ts: float) -> None:
         trade = dict(row.get("trade") or row.get("msg") or row)
-        trade.setdefault("created_time", _iso(ts))
+        if not trade.get("created_time"):
+            # The websocket trade message carries the exchange's own time
+            # (ts_ms, else ts in seconds), not created_time. Stamping the
+            # receive time made a print from before our order existed look
+            # like it hit us. Never later than receipt (a bad clock or a
+            # missing field falls back to the receive time).
+            trade["created_time"] = _iso(min(float(ts), _trade_exchange_ts(trade, ts)))
         trade.setdefault("ticker", trade.get("market_ticker") or "")
         if not trade.get("trade_id"):
             return
@@ -2264,7 +2323,8 @@ class RunLoop:
         done = [m for m in k_marks if m.get("markout_300s") is not None]
         contracts = sum(float(m["count"]) for m in done)
         usd = sum(float(m["markout_300s"]) for m in done)
-        session_s = max(0.0, float(self.now or 0) - float(self.started_ts or self.now or 0))
+        start = self.campaign_start_ts or self.started_ts or self.now or 0
+        session_s = max(0.0, float(self.now or 0) - float(start))
         return checkpoint_report(
             kalshi_fills_print=self.fills_by_source.get("kalshi:print", 0),
             kalshi_fills_cross=self.fills_by_source.get("kalshi:paper_cross", 0),
@@ -4022,6 +4082,22 @@ def _exchange_ts(msg: dict):
         return None if raw is None else float(raw) / 1000.0
     except (TypeError, ValueError):
         return None
+
+
+def _trade_exchange_ts(trade: dict, default: float) -> float:
+    """Exchange time (epoch s) of a websocket trade message: ``ts_ms``, else
+    ``ts`` (whole seconds). ``default`` when absent or not a plausible epoch."""
+    for key, scale in (("ts_ms", 1000.0), ("ts", 1.0)):
+        raw = trade.get(key)
+        if raw is None:
+            continue
+        try:
+            val = float(raw) / scale
+        except (TypeError, ValueError):
+            continue
+        if val > 1e9:
+            return val
+    return float(default)
 
 
 def _program_sig(frame: dict) -> tuple:
