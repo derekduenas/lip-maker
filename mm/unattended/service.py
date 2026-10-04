@@ -249,6 +249,7 @@ class EngineTimer:
         loop = self.loop
         with loop.lock:
             _honor_kill_file(loop, self.kill_path)
+            loop.maybe_load_credits(time.time())   # operator reward credits (LIP_REWARD_CREDITS_FILE)
             if getattr(loop, "pmus", None) is not None:
                 # PM US frames are applied here too: they used to be drained
                 # only inside the Kalshi frame callback, so a quiet or down

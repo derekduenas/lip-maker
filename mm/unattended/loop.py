@@ -269,6 +269,13 @@ class RunLoop:
         self.risk_rows: list[dict] = []
         self.excluded: list[tuple[str, str]] = []
         self.ledger: list[dict] = []
+        # Paid-vs-estimated reconciliation (mm/unattended/reward_recon.py): one
+        # estimate per archived program period, and the operator credit file.
+        self.period_estimates: list[dict] = []
+        self.credits_file: str | None = os.environ.get("LIP_REWARD_CREDITS_FILE") or None
+        self._credits_at = 0.0
+        self._credits_mtime: float | None = None
+        self.credits_load: dict = {}
         self.cash: dict | None = None
         self.selection_count = 0
         self.last_select_ts: float | None = None
@@ -1193,8 +1200,13 @@ class RunLoop:
                            "fees_usd": round(float(acc["fees"]), 4), "reward_usd": round(reward, 4),
                            "markout_5m_cost_usd": round(cost_usd, 4), "markout_5m_fills": n5,
                            "markout_5m_cost_per_fill_usd": round(per_fill, 5), "go": ok, "why": why}
-        from mm.unattended import go_no_go
+        from mm.unattended import go_no_go, reward_recon
         stats = go_no_go.event_stats(self.event_acc)
+        gcfg = go_no_go.config()
+        measured_haircut = reward_recon.haircut_recommendation(
+            reward_recon.reconcile_periods(self.period_estimates, self.ledger))
+        if measured_haircut is not None:
+            gcfg = dict(gcfg, reward_haircut=measured_haircut)
         # Reward per contract whose 5-minute markout was measured: only the
         # series that have such contracts contribute their reward. Rewards of
         # series with no measured fills (reward quotes that never fill) would
@@ -1215,7 +1227,9 @@ class RunLoop:
                 "go_no_go": {"statistics": {k: (None if v is None else round(v, 4)) if isinstance(v, float) else v
                                             for k, v in stats.items()},
                              "verdict": go_no_go.verdict(stats, reward_cents_per_contract=reward_cents,
-                                                         frozen_days=frozen),
+                                                         frozen_days=frozen, cfg=gcfg),
+                             "haircut_source": ("measured paid/estimated ratio" if measured_haircut is not None
+                                                else "configured default"),
                              "reward_cents_per_measured_contract": round(reward_cents, 4),
                              "markout_by_price_bucket": {
                                  b: self._price_bucket_row(b) for b in PRICE_BUCKETS},
@@ -1357,7 +1371,47 @@ class RunLoop:
             return  # nothing earned (never quoted): nothing to keep
         self.closed_periods[market] = self.closed_periods.get(market, 0.0) + float(raw)
         self.closed_periods_n += 1
+        try:
+            est = acc.estimate()
+            self.period_estimates.append({
+                "market": market, "program_id": est.program_id, "series": est.series,
+                "period_start": _iso(acc.params.start_ts) if acc.params.start_ts else "",
+                "estimated_usd": est.estimated_usd, "raw_usd": format(Decimal(str(raw)), "f")})
+            del self.period_estimates[:-5000]
+        except Exception:
+            logging.getLogger("lip.risk").exception("period estimate for %s failed", market)
         self._state_dirty = True
+
+    def maybe_load_credits(self, now: float, *, force: bool = False) -> None:
+        """Read the operator credit file (LIP_REWARD_CREDITS_FILE) when it changed;
+        at most every 300 s. Provenance is checked at reconciliation time."""
+        if not self.credits_file or (not force and now - self._credits_at < 300.0):
+            return
+        self._credits_at = now
+        try:
+            mtime = os.stat(self.credits_file).st_mtime
+        except OSError:
+            self.credits_load = {"error": "unreadable"}
+            return
+        if not force and mtime == self._credits_mtime:
+            return
+        from mm.unattended import reward_recon
+        self.credits_load = reward_recon.load_credit_file(self.credits_file, self.ledger)
+        self._credits_mtime = mtime
+        if self.credits_load.get("added"):
+            self._state_dirty = True
+
+    def rewards_reconciliation(self) -> dict:
+        """Paid vs estimated LIP rewards over archived periods (read-only)."""
+        from mm.unattended import reward_recon
+        rep = reward_recon.reconcile_periods(self.period_estimates, self.ledger)
+        rec = reward_recon.haircut_recommendation(rep)
+        rep.update({"label": reward_recon.LABEL, "periods_recorded": len(self.period_estimates),
+                    "credits_file": bool(self.credits_file), "credits_load": dict(self.credits_load),
+                    "haircut_recommendation": None if rec is None else round(rec, 4),
+                    "haircut_needs": {"matched": reward_recon.MIN_MATCHES,
+                                      "paid_days": reward_recon.MIN_PAID_DAYS}})
+        return rep
 
     # ------------------------------------------------------------ marks / P&L
     def _note_mark(self, market: str) -> None:
@@ -1616,6 +1670,7 @@ class RunLoop:
             "series_acc": self.series_acc,
             "event_acc": self.event_acc, "param_history": self.param_history,
             "price_acc": self.price_acc, "price_event_acc": self.price_event_acc,
+            "reward_ledger": self.ledger[-5000:], "period_estimates": self.period_estimates,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1725,6 +1780,10 @@ class RunLoop:
                 event = self._event_of(market) if market in self.programs else market.rsplit("-", 1)[0]
                 self._price_event_note(price_bucket(float(m["price_cents"])), event, 1,
                                        float(m["count"]), float(m["markout_300s"]))
+        for attr, key in (("ledger", "reward_ledger"), ("period_estimates", "period_estimates")):
+            raw_l = data.get(key)
+            if isinstance(raw_l, list):
+                setattr(self, attr, [dict(x) for x in raw_l if isinstance(x, dict)][-5000:])
         hist = []
         raw_h = data.get("param_history")
         for h in (raw_h if isinstance(raw_h, list) else []):
@@ -3815,6 +3874,7 @@ class RunLoop:
                                   trades_per_day={m: self.trades_per_day(m) for m in sorted(self.sample_markets)}),
             "checkpoint": self.checkpoint_report(),
             "series_gate": self.series_gate_report(accrual),
+            "rewards_reconciliation": self.rewards_reconciliation(),
             "repegs_n": self.repegs_n,
             "skew": self._skew_status(),
             "recorder": (self.recorder.summary() if getattr(self, "recorder", None) is not None
@@ -4093,7 +4153,7 @@ class RunLoop:
         accepted, rejected = credits_from_ledger(self.ledger)
         shares = {market: amount for market, amount in estimates.items()}
         series_by = {market: prog.series for market, prog in self.programs.items()}
-        program_by = {market: market for market in self.programs}
+        program_by = {market: prog.program_id for market, prog in self.programs.items()}
         cash = self.cash or {}
         inferred = infer_reward_credits(
             balance_delta_usd=cash.get("balance_delta_usd", 0),
@@ -4105,7 +4165,7 @@ class RunLoop:
             program_by_market=program_by,
         )
         matched = reconcile([
-            EstimateRow(market, market, self.programs[market].series, amount)
+            EstimateRow(market, self.programs[market].program_id, self.programs[market].series, amount)
             for market, amount in estimates.items()
         ], accepted)
         observations = [
