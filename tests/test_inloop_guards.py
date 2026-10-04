@@ -163,7 +163,7 @@ def test_one_noisy_snapshot_does_not_exit_but_sustained_competition_does(monkeyp
 
 
 def test_toxicity_exit_when_the_series_markout_worsens_against_the_entry_baseline(monkeypatch):
-    lp = _quoting(monkeypatch, LIP_EXITS_ENABLE=1)
+    lp = _quoting(monkeypatch, LIP_EXITS_ENABLE=1, LIP_EMPIRICAL_MARKOUT_ENABLE=1)
     entry = lp.entry_state[M]["markout_cents"]
     lp.series_acc["KXCPI"] = {"fills": 10, "fees": 0.0, "settled_fills": 0, "settled_usd": 0.0,
                               "mk5_usd": -10.0, "mk5_contracts": 100.0, "mk5_n": 10}   # -10c per contract

@@ -3358,8 +3358,12 @@ class RunLoop:
         book = self.accruals[market].book.book
         row = self._fv_quote_row(market)
         emp_cents, emp_n = None, 0
-        acc = self.series_acc.get(prog.series.upper()) if prog.venue == "kalshi" else None
+        acc = (self.series_acc.get(prog.series.upper())
+               if prog.venue == "kalshi" and _env_num("LIP_EMPIRICAL_MARKOUT_ENABLE", 0.0) > 0 else None)
         if acc and float(acc.get("mk5_contracts") or 0.0) > 0:
+            # OPT-IN (LIP_EMPIRICAL_MARKOUT_ENABLE, default off): a selection that
+            # adapts to our own fills while the go/no-go is being evaluated would
+            # break the frozen-parameter premise of that evaluation.
             # Measured 5-minute markout of OUR paper fills in this series, in
             # cents per contract (negative = adverse). Selection blends it
             # with the family prior once EMPIRICAL_MIN_N fills exist. A

@@ -603,7 +603,21 @@ def _with_series_markout(usd, contracts, n):
     return lp
 
 
-def test_measured_5m_markout_raises_the_adverse_selection_charge():
+def test_measured_markout_does_not_change_selection_by_default(monkeypatch):
+    """Selection that adapts to our own fills mid-evaluation breaks the frozen-parameter
+    go/no-go, so the learning is opt-in (LIP_EMPIRICAL_MARKOUT_ENABLE)."""
+    from mm.selector import adverse_cost_per_contract_day
+    monkeypatch.delenv("LIP_EMPIRICAL_MARKOUT_ENABLE", raising=False)
+    quiet = adverse_cost_per_contract_day(_with_series_markout(0, 0, 0)._km(M))
+    km = _with_series_markout(-9.0, 100.0, 50)._km(M)          # 50 measured fills, -9c per contract
+    assert km.empirical_markout_cents is None and km.empirical_n == 0
+    assert adverse_cost_per_contract_day(km) == quiet
+    monkeypatch.setenv("LIP_EMPIRICAL_MARKOUT_ENABLE", "1")
+    assert _with_series_markout(-9.0, 100.0, 50)._km(M).empirical_n == 50
+
+
+def test_measured_5m_markout_raises_the_adverse_selection_charge(monkeypatch):
+    monkeypatch.setenv("LIP_EMPIRICAL_MARKOUT_ENABLE", "1")
     from mm.selector import EMPIRICAL_MIN_N, adverse_cost_per_contract_day
     base = adverse_cost_per_contract_day(_with_series_markout(0, 0, 0)._km(M))
     lp = _with_series_markout(-5.0, 100.0, 10)                 # -5c per contract over 10 fills
@@ -612,7 +626,8 @@ def test_measured_5m_markout_raises_the_adverse_selection_charge():
     assert adverse_cost_per_contract_day(km) > base
 
 
-def test_a_lucky_sample_never_turns_adverse_selection_into_a_reward():
+def test_a_lucky_sample_never_turns_adverse_selection_into_a_reward(monkeypatch):
+    monkeypatch.setenv("LIP_EMPIRICAL_MARKOUT_ENABLE", "1")
     from mm.selector import adverse_cost_per_contract_day
     base = adverse_cost_per_contract_day(_with_series_markout(0, 0, 0)._km(M))
     km = _with_series_markout(+8.0, 100.0, 10)._km(M)          # +8c: favourable
