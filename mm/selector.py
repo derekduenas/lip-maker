@@ -138,6 +138,8 @@ class KalshiMarket:
     other_shard_index: int | None = None
     incumbent: bool = False
     entry_competition: float | None = None
+    # Time-averaged competition ratio (RunLoop.comp_ewma); None = use the snapshot.
+    competition_ewma: float | None = None
     entry_markout_cents: float | None = None
     empirical_markout_cents: float | None = None
     empirical_n: int = 0
@@ -269,11 +271,18 @@ def join_rung(ref: int | None, bids: list[tuple[int, float]],
 
 
 def competition_ratio(market: KalshiMarket) -> float:
-    if market.target_size <= 0:
+    """Resting competitor depth per side relative to the target. A time-averaged
+    value (``competition_ewma``) replaces the snapshot when the engine supplies one:
+    a single noisy book must not trigger an exit."""
+    if market.competition_ewma is not None:
+        return float(market.competition_ewma)
+    return raw_competition_ratio(market.yes_bids, market.no_bids, market.target_size)
+
+
+def raw_competition_ratio(yes_bids, no_bids, target_size: float) -> float:
+    if target_size <= 0:
         return 0.0
-    yes = sum(size for _price, size in market.yes_bids)
-    no = sum(size for _price, size in market.no_bids)
-    return ((yes + no) / 2.0) / market.target_size
+    return ((sum(size for _p, size in yes_bids) + sum(size for _p, size in no_bids)) / 2.0) / target_size
 
 
 def family_of(market: KalshiMarket) -> str:
@@ -709,9 +718,14 @@ def _env_float_sel(name: str, default: float) -> float:
 
 
 def exit_reason(market: KalshiMarket) -> str:
-    if (market.entry_competition is not None
-            and competition_ratio(market) > market.entry_competition + 0.5):
-        return "competition_spike"
+    if market.entry_competition is not None:
+        now = competition_ratio(market)
+        # LIP_EXIT_COMP_REL (default 0 = absolute rule only): also require the
+        # ratio to exceed entry x (1 + rel). The absolute +0.5 is tiny against
+        # books that hold many times the target.
+        rel = _env_float_sel("LIP_EXIT_COMP_REL", 0.0)
+        if now > market.entry_competition + 0.5 and now > market.entry_competition * (1.0 + rel):
+            return "competition_spike"
     if market.entry_markout_cents is not None:
         if markout_cents(market) < market.entry_markout_cents - 0.5:
             return "toxicity"

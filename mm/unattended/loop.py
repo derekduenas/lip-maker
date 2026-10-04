@@ -468,6 +468,16 @@ class RunLoop:
         # Same, per EVENT (the unit of independence): bucket -> event ->
         # [fills, contracts, usd], capped at PRICE_EVENT_KEEP events per bucket.
         self.price_event_acc: dict[str, dict] = {}
+        # In-loop adverse-selection guard (opt-in LIP_AS_GUARD_ENABLE): per-market
+        # quantity-weighted EWMA of the 60 s markout [ewma_cents, weight, n]; the
+        # one-tick back-off set by it; recent same-side fills for the burst rule.
+        self.mk_ewma: dict[str, list] = {}
+        self._as_back: dict[str, int] = {}
+        self._burst: dict[tuple, list] = {}
+        # Exits (opt-in LIP_EXITS_ENABLE): entry baseline per quoted market and the
+        # time-averaged competition ratio (mm/selector.py exit_reason).
+        self.entry_state: dict[str, dict] = {}
+        self.comp_ewma: dict[str, float] = {}
         self.param_history: list = []
         self._params_noted = False
         # Phase 4: multi-horizon fill markouts (measurement only).
@@ -971,6 +981,8 @@ class RunLoop:
             self._archive_period(market, acc)
         self._fold_closed_period(market, self.programs[market].venue)
         self.programs.pop(market, None)
+        for table in (self.entry_state, self.comp_ewma, self._as_back):
+            table.pop(market, None)
         for table in (self.open_seconds, self._book_ts, self.last_plan, self._repeg_at, self._fv_state):
             table.pop(market, None)
         self._fv_wanted.discard(market)
@@ -1103,6 +1115,132 @@ class RunLoop:
         return self.series_acc.setdefault(series, {"fills": 0, "fees": 0.0, "settled_fills": 0,
                                                     "settled_usd": 0.0, "mk5_usd": 0.0, "mk5_contracts": 0.0,
                                                     "mk5_n": 0})
+
+    # ------------------------------------------------------------ gaps 4 + 5
+    @staticmethod
+    def _as_on() -> bool:
+        return _env_num("LIP_AS_GUARD_ENABLE", 0.0) > 0
+
+    def _as_exempt(self, market: str) -> bool:
+        """The sampling group exists to collect fills: measured, never pulled by
+        the guard unless LIP_AS_GUARD_SAMPLE is set."""
+        return market in self.sample_markets and _env_num("LIP_AS_GUARD_SAMPLE", 0.0) <= 0
+
+    def _as_note(self, market: str, count: float, cents: float, ts: float) -> None:
+        """One measured 60 s markout (cents per contract, positive = our favour):
+        update the market's quantity-weighted EWMA, then apply the guard."""
+        st = self.mk_ewma.get(market)
+        decay = _env_num("LIP_AS_EWMA_DECAY", 0.7)
+        if st is None:
+            ewma, weight, n = float(cents), float(count), 1
+        else:
+            w_old = decay * float(st[1])
+            weight = w_old + float(count)
+            ewma = (w_old * float(st[0]) + float(count) * float(cents)) / weight
+            n = int(st[2]) + 1
+        self.mk_ewma[market] = [ewma, weight, n]
+        if len(self.mk_ewma) > 2000:
+            for k in list(self.mk_ewma)[: len(self.mk_ewma) - 2000]:
+                del self.mk_ewma[k]
+        self._state_dirty = True
+        self._as_apply(market, ts)
+
+    def _as_apply(self, market: str, ts: float) -> None:
+        if not self._as_on() or self._as_exempt(market):
+            return
+        ewma, _w, n = self.mk_ewma.get(market, (0.0, 0.0, 0))
+        if n < int(_env_num("LIP_AS_MIN_OBS", 3)):
+            return
+        pull = _env_num("LIP_AS_PULL_CENTS", 3.0)
+        widen = _env_num("LIP_AS_WIDEN_CENTS", 1.0)
+        back = self._as_back.get(market, 0)
+        if ewma <= -pull:
+            self._as_back.pop(market, None)
+            if market in self.resting:
+                self._pull_one(market, "as_toxic", ts, _env_num("LIP_AS_TOXIC_COOLDOWN_S", 600.0))
+            return
+        want = 1 if ewma <= -widen else (back if ewma < -widen / 2.0 else 0)
+        if want != back:
+            if want:
+                self._as_back[market] = want
+            else:
+                self._as_back.pop(market, None)
+            self._requote_delta(market, back - want, ts)
+
+    def _requote_delta(self, market: str, delta: int, ts: float) -> None:
+        """Move the resting quote's prices by ``delta`` cents (positive = up)."""
+        quote = self.resting.get(market)
+        if quote is None or market not in self.accruals:
+            return
+        size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
+        sides = tuple(sd for sd in ("yes", "no") if float(quote.get(sd) or 0) > 0)
+        best0 = quote.get("best0")
+        y = max(1, int(quote["yes_cents"]) + int(delta))
+        n = max(1, int(quote["no_cents"]) + int(delta))
+        if size > 0 and sides and self._quote(market, y, n, size, ts, sides=sides, skewed=True):
+            if best0 is not None and market in self.resting:
+                self.resting[market]["best0"] = best0
+
+    def _as_burst(self, market: str, side: str, count: float, ts: float) -> None:
+        """Same-side fill burst (>= LIP_AS_BURST_CONTRACTS inside LIP_AS_BURST_WINDOW_S):
+        pull the market for LIP_AS_BURST_COOLDOWN_S."""
+        if not self._as_on() or self._as_exempt(market) or side not in ("yes", "no"):
+            return
+        window = _env_num("LIP_AS_BURST_WINDOW_S", 60.0)
+        rows = self._burst.setdefault((market, side), [])
+        rows.append((float(ts), float(count)))
+        while rows and ts - rows[0][0] > window:
+            rows.pop(0)
+        if sum(c for _t, c in rows) >= _env_num("LIP_AS_BURST_CONTRACTS", 100.0) and market in self.resting:
+            rows.clear()
+            self._pull_one(market, "as_burst", ts, _env_num("LIP_AS_BURST_COOLDOWN_S", 120.0))
+
+    @staticmethod
+    def _exits_on() -> bool:
+        return _env_num("LIP_EXITS_ENABLE", 0.0) > 0
+
+    def _update_competition(self) -> None:
+        """Once per selection: time-average each fed market's competition ratio
+        (EWMA, LIP_COMP_EWMA_ALPHA 0.3) so one noisy snapshot cannot trigger an exit."""
+        from mm.selector import raw_competition_ratio
+        alpha = min(1.0, max(0.01, _env_num("LIP_COMP_EWMA_ALPHA", 0.3)))
+        for market, prog in self.programs.items():
+            acc = self.accruals.get(market)
+            if acc is None or market in self.inactive or prog.venue != "kalshi":
+                continue
+            book = acc.book.book
+            if not book.is_usable():
+                continue
+            raw = raw_competition_ratio(_bids(book.yes_bids), _bids(book.no_bids), prog.target_size)
+            prev = self.comp_ewma.get(market)
+            self.comp_ewma[market] = raw if prev is None else alpha * raw + (1.0 - alpha) * prev
+        for market in [m for m in self.comp_ewma if m not in self.programs]:
+            del self.comp_ewma[market]
+
+    def _note_entry(self, market: str) -> None:
+        """Entry baseline for the exit rules: competition and markout when the
+        market is first quoted (until it exits or its program ends)."""
+        if not self._exits_on() or market in self.entry_state or market in self.sample_markets:
+            return
+        km = self._km(market)
+        if km is None or km.venue != "kalshi":
+            return
+        from mm.selector import markout_cents, raw_competition_ratio
+        comp = self.comp_ewma.get(market)
+        if comp is None:
+            comp = raw_competition_ratio(km.yes_bids, km.no_bids, km.target_size)
+        self.entry_state[market] = {"competition": float(comp), "markout_cents": float(markout_cents(km)),
+                                    "ts": float(self.now or 0.0)}
+        self._state_dirty = True
+
+    def _exit_market(self, market: str, why: str, ts: float) -> None:
+        self.pulls[f"exit:{why}"] = self.pulls.get(f"exit:{why}", 0) + 1
+        self.entry_state.pop(market, None)
+        self.cooldown[(market, "*")] = max(self.cooldown.get((market, "*"), 0.0),
+                                           ts + _env_num("LIP_EXIT_COOLDOWN_S", 3600.0))
+        logging.getLogger("lip.risk").info("exit %s: %s", market, why)
+        self._cancel(market, f"exit:{why}")
+        self._state_dirty = True
 
     def _price_event_note(self, bucket: str, event: str, fills: float, contracts: float, usd: float) -> None:
         rows = self.price_event_acc.setdefault(bucket, {})
@@ -1671,6 +1809,7 @@ class RunLoop:
             "event_acc": self.event_acc, "param_history": self.param_history,
             "price_acc": self.price_acc, "price_event_acc": self.price_event_acc,
             "reward_ledger": self.ledger[-5000:], "period_estimates": self.period_estimates,
+            "mk_ewma": self.mk_ewma, "entry_state": self.entry_state, "comp_ewma": self.comp_ewma,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1780,6 +1919,18 @@ class RunLoop:
                 event = self._event_of(market) if market in self.programs else market.rsplit("-", 1)[0]
                 self._price_event_note(price_bucket(float(m["price_cents"])), event, 1,
                                        float(m["count"]), float(m["markout_300s"]))
+        try:
+            if isinstance(data.get("mk_ewma"), dict):
+                self.mk_ewma = {str(m): [float(v[0]), float(v[1]), int(v[2])] for m, v in data["mk_ewma"].items()}
+            if isinstance(data.get("comp_ewma"), dict):
+                self.comp_ewma = {str(m): float(v) for m, v in data["comp_ewma"].items()}
+            if isinstance(data.get("entry_state"), dict):
+                self.entry_state = {str(m): {"competition": float(v["competition"]),
+                                             "markout_cents": float(v["markout_cents"]),
+                                             "ts": float(v.get("ts") or 0.0)}
+                                    for m, v in data["entry_state"].items()}
+        except (IndexError, KeyError, TypeError, ValueError):
+            logging.getLogger("lip.risk").warning("guard/exit state unreadable: ignored")
         for attr, key in (("ledger", "reward_ledger"), ("period_estimates", "period_estimates")):
             raw_l = data.get(key)
             if isinstance(raw_l, list):
@@ -2385,6 +2536,8 @@ class RunLoop:
             bpos["rebates"] = bpos.get("rebates", 0.0) + rebate
         self.markouts.add(market=market, side=side, price_cents=price, count=count, ts=ts,
                           venue=venue, bucket=bucket, mid0=mid, synthetic=bool(fill.get("synthetic")))
+        if venue == "kalshi" and not fill.get("synthetic"):
+            self._as_burst(market, side, count, ts)
         self.fill_marks.append({
             "market": market, "side": side, "price_cents": price, "count": count, "ts": ts,
             "mid0": mid, "venue": self._venue(market), "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
@@ -2871,6 +3024,10 @@ class RunLoop:
                     sy, sn, _info = self._skew_target(market, new_y, new_n)
                     new_y = sy if on["yes"] else new_y
                     new_n = sn if on["no"] else new_n
+                bk = self._as_back.get(market, 0)
+                if bk:
+                    new_y = max(1, new_y - bk) if on["yes"] else new_y
+                    new_n = max(1, new_n - bk) if on["no"] else new_n
                 if (new_y, new_n) != (int(quote["yes_cents"]), int(quote["no_cents"])):
                     self._repeg_at[market] = ts
                     size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
@@ -2928,6 +3085,9 @@ class RunLoop:
                     mid = self._side_mid_cents(mark["market"], str(mark["side"]))
                     if mid is not None:
                         mark[key] = round(float(mark["count"]) * (mid - float(mark["price_cents"])) / 100.0, 4)
+                        if horizon == 60 and mark.get("venue") == "kalshi" and not mark.get("synthetic"):
+                            self._as_note(str(mark["market"]), float(mark["count"]),
+                                          float(mid) - float(mark["price_cents"]), ts)
                         if horizon == 300 and mark.get("venue") == "kalshi" and not mark.get("synthetic"):
                             acc = self._series_acc(str(mark["market"]))
                             if acc is not None:
@@ -3101,6 +3261,10 @@ class RunLoop:
             fv_calibrated=row is not None and self.fv_calib.passed(),
             empirical_markout_cents=emp_cents,
             empirical_n=emp_n,
+            competition_ewma=self.comp_ewma.get(market) if self._exits_on() else None,
+            entry_competition=(self.entry_state.get(market) or {}).get("competition") if self._exits_on() else None,
+            entry_markout_cents=(self.entry_state.get(market) or {}).get("markout_cents") if self._exits_on() else None,
+            incumbent=self._exits_on() and market in self.resting,
         )
 
     def _fv_note_admitted(self, markets: list) -> None:
@@ -3129,6 +3293,8 @@ class RunLoop:
         self.prune_ended(ts)
         self.selection_count += 1
         self.last_select_ts = ts
+        if self._exits_on():
+            self._update_competition()
         markets = self._markets()
         live = self.mode != "paper"
         lim = self.risk.limits
@@ -3156,6 +3322,9 @@ class RunLoop:
                 single_fill_cap_usd=self.screen_fill_cap,
             )
         self.excluded = list(selection.excluded)
+        if self._exits_on():
+            for market, why in getattr(selection, "exits", []):
+                self._exit_market(market, why, ts)
         self._fv_note_admitted(markets)
         # Fill-sampling group: picked first, quoted at best bid after the
         # ranked pass, out of a reserved slice of the Kalshi budget.
@@ -3526,6 +3695,10 @@ class RunLoop:
                 if skew_info and (skew_info["agg"] or skew_info["back"]):
                     self.skew_stats["skewed_quotes"] = self.skew_stats.get("skewed_quotes", 0) + 1
                     self.skew_stats["last"] = {"market": market, **skew_info}
+        back = 0 if skewed else self._as_back.get(market, 0)
+        if back:
+            # In-loop adverse-selection guard: one tick behind the target on both sides.
+            yes_cents, no_cents = max(1, int(yes_cents) - back), max(1, int(no_cents) - back)
         if self.kill is not None:
             self._cancel(market, self.kill["reason"])
             return False
@@ -3668,6 +3841,7 @@ class RunLoop:
         })
         self.quotes_total += 1
         self.quoted_ever.add(market)
+        self._note_entry(market)
         if self.carry_forward:
             self._trim_history()
         return True
@@ -3875,6 +4049,14 @@ class RunLoop:
             "checkpoint": self.checkpoint_report(),
             "series_gate": self.series_gate_report(accrual),
             "rewards_reconciliation": self.rewards_reconciliation(),
+            "adverse_guard": {"enabled": self._as_on(), "exits_enabled": self._exits_on(),
+                              "backed_off": sorted(self._as_back),
+                              "worst_markout_ewma": sorted(
+                                  ({"market": m, "ewma_cents": round(v[0], 3), "n": v[2]}
+                                   for m, v in self.mk_ewma.items()), key=lambda r: r["ewma_cents"])[:10],
+                              "exits": {k: v for k, v in self.pulls.items() if k.startswith("exit:")},
+                              "as_pulls": {k: v for k, v in self.pulls.items() if k.startswith("as_")},
+                              "entry_baselines": len(self.entry_state)},
             "repegs_n": self.repegs_n,
             "skew": self._skew_status(),
             "recorder": (self.recorder.summary() if getattr(self, "recorder", None) is not None
