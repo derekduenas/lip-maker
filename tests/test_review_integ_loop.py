@@ -117,9 +117,10 @@ def test_kalshi_fill_is_not_synthetic():
 
 
 # ------------------------------------------------------------- 3d penalty units
-def test_rank_penalty_is_scaled_to_the_evaluated_size():
+def test_rank_penalty_is_scaled_to_the_evaluated_size(monkeypatch):
     """rank_penalty_per_day is $/day per 100 contracts per side; a loop
     evaluating net at chunk=50 must subtract half of it, as _size_curve does."""
+    monkeypatch.setenv("LIP_ACTIVITY_WEIGHT", "0")  # isolate the penalty arithmetic
     from mm.selector import quote_economics
     probe = newloop(chunk=50.0)
     probe.on_frame(program(K))

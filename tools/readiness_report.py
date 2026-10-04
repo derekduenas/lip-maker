@@ -15,6 +15,12 @@ enforcement flags in execution/order_request.py, the watchdog's
 LIP_WD_LIVE_ARMED, or any unit or env file. Going live stays an explicit
 human decision behind those existing gates.
 
+Paper gate dates (COMMAND 2026-10-04, mm/unattended/gates.py): Oct 6 2026 is
+a CHECKPOINT only (>= 30 real Kalshi paper fills, clock_skew pulls < 100/day,
+5-minute markout reported; printed below from /status ``checkpoint``, not a
+criterion here). The real go/no-go is Oct 10 2026: per-series
+mm.session_gates.series_go plus this report.
+
 Criteria (thresholds are flags):
 
   paper_days        >= --min-days (14) distinct UTC days whose daily summary
@@ -631,6 +637,7 @@ def build_report(a) -> dict:
                  "status_mode": None if status is None else status.get("mode"),
                  "watchdog_config_armed": None if not isinstance(health, dict) else health.get("config_armed")},
         "reminder": REMINDER,
+        "checkpoint": None if status is None else status.get("checkpoint"),
     }
 
 
@@ -651,6 +658,10 @@ def render(rep: dict) -> str:
         out.append(f"input: {e}")
     out.append(f"info: status mode={rep['info']['status_mode']} live_armed={rep['info']['status_live_armed']} "
                f"watchdog config_armed={rep['info']['watchdog_config_armed']}")
+    cp = rep.get("checkpoint")
+    if isinstance(cp, dict):
+        out.append(f"checkpoint {cp.get('checkpoint_date')} (diagnostic): {cp.get('overall')} "
+                   f"{json.dumps(cp.get('checks'), default=str)[:600]}; go/no-go {cp.get('go_no_go_date')}")
     out.append("")
     out.append(f"OVERALL: {rep['overall']}")
     out.append("")

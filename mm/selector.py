@@ -227,6 +227,45 @@ def touch(bids: list[tuple[int, float]], default: int = 50) -> int:
     return max(prices) if prices else default
 
 
+def join_touch_enabled() -> bool:
+    """LIP_JOIN_TOUCH (default 0): quote a Kalshi side at/near the touch
+    instead of at the LIP reference (cumulative Target/5), see join_rung."""
+    return _env_float("LIP_JOIN_TOUCH", 0.0) > 0
+
+
+def join_max_ticks() -> int:
+    """LIP_JOIN_MAX_TICKS (default 2): at most this many ticks above the
+    reference when joining the touch."""
+    return max(0, int(_env_float("LIP_JOIN_MAX_TICKS", 2.0)))
+
+
+def join_rung(ref: int | None, bids: list[tuple[int, float]],
+              opp_bids: list[tuple[int, float]]) -> int | None:
+    """Kalshi quote rung with LIP_JOIN_TOUCH: move up from the reference
+    toward this side's best bid, at most LIP_JOIN_MAX_TICKS, never at or
+    through the opposite implied ask (price + opposite best bid < 100:
+    maker only, never crossing or locking). Off, no reference, or a touch
+    at/below the reference: the reference unchanged.
+
+    Reward: Kalshi LIP gives full credit at or above the reference (the
+    level holding Target/5), so a rung between the reference and the touch
+    keeps full credit (engine.lip_scorer); it only joins the queue that
+    actually trades. Never above the touch (no price improvement)."""
+    if ref is None or not join_touch_enabled():
+        return ref
+    prices = [int(p) for p, q in bids if q > 0]
+    if not prices:
+        return ref
+    best = max(prices)
+    if best <= int(ref):
+        return ref
+    target = min(best, int(ref) + join_max_ticks())
+    opp = max((int(p) for p, q in opp_bids if q > 0), default=None)
+    if opp is not None and target + opp >= 100:
+        target = 99 - opp
+    return max(int(ref), int(target))
+
+
 def competition_ratio(market: KalshiMarket) -> float:
     if market.target_size <= 0:
         return 0.0
@@ -335,8 +374,10 @@ def side_rungs(market: KalshiMarket, size: float, *, fallback_touch: bool = True
     if market.venue == "pmus":
         return (pmus_side_rung(market.yes_bids, market.no_bids, size, market.target_size, market.discount_factor),
                 pmus_side_rung(market.no_bids, market.yes_bids, size, market.target_size, market.discount_factor))
-    yes_ref = reference_cents(market.yes_bids, market.target_size)
-    no_ref = reference_cents(market.no_bids, market.target_size)
+    yes_ref = join_rung(reference_cents(market.yes_bids, market.target_size),
+                        market.yes_bids, market.no_bids)
+    no_ref = join_rung(reference_cents(market.no_bids, market.target_size),
+                       market.no_bids, market.yes_bids)
     if not fallback_touch:
         return yes_ref, no_ref
     return (touch(market.yes_bids) if yes_ref is None else yes_ref,

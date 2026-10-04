@@ -352,6 +352,11 @@ class _Engine:
                 loop.drain_external()  # Patch 21: PM US frames, same thread
         # Status refresh and state saves run on the EngineTimer thread.
 
+    def pinned(self) -> frozenset:
+        """Kalshi markets whose book subscription must stay (the loop's
+        ``pinned_view``, an immutable frozenset replaced whole: no lock)."""
+        return getattr(self.loop, "pinned_view", frozenset())
+
     def settle_candidates(self) -> list:
         """Kalshi markets due a settlement check: held positions first (the
         loop's ``settle_view``), then markets with pending fair-value
@@ -596,7 +601,8 @@ def _summary_row(report: dict) -> dict:
             "rewards_usd": float(report.get("rewards_usd") or 0),
             "premium_paid_usd": (None if report.get("premium_paid_usd") is None
                                  else float(report["premium_paid_usd"])),
-            "attribution": report.get("pnl_attribution")}
+            "attribution": report.get("pnl_attribution"),
+            "checkpoint": report.get("checkpoint")}
 
 
 def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
@@ -620,6 +626,7 @@ def _write_run_outputs(args, report: dict, started: list | None = None) -> None:
             premium_paid_usd=(None if report.get("premium_paid_usd") is None
                               else float(report["premium_paid_usd"])),
             attribution=report.get("pnl_attribution"),
+            checkpoint=report.get("checkpoint"),
         ), encoding="utf-8")
     if args.report:
         dest = Path(args.report)
@@ -757,7 +764,7 @@ def main(argv: list[str] | None = None) -> int:
                         if plan.get("reader"):
                             stopped = asyncio.run(_until_sigterm(drive_readonly_books(
                                 books, engine.on_frame, settle_candidates=engine.settle_candidates,
-                                paper=mode == "paper")))
+                                paper=mode == "paper", pinned=getattr(engine, "pinned", None))))
                         else:
                             stopped = asyncio.run(_until_sigterm(drive_socket(plan["url"], engine.on_frame)))
                     finally:

@@ -40,7 +40,9 @@ def test_one_late_frame_does_not_pull():
     assert M in lp.resting
 
 
-def test_n_consecutive_skewed_frames_pull_and_next_clean_frame_requotes():
+def test_n_consecutive_skewed_frames_pull_and_next_clean_frame_requotes(monkeypatch):
+    # Legacy rule (LIP_CLOCK_SKEW_CLEAR_S=0): one clean frame clears.
+    monkeypatch.setenv("LIP_CLOCK_SKEW_CLEAR_S", "0")
     lp = _quoting()
     for k in range(3):
         lp.on_frame(_delta(T0 + 2 + 0.1 * k, 6.0))

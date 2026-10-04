@@ -104,6 +104,28 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def activity_weight(volume_24h: float | None) -> float:
+    """Rank weight in [LIP_ACTIVITY_FLOOR, 1] from 24 h traded contracts
+    (2026-10-04: 10 of 17 quoted markets had zero trades in 40 h, so paper
+    never filled). Off (LIP_ACTIVITY_WEIGHT unset/0): 1.0. On:
+    floor + (1 - floor) x min(1, volume / LIP_ACTIVITY_REF_VOL); unknown
+    volume counts as zero. Defaults: floor 0.3, reference 200 contracts."""
+    if _env_float("LIP_ACTIVITY_WEIGHT", 0.0) <= 0:
+        return 1.0
+    floor = min(1.0, max(0.0, _env_float("LIP_ACTIVITY_FLOOR", 0.3)))
+    ref = max(1e-9, _env_float("LIP_ACTIVITY_REF_VOL", 200.0))
+    vol = max(0.0, float(volume_24h or 0.0))
+    return floor + (1.0 - floor) * min(1.0, vol / ref)
+
+
+def activity_adjust(score: float, weight: float) -> float:
+    """Apply an activity weight to a rank score: a positive score shrinks
+    toward 0, a negative one is pushed further down (never improved)."""
+    score = float(score)
+    weight = min(1.0, max(0.0, float(weight)))
+    return score * weight if score > 0 else score - (1.0 - weight) * abs(score)
+
+
 def candidate_top() -> int:
     return int(_env_float("LIP_CANDIDATE_TOP", 300))
 
@@ -407,13 +429,17 @@ def screen(frames: list[dict], cache: MetaCache, *, now: float | None = None,
         rk = rank_score(frame, meta, category=category, days=days)
         out["rank_score"] = round(rk["score"], 6)
         out["rank_penalty_per_day"] = round(rk["penalty"], 6)
+        out["volume_24h"] = meta.get("volume_24h")
+        aw = activity_weight(meta.get("volume_24h"))
+        out["activity_weight"] = round(aw, 4)
+        out["rank_score_active"] = round(activity_adjust(rk["score"], aw), 6)
         out["occurrence_ts"] = meta.get("occurrence_ts")
         out["event_ticker"] = meta.get("event_ticker")
         for key in ("strike_type", "floor_strike", "cap_strike"):
             if meta.get(key) is not None:
                 out[key] = meta[key]
         ok.append(out)
-    ok.sort(key=lambda f: (-f["rank_score"], -pool_per_day(f)))
+    ok.sort(key=lambda f: (-f["rank_score_active"], -pool_per_day(f)))
     chosen = ok[:top]
     if len(ok) > top:
         reasons["below_candidate_top"] = len(ok) - top

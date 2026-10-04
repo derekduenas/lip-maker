@@ -50,6 +50,10 @@ SELECT_EVERY_S = 600.0
 # Default LIP_CLOCK_SKEW_LIMIT_S for the loop's skew guard (mm.ops.SKEW_LIMIT_S,
 # 2 s, pulled quotes on ordinary network jitter).
 CLOCK_SKEW_LIMIT_S = 5.0
+# Default LIP_CLOCK_SKEW_CLEAR_S: clean-frame hold before the guard clears.
+CLOCK_SKEW_CLEAR_S = 15.0
+# Window of the Kalshi lag telemetry (RunLoop.lag_report).
+LAG_WINDOW_S = 60
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -182,6 +186,8 @@ class _Program:
     program_id: str = ""
     # max_reward_per_account in dollars (None: the program sets no account cap).
     max_reward_usd: float | None = None
+    # Kalshi GET /markets volume_24h (contracts) from the screen (None: unknown).
+    volume_24h: float | None = None
 
 
 VENUES = ("kalshi", "pmus")
@@ -369,6 +375,41 @@ class RunLoop:
         self._skew_streak = 0
         self._skew_since = 0.0
         self._skew_active = False
+        self._skew_clean_since: float | None = None
+        self.skew_trips_n = 0
+        self.skew_clears_n = 0
+        # Receive-minus-exchange lag of Kalshi book frames (status ``feed``):
+        # per-second buckets of (n, sum, max) for the last LAG_WINDOW_S.
+        self._lag_buckets: dict[int, list] = {}
+        self.lag_last_s: float | None = None
+        # Fix 2026-10-04: subscriptions are capped (drive_readonly_books plans
+        # them). A fed program whose book is not subscribed is ``inactive``:
+        # left out of selection and books-ready until its next snapshot.
+        self.inactive: set = set()
+        # Markets the subscription plan must keep (resting quotes, held
+        # Kalshi positions, active cooldowns); refreshed once a second on
+        # the frame thread, read by the background refresh (immutable).
+        self.pinned_view: frozenset = frozenset()
+        self.subscription_stats: dict = {}
+        # Observed public trade volume per market (contracts), per-hour
+        # buckets for the activity weight (activity_weight).
+        self.trade_vol: dict[str, dict[int, float]] = {}
+        self.trade_cnt: dict[str, dict[int, int]] = {}
+        # Public trades in the last 24 h per market (REST counts from the
+        # background refresh, ``activity`` frames).
+        self.trades_24h: dict[str, int] = {}
+        self.activity_ts: float | None = None
+        # Fill-sampling group (LIP_SAMPLE_*): markets quoted at best bid
+        # outside the ranked allocation, to collect real fills/markouts.
+        self.sample_markets: set = set()
+        self.sample_reserve_usd = 0.0
+        self.sample_fills_n = 0
+        self.sample_stats: dict = {}
+        # Paper fills per "venue:source" (print | paper_cross | synthetic).
+        self.fills_by_source: dict[str, int] = {}
+        # clock_skew pulls per hour bucket (checkpoint: pulls/day).
+        self._skew_pull_hours: dict[int, int] = {}
+        self.started_ts: float | None = None
         # Phase 4: multi-horizon fill markouts (measurement only).
         from mm.unattended.markouts import MarkoutBook
         self.markouts = MarkoutBook()
@@ -421,6 +462,7 @@ class RunLoop:
             fee_multiplier=float(row.get("fee_multiplier") if row.get("fee_multiplier") is not None else 1.0),
             program_id=str(row.get("program_id") or market),
             max_reward_usd=None if row.get("max_reward_usd") is None else float(row["max_reward_usd"]),
+            volume_24h=None if row.get("volume_24h") is None else float(row["volume_24h"]),
         )
         if prog.venue not in VENUES:
             raise ValueError(f"unknown venue {prog.venue!r}")
@@ -514,12 +556,23 @@ class RunLoop:
         if kind == "program_end":
             self.end_program(str(row.get("market") or ""), str(row.get("reason") or "program_end"))
             return
+        if kind == "book_inactive":
+            self.mark_inactive(str(row.get("market") or ""))
+            return
+        if kind == "subscriptions":
+            self.subscription_stats = dict(row.get("stats") or {})
+            return
+        if kind == "activity":
+            self.note_activity(row)
+            return
         if kind == "settlement":
             self.settle(str(row.get("market") or ""), str(row.get("result") or ""),
                         source=str(row.get("source") or "ws_lifecycle"))
             return
         ts = float(row.get("ts") if row.get("ts") is not None else self.now)
         self.now = ts
+        if self.started_ts is None and ts:
+            self.started_ts = ts
         if kind in ("orderbook_snapshot", "orderbook_delta", "trade", "clock"):
             self._check_settlements(ts)
         if kind in ("orderbook_snapshot", "orderbook_delta"):
@@ -578,8 +631,14 @@ class RunLoop:
         accrual = self.accruals.get(market)
         if accrual is None:
             return
+        if market in self.inactive:
+            if str(row.get("type") or "") != "orderbook_snapshot":
+                return  # unsubscribed: stale until its next snapshot
+            self.inactive.discard(market)
         accrual.on_message(row, ts)
         self.open_seconds[market] = int(ts)
+        if self.mode == "paper" and self.sim.orders and _env_num("LIP_SIM_BOOK_DEPLETION", 1.0) > 0:
+            self._sim_depletion(market, accrual.book.book, ts)
         # PM US books are polled through a cache: ``data_ts`` is the data
         # time the poller derived (older than the receive time), and
         # drain_external clamps ``ts`` to the loop clock, so the book's age
@@ -590,6 +649,72 @@ class RunLoop:
         exchange_ts = row.get("exchange_ts")
         if exchange_ts is not None:
             self._note_clock_skew(ts, float(exchange_ts))
+
+    def note_activity(self, row: dict) -> None:
+        """REST activity from the background refresh: 24 h public trade
+        counts (probed markets) and screen volume_24h (fed markets)."""
+        counts = row.get("trades_24h") or {}
+        self.trades_24h = {str(m): int(n) for m, n in counts.items()}
+        for m, v in (row.get("volume_24h") or {}).items():
+            prog = self.programs.get(m)
+            if prog is not None and v is not None:
+                prog.volume_24h = float(v)
+        self.activity_ts = float(row.get("ts") or self.now or time.time())
+
+    def trades_per_day(self, market: str) -> float:
+        """max(REST 24 h trade count, trades seen on the socket in 24 h)."""
+        bk = self.trade_cnt.get(market) or {}
+        hour = int((self.now or 0) // 3600)
+        seen = sum(v for h, v in bk.items() if h > hour - 24)
+        return float(max(self.trades_24h.get(market, 0), seen))
+
+    def mark_inactive(self, market: str) -> None:
+        """The market's book is no longer subscribed (subscription plan):
+        cancel any quote, mark the book stale, leave it out of selection
+        until its next snapshot. The program, accrual and per-market state
+        (cooldowns, positions) stay."""
+        acc = self.accruals.get(market)
+        if acc is None:
+            return
+        if market in self.resting:
+            self._cancel(market, "unsubscribed")
+        acc.book.note_disconnect()
+        self.inactive.add(market)
+
+    def _sim_depletion(self, market: str, book, ts: float) -> None:
+        """Paper: shrink each tracked order's queue-ahead to the size still
+        displayed at its price (cancellations ahead of us). Only markets we
+        rest in are touched."""
+        for side in ("yes", "no"):
+            o = self.sim.orders.get(f"{market}:{side}")
+            if o is None or o.queue_ahead <= 0:
+                continue
+            levels = book.yes_bids if side == "yes" else book.no_bids
+            size = sum(float(l.size) for l in levels if int(l.price_cents) == o.price_cents)
+            self.sim.on_book_level(market, side, o.price_cents, size, now=ts)
+
+    def _note_lag(self, ts: float, lag: float) -> None:
+        sec = int(ts)
+        b = self._lag_buckets.get(sec)
+        if b is None:
+            b = self._lag_buckets[sec] = [0, 0.0, -1e9]
+            if len(self._lag_buckets) > LAG_WINDOW_S + 5:
+                for k in [k for k in self._lag_buckets if k <= sec - LAG_WINDOW_S]:
+                    del self._lag_buckets[k]
+        b[0] += 1
+        b[1] += lag
+        b[2] = max(b[2], lag)
+        self.lag_last_s = lag
+
+    def lag_report(self) -> dict:
+        """Kalshi receive-minus-exchange lag over the last LAG_WINDOW_S."""
+        now = int(self.now or time.time())
+        rows = [b for k, b in list(self._lag_buckets.items()) if k > now - LAG_WINDOW_S]
+        n = sum(b[0] for b in rows)
+        return {"window_s": LAG_WINDOW_S, "frames": n,
+                "mean_s": None if not n else round(sum(b[1] for b in rows) / n, 3),
+                "max_s": None if not n else round(max(b[2] for b in rows), 3),
+                "last_s": None if self.lag_last_s is None else round(self.lag_last_s, 3)}
 
     def _note_clock_skew(self, ts: float, exchange_ts: float) -> None:
         """Clock-skew guard on Kalshi book frames (snapshots and deltas).
@@ -608,16 +733,33 @@ class RunLoop:
         consecutive frames spanning LIP_CLOCK_SKEW_SUSTAIN_S (3 s), means the
         local clock or processing is behind: every resting quote is pulled
         (the lag is process-wide) and selection is held. The first clean
-        frame clears it and re-selects (re-quotes) at once."""
+        frame clears it and re-selects (re-quotes) at once.
+
+        Hysteresis (2026-10-04): the guard clears only after clean frames for
+        LIP_CLOCK_SKEW_CLEAR_S (default 15 s) with no late frame in between.
+        One clean frame used to clear it, so a lag hovering at the limit
+        pulled and re-placed every quote every ~2.4 s (968k clock_skew pulls
+        in 40 h), and each clear ran a full re-selection, which itself kept
+        the process CPU-bound and the lag high. 0 restores the old rule."""
+        self._note_lag(ts, ts - exchange_ts)
         limit = _env_num("LIP_CLOCK_SKEW_LIMIT_S", CLOCK_SKEW_LIMIT_S)
         if not skew_is_excessive(ts, exchange_ts, limit_s=limit):
             self._skew_streak = 0
             if self._skew_active:
+                hold = _env_num("LIP_CLOCK_SKEW_CLEAR_S", CLOCK_SKEW_CLEAR_S)
+                if hold > 0:
+                    if self._skew_clean_since is None:
+                        self._skew_clean_since = ts
+                    if ts - self._skew_clean_since < hold:
+                        return
+                self._skew_clean_since = None
                 self._skew_active = False
+                self.skew_clears_n += 1
                 self._reselect_pending = True
                 logging.getLogger("lip.risk").warning("clock skew cleared: re-selecting")
             return
         self.skew_n += 1
+        self._skew_clean_since = None
         if self._skew_streak == 0:
             self._skew_since = ts
         self._skew_streak += 1
@@ -627,9 +769,14 @@ class RunLoop:
         sustain = _env_num("LIP_CLOCK_SKEW_SUSTAIN_S", 3.0)
         if self._skew_streak >= need or (self._skew_streak >= 2 and ts - self._skew_since >= sustain):
             self._skew_active = True
+            self.skew_trips_n += 1
             n = len(self.resting)
             if n:
                 self.pulls["clock_skew"] = self.pulls.get("clock_skew", 0) + n
+                hr = int(ts // 3600)
+                self._skew_pull_hours[hr] = self._skew_pull_hours.get(hr, 0) + n
+                for h in [h for h in self._skew_pull_hours if h <= hr - 48]:
+                    del self._skew_pull_hours[h]
                 self._cancel_all("clock_skew")
             logging.getLogger("lip.risk").warning(
                 "clock skew %.1fs > %.1fs on %d frames: %d quotes pulled until a clean frame",
@@ -1678,15 +1825,56 @@ class RunLoop:
         trade.setdefault("ticker", trade.get("market_ticker") or "")
         if not trade.get("trade_id"):
             return
+        self._note_trade_volume(str(trade.get("ticker") or ""), trade, ts)
         for fill in self.sim.apply_trades([trade]):
             self._record_fill(fill, ts)
+
+    def _note_trade_volume(self, market: str, trade: dict, ts: float) -> None:
+        if market not in self.programs:
+            return
+        try:
+            qty = float(trade.get("count_fp") or trade.get("count") or 0)
+        except (TypeError, ValueError):
+            return
+        hour = int(ts // 3600)
+        bk = self.trade_vol.setdefault(market, {})
+        bk[hour] = bk.get(hour, 0.0) + qty
+        ck = self.trade_cnt.setdefault(market, {})
+        ck[hour] = ck.get(hour, 0) + 1
+        if len(bk) > 26:
+            for h in [h for h in bk if h <= hour - 24]:
+                del bk[h]
+                ck.pop(h, None)
+
+    def observed_volume_24h(self, market: str, ts: float | None = None) -> float:
+        """Public trade contracts seen on the socket in the last 24 h."""
+        bk = self.trade_vol.get(market)
+        if not bk:
+            return 0.0
+        hour = int((self.now if ts is None else ts) // 3600)
+        return float(sum(v for h, v in bk.items() if h > hour - 24))
+
+    def activity_volume(self, market: str) -> float | None:
+        """Best known 24 h volume: max(screen volume_24h, observed). None
+        when neither is known (no metadata and nothing observed)."""
+        prog = self.programs.get(market)
+        meta = None if prog is None else prog.volume_24h
+        seen = self.observed_volume_24h(market)
+        if meta is None and seen <= 0:
+            return None
+        return max(float(meta or 0.0), seen)
 
     def _record_fill(self, fill: dict, ts: float) -> bool:
         """One paper fill: bounded history + exact aggregates, inventory,
         fees, the fills-per-minute clock. False when the fill latched a kill."""
+        venue = self._venue(str(fill.get("market_ticker")))
+        if str(fill.get("market_ticker")) in self.sample_markets:
+            fill["sample"] = True
+            self.sample_fills_n += 1
+        src = "synthetic" if fill.get("synthetic") else str(fill.get("source") or "print")
+        self.fills_by_source[f"{venue}:{src}"] = self.fills_by_source.get(f"{venue}:{src}", 0) + 1
         self.fills.append(fill)
         self.fills_total += 1
-        venue = self._venue(str(fill.get("market_ticker")))
         self.fills_by_venue[venue] = self.fills_by_venue.get(venue, 0) + 1
         if fill.get("synthetic"):
             self.fills_synthetic_by_venue[venue] = self.fills_synthetic_by_venue.get(venue, 0) + 1
@@ -1812,7 +2000,7 @@ class RunLoop:
         quote = self.resting.get(market)
         if quote is None or market not in self.accruals:
             return
-        yr, nr = self._refs(market)
+        yr, nr = self._targets(market)
         y = int(yr) if yr is not None else int(quote["yes_cents"])
         n = int(nr) if nr is not None else int(quote["no_cents"])
         size = max(float(quote.get("yes") or 0), float(quote.get("no") or 0))
@@ -1924,8 +2112,117 @@ class RunLoop:
             yb, nb = _bids(book.yes_bids), _bids(book.no_bids)
             return (pmus_side_rung(yb, nb, size, prog.target_size, prog.discount_factor),
                     pmus_side_rung(nb, yb, size, prog.target_size, prog.discount_factor))
-        return (reference_cents(_bids(book.yes_bids), prog.target_size),
-                reference_cents(_bids(book.no_bids), prog.target_size))
+        from mm.selector import join_rung
+        yb, nb = _bids(book.yes_bids), _bids(book.no_bids)
+        return (join_rung(reference_cents(yb, prog.target_size), yb, nb),
+                join_rung(reference_cents(nb, prog.target_size), nb, yb))
+
+    def _targets(self, market: str):
+        """Quote rungs: best bids for a fill-sampling market (joins the
+        touch, never crosses: an uncrossed book has yes + no best < 100),
+        else the reward rungs (_refs)."""
+        if market in self.sample_markets:
+            return self._best(market)
+        return self._refs(market)
+
+    def _pick_sample(self, markets: list, ts: float) -> list:
+        """Fill-sampling group (LIP_SAMPLE_ENABLE): up to LIP_SAMPLE_N (8,
+        at most 10) Kalshi markets with >= LIP_SAMPLE_MIN_TRADES_DAY (20)
+        public trades in 24 h, most traded first, at most
+        LIP_SAMPLE_PER_EVENT (2) per event. They pass the same exclusions,
+        exits, policy blocks and book checks as any market but skip the rank
+        (no fill-fraction/adverse penalty): the point is real fills and
+        markouts. Paper only."""
+        cfg = sample_cfg()
+        if not cfg["enabled"] or self.mode != "paper" or cfg["n"] <= 0:
+            self.sample_stats = {"enabled": False}
+            return []
+        from mm.selector import exclusion_reason, exit_reason
+        rows = []
+        for km in markets:
+            if km.venue != "kalshi" or km.market in self.inactive:
+                continue
+            tpd = self.trades_per_day(km.market)
+            if tpd < cfg["min_trades"]:
+                continue
+            if exclusion_reason(km) or exit_reason(km) or self._policy_block(km.market, ts):
+                continue
+            if self._inside_close(km.market, ts):
+                continue
+            book = self.accruals[km.market].book.book
+            if not book.is_usable():
+                continue
+            yb, nb = self._best(km.market)
+            ok = [p for p in (yb, nb) if p is not None and cfg["min_cents"] <= p <= cfg["max_cents"]]
+            if not ok:
+                continue
+            rows.append((-tpd, km.market))
+        rows.sort()
+        out, per_event = [], {}
+        for _neg, market in rows:
+            ev = self._event_of(market)
+            if per_event.get(ev, 0) >= cfg["per_event"]:
+                continue
+            per_event[ev] = per_event.get(ev, 0) + 1
+            out.append(market)
+            if len(out) >= cfg["n"]:
+                break
+        self.sample_stats = {"enabled": True, "eligible": len(rows), "picked": len(out)}
+        return out
+
+    def _quote_sample(self, ts: float) -> None:
+        """Quote the sampling group at best bid, LIP_SAMPLE_SIZE (10)
+        contracts per side, inside the reserved budget; every quote still
+        goes through _quote (skew, cross guard, fair value, inventory caps,
+        risk engine caps, fill cap)."""
+        if not self.sample_markets:
+            return
+        cfg = sample_cfg()
+        spent = 0.0
+        for market in sorted(self.sample_markets, key=lambda m: -self.trades_per_day(m)):
+            yb, nb = self._best(market)
+            sides = tuple(sd for sd, p in (("yes", yb), ("no", nb))
+                          if p is not None and cfg["min_cents"] <= p <= cfg["max_cents"]
+                          and not self._side_blocked(market, sd, ts))
+            if not sides:
+                self._cancel(market, "sample_no_side")
+                self.sample_markets.discard(market)
+                continue
+            yc = int(yb) if yb is not None else 1
+            nc = int(nb) if nb is not None else 1
+            need = sum((yc if sd == "yes" else nc) * cfg["size"] for sd in sides) / 100.0
+            if spent + need > self.sample_reserve_usd + 1e-9:
+                self._cancel(market, "sample_budget")
+                self.sample_markets.discard(market)
+                continue
+            if self._quote(market, yc, nc, cfg["size"], ts, sides=sides):
+                spent += float(self.committed.get(market, 0))
+            else:
+                self.sample_markets.discard(market)
+        self.sample_stats["quoted"] = len([m for m in self.sample_markets if m in self.resting])
+        self.sample_stats["capital_usd"] = round(spent, 2)
+
+    def skew_pulls_24h(self, ts: float | None = None) -> int:
+        hr = int((self.now if ts is None else ts) // 3600)
+        return int(sum(v for h, v in self._skew_pull_hours.items() if h > hr - 24))
+
+    def checkpoint_report(self) -> dict:
+        """Oct 6 checkpoint / Oct 10 go-no-go inputs (mm.unattended.gates)."""
+        from mm.unattended.gates import checkpoint_report
+        k_marks = [m for m in self.fill_marks if m.get("venue") == "kalshi" and not m.get("synthetic")]
+        done = [m for m in k_marks if m.get("markout_300s") is not None]
+        contracts = sum(float(m["count"]) for m in done)
+        usd = sum(float(m["markout_300s"]) for m in done)
+        session_s = max(0.0, float(self.now or 0) - float(self.started_ts or self.now or 0))
+        return checkpoint_report(
+            kalshi_fills_print=self.fills_by_source.get("kalshi:print", 0),
+            kalshi_fills_cross=self.fills_by_source.get("kalshi:paper_cross", 0),
+            kalshi_fills_synthetic=self.fills_by_source.get("kalshi:synthetic", 0),
+            kalshi_fills_total=self.fills_by_venue.get("kalshi", 0),
+            sample_fills=self.sample_fills_n,
+            skew_pulls_24h=self.skew_pulls_24h(), skew_pulls_session=int(self.pulls.get("clock_skew", 0)),
+            session_s=session_s, markout_5m_usd=usd, markout_5m_fills=len(done),
+            markout_5m_contracts=contracts, now=self.now or time.time())
 
     def _best(self, market: str):
         book = self.accruals[market].book.book
@@ -2034,7 +2331,7 @@ class RunLoop:
                     self._pull_one(market, "fast_move", ts, cool)
                     continue
             if repeg > 0 and ts - self._repeg_at.get(market, 0.0) >= repeg:
-                yr, nr = self._refs(market)
+                yr, nr = self._targets(market)
                 new_y = int(quote["yes_cents"]) if (yr is None or not on["yes"]) else int(yr)
                 new_n = int(quote["no_cents"]) if (nr is None or not on["no"]) else int(nr)
                 from mm.unattended import skew as _skew
@@ -2158,11 +2455,15 @@ class RunLoop:
         if not self.programs:
             return False
         have = 0
+        active = 0
         for market in self.programs:
+            if market in self.inactive:
+                continue
+            active += 1
             book = self.accruals[market].book.book
             if (book.yes_bids or book.no_bids) and book.is_usable():
                 have += 1
-        return have >= self.books_ready_fraction * len(self.programs)
+        return active > 0 and have >= self.books_ready_fraction * active
 
     def _maybe_select(self, ts: float) -> None:
         if not self.programs or self._skew_active:
@@ -2183,7 +2484,9 @@ class RunLoop:
         self._select(ts)
 
     def _markets(self) -> list[KalshiMarket]:
-        return [km for km in (self._km(market) for market in self.programs) if km is not None]
+        inactive = self.inactive
+        return [km for km in (self._km(market) for market in self.programs if market not in inactive)
+                if km is not None]
 
     def _km(self, market: str) -> KalshiMarket | None:
         """Selector view of one program: live book, close, fees, and the
@@ -2272,6 +2575,15 @@ class RunLoop:
             )
         self.excluded = list(selection.excluded)
         self._fv_note_admitted(markets)
+        # Fill-sampling group: picked first, quoted at best bid after the
+        # ranked pass, out of a reserved slice of the Kalshi budget.
+        self.sample_markets = set(self._pick_sample(markets, ts))
+        self.sample_reserve_usd = 0.0
+        if self.sample_markets:
+            reserve = min(sample_cfg()["budget"], venue_budget.get("kalshi", 0.0))
+            venue_budget["kalshi"] = venue_budget.get("kalshi", 0.0) - reserve
+            self.sample_reserve_usd = reserve
+            budget = sum(venue_budget.values())
         # per_event_usd=pool: optimize_sizes groups by series and would cut a
         # series by RAW objective before the markout-penalised rank pass. The
         # per-series cap is enforced below (alloc_series) in rank order.
@@ -2299,6 +2611,8 @@ class RunLoop:
             self._release(market)
         wanted = []
         for market in self.programs:
+            if market in self.sample_markets:
+                continue  # quoted by the sampling pass (_quote_sample)
             row = chosen.get(market)
             if row is None or market not in taken or row.size <= 0:
                 self._cancel(market, "not_selected")
@@ -2311,9 +2625,17 @@ class RunLoop:
             penalty = (self.programs[market].rank_penalty_per_day
                        * float(info.get("net_size") or self.chunk) / RANK_PENALTY_UNIT)
             per_dollar = rank_live_score(info.get("net_per_day") or 0.0, penalty, cap)
+            if self._venue(market) == "kalshi":
+                from mm.unattended.screen import activity_adjust, activity_weight
+                w = activity_weight(self.activity_volume(market))
+                if w < 1.0:
+                    info["rank_raw"] = per_dollar
+                    info["activity_weight"] = round(w, 4)
+                    per_dollar = activity_adjust(per_dollar, w)
             info["rank"] = per_dollar
             wanted.append((per_dollar, market, row))
         wanted.sort(key=lambda item: (-item[0], item[1]))
+        wanted = [item for item in wanted if item[1] not in self.sample_markets]
         self.cap_skips = []
         self.rank_skips = []
         min_rank = rank_min_score()
@@ -2503,6 +2825,7 @@ class RunLoop:
         for _per, market, _row in wanted:
             if market not in curves:
                 self._cancel(market, "no_curve")
+        self._quote_sample(ts)
         self.select_ms = round((time.time() - getattr(self, "_select_t0", time.time())) * 1000.0, 1)
         try:
             self._dump_selection(chosen, taken, plan, budget)
@@ -2718,8 +3041,18 @@ class RunLoop:
                 self.poster.place(market=market, side="no", price_cents=no_cents,
                                   size=side_size["no"], opposing_bid_cents=yes_bid)
         else:
+            keep_q = _env_num("LIP_SIM_KEEP_QUEUE", 1.0) > 0
             for side, price in (("yes", yes_cents), ("no", no_cents)):
-                self.sim.untrack(f"{market}:{side}")
+                oid = f"{market}:{side}"
+                prev = self.sim.orders.get(oid)
+                if (keep_q and side in sides and prev is not None
+                        and prev.price_cents == int(price)
+                        and float(side_size[side]) <= prev.remaining + 1e-9):
+                    # Same price, same or smaller size: an exchange keeps
+                    # priority, so the paper order keeps its queue position.
+                    self.sim.resize(oid, side_size[side])
+                    continue
+                self.sim.untrack(oid)
                 if side not in sides:
                     continue
                 self.sim.track(
@@ -2763,9 +3096,22 @@ class RunLoop:
         for market in list(self.programs):
             if self._inside_close(market, ts):
                 self._cancel(market, "close_cutoff")
+        self._refresh_pinned(ts)
         self._guard_resting(ts)
         self.markouts.on_clock(ts, self._side_mid_cents, self._fv_side_cents)
         self._fv_calib_tick(ts)
+
+    def _refresh_pinned(self, ts: float) -> None:
+        """``pinned_view``: Kalshi markets whose book subscription must stay
+        (resting quotes, held unsettled positions, active move cooldowns)."""
+        pinned = {m for m in self.resting if self._venue(m) == "kalshi"}
+        pinned.update(m for m, pos in self.position.items()
+                      if m not in self.settled and str(pos.get("venue") or "kalshi") == "kalshi"
+                      and (float(pos.get("yes") or 0) > 0 or float(pos.get("no") or 0) > 0))
+        pinned.update(k[0] for k, until in self.cooldown.items()
+                      if until > ts and self._venue(k[0]) == "kalshi")
+        if pinned != self.pinned_view:
+            self.pinned_view = frozenset(pinned)
 
     def _cancel(self, market: str, reason: str) -> None:
         had = market in self.resting
@@ -2934,6 +3280,13 @@ class RunLoop:
             "event_calendar": self.calendar.summary(self.now or None),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
             "pulls": dict(self.pulls),
+            "clock_skew_pulls_24h": self.skew_pulls_24h(),
+            "fills_by_source": dict(self.fills_by_source),
+            "fill_sampling": dict(self.sample_stats, markets=sorted(self.sample_markets),
+                                  reserve_usd=round(self.sample_reserve_usd, 2),
+                                  fills_n=self.sample_fills_n,
+                                  trades_per_day={m: self.trades_per_day(m) for m in sorted(self.sample_markets)}),
+            "checkpoint": self.checkpoint_report(),
             "repegs_n": self.repegs_n,
             "skew": self._skew_status(),
             "recorder": (self.recorder.summary() if getattr(self, "recorder", None) is not None
@@ -2959,7 +3312,12 @@ class RunLoop:
             "engine_alerts": list(self.alerts[-10:]),
             "feed": {"connected": self.connected, "disconnects_n": self.disconnects_n,
                      "last_reconnect": self.last_reconnect, "clock_skew_n": self.skew_n,
-                     "clock_skew_active": self._skew_active},
+                     "clock_skew_active": self._skew_active,
+                     "clock_skew_trips_n": self.skew_trips_n,
+                     "clock_skew_clears_n": self.skew_clears_n,
+                     "kalshi_lag": self.lag_report(),
+                     "inactive_n": len(self.inactive),
+                     "subscriptions": self.subscription_stats or None},
             "cap_trims_n": self.cap_trims_n,
             "programs_pruned_n": self.programs_pruned_n,
             "state": {"path": self.state_path, "error": self.state_error,
@@ -3517,7 +3875,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
                                refresh_s: float = PROGRAM_REFRESH_S,
                                cache: "ExchangeIndexCache | None" = None,
                                meta=None, settle_candidates: Callable | None = None,
-                               paper: bool = False) -> None:
+                               paper: bool = False, pinned: Callable | None = None) -> None:
     """Production books and public trades. The reader cannot place an order.
     ``paper`` (False: fail closed) lets the screen feed model families early
     (screen.fv_early_feed); the service passes True only in paper mode.
@@ -3545,7 +3903,8 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
     session = requests.Session()
     ctx = {"cache": cache or ExchangeIndexCache(), "meta": meta or MetaCache().load(),
            "fed": {}, "refresh_s": float(refresh_s), "programs": [],
-           "lock": threading.Lock(), "settle_candidates": settle_candidates, "paper": bool(paper)}
+           "lock": threading.Lock(), "settle_candidates": settle_candidates, "paper": bool(paper),
+           "pinned": pinned}
     backoff = READONLY_BACKOFF_START_S
     attempts = 0
     last_wall = None
@@ -3727,6 +4086,18 @@ def _env_num(name: str, default: float) -> float:
         return float(default)
 
 
+def sample_cfg() -> dict:
+    """Fill-sampling group knobs (RunLoop._pick_sample / _quote_sample)."""
+    return {"enabled": _env_num("LIP_SAMPLE_ENABLE", 0.0) > 0,
+            "n": min(10, max(0, int(_env_num("LIP_SAMPLE_N", 8)))),
+            "min_trades": _env_num("LIP_SAMPLE_MIN_TRADES_DAY", 20.0),
+            "size": max(1.0, float(int(_env_num("LIP_SAMPLE_SIZE", 10)))),
+            "budget": max(0.0, _env_num("LIP_SAMPLE_BUDGET_USD", 60.0)),
+            "per_event": max(1, int(_env_num("LIP_SAMPLE_PER_EVENT", 2))),
+            "min_cents": int(_env_num("LIP_SAMPLE_MIN_CENTS", 3)),
+            "max_cents": int(_env_num("LIP_SAMPLE_MAX_CENTS", 97))}
+
+
 def size_ladder(chunk: float = 100.0) -> list[float]:
     """LIP_SIZE_LADDER: comma list of contract sizes per side. Unset = [chunk]."""
     raw = os.environ.get("LIP_SIZE_LADDER", "")
@@ -3843,6 +4214,8 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
     finally:
         ctx["lock"].release()
     new = _feed_programs(candidates, ctx["fed"], on_frame, ctx.setdefault("sigs", {}))
+    ctx["ranked"] = [f["market"] for f in candidates if f.get("market")]
+    ctx["volume"] = {f["market"]: f.get("volume_24h") for f in candidates if f.get("market")}
     stats["pruned"] = len(_prune_fed(candidates, ctx, on_frame))
     stats["fed"] = len(ctx["fed"])
     stats["new"] = len(new)
@@ -3857,13 +4230,162 @@ def _screen_and_feed(ctx: dict, on_frame: Callable[[dict], None]) -> list[str]:
     return new
 
 
-async def _subscribe(sock, tickers) -> None:
+def ws_channels() -> list[str]:
+    """Per-ticker websocket channels (LIP_WS_CHANNELS, default
+    "orderbook_delta,trade"). The ``ticker`` channel is off by default: no
+    consumer reads it (_dispatch_ws_message drops it), it only cost CPU.
+    orderbook_delta is always included."""
     from mm.venues.readonly import TICKER_WS_CHANNELS
+    raw = os.environ.get("LIP_WS_CHANNELS", "orderbook_delta,trade")
+    want = {c.strip() for c in raw.split(",") if c.strip() in TICKER_WS_CHANNELS}
+    want.add("orderbook_delta")
+    return sorted(want)
+
+
+async def _subscribe(sock, tickers) -> None:
     names = sorted(tickers)
     if not names:  # an empty ticker list must never become a subscribe-to-everything
         return
     for i in range(0, len(names), 100):
-        await sock.subscribe(sorted(TICKER_WS_CHANNELS), names[i:i + 100])
+        await sock.subscribe(ws_channels(), names[i:i + 100])
+
+
+def sub_limits() -> dict:
+    """Websocket subscription plan (2026-10-04 fix: ~1,395 subscribed
+    programs, ~220 frames/s, pegged the process and made every frame 5-10 s
+    late). LIP_WS_SUB_MAX (150; 0 = subscribe every fed program, the old
+    behaviour), LIP_WS_SUB_CORE (60 top-ranked), LIP_WS_SUB_ACTIVE (20 most
+    traded, from the REST trade counts), LIP_WS_SUB_ROTATE (40 rotating
+    through the rest of the candidates every LIP_WS_ROTATE_S, 120 s)."""
+    return {"max": max(0, int(_env_num("LIP_WS_SUB_MAX", 150))),
+            "core": max(0, int(_env_num("LIP_WS_SUB_CORE", 60))),
+            "active": max(0, int(_env_num("LIP_WS_SUB_ACTIVE", 20))),
+            "rotate": max(0, int(_env_num("LIP_WS_SUB_ROTATE", 40))),
+            "rotate_s": max(10.0, _env_num("LIP_WS_ROTATE_S", 120.0))}
+
+
+def plan_subscriptions(fed, ranked: list, pinned, active: list, cursor: int,
+                       limits: dict | None = None) -> tuple[set, int, dict]:
+    """Markets whose books to subscribe: every pinned fed market (resting
+    quotes, held positions, cooldowns; kept even above the cap), then the
+    most-traded, then the top ``core`` by screen rank, then ``rotate``
+    markets taken round-robin from the rest of the ranked candidates
+    starting at ``cursor``; at most ``max`` in total. Returns (set, next
+    cursor, stats). ``max`` 0: every fed market."""
+    lim = limits or sub_limits()
+    fed = set(fed)
+    if lim["max"] <= 0:
+        return set(fed), cursor, {"mode": "all", "subscribed": len(fed)}
+    out: list = []
+    seen: set = set()
+
+    def _add(m, force=False):
+        if m in fed and m not in seen and (force or len(out) < lim["max"]):
+            out.append(m)
+            seen.add(m)
+
+    pins = sorted(m for m in (pinned or ()) if m in fed)
+    for m in pins:
+        _add(m, force=True)
+    for m in list(active)[: lim["active"]]:
+        _add(m)
+    ranked = [m for m in ranked if m in fed]
+    for m in ranked[: lim["core"]]:
+        _add(m)
+    rest = [m for m in ranked[lim["core"]:] if m not in seen]
+    rot = 0
+    if rest and lim["rotate"] > 0:
+        cursor = cursor % len(rest)
+        take = rest[cursor:] + rest[:cursor]
+        for m in take[: lim["rotate"]]:
+            if len(out) >= lim["max"]:
+                break
+            _add(m)
+            rot += 1
+        cursor = (cursor + lim["rotate"]) % len(rest)
+    stats = {"mode": "capped", "subscribed": len(out), "pinned": len(pins), "rotating": rot,
+             "rotation_pool": len(rest), "fed": len(fed), "max": lim["max"]}
+    return set(out), cursor, stats
+
+
+async def _apply_subscriptions(sock, ctx: dict, on_frame: Callable[[dict], None]) -> dict:
+    """Bring the live subscription to ``plan_subscriptions``: subscribe the
+    new markets, ``update_subscription``/``delete_markets`` the dropped ones,
+    and tell the loop which fed markets have no subscribed book
+    (``book_inactive``: left out of selection until their next snapshot)."""
+    ctx.setdefault("fed", {})
+    pinned = set()
+    fn = ctx.get("pinned")
+    if fn is not None:
+        try:
+            pinned = set(fn() or ())
+        except Exception:
+            pinned = set()
+    active = list(ctx.get("active") or [])
+    desired, ctx["sub_cursor"], stats = plan_subscriptions(
+        ctx["fed"], ctx.get("ranked") or list(ctx["fed"]), pinned, active, int(ctx.get("sub_cursor") or 0))
+    cur = set(ctx.get("subscribed") or ())
+    add = desired - cur
+    drop = cur - desired
+    sent = ctx.setdefault("inactive_sent", set())
+    if stats.get("mode") == "capped":
+        for m in sorted(set(ctx["fed"]) - desired - sent):
+            on_frame({"kind": "book_inactive", "market": m})
+            sent.add(m)
+    sent -= desired
+    sent &= set(ctx["fed"])
+    if add:
+        await _subscribe(sock, add)
+    if drop:
+        unsub = getattr(sock, "unsubscribe_markets", None)
+        if unsub is not None:
+            await unsub(sorted(drop))
+    ctx["subscribed"] = desired
+    stats.update({"added": len(add), "dropped": len(drop), "channels": ws_channels(), "ts": time.time()})
+    ctx["sub_stats"] = stats
+    on_frame({"kind": "subscriptions", "stats": stats})
+    return stats
+
+
+def _fetch_trade_counts(reader, tickers: list, since_ts: float) -> dict:
+    """Thread body: public trades per ticker since ``since_ts`` (read-only
+    GET /markets/trades, one page of up to 1000). A failed ticker is skipped."""
+    from mm.venues.readonly import ReadOnlyHTTPError
+    out = {}
+    for t in tickers:
+        try:
+            payload = reader.get("/markets/trades", params={"ticker": t, "min_ts": int(since_ts), "limit": 1000})
+        except ReadOnlyHTTPError as exc:
+            logging.getLogger("lip.readonly").warning("trade count %s HTTP %s", t, exc.status)
+            continue
+        out[t] = len(payload.get("trades") or [])
+        time.sleep(0.05)
+    return out
+
+
+async def _refresh_activity(reader, ctx: dict, on_frame, now: float | None = None) -> int:
+    """Every LIP_ACTIVITY_REFRESH_S (1800 s): count the last 24 h of public
+    trades for the LIP_ACTIVITY_PROBE_N (60) fed candidates with the largest
+    volume_24h, rank the most traded for the subscription plan, and send the
+    loop an ``activity`` frame (trades_24h, volume_24h)."""
+    import asyncio
+    now = time.time() if now is None else float(now)
+    every = _env_num("LIP_ACTIVITY_REFRESH_S", 1800.0)
+    if every <= 0 or now - float(ctx.get("activity_at") or 0.0) < every:
+        return 0
+    ctx["activity_at"] = now
+    fed = ctx.get("fed") or {}
+    vol = {m: v for m, v in (ctx.get("volume") or {}).items() if m in fed}
+    probe = [m for m, v in sorted(vol.items(), key=lambda kv: -(kv[1] or 0.0)) if (v or 0) > 0]
+    probe = probe[: max(0, int(_env_num("LIP_ACTIVITY_PROBE_N", 60)))]
+    counts = await asyncio.to_thread(_fetch_trade_counts, reader, probe, now - 86400.0) if probe else {}
+    ctx["trades_24h"] = counts
+    ctx["active"] = [m for m, n in sorted(counts.items(), key=lambda kv: -kv[1]) if n > 0]
+    on_frame({"kind": "activity", "ts": now, "trades_24h": dict(counts),
+              "volume_24h": {m: v for m, v in vol.items() if v is not None}})
+    logging.getLogger("lip.readonly").info("activity: %d probed, %d traded in 24 h", len(probe),
+                                           len(ctx["active"]))
+    return len(counts)
 
 
 async def _subscribe_lifecycle(sock) -> None:
@@ -3880,6 +4402,8 @@ async def _flush_unsubscribes(sock, ctx: dict) -> None:
         return
     names = sorted(set(pending))
     ctx["unsubscribe_pending"] = []
+    if ctx.get("subscribed"):
+        ctx["subscribed"] = set(ctx["subscribed"]) - set(names)
     unsub = getattr(sock, "unsubscribe_markets", None)
     if unsub is not None:
         await unsub(names)
@@ -4018,21 +4542,46 @@ async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
     log = logging.getLogger("lip.readonly")
     transient = readonly_transient_types()
     first = True
+    last_full = 0.0
     while True:
         if not first:
-            await asyncio.sleep(ctx["refresh_s"])
+            capped = sub_limits()["max"] > 0
+            await asyncio.sleep(min(ctx["refresh_s"], sub_limits()["rotate_s"]) if capped else ctx["refresh_s"])
+            if capped and time.time() - last_full < ctx["refresh_s"]:
+                # Rotation tick: re-plan the subscription only.
+                try:
+                    await _refresh_activity(reader, ctx, on_frame)
+                    await _apply_subscriptions(sock, ctx, on_frame)
+                except asyncio.CancelledError:
+                    raise
+                except transient as exc:
+                    log.warning("subscription rotation transient error (%s: %s)",
+                                type(exc).__name__, str(exc)[:200])
+                except BaseException as exc:  # safety refusal: stop the session
+                    state["fatal"] = exc
+                    try:
+                        await sock.close()
+                    except Exception:
+                        pass
+                    return
+                continue
         try:
             if not first or not ctx["programs"]:
                 ctx["programs"] = await asyncio.to_thread(_fetch_programs, reader)
             first = False
+            last_full = time.time()
             t0 = time.time()
             await asyncio.to_thread(_refresh_meta, reader, ctx)
             new = _screen_and_feed(ctx, on_frame)
-            if new:
-                await _subscribe(sock, new)
             await _flush_unsubscribes(sock, ctx)
+            if sub_limits()["max"] > 0:
+                await _refresh_activity(reader, ctx, on_frame)
+                await _apply_subscriptions(sock, ctx, on_frame)
+            elif new:
+                await _subscribe(sock, new)
             await _settlement_backfill(reader, ctx, on_frame)
-            log.info("background refresh %.1fs; subscribed %d new", time.time() - t0, len(new))
+            log.info("background refresh %.1fs; fed %d new; subscribed %d", time.time() - t0, len(new),
+                     len(ctx.get("subscribed") or ctx["fed"]))
         except asyncio.CancelledError:
             raise
         except transient as exc:
@@ -4068,7 +4617,11 @@ async def _readonly_books_session(source: dict, key, session,
         await sock.connect()
         # a fresh connection subscribes only what is fed now
         ctx["unsubscribe_pending"] = []
-        await _subscribe(sock, ctx["fed"])
+        if sub_limits()["max"] > 0:
+            ctx["subscribed"] = set()
+            await _apply_subscriptions(sock, ctx, on_frame)
+        else:
+            await _subscribe(sock, ctx["fed"])
         await _subscribe_lifecycle(sock)
         task = asyncio.create_task(_background(reader, ctx, on_frame, sock, state))
         seqr = SidSequencer()

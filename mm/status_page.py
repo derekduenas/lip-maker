@@ -36,6 +36,8 @@ LIVE_STATUS_FIELDS = (
     "fv_calibration", "settled_positions_n", "settled_positions_by_venue",
     "settled_total_usd", "settled_positions_lower_bound",
     "day", "rewards_usd", "socket_opened",
+    # 2026-10-04 fill fix: Oct 6 checkpoint inputs, fill sources, sampling group.
+    "checkpoint", "fills_by_source", "fill_sampling", "clock_skew_pulls_24h",
 )
 
 

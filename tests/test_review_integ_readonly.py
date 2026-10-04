@@ -63,7 +63,21 @@ def test_ticker_subscribe_uses_only_ticker_channels():
             sent.append((list(ch), list(tickers)))
 
     asyncio.run(L._subscribe(Sock(), ["B", "A"]))
-    assert sent == [(sorted(TICKER_WS_CHANNELS), ["A", "B"])]
+    # 2026-10-04: the unused ``ticker`` channel is off by default.
+    assert sent == [(["orderbook_delta", "trade"], ["A", "B"])]
+    assert set(sent[0][0]) <= set(TICKER_WS_CHANNELS)
+
+
+def test_ticker_channel_can_be_turned_back_on(monkeypatch):
+    sent = []
+
+    class Sock:
+        async def subscribe(self, ch, tickers):
+            sent.append((list(ch), list(tickers)))
+
+    monkeypatch.setenv("LIP_WS_CHANNELS", "orderbook_delta,ticker,trade,bogus")
+    asyncio.run(L._subscribe(Sock(), ["A"]))
+    assert sent == [(sorted(TICKER_WS_CHANNELS), ["A"])]
 
 
 def _subscribed(sock):

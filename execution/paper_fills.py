@@ -69,6 +69,9 @@ API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_LATENCY_MS = 250.0
 # Float residue from fixed-point counts. A 1e-15 "fill" is not a contract.
 DUST_QTY = 1e-9
+# A level cut (book depletion) and the print that caused it arrive on the
+# same socket within this window; older cuts were cancellations.
+DEPLETION_MATCH_S = 5.0
 # De-duplication memory for trade ids. Trades arrive roughly in time order,
 # so the most recent ids are the only ones a redelivery can repeat; the set
 # used to grow for the life of the process.
@@ -171,6 +174,10 @@ class SimOrder:
     program_id: str = ""
     filled: float = 0.0
     fill_trade_ids: list = field(default_factory=list)
+    # Book depletion (on_book_level): queue removed because the displayed
+    # level shrank, not yet matched by a print at our price, and when.
+    depleted_unmatched: float = 0.0
+    depleted_ts: float = 0.0
 
 
 class PaperFillSimulator:
@@ -206,6 +213,43 @@ class PaperFillSimulator:
 
     def untrack(self, order_id: str) -> None:
         self.orders.pop(order_id, None)
+
+    def resize(self, order_id: str, size: float) -> bool:
+        """Re-quote of a tracked order at the SAME price with the same or a
+        smaller size: keep its queue position (an exchange keeps priority on
+        an unchanged or decreased order; an increase is a new order behind
+        the queue, which the caller handles by re-tracking). True when the
+        order was kept."""
+        o = self.orders.get(order_id)
+        if o is None:
+            return False
+        o.remaining = max(0.0, float(size))
+        return True
+
+    def on_book_level(self, market_ticker: str, side: str, price_cents: int,
+                      level_size: float, now: Optional[float] = None) -> None:
+        """Book depletion: the displayed size at our price is an upper bound
+        on the queue ahead of us (paper orders are not in the public book).
+        When the level shrinks below our queue-ahead (cancellations ahead of
+        us, or a print whose trade message has not arrived yet), queue-ahead
+        is cut to what is still displayed. Conservative: every contract still
+        displayed at the level is assumed to be ahead of us.
+
+        The cut is remembered as ``depleted_unmatched`` for
+        DEPLETION_MATCH_S: when the book delta of a print arrives before its
+        trade message, apply_trades must not take the same contracts out of
+        the queue a second time (that would fill us early)."""
+        now = time.time() if now is None else float(now)
+        for o in self.orders.values():
+            if (o.market_ticker == market_ticker and o.side == side
+                    and o.price_cents == int(price_cents)
+                    and o.queue_ahead > level_size):
+                cut = o.queue_ahead - max(0.0, float(level_size))
+                if now - o.depleted_ts > DEPLETION_MATCH_S:
+                    o.depleted_unmatched = 0.0
+                o.depleted_unmatched += cut
+                o.depleted_ts = now
+                o.queue_ahead = max(0.0, float(level_size))
 
     # ── trade ingestion ───────────────────────────────────────────────
     def fetch_trades(self, tickers: Iterable[str], *, limit: int = 200) -> list[dict]:
@@ -267,11 +311,20 @@ class PaperFillSimulator:
                     if taker != "yes" or no_c <= 0 or no_c > o.price_cents:
                         continue
                     through = no_c < o.price_cents
+                vol = qty
                 if through:
                     # The print is past our level, so the queue at our
                     # price was cleared before this trade could happen.
                     o.queue_ahead = 0.0
-                vol = qty
+                    o.depleted_unmatched = 0.0
+                elif o.depleted_unmatched > 0:
+                    # Book delta of this print arrived first and already took
+                    # these contracts out of our queue (on_book_level).
+                    if t_ts - o.depleted_ts > DEPLETION_MATCH_S:
+                        o.depleted_unmatched = 0.0
+                    matched = min(o.depleted_unmatched, vol)
+                    o.depleted_unmatched -= matched
+                    vol -= matched
                 if o.queue_ahead > 0:
                     used = min(o.queue_ahead, vol)
                     o.queue_ahead -= used

@@ -17,7 +17,7 @@ ATTRIBUTION_KEYS = ("spread_capture_usd", "adverse_selection_usd", "inventory_mt
 def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: float,
                          data_source: str | None = None, buckets: dict | None = None,
                          premium_paid_usd: float | None = None,
-                         attribution: dict | None = None) -> str:
+                         attribution: dict | None = None, checkpoint: dict | None = None) -> str:
     """``pnl_usd`` is the engine's estimated P&L (MTM markout + estimated
     rewards + rebates - fees); ``premium_paid_usd`` is what fills cost;
     ``rewards_usd`` is paid/inferred rewards only. ``attribution``
@@ -36,6 +36,20 @@ def render_daily_summary(*, day: str, fills: int, pnl_usd: float, rewards_usd: f
     if attribution:
         text += "pnl_attribution_estimate_paper " + " ".join(
             f"{k} {float(attribution.get(k) or 0.0):.4f}" for k in ATTRIBUTION_KEYS) + "\n"
+    if checkpoint:
+        # Oct 6 checkpoint inputs (mm.unattended.gates), one line.
+        kf = checkpoint.get("kalshi_fills") or {}
+        sk = (checkpoint.get("checks") or {}).get("clock_skew_pulls_per_day") or {}
+        mk = checkpoint.get("markout_5m") or {}
+        text += (f"checkpoint {checkpoint.get('checkpoint_date')} {checkpoint.get('overall')} "
+                 f"real_kalshi_fills {int(kf.get('real_print') or 0)} "
+                 f"cross_fills {int(kf.get('paper_cross') or 0)} "
+                 f"synthetic_fills {int(kf.get('synthetic') or 0)} "
+                 f"clock_skew_pulls_per_day {sk.get('value')} "
+                 f"markout_5m_fills {int(mk.get('fills') or 0)} "
+                 f"markout_5m_usd {float(mk.get('usd') or 0.0):.4f} "
+                 f"markout_5m_c_per_contract {mk.get('cents_per_contract')} "
+                 f"go_no_go {checkpoint.get('go_no_go_date')}\n")
     for name, b in sorted((buckets or {}).items()):
         text += (f"bucket {name} selected {int(b.get('selected_n', 0))} "
                  f"capital_usd {float(b.get('capital_usd', 0)):.2f} "
