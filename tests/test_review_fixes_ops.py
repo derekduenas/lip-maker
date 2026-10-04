@@ -298,3 +298,13 @@ def test_measured_haircut_never_loosens_the_operators():
     assert RR.effective_haircut(0.5, 0.2) == 0.5
     assert RR.effective_haircut(0.5, 0.8) == 0.8
     assert RR.effective_haircut(0.5, None) == 0.5
+
+
+def test_apex_deploy_import_check_does_not_depend_on_the_working_directory(tmp_path):
+    """Run from /root, `python -c "import mm..."` failed with ModuleNotFoundError and aborted the deploy."""
+    src = (ROOT / "deploy" / "apex" / "deploy.sh").read_text()
+    line = next(l for l in src.splitlines() if "import mm.unattended.loop" in l)
+    assert 'PYTHONPATH="$NEW"' in line
+    r = subprocess.run([sys.executable, "-c", "import mm.safety.lip_watchdog"], cwd=str(tmp_path),
+                       env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-300:]

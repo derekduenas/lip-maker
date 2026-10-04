@@ -124,7 +124,8 @@ log "building venv"
 python3 -m venv "$NEW/.venv"
 "$NEW/.venv/bin/pip" install -q --upgrade pip
 "$NEW/.venv/bin/pip" install -q -r "$NEW/requirements.txt"
-"$NEW/.venv/bin/python" -c "import mm.unattended.loop, mm.safety.lip_watchdog" \
+# PYTHONPATH: `python -c` only finds `mm` when the CWD is the checkout, and this script is run from anywhere.
+PYTHONPATH="$NEW" "$NEW/.venv/bin/python" -c "import mm.unattended.loop, mm.safety.lip_watchdog" \
   || { echo "import check failed; nothing changed on the running system" >&2; rm -rf "$NEW"; exit 1; }
 
 log "stopping services"
