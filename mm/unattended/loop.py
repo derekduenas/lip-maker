@@ -56,6 +56,9 @@ CLOCK_SKEW_CLEAR_S = 15.0
 LAG_WINDOW_S = 60
 # Fill markout marks kept in memory and in the state file (the 5-min checkpoint).
 FILL_MARKS_KEEP = 500
+# A markout horizon measured later than horizon + max(this, horizon / 2) is
+# skipped (a restart or book gap would otherwise record a late mid).
+MARKOUT_GRACE_S = 30.0
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -2383,7 +2386,10 @@ class RunLoop:
         order, same queue position). Paper only."""
         cfg = sample_cfg()
         if (not cfg["enabled"] or self.mode != "paper" or cfg["n"] <= 0
-                or self.last_select_ts is None or not self.connected or self.kill is not None):
+                or self.last_select_ts is None or not self.connected or self.kill is not None
+                or self._reselect_pending):
+            # _reselect_pending: books were stale after a disconnect; the
+            # full re-selection quotes first, once they are usable again.
             return
         if len(self.sample_markets) >= cfg["n"] or self.sample_reserve_usd <= 0:
             self._sample_dirty = False
@@ -2644,6 +2650,10 @@ class RunLoop:
             for horizon in (60, 300, 1800):
                 key = f"markout_{horizon}s"
                 if mark[key] is None and ts >= mark["ts"] + horizon:
+                    if ts > mark["ts"] + horizon + max(MARKOUT_GRACE_S, horizon / 2.0):
+                        # Due long ago (restart, book gap): a mid measured now
+                        # is not this horizon's markout. Left unmeasured.
+                        continue
                     mid = self._side_mid_cents(mark["market"], str(mark["side"]))
                     if mid is not None:
                         mark[key] = round(float(mark["count"]) * (mid - float(mark["price_cents"])) / 100.0, 4)
@@ -4676,14 +4686,26 @@ async def _refresh_activity(reader, ctx: dict, on_frame, now: float | None = Non
     import asyncio
     now = time.time() if now is None else float(now)
     every = _env_num("LIP_ACTIVITY_REFRESH_S", 1800.0)
-    if every <= 0 or now - float(ctx.get("activity_at") or 0.0) < every:
+    prev = ctx.get("activity_at")
+    if every <= 0 or now - float(prev or 0.0) < every:
         return 0
-    ctx["activity_at"] = now
     fed = ctx.get("fed") or {}
     vol = {m: v for m, v in (ctx.get("volume") or {}).items() if m in fed}
     probe = [m for m, v in sorted(vol.items(), key=lambda kv: -(kv[1] or 0.0)) if (v or 0) > 0]
     probe = probe[: max(0, int(_env_num("LIP_ACTIVITY_PROBE_N", 60)))]
-    counts = await asyncio.to_thread(_fetch_trade_counts, reader, probe, now - 86400.0) if probe else {}
+    if not probe:
+        # Nothing to probe yet (cold metadata cache: no volume_24h): do not
+        # latch the period, the next refresh tick tries again.
+        return 0
+    ctx["activity_at"] = now
+    try:
+        counts = await asyncio.to_thread(_fetch_trade_counts, reader, probe, now - 86400.0)
+    except BaseException:
+        ctx["activity_at"] = prev         # a failed probe is retried on the next tick
+        raise
+    if not counts:
+        ctx["activity_at"] = prev         # every ticker failed: retry, keep the old counts
+        return 0
     ctx["trades_24h"] = counts
     ctx["active"] = [m for m, n in sorted(counts.items(), key=lambda kv: -kv[1]) if n > 0]
     on_frame({"kind": "activity", "ts": now, "trades_24h": dict(counts),

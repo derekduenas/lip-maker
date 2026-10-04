@@ -707,3 +707,80 @@ def test_series_gate_settled_fills_exclude_synthetic_fills(monkeypatch):
     row = lp.series_gate_report(accrual=lp.live_accrual())["series"]["KXCPI"]
     assert row["fills"] == 1
     assert row["settled_fills"] == 1, "a synthetic fill must not count toward the 30 settled fills"
+
+
+def test_activity_probe_with_nothing_to_probe_does_not_latch_the_period(monkeypatch):
+    """Cold metadata cache at startup: no volume_24h yet. The probe must not
+    block the background refresh for LIP_ACTIVITY_REFRESH_S."""
+    calls = []
+
+    class Reader:
+        def get(self, path, params=None):
+            calls.append(params["ticker"])
+            return {"trades": [{}] * 25}
+
+    frames = []
+    ctx = {"fed": {"A": 1}, "volume": {}}
+    assert asyncio.run(L._refresh_activity(Reader(), ctx, frames.append, now=T0)) == 0
+    assert "activity_at" not in ctx and not calls and not frames
+    ctx["volume"] = {"A": 50.0}
+    assert asyncio.run(L._refresh_activity(Reader(), ctx, frames.append, now=T0 + 60)) == 1
+    assert ctx["activity_at"] == T0 + 60 and calls == ["A"] and frames[-1]["trades_24h"] == {"A": 25}
+
+
+def test_failed_activity_probe_is_retried_not_latched(monkeypatch):
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+
+    class Down:
+        def get(self, path, params=None):
+            raise ConnectionError("gateway blip")
+
+    ctx = {"fed": {"A": 1}, "volume": {"A": 50.0}, "activity_at": None}
+    with pytest.raises(ConnectionError):
+        asyncio.run(L._refresh_activity(Down(), ctx, lambda f: None, now=T0))
+    assert ctx["activity_at"] is None
+
+
+def test_markout_due_long_ago_is_not_measured_with_a_late_mid(monkeypatch, tmp_path):
+    """A fill restored after a long restart gap: its 60 s / 300 s markouts are
+    far past due; measuring them with the current mid would feed the gate and
+    selection a wrong number."""
+    path = tmp_path / "state.json"
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.attach_state(str(path))
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp.on_frame(_activity(T0, {M: 40}))
+    lp.on_frame(snap(M, T0, YES, NO))
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    lp.on_frame(snap(M, T0 + 2, [(40, 2000)], NO))
+    lp.on_frame(trade(M, T0 + 3, "t1", 44, 50, "no"))
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    lp2.on_frame(program(M, rank_penalty_per_day=1e6))
+    lp2.on_frame(snap(M, T0 + 900, [(60, 50)], [(38, 50)]))
+    lp2.on_frame({"type": "clock", "ts": T0 + 901})           # 300 s due at T0+303, grace 150 s
+    mark = lp2.fill_marks[0]
+    assert mark["markout_60s"] is None and mark["markout_300s"] is None
+    assert lp2.series_acc["KXCPI"]["mk5_n"] == 0
+    lp2.on_frame({"type": "clock", "ts": T0 + 1805})          # 1800 s horizon is on time
+    assert lp2.fill_marks[0]["markout_1800s"] is not None
+
+
+def test_top_up_waits_for_the_reselect_after_a_disconnect(monkeypatch):
+    monkeypatch.setenv("LIP_SAMPLE_ENABLE", "1")
+    lp = newloop(bankroll=1500.0)
+    lp.on_frame(program(M, rank_penalty_per_day=1e6))
+    _book(lp, M, T0, YES, NO)
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    assert not lp.sample_markets
+    lp.trades_24h = {M: 40}
+    lp.connected = True
+    lp._sample_dirty = True
+    lp._reselect_pending = True
+    lp._top_up_sample(T0 + 30)
+    assert not lp.sample_markets
+    lp._reselect_pending = False                              # control: it would pick M
+    lp._top_up_sample(T0 + 60)
+    assert M in lp.sample_markets
