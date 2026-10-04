@@ -30,7 +30,10 @@ GO_NO_GO_DATE = "2026-10-10"
 GO_NO_GO_CRITERIA = (
     "per series mm.session_gates.series_go: >= 5 days, >= 30 settled fills, net > 0, "
     "5-min markout per fill < reward per fill, > 0 after a 50% reward haircut; "
-    "plus tools/readiness_report.py (advisory). Live arming stays a human decision."
+    "plus the statistical bar (mm/unattended/go_no_go.py, /status series_gate.go_no_go): 5-minute "
+    "markout across independent EVENTS, one-sided 90% lower bound of (markout + haircut reward) > 0 "
+    "on >= 30 events, parameters unchanged >= 3 days; plus tools/readiness_report.py (advisory). "
+    "Live arming stays a human decision."
 )
 
 

@@ -784,3 +784,53 @@ def test_top_up_waits_for_the_reselect_after_a_disconnect(monkeypatch):
     lp._reselect_pending = False                              # control: it would pick M
     lp._top_up_sample(T0 + 60)
     assert M in lp.sample_markets
+
+
+# ------------------------------------------------- 12. Oct 10 statistical bar wired into the engine
+def test_markouts_accumulate_per_event_not_per_fill(monkeypatch, tmp_path):
+    lp = _campaign(monkeypatch, tmp_path / "state.json")
+    ev = lp._event_of(M)
+    assert set(lp.event_acc) == {ev}
+    fills, contracts, usd = lp.event_acc[ev]
+    assert fills == 1 and contracts == pytest.approx(10.0)
+
+
+def test_go_no_go_block_is_in_the_series_gate_and_status(monkeypatch):
+    from mm.status_page import status_payload
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
+    gate = status_payload(lp.live_snapshot())["series_gate"]
+    gn = gate["go_no_go"]
+    assert gn["statistics"]["events"] == 1 and gn["verdict"]["verdict"] == "INSUFFICIENT"
+    assert gn["verdict"]["why"] == "too_few_events"
+    assert gn["trials"] >= 1 and len(gn["params_fingerprint"]) == 16
+
+
+def test_parameter_change_is_recorded_as_a_new_trial_and_restarts_the_frozen_window(monkeypatch, tmp_path):
+    path = tmp_path / "state.json"
+    monkeypatch.setenv("LIP_SAMPLE_N", "8")
+    lp = newloop(bankroll=1500.0)
+    lp.attach_state(str(path))
+    lp.on_frame({"type": "clock", "ts": T0})
+    assert len(lp.param_history) == 1
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(path))
+    lp2.on_frame({"type": "clock", "ts": T0 + 86400})            # same parameters: same trial
+    assert len(lp2.param_history) == 1
+    lp2.save_state(force=True)
+    monkeypatch.setenv("LIP_SAMPLE_N", "9")
+    lp3 = newloop(bankroll=1500.0)
+    lp3.attach_state(str(path))
+    lp3.on_frame({"type": "clock", "ts": T0 + 2 * 86400})
+    assert len(lp3.param_history) == 2
+    assert lp3.series_gate_report()["go_no_go"]["frozen_days"] == pytest.approx(0.0, abs=0.01)
+    assert lp3.series_gate_report()["go_no_go"]["trials"] == 2
+
+
+def test_event_markouts_survive_a_restart(monkeypatch, tmp_path):
+    lp = _campaign(monkeypatch, tmp_path / "state.json")
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(tmp_path / "state.json"))
+    assert lp2.event_acc == lp.event_acc

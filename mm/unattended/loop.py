@@ -59,6 +59,8 @@ FILL_MARKS_KEEP = 500
 # A markout horizon measured later than horizon + max(this, horizon / 2) is
 # skipped (a restart or book gap would otherwise record a late mid).
 MARKOUT_GRACE_S = 30.0
+# Events kept in the persisted 5-minute markout accumulator (oldest dropped).
+EVENT_ACC_KEEP = 3000
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -426,6 +428,14 @@ class RunLoop:
         # (series_gate_report): first fill, fills, fees, settled fills and
         # settlement P&L, 5-minute markout sum.
         self.series_acc: dict[str, dict] = {}
+        # Oct 10 statistical bar (mm/unattended/go_no_go.py), persisted:
+        # event -> [fills, contracts, usd] of measured 5-minute markouts (the
+        # unit of independence is the event), and every distinct tuning
+        # parameter set seen [{fp, ts}] (trials; the frozen window restarts
+        # at the last change).
+        self.event_acc: dict[str, list] = {}
+        self.param_history: list = []
+        self._params_noted = False
         # Phase 4: multi-horizon fill markouts (measurement only).
         from mm.unattended.markouts import MarkoutBook
         self.markouts = MarkoutBook()
@@ -591,6 +601,11 @@ class RunLoop:
             self.started_ts = ts
         if self.campaign_start_ts is None and ts:
             self.campaign_start_ts = ts
+        if not self._params_noted and ts:
+            from mm.unattended import go_no_go
+            self._params_noted = True
+            if go_no_go.note_params(self.param_history, ts):
+                self._state_dirty = True
         if kind in ("orderbook_snapshot", "orderbook_delta", "trade", "clock"):
             self._check_settlements(ts)
         if kind in ("orderbook_snapshot", "orderbook_delta"):
@@ -1071,10 +1086,25 @@ class RunLoop:
                            "fees_usd": round(float(acc["fees"]), 4), "reward_usd": round(reward, 4),
                            "markout_5m_cost_usd": round(cost_usd, 4), "markout_5m_fills": n5,
                            "markout_5m_cost_per_fill_usd": round(per_fill, 5), "go": ok, "why": why}
+        from mm.unattended import go_no_go
+        stats = go_no_go.event_stats(self.event_acc)
+        measured = sum(float(a.get("mk5_contracts") or 0.0) for a in self.series_acc.values())
+        reward_cents = (sum(rewards.values()) * 100.0 / measured) if measured > 0 else 0.0
+        fp, _params = go_no_go.fingerprint()
+        frozen = go_no_go.frozen_days(self.param_history, now)
         return {"label": "estimate (paper): rewards are not paid money; Oct 10 go/no-go inputs",
                 "criteria": {"min_days": cfg.min_days, "min_settled_fills": cfg.min_settled_fills,
                              "reward_haircut": cfg.reward_haircut},
-                "series": out, "go_series": go}
+                "series": out, "go_series": go,
+                # Statistical bar: 5-minute markout across independent EVENTS with a
+                # one-sided 90% lower bound; advisory, nothing arms anything.
+                "go_no_go": {"statistics": {k: (None if v is None else round(v, 4)) if isinstance(v, float) else v
+                                            for k, v in stats.items()},
+                             "verdict": go_no_go.verdict(stats, reward_cents_per_contract=reward_cents,
+                                                         frozen_days=frozen),
+                             "reward_cents_per_measured_contract": round(reward_cents, 4),
+                             "trials": len(self.param_history), "params_fingerprint": fp,
+                             "frozen_days": round(frozen, 3)}}
 
     def _count_settled(self, market: str, result: str) -> None:
         """Lifetime counters (``settled_lifetime``) for a held position that
@@ -1468,6 +1498,7 @@ class RunLoop:
             "campaign_start_ts": self.campaign_start_ts,
             "fill_marks": self.fill_marks[-FILL_MARKS_KEEP:],
             "series_acc": self.series_acc,
+            "event_acc": self.event_acc, "param_history": self.param_history,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1522,6 +1553,24 @@ class RunLoop:
             acc[str(series)] = row
         if "series_acc" in data:
             self.series_acc = acc
+        ev = {}
+        raw_ev = data.get("event_acc")
+        for event, r in (raw_ev.items() if isinstance(raw_ev, dict) else []):
+            try:
+                ev[str(event)] = [int(r[0]), float(r[1]), float(r[2])]
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+        if "event_acc" in data:
+            self.event_acc = ev
+        hist = []
+        raw_h = data.get("param_history")
+        for h in (raw_h if isinstance(raw_h, list) else []):
+            try:
+                hist.append({"fp": str(h["fp"]), "ts": float(h["ts"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        if "param_history" in data:
+            self.param_history = hist
 
     def attach_state(self, path: str) -> None:
         """Load ``path`` when it exists and persist there from now on.
@@ -2663,6 +2712,15 @@ class RunLoop:
                                 acc["mk5_usd"] += mark[key]
                                 acc["mk5_contracts"] += float(mark["count"])
                                 acc["mk5_n"] += 1
+                                row = self.event_acc.setdefault(self._event_of(str(mark["market"])),
+                                                                [0, 0.0, 0.0])
+                                row[0] += 1
+                                row[1] += float(mark["count"])
+                                row[2] += mark[key]
+                                if len(self.event_acc) > EVENT_ACC_KEEP:
+                                    for k in list(self.event_acc)[: len(self.event_acc) - EVENT_ACC_KEEP]:
+                                        del self.event_acc[k]
+                                self._state_dirty = True
 
     def markout_summary(self) -> dict:
         out = {"fills": len(self.fill_marks)}
