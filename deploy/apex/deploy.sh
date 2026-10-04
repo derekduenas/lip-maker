@@ -120,6 +120,10 @@ log "fetching $REF from $REPO_URL"
 NEW="$APP.new-$TS"
 git clone -q --depth 1 --branch "$REF" "$REPO_URL" "$NEW"
 log "code at $(git -C "$NEW" rev-parse --short HEAD): $(git -C "$NEW" log -1 --format=%s)"
+# The engine runs as user lip and git refuses a checkout owned by root, so /status could not
+# report its commit: record it in a file the engine reads (mm.unattended.loop.build_info).
+git -C "$NEW" rev-parse HEAD > "$NEW/BUILD_COMMIT"
+chmod 644 "$NEW/BUILD_COMMIT"
 log "building venv"
 python3 -m venv "$NEW/.venv"
 "$NEW/.venv/bin/pip" install -q --upgrade pip

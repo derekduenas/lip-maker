@@ -66,10 +66,17 @@ _BUILD: dict = {}
 
 
 def build_info() -> dict:
-    """Code version for /status (deploy verification): LIP_BUILD_COMMIT, else the checkout's
-    git HEAD (cached), else None. Read once per process."""
+    """Code version for /status (deploy verification): LIP_BUILD_COMMIT, else the BUILD_COMMIT
+    file the deploy script writes at the checkout root, else the checkout's git HEAD (cached),
+    else None. Read once per process. (git alone is not enough: the engine runs as a different
+    user than the one that cloned, and git refuses a checkout it does not own.)"""
     if not _BUILD:
         commit = os.environ.get("LIP_BUILD_COMMIT") or None
+        if commit is None:
+            try:
+                commit = (Path(__file__).resolve().parents[2] / "BUILD_COMMIT").read_text().strip() or None
+            except OSError:
+                commit = None
         if commit is None:
             try:
                 import subprocess

@@ -308,3 +308,20 @@ def test_apex_deploy_import_check_does_not_depend_on_the_working_directory(tmp_p
     r = subprocess.run([sys.executable, "-c", "import mm.safety.lip_watchdog"], cwd=str(tmp_path),
                        env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr[-300:]
+
+
+def test_build_info_reads_the_deploy_written_commit_file_when_git_is_unusable(monkeypatch):
+    """On the droplet the engine (user lip) could not run git in a root-owned checkout, so /status
+    said commit=unknown and verify_deploy failed."""
+    from mm.unattended import loop as L
+    f = ROOT / "BUILD_COMMIT"
+    assert not f.exists()
+    monkeypatch.delenv("LIP_BUILD_COMMIT", raising=False)
+    monkeypatch.setattr(L, "_BUILD", {})
+    f.write_text("a" * 40 + "\n")
+    try:
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: (_ for _ in ()).throw(OSError("dubious ownership")))
+        assert L.build_info()["commit"] == "a" * 40
+    finally:
+        f.unlink()
+    assert "BUILD_COMMIT" in (ROOT / "deploy" / "apex" / "deploy.sh").read_text()
