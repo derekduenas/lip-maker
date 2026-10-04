@@ -853,3 +853,30 @@ def test_markout_by_price_bucket_is_accumulated_reported_and_persisted(monkeypat
     lp2 = newloop(bankroll=1500.0)
     lp2.attach_state(str(tmp_path / "state.json"))
     assert lp2.price_acc == lp.price_acc
+
+
+# ------------------------------------------------- review fixes 3 (2026-10-04, Grok Bot)
+def test_go_no_go_reward_comes_only_from_series_with_measured_markouts(monkeypatch):
+    """A series that earned rewards but never had a measured 5-minute markout
+    must not lend its reward to the measured contracts (that lifted the edge's
+    lower bound above 0 on unrelated reward alone)."""
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)    # KXCPI: 10 measured contracts
+    base = lp.series_gate_report()["go_no_go"]["reward_cents_per_measured_contract"]
+    lp.closed_periods[M2] = 50.0                                 # KXGDP: $50 reward, no fills
+    assert lp._venue_of(M2) == "kalshi"
+    rep = lp.series_gate_report()
+    assert "KXGDP" not in lp.series_acc
+    assert rep["go_no_go"]["reward_cents_per_measured_contract"] == pytest.approx(base)
+    lp.closed_periods[M] = 1.0                                   # KXCPI's own reward does count
+    rep = lp.series_gate_report()
+    assert rep["go_no_go"]["reward_cents_per_measured_contract"] == pytest.approx(base + 100.0 / 10.0)
+
+
+def test_t_critical_value_beyond_the_table_is_never_looser_than_exact():
+    """t(0.90) at df 31..60 is 1.309..1.296 and at df 61..120 is 1.296..1.289:
+    a band value below the exact one makes the lower bound too generous."""
+    from mm.unattended import go_no_go as G
+    exact = {31: 1.309, 40: 1.303, 60: 1.296, 61: 1.296, 100: 1.290, 120: 1.289, 121: 1.289, 241: 1.285}
+    for df, t in exact.items():
+        assert G.t_crit_90(df) >= t - 1e-9, df

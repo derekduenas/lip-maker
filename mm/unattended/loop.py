@@ -1099,8 +1099,15 @@ class RunLoop:
                            "markout_5m_cost_per_fill_usd": round(per_fill, 5), "go": ok, "why": why}
         from mm.unattended import go_no_go
         stats = go_no_go.event_stats(self.event_acc)
-        measured = sum(float(a.get("mk5_contracts") or 0.0) for a in self.series_acc.values())
-        reward_cents = (sum(rewards.values()) * 100.0 / measured) if measured > 0 else 0.0
+        # Reward per contract whose 5-minute markout was measured: only the
+        # series that have such contracts contribute their reward. Rewards of
+        # series with no measured fills (reward quotes that never fill) would
+        # otherwise be spread over the few measured contracts and lift the
+        # edge's lower bound above 0 on reward alone.
+        measured_by = {s: float(a.get("mk5_contracts") or 0.0) for s, a in self.series_acc.items()
+                       if float(a.get("mk5_contracts") or 0.0) > 0}
+        measured = sum(measured_by.values())
+        reward_cents = (sum(rewards.get(s, 0.0) for s in measured_by) * 100.0 / measured) if measured > 0 else 0.0
         fp, _params = go_no_go.fingerprint()
         frozen = go_no_go.frozen_days(self.param_history, now)
         return {"label": "estimate (paper): rewards are not paid money; Oct 10 go/no-go inputs",

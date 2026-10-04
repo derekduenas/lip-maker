@@ -51,11 +51,17 @@ def t_crit_90(df: int) -> float:
         return float("inf")
     if df <= 30:
         return _T90[df - 1]
+    # Beyond the table, the value at the START of each band (t falls with
+    # df), so the bound never gets looser than the exact one.
     if df <= 60:
-        return 1.30
+        return 1.309   # df 31
     if df <= 120:
-        return 1.29
-    return 1.282
+        return 1.296   # df 61
+    if df <= 240:
+        return 1.289   # df 121
+    if df < 1000:
+        return 1.285   # df 241
+    return 1.282       # normal limit (exact 1.2824 at df 1000)
 
 
 def config() -> dict:
