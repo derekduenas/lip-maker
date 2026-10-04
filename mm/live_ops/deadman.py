@@ -10,6 +10,7 @@ a latched kill or a dead feed stops the pings, which is the point.
 from __future__ import annotations
 
 import os
+import threading
 import time
 import urllib.request
 from typing import Callable, Optional
@@ -33,6 +34,7 @@ class DeadMansSwitch:
         self.consecutive_failures = 0
         self.skipped_unhealthy = 0
         self.last_error: Optional[str] = None
+        self._thread: Optional[threading.Thread] = None
 
     @classmethod
     def from_env(cls) -> "DeadMansSwitch":
@@ -69,6 +71,25 @@ class DeadMansSwitch:
         self.consecutive_failures = 0
         self.last_error = None
         return {"sent": True}
+
+    def ping_async(self, now: Optional[float] = None, *, healthy: bool = True) -> dict:
+        """``ping`` on a daemon thread so a slow DNS lookup or connect can never stall the
+        caller (urllib's timeout is per socket operation, not a total deadline). At most one
+        ping is in flight; the outcome lands in status()."""
+        if self._thread is not None and self._thread.is_alive():
+            return {"sent": False, "reason": "inflight"}
+        if not self.configured or not healthy or (
+                self._last_attempt is not None
+                and (time.time() if now is None else float(now)) - self._last_attempt < self.interval_s):
+            return self.ping(now, healthy=healthy)            # nothing to send: bookkeeping only, no I/O
+        self._thread = threading.Thread(target=self.ping, args=(now,), kwargs={"healthy": healthy},
+                                        name="lip-deadman-ping", daemon=True)
+        self._thread.start()
+        return {"sent": False, "reason": "started"}
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
 
     def status(self) -> dict:
         return {"configured": self.configured, "interval_s": self.interval_s, "last_ok_ts": self.last_ok_ts,

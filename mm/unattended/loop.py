@@ -11,6 +11,7 @@ both flags are set, so the droplet unit cannot send.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -445,6 +446,7 @@ class RunLoop:
         self.offset_shift_n = 0
         self._shift_active = False
         self.chrony = None
+        build_info()                     # run the one-off `git rev-parse` now, never under the lock later
         self.deadman = None     # mm.live_ops.deadman.DeadMansSwitch (set by the service when configured)
         # Fix 2026-10-04: subscriptions are capped (drive_readonly_books plans
         # them). A fed program whose book is not subscribed is ``inactive``:
@@ -647,6 +649,10 @@ class RunLoop:
             tagged = str(entry.get("entry_kind") or entry.get("reward_kind") or "")
             if tagged:
                 entry["kind"] = tagged
+            entry.pop("entry_id", None)
+            entry["entry_id"] = hashlib.sha1(json.dumps(entry, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            if any(isinstance(e, dict) and e.get("entry_id") == entry["entry_id"] for e in self.ledger):
+                return                                     # a re-fed credit never adds to the paid total
             self.ledger.append(entry)
             return
         if kind == "cash":
@@ -823,11 +829,14 @@ class RunLoop:
         """(offset_s, shift_s) of the offset-aware guard, else (None, None).
 
         offset = minimum lag over LIP_SKEW_OFFSET_WINDOW_S (3600 s) of
-        per-minute minimums, only after LIP_SKEW_OFFSET_WARMUP_S (600 s) of
+        per-minute minimums (capped, see below), only after LIP_SKEW_OFFSET_WARMUP_S (600 s) of
         frames: until then the raw rule applies. A window this long cannot
         absorb a real latency problem that lasts minutes (the minimum stays
-        at the old, low value). shift = minimum of the last ~60 s minus the
-        offset: a persistent clock step or latency floor change."""
+        at the old, low value); a silent gap (LIP_SKEW_OFFSET_GAP_S, 300 s)
+        restarts the warm-up, and the absorbed offset is capped at
+        LIP_SKEW_OFFSET_MAX_S (5 s) so a sustained real latency problem is
+        never absorbed. shift = minimum of the last ~60 s minus the older
+        baseline (signed): a persistent clock step or latency floor change."""
         if _env_num("LIP_SKEW_OFFSET_AWARE", 0.0) <= 0 or self._off_first_ts is None:
             return None, None
         sec = int(ts)
@@ -840,8 +849,16 @@ class RunLoop:
             base = [v for k, v in self._off_min.items() if k >= lo]
             now_min = int(ts // 60)
             recent = [v for k, v in self._off_min.items() if k >= now_min - 1]
+            older = [v for k, v in self._off_min.items() if lo <= k < now_min - 1]
             if base and recent:
-                out = (min(base), min(recent) - min(base))
+                # The absorbed offset is capped (LIP_SKEW_OFFSET_MAX_S, default 5 s): a baseline
+                # that rises with a real, sustained latency problem would hide it for good.
+                cap = max(0.0, _env_num("LIP_SKEW_OFFSET_MAX_S", 5.0))
+                off = max(-cap, min(cap, min(base)))
+                # Signed shift of the last minute against the OLDER baseline (recent excluded), so a
+                # drop in the lag floor shows as negative.
+                ref = min(older) if older else min(base)
+                out = (off, min(recent) - ref)
         self._off_cache = (sec, out[0], out[1])
         return out
 
@@ -891,6 +908,12 @@ class RunLoop:
         self._note_lag(ts, raw_lag)
         if _env_num("LIP_SKEW_OFFSET_AWARE", 0.0) > 0:
             minute = int(ts // 60)
+            if self._off_min and minute - max(self._off_min) > max(2.0, _env_num("LIP_SKEW_OFFSET_GAP_S", 300.0) / 60.0):
+                # A silent gap: the baseline no longer describes the present (real lag after a
+                # gap would otherwise be absorbed into a fresh, empty window). Warm up again.
+                self._off_min.clear()
+                self._off_first_ts = ts
+                self._off_cache = (-1, None, None)
             if self._off_first_ts is None:
                 self._off_first_ts = ts
             cur = self._off_min.get(minute)
@@ -1046,6 +1069,9 @@ class RunLoop:
         for market in [m for m in self.closed_periods if m not in self.programs]:
             self._fold_closed_period(market, self._venue_of(market))
         self._drop_settled(ts)
+        for market in [m for m in self.inv_since if m not in self.position or m in self.settled]:
+            del self.inv_since[market]            # inventory age is meaningless once flat or settled
+            self._state_dirty = True
         return len(gone)
 
     def _fold_closed_period(self, market: str, venue: str) -> None:
@@ -1164,7 +1190,9 @@ class RunLoop:
     def _as_note(self, market: str, count: float, cents: float, ts: float) -> None:
         """One measured 60 s markout (cents per contract, positive = our favour):
         update the market's quantity-weighted EWMA, then apply the guard."""
-        st = self.mk_ewma.get(market)
+        if not self._as_on():
+            return                       # guard off: nothing reads it, so do not grow or persist it
+        st = self.mk_ewma.pop(market, None)          # pop + reinsert: dict order is recency (LRU eviction)
         decay = _env_num("LIP_AS_EWMA_DECAY", 0.7)
         if st is None:
             ewma, weight, n = float(cents), float(count), 1
@@ -1377,9 +1405,10 @@ class RunLoop:
         stats = go_no_go.event_stats(self.event_acc)
         gcfg = go_no_go.config()
         measured_haircut = reward_recon.haircut_recommendation(
-            reward_recon.reconcile_periods(self.period_estimates, self.ledger))
-        if measured_haircut is not None:
-            gcfg = dict(gcfg, reward_haircut=measured_haircut)
+            reward_recon.reconcile_periods(self.period_estimates, self.ledger, now=now,
+                                           lag_s=_env_num("LIP_RECON_LAG_S", reward_recon.LAG_S)))
+        # The measured haircut may only make the go/no-go MORE conservative than the operator's.
+        gcfg = dict(gcfg, reward_haircut=reward_recon.effective_haircut(gcfg["reward_haircut"], measured_haircut))
         # Reward per contract whose 5-minute markout was measured: only the
         # series that have such contracts contribute their reward. Rewards of
         # series with no measured fills (reward quotes that never fill) would
@@ -1401,8 +1430,11 @@ class RunLoop:
                                             for k, v in stats.items()},
                              "verdict": go_no_go.verdict(stats, reward_cents_per_contract=reward_cents,
                                                          frozen_days=frozen, cfg=gcfg),
-                             "haircut_source": ("measured paid/estimated ratio" if measured_haircut is not None
-                                                else "configured default"),
+                             "haircut_source": (
+                                 "operator setting (measured paid/due-estimate ratio is looser: not applied)"
+                                 if measured_haircut is not None and measured_haircut < float(go_no_go.config()["reward_haircut"])
+                                 else "measured paid/due-estimate ratio (only ever tightens the operator setting)"
+                                 if measured_haircut is not None else "configured default"),
                              "reward_cents_per_measured_contract": round(reward_cents, 4),
                              "markout_by_price_bucket": {
                                  b: self._price_bucket_row(b) for b in PRICE_BUCKETS},
@@ -1549,7 +1581,8 @@ class RunLoop:
             self.period_estimates.append({
                 "market": market, "program_id": est.program_id, "series": est.series,
                 "period_start": _iso(acc.params.start_ts) if acc.params.start_ts else "",
-                "estimated_usd": est.estimated_usd, "raw_usd": format(Decimal(str(raw)), "f")})
+                "estimated_usd": est.estimated_usd, "raw_usd": format(Decimal(str(raw)), "f"),
+                "ts": float(self.now or time.time())})
             del self.period_estimates[:-5000]
         except Exception:
             logging.getLogger("lip.risk").exception("period estimate for %s failed", market)
@@ -1564,6 +1597,8 @@ class RunLoop:
             return False, "state_error"
         if not self.connected:
             return False, "feed_disconnected"
+        if not self.now:
+            return False, "no_frames"          # connected at construction is not a working feed
         age = time.time() - float(self.now or 0.0) if self.now else None
         if age is not None and age > _env_num("LIP_DEADMAN_MAX_FRAME_AGE_S", 180.0):
             return False, "feed_stale"
@@ -1591,7 +1626,8 @@ class RunLoop:
     def rewards_reconciliation(self) -> dict:
         """Paid vs estimated LIP rewards over archived periods (read-only)."""
         from mm.unattended import reward_recon
-        rep = reward_recon.reconcile_periods(self.period_estimates, self.ledger)
+        rep = reward_recon.reconcile_periods(self.period_estimates, self.ledger, now=time.time(),
+                                             lag_s=_env_num("LIP_RECON_LAG_S", reward_recon.LAG_S))
         rec = reward_recon.haircut_recommendation(rep)
         rep.update({"label": reward_recon.LABEL, "periods_recorded": len(self.period_estimates),
                     "credits_file": bool(self.credits_file), "credits_load": dict(self.credits_load),
@@ -1957,8 +1993,8 @@ class RunLoop:
         raw_pe = data.get("price_event_acc")
         for bucket, rows in (raw_pe.items() if isinstance(raw_pe, dict) else []):
             try:
-                pe[str(bucket)] = {str(e): [int(r[0]), float(r[1]), float(r[2])] for e, r in dict(rows).items()}
-            except (IndexError, KeyError, TypeError, ValueError):
+                pe[str(bucket)] = {str(e): [int(_fin(r[0])), _fin(r[1]), _fin(r[2])] for e, r in dict(rows).items()}
+            except (IndexError, KeyError, TypeError, ValueError, OverflowError):
                 continue
         if "price_event_acc" in data:
             self.price_event_acc = pe
@@ -1974,17 +2010,17 @@ class RunLoop:
                                        float(m["count"]), float(m["markout_300s"]))
         try:
             if isinstance(data.get("mk_ewma"), dict):
-                self.mk_ewma = {str(m): [float(v[0]), float(v[1]), int(v[2])] for m, v in data["mk_ewma"].items()}
+                self.mk_ewma = {str(m): [_fin(v[0]), _fin(v[1]), int(_fin(v[2]))] for m, v in data["mk_ewma"].items()}
             if isinstance(data.get("comp_ewma"), dict):
-                self.comp_ewma = {str(m): float(v) for m, v in data["comp_ewma"].items()}
+                self.comp_ewma = {str(m): _fin(v) for m, v in data["comp_ewma"].items()}
             if isinstance(data.get("entry_state"), dict):
-                self.entry_state = {str(m): {"competition": float(v["competition"]),
-                                             "markout_cents": float(v["markout_cents"]),
-                                             "ts": float(v.get("ts") or 0.0)}
+                self.entry_state = {str(m): {"competition": _fin(v["competition"]),
+                                             "markout_cents": _fin(v["markout_cents"]),
+                                             "ts": _fin(v.get("ts") or 0.0)}
                                     for m, v in data["entry_state"].items()}
             if isinstance(data.get("inv_since"), dict):
-                self.inv_since = {str(m): float(v) for m, v in data["inv_since"].items()}
-        except (IndexError, KeyError, TypeError, ValueError):
+                self.inv_since = {str(m): _fin(v) for m, v in data["inv_since"].items()}
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError, AttributeError):
             logging.getLogger("lip.risk").warning("guard/exit state unreadable: ignored")
         for attr, key in (("ledger", "reward_ledger"), ("period_estimates", "period_estimates")):
             raw_l = data.get(key)
@@ -5002,6 +5038,14 @@ class SidSequencer:
             self.gaps += 1
             return "gap"
         return "ok"
+
+
+def _fin(value) -> float:
+    """float(value), refusing NaN/inf (a corrupt guard value must not enter live state)."""
+    out = float(value)
+    if out != out or out in (float("inf"), float("-inf")):
+        raise ValueError("non-finite")
+    return out
 
 
 def _env_num(name: str, default: float) -> float:

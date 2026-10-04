@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 import time
 import urllib.request
+
+
+_HEX = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def check(status: dict, *, expect_commit: str | None, now: float | None = None,
@@ -36,13 +41,19 @@ def check(status: dict, *, expect_commit: str | None, now: float | None = None,
     if not (status.get("feed") or {}).get("connected"):
         fails.append("feed not connected")
     last = status.get("last_frame_ts")
-    if not last or now - float(last) > max_frame_age_s:
-        fails.append(f"no recent frame (last_frame_ts={last})")
+    try:
+        age = now - float(last)
+    except (TypeError, ValueError):
+        age = float("nan")
+    if not math.isfinite(age) or age < -5.0 or age > max_frame_age_s:     # NaN, future, or stale all fail
+        fails.append(f"no recent frame (last_frame_ts={last!r})")
     if status.get("budget_warning"):
         fails.append(f"budget warning: {status.get('budget_warning')}")
     if expect_commit:
-        got = (status.get("build") or {}).get("commit") or ""
-        if not got or not (got.startswith(expect_commit) or expect_commit.startswith(got)):
+        got = str((status.get("build") or {}).get("commit") or "").lower()
+        want = expect_commit.lower()
+        # a short or empty commit never matches by prefix: both must be >= 7 hex chars
+        if not (_HEX.match(got) and _HEX.match(want) and (got.startswith(want) or want.startswith(got))):
             fails.append(f"commit mismatch: running {got or 'unknown'}, expected {expect_commit}")
     return fails
 
@@ -59,6 +70,9 @@ def main(argv=None) -> int:
     ap.add_argument("--wait-s", type=float, default=120.0)
     ap.add_argument("--max-frame-age-s", type=float, default=300.0)
     args = ap.parse_args(argv)
+    if args.expect_commit is not None and not _HEX.match(args.expect_commit.lower()):
+        print("--expect-commit must be 7-40 hex characters (is `git rev-parse HEAD` failing?)", file=sys.stderr)
+        return 2
     deadline = time.time() + args.wait_s
     fails = ["engine not reachable"]
     while True:

@@ -52,7 +52,7 @@ def queue_band_configs() -> list:
     (execution/paper_fills.py ``queue_model``)."""
     out = [("q_risk_averse", {"LIP_SIM_QUEUE_MODEL": "risk_averse"}),
            ("q_depletion", {"LIP_SIM_QUEUE_MODEL": "depletion"})]
-    for n in (3, 2, 1):      # larger n credits less depletion: pessimistic -> optimistic
+    for n in (3, 2, 1):      # n sharpens the depletion split; the effect is not monotone, the band is the min/max
         out.append((f"q_prob_n{n}", {"LIP_SIM_QUEUE_MODEL": "prob_power", "LIP_SIM_QUEUE_POWER": str(n)}))
     return out
 

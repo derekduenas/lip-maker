@@ -92,9 +92,11 @@ def test_no_cancel_latency_by_default_and_a_replacement_is_not_confused_with_the
     sim.untrack("o", now=T0 + 10)
     sim.track(order_id="o", market_ticker=M, side="yes", price_cents=41, size=50,
               book=_Book([]), now=T0 + 10)                      # re-quoted at a new price
-    fills = sim.apply_trades([_tr("t1", 40, 20, T0 + 10.3)])    # a 40c print: through the new 41c bid, and
-    assert sorted(f["price_cents"] for f in fills) == [40, 41]   # the old 40c order is still exposed
-    assert sim.orders["o"].price_cents == 41 and sim.orders["o"].remaining == 30   # replacement intact
+    # a 40c print of 60: through the new 41c bid (price priority: it fills first), and the old
+    # 40c order is still exposed. One print fills at most its size across both orders.
+    fills = sim.apply_trades([_tr("t1", 40, 60, T0 + 10.3)])
+    assert [(f["price_cents"], f["count"]) for f in fills] == [(41, 50), (40, 10)]
+    assert "o" not in sim.orders                                         # the replacement filled completely
 
 
 def test_loop_reads_the_queue_model_from_the_environment(monkeypatch):

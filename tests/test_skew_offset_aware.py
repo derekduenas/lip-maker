@@ -48,8 +48,9 @@ def test_constant_offset_does_not_trip_once_the_baseline_exists(monkeypatch):
     ts = _feed(lp, ts, 600, lag=6.0)
     assert lp.skew_trips_n == trips and not lp._skew_active
     rep = lp.lag_report()
-    assert rep["offset_aware"] is True and rep["offset_s"] == pytest.approx(6.0, abs=0.01)
-    assert abs(rep["corrected_last_s"]) < 0.01
+    # the absorbed offset is capped at LIP_SKEW_OFFSET_MAX_S (5 s): the 1 s left over is judged normally
+    assert rep["offset_aware"] is True and rep["offset_s"] == pytest.approx(5.0, abs=0.01)
+    assert rep["corrected_last_s"] == pytest.approx(1.0, abs=0.01)
 
 
 def test_real_latency_spike_on_top_of_a_known_offset_still_trips(monkeypatch):
@@ -68,7 +69,7 @@ def test_negative_offset_local_clock_behind_is_absorbed(monkeypatch):
     trips = lp.skew_trips_n
     _feed(lp, ts, 300, lag=-7.0)
     assert lp.skew_trips_n == trips and not lp._skew_active
-    assert lp.lag_report()["offset_s"] == pytest.approx(-7.0, abs=0.01)
+    assert lp.lag_report()["offset_s"] == pytest.approx(-5.0, abs=0.01)     # capped at -LIP_SKEW_OFFSET_MAX_S
 
 
 def test_offset_shift_is_reported_and_counted_once_per_episode(monkeypatch):

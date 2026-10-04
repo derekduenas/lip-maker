@@ -88,7 +88,7 @@ def program_metadata(row: dict) -> dict:
 
 def _money(value) -> Decimal:
     amount = Decimal(str(value))
-    if amount < 0 or amount != amount:
+    if not amount.is_finite() or amount < 0:
         raise ValueError("reward amount must be a non-negative number")
     return amount
 

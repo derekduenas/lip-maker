@@ -14,7 +14,17 @@ import secrets
 import time
 from typing import Callable, Optional
 
-TERMINAL = ("acked", "rejected", "absent")
+TERMINAL = ("acked", "rejected", "absent", "cancelled")
+_DEAD = ("canceled", "cancelled", "expired", "rejected")
+
+
+def _fsync_dir(path: str) -> None:
+    """Make a directory entry durable (a new file is not on disk until its directory is)."""
+    fd = os.open(path or ".", os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class AmbiguousResponse(Exception):
@@ -25,6 +35,11 @@ class RejectedOrder(Exception):
     """The venue definitively refused the order (e.g. post-only would cross)."""
 
 
+class DuplicateOrder(Exception):
+    """The venue refused a resend because the client order id already exists: the first
+    send reached it. NOT a rejection; the order may be resting."""
+
+
 class ClientOrderIds:
     def __init__(self, path: str, clock: Callable[[], float] = time.time) -> None:
         self.path = path
@@ -33,23 +48,35 @@ class ClientOrderIds:
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        if os.path.exists(path):
-            for line in open(path, encoding="utf-8"):
+        self._new_file = not os.path.exists(path)
+        if not self._new_file:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            for line in data.decode("utf-8", errors="replace").splitlines():
                 try:
                     row = json.loads(line)
                     self._state.setdefault(row["coid"], {}).update(row)
-                except (ValueError, KeyError):
+                except (ValueError, KeyError, TypeError):
                     continue                                    # a torn last line never blocks startup
+            if data and not data.endswith(b"\n"):
+                with open(path, "ab") as fh:                    # end the torn line so the next row starts clean
+                    fh.write(b"\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
 
     def _append(self, row: dict) -> None:
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
+        if self._new_file:
+            _fsync_dir(os.path.dirname(self.path))
+            self._new_file = False
         self._state.setdefault(row["coid"], {}).update(row)
 
     def new(self, market: str, side: str, prefix: str = "LIP") -> str:
-        coid = f"{prefix}-{int(self._clock() * 1000):x}-{secrets.token_hex(6)}"[:64]
+        tail = f"-{int(self._clock() * 1000):x}-{secrets.token_hex(6)}"
+        coid = prefix[: 64 - len(tail)] + tail                  # truncate the prefix, never the random part
         self._append({"coid": coid, "state": "intent", "market": market, "side": side, "ts": self._clock()})
         return coid
 
@@ -79,15 +106,23 @@ def submit_idempotent(store: ClientOrderIds, coid: str, send: Callable[[str], di
         except RejectedOrder as exc:
             store.mark(coid, "rejected", reason=str(exc)[:120])
             return {"status": "rejected", "attempts": attempts}
-        except AmbiguousResponse:
+        except (AmbiguousResponse, DuplicateOrder) as exc:
             try:
                 found = lookup(coid)
             except Exception:
                 store.mark(coid, "unknown", reason="lookup_failed")
                 return {"status": "unknown", "attempts": attempts, "reason": "lookup_failed"}
             if found:
+                if str(found.get("status", "")).lower() in _DEAD:
+                    store.mark(coid, "cancelled", order_id=found.get("order_id", ""))
+                    return {"status": "cancelled_after_lookup", "attempts": attempts, "response": found}
                 store.mark(coid, "acked", order_id=found.get("order_id", ""))
                 return {"status": "acked_after_lookup", "attempts": attempts, "response": found}
+            if isinstance(exc, DuplicateOrder):
+                # The venue says the id exists but the lookup does not show it yet (lag):
+                # never terminal, reconciliation resolves it.
+                store.mark(coid, "unknown", reason="duplicate_but_not_visible")
+                return {"status": "unknown", "attempts": attempts, "reason": "duplicate_but_not_visible"}
             if attempts < max_attempts:
                 sleep(backoff_s * (2 ** (attempts - 1)))
     store.mark(coid, "unknown", reason="retries_exhausted")

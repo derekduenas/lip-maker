@@ -202,8 +202,10 @@ class PaperFillSimulator:
           never assumed (the most pessimistic fill count).
         * ``prob_power``: as depletion, but a decrease of the displayed level
           is attributed ahead of us with probability a^n / (a^n + b^n)
-          (a = queue ahead, b = size behind us, n = ``queue_power``; larger n
-          credits less depletion), the hftbacktest probability-queue family.
+          (a = queue ahead, b = size behind us, n = ``queue_power``). n sharpens
+          the split: when a > b a larger n attributes MORE of a decrease to the
+          queue ahead of us (earlier fills), when a < b less; so the effect of
+          n is not monotone in optimism. The hftbacktest probability-queue family.
 
         ``cancel_latency_ms``: a cancelled/replaced paper order stays fillable
         for this long (default 0), the picking-off of stale cancels."""
@@ -314,7 +316,19 @@ class PaperFillSimulator:
                 o.depleted_unmatched += cut
                 o.depleted_ts = now
                 o.queue_ahead = ahead - cut
-            o.behind = max(0.0, behind - (delta - cut))
+            rest = delta - cut
+            o.behind = max(0.0, behind - rest)
+            overflow = rest - behind
+            if overflow > 0 and o.queue_ahead > 0:
+                # More left the level than was behind us: the rest came off the front.
+                if now - o.depleted_ts > DEPLETION_MATCH_S:
+                    o.depleted_unmatched = 0.0
+                taken = min(o.queue_ahead, overflow)
+                o.depleted_unmatched += taken
+                o.depleted_ts = now
+                o.queue_ahead -= taken
+            if o.queue_ahead > lvl:               # never more queue ahead than the level shows
+                o.queue_ahead = lvl
 
     # ── trade ingestion ───────────────────────────────────────────────
     def fetch_trades(self, tickers: Iterable[str], *, limit: int = 200) -> list[dict]:
@@ -363,7 +377,10 @@ class PaperFillSimulator:
 
             if self._cancelling:
                 self._cancelling = [(c, u) for c, u in self._cancelling if t_ts < u and c.remaining >= DUST_QTY]
-            live = list(self.orders.values()) + [c for c, u in self._cancelling if t_ts < u]
+            # cancelling orders first: they were ahead of their replacements in time
+            live = [c for c, u in self._cancelling if t_ts < u] + list(self.orders.values())
+            live.sort(key=lambda o: -o.price_cents)      # bids: the higher price is matched first (stable)
+            print_left = qty                       # one print can fill at most its size across all our orders
             for o in live:
                 if o.market_ticker != ticker or o.remaining < DUST_QTY:
                     continue
@@ -379,7 +396,7 @@ class PaperFillSimulator:
                     if taker != "yes" or no_c <= 0 or no_c > o.price_cents:
                         continue
                     through = no_c < o.price_cents
-                vol = qty
+                vol = print_left
                 if through:
                     # The print is past our level, so the queue at our
                     # price was cleared before this trade could happen.
@@ -406,6 +423,7 @@ class PaperFillSimulator:
                 if got < DUST_QTY:
                     continue
                 o.remaining -= got
+                print_left -= got
                 if o.remaining < DUST_QTY:
                     o.remaining = 0.0
                 o.filled += got

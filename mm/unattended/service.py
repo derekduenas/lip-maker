@@ -261,7 +261,7 @@ class EngineTimer:
         write_heartbeat(self.heartbeat)
         if getattr(loop, "deadman", None) is not None:
             ok, _why = loop.healthy_for_deadman()
-            loop.deadman.ping(time.time(), healthy=ok)   # off-VM dead-man's switch (LIP_DEADMAN_URL)
+            loop.deadman.ping_async(time.time(), healthy=ok)   # off-VM dead-man's switch (LIP_DEADMAN_URL), off-thread
         flush_fv_samples(loop, samples)
         if report is not None:
             self.refresher.publish(report)
@@ -315,7 +315,7 @@ class _Engine:
             loop.deadman = _dm
         if str(os.environ.get("LIP_CHRONY_STATUS", "0")).strip().lower() in ("1", "true", "yes", "on"):
             from mm.ops import ChronyProbe
-            loop.chrony = ChronyProbe()   # /status feed.clock_sync (optional, cached)
+            loop.chrony = ChronyProbe(background=True)   # /status feed.clock_sync (optional, cached, off-thread)
         loop.check_watchdog_capital()
         loop.attach_state(os.environ.get("LIP_STATE_FILE", "/var/lib/lip-maker/engine_state.json"))
         self.loop = loop

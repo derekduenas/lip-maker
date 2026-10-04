@@ -22,7 +22,7 @@ def _quoting(monkeypatch, **env):
 
 # ------------------------------------------------------------- EWMA math
 def test_markout_ewma_is_quantity_weighted_and_decays(monkeypatch):
-    lp = _quoting(monkeypatch)
+    lp = _quoting(monkeypatch, LIP_AS_GUARD_ENABLE=1)
     lp._as_note(M, 10, -2.0, T0 + 5)
     assert lp.mk_ewma[M][0] == pytest.approx(-2.0) and lp.mk_ewma[M][2] == 1
     lp._as_note(M, 30, -6.0, T0 + 6)

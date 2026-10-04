@@ -443,8 +443,13 @@ def test_timer_pings_the_deadman_only_when_configured(monkeypatch, tmp_path):
     from tests.test_review_loop_pnl import newloop
     lp = newloop(bankroll=1500.0)
     calls = []
+    from tests.test_review_loop_pnl import M, T0, program, snap
+    lp.on_frame(program(M))
+    lp.on_frame(snap(M, T0, [(40, 2000)], [(55, 2000)]))                 # a frame has arrived: the feed works
+    monkeypatch.setattr("time.time", lambda: T0 + 5)
     lp.deadman = D.DeadMansSwitch(url="https://x/y", interval_s=1, fetch=lambda u, t: calls.append(1))
     EngineTimer(lp, heartbeat=str(tmp_path / "hb"), kill_path=str(tmp_path / "KILL")).tick()
+    lp.deadman.join(2.0)                                                 # the ping runs on its own thread
     assert len(calls) == 1
     assert "deadman" in lp.live_snapshot() and "x/y" not in json.dumps(lp.live_snapshot()["deadman"])
 

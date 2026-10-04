@@ -6,8 +6,13 @@ live operator must hear about, so this layer classifies every difference first:
 
   explained   a recorded fill accounts for it; a cancel we requested has landed; a fresh
               pending_new the venue has not shown yet (grace)
-  unexplained unknown_venue_order, missing_at_venue, qty_mismatch, lost_order (pending_new
-              past the grace), position_mismatch (beyond tolerance)
+  unexplained unknown_venue_order, missing_at_venue, qty_mismatch, price_mismatch,
+              duplicate_client_order_id, lost_order (pending_new past the grace),
+              position_mismatch (beyond tolerance)
+
+A fill explains a difference only if it is NEW: fills already applied to the local order
+(``ManagedOrder.filled``) or counted by an earlier run are not counted again. The caller keeps
+``filled`` in step with the fills it applies.
 
 More than ``max_unexplained`` (default 0) halts: ``on_halt(reason, report)`` is called (the
 caller cancels everything and latches the kill). Venue truth is applied to the local book either
@@ -22,6 +27,7 @@ from typing import Callable, Optional
 from mm.order_machine import OrderBook
 from mm.types import OrderState
 
+_DEAD_STATUS = ("canceled", "cancelled", "expired", "rejected")
 _LIVE = (OrderState.RESTING, OrderState.PARTIAL, OrderState.PENDING_AMEND,
          OrderState.PENDING_CANCEL, OrderState.UNKNOWN, OrderState.PENDING_NEW)
 
@@ -44,6 +50,7 @@ class Reconciler:
         self.max_unexplained = int(max_unexplained)
         self.position_tolerance = float(position_tolerance)
         self._clock = clock
+        self._fill_seen: dict = {}
         self._last_run: Optional[float] = None
         self.runs = 0
         self.halts = 0
@@ -72,8 +79,13 @@ class Reconciler:
             rep.update(halt=True, error=f"{type(exc).__name__}: {str(exc)[:100]}")
             self._halt("venue_unreachable", rep)
             return rep
+        venue = [v for v in venue if str(v.status).lower() not in _DEAD_STATUS]   # cancelled rows are not live orders
         by_id = {v.order_id: v for v in venue if v.order_id}
         by_coid = {v.client_order_id: v for v in venue if v.client_order_id}
+        coid_rows: dict = {}
+        for v in venue:
+            if v.client_order_id and v.remaining > 0:
+                coid_rows.setdefault(v.client_order_id, set()).add(v.order_id)
 
         def add(kind: str, key: str, ok: bool, detail: str = "") -> None:
             (rep["explained"] if ok else rep["unexplained"]).append({"kind": kind, "key": key, "detail": detail})
@@ -86,7 +98,9 @@ class Reconciler:
             known_coids.add(o.client_order_id)
             view = by_id.get(o.order_id) if o.order_id else None
             view = view or by_coid.get(o.client_order_id)
-            filled = self._fill_total(fills, o.order_id, o.client_order_id)
+            total = self._fill_total(fills, o.order_id, o.client_order_id)
+            filled = max(0.0, total - max(float(o.filled or 0.0), self._fill_seen.get(o.client_order_id, 0.0)))
+            self._fill_seen[o.client_order_id] = max(total, self._fill_seen.get(o.client_order_id, 0.0))
             if view is None:
                 if o.state == OrderState.PENDING_CANCEL:
                     add("cancel_landed", o.client_order_id, True)
@@ -97,13 +111,18 @@ class Reconciler:
                 elif filled >= float(o.remaining) - 1e-9 and filled > 0:
                     add("filled", o.client_order_id, True)
                 else:
-                    add("missing_at_venue", o.client_order_id, False, f"fills {filled:g} < remaining {o.remaining:g}")
+                    add("missing_at_venue", o.client_order_id, False, f"new fills {filled:g} < remaining {o.remaining:g}")
+            elif len(coid_rows.get(o.client_order_id, ())) > 1:
+                add("duplicate_client_order_id", o.client_order_id, False,
+                    f"{len(coid_rows[o.client_order_id])} venue orders carry this id")
             elif abs(float(view.remaining) - float(o.remaining)) > 1e-9:
                 diff = float(o.remaining) - float(view.remaining)
                 add("qty_change", o.client_order_id, diff > 0 and filled >= diff - 1e-9,
                     f"local {o.remaining:g} venue {view.remaining:g} fills {filled:g}")
                 if rep["unexplained"] and rep["unexplained"][-1]["key"] == o.client_order_id:
                     rep["unexplained"][-1]["kind"] = "qty_mismatch"
+            elif int(view.price_cents) != int(o.price_cents):
+                add("price_mismatch", o.client_order_id, False, f"local {o.price_cents} venue {view.price_cents}")
         for v in venue:
             if v.remaining <= 0:
                 continue
@@ -119,7 +138,10 @@ class Reconciler:
                 add("position_mismatch" if gap > self.position_tolerance else "position_ok", market,
                     gap <= self.position_tolerance, f"venue {a} local {b}")
         rep["explained"] = [e for e in rep["explained"] if e["kind"] != "position_ok"]
-        self.book.reconcile(venue, ts=now)           # venue truth, applied regardless of the halt
+        if len(self._fill_seen) > 5000:
+            self._fill_seen = {k: v for k, v in self._fill_seen.items() if k in known_coids}
+        # venue truth, applied regardless of the halt; a just-sent pending_new gets its grace
+        self.book.reconcile(venue, ts=now, keep_pending_after=now - self.fill_grace_s)
         rep["halt"] = len(rep["unexplained"]) > self.max_unexplained
         if rep["halt"]:
             self._halt(f"{len(rep['unexplained'])} unexplained divergence(s): "

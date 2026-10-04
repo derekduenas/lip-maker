@@ -75,12 +75,42 @@ class RateBudget:
 
     def acquire(self, kind: str, items: int = 1, cost: float = DEFAULT_COST) -> bool:
         total = float(cost) * max(1, int(items))
-        for lane in self._lanes(kind):
-            if self._b[lane].take(total):
-                return True
-        self.denied[kind] += 1
-        return False
+        lanes = self._lanes(kind)
+        for lane in lanes:
+            self._b[lane]._refill()
+        if sum(self._b[lane].tokens for lane in lanes) + 1e-9 < total:
+            self.denied[kind] += 1
+            return False
+        # A cancel spends its reserve first and tops up from the write lane; a write or read
+        # has a single lane. Lanes are combined only for cancels, so quotes can never use the reserve.
+        for lane in lanes:
+            take = min(total, self._b[lane].tokens)
+            self._b[lane].tokens -= take
+            total -= take
+        return True
+
+    def max_items(self, kind: str, cost: float = DEFAULT_COST) -> int:
+        """Largest batch that can ever be admitted (combined capacity of the kind's lanes)."""
+        cap = sum(self._b[lane].capacity for lane in self._lanes(kind))
+        return int((cap + 1e-9) // float(cost))
+
+    def chunks(self, kind: str, items: int, cost: float = DEFAULT_COST) -> list:
+        """Split ``items`` into batches that fit the budget. A batch larger than ``max_items``
+        is never admitted (wait_time is inf), so callers send these chunks instead."""
+        size = max(1, self.max_items(kind, cost))
+        n, out = max(0, int(items)), []
+        while n > 0:
+            out.append(min(size, n))
+            n -= out[-1]
+        return out
 
     def wait_time(self, kind: str, items: int = 1, cost: float = DEFAULT_COST) -> float:
         total = float(cost) * max(1, int(items))
-        return min(self._b[lane].wait(total) for lane in self._lanes(kind))
+        lanes = self._lanes(kind)
+        for lane in lanes:
+            self._b[lane]._refill()
+        if total > sum(self._b[lane].capacity for lane in lanes) + 1e-9:
+            return float("inf")
+        have = sum(self._b[lane].tokens for lane in lanes)
+        rate = sum(self._b[lane].rate for lane in lanes)
+        return 0.0 if rate <= 0 and have >= total else (float("inf") if rate <= 0 else max(0.0, (total - have) / rate))

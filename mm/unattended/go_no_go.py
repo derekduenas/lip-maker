@@ -14,8 +14,8 @@ hurdle). This module adds what a pre-registered evaluation needs:
 * how many more independent events are needed for the planned edge at 80%
   power, from the observed spread (a planning number, not a verdict);
 * a fingerprint of the tuning parameters, so a change during the evaluation
-  window is visible (the frozen window restarts) and every distinct set tried
-  is counted (trials, for multiple-testing discipline).
+  window is visible (the frozen window restarts) and every change is recorded
+  (a trial log, capped at 200 entries; not used in the verdict).
 
 Everything here is a pure function of numbers; the engine feeds it.
 Markout sign: cents per contract, positive = the mid moved in our favour.
@@ -69,7 +69,8 @@ def config() -> dict:
     return {"min_events": int(_num("LIP_GO_MIN_EVENTS", 30)),
             "target_edge_cents": _num("LIP_GO_TARGET_EDGE_CENTS", 0.5),
             "reward_haircut": min(1.0, max(0.0, _num("LIP_GO_REWARD_HAIRCUT", 0.5))),
-            "min_frozen_days": _num("LIP_GO_MIN_FROZEN_DAYS", 3.0)}
+            "min_frozen_days": _num("LIP_GO_MIN_FROZEN_DAYS", 3.0),
+            "min_se_cents": max(0.0, _num("LIP_GO_MIN_SE_CENTS", 0.05))}
 
 
 def event_stats(events: dict) -> dict:
@@ -78,27 +79,34 @@ def event_stats(events: dict) -> dict:
     ``events``: event -> [fills, contracts, usd] (usd = sum of the fills'
     5-minute markouts in dollars). Each event contributes its contract-weighted
     mean in cents per contract; events are then equally weighted (the unit of
-    independence). Events with no contracts are ignored."""
-    means = [row[2] * 100.0 / row[1] for row in events.values() if row[1] > 0]
+    independence) for the interval. ``pooled_cents`` is the contract-weighted
+    mean over all events (what the money does): the verdict requires it to be
+    positive too, because event weights can hide a loss on the big events.
+    Events with no contracts are ignored."""
+    rows = [row for row in events.values() if row[1] > 0]
+    means = [row[2] * 100.0 / row[1] for row in rows]
     k = len(means)
-    fills = int(sum(row[0] for row in events.values() if row[1] > 0))
+    fills = int(sum(row[0] for row in rows))
     if k == 0:
         return {"events": 0, "fills": 0, "mean_cents": None, "sd_cents": None,
-                "se_cents": None, "lower_90_cents": None}
+                "se_cents": None, "lower_90_cents": None, "pooled_cents": None}
     mean = sum(means) / k
+    pooled = sum(row[2] for row in rows) * 100.0 / sum(row[1] for row in rows)
     if k < 2:
         return {"events": k, "fills": fills, "mean_cents": mean, "sd_cents": None,
-                "se_cents": None, "lower_90_cents": None}
+                "se_cents": None, "lower_90_cents": None, "pooled_cents": pooled}
     var = sum((m - mean) ** 2 for m in means) / (k - 1)
     sd = math.sqrt(var)
     se = sd / math.sqrt(k)
     return {"events": k, "fills": fills, "mean_cents": mean, "sd_cents": sd, "se_cents": se,
-            "lower_90_cents": mean - t_crit_90(k - 1) * se}
+            "lower_90_cents": mean - t_crit_90(k - 1) * se, "pooled_cents": pooled}
 
 
 def events_needed(sd_cents: float | None, target_edge_cents: float) -> int | None:
     """Independent events for 80% power at one-sided alpha 5% to detect
-    ``target_edge_cents`` given the observed event-level SD (planning number)."""
+    ``target_edge_cents`` given the observed event-level SD (planning number;
+    the verdict itself uses a one-sided 90% bound, so this is a little more
+    demanding than the verdict's alpha)."""
     if not sd_cents or target_edge_cents <= 0:
         return None
     return int(math.ceil(((Z_ALPHA_ONE_SIDED_5 + Z_POWER_80) * sd_cents / target_edge_cents) ** 2))
@@ -110,8 +118,11 @@ def verdict(stats: dict, *, reward_cents_per_contract: float, frozen_days: float
 
     edge per contract = markout + (1 - haircut) x reward per contract (the
     reward is an estimate, never paid money, hence the haircut). GO needs the
-    one-sided 90% LOWER bound of that edge > 0 on >= min_events independent
-    events and a parameter set unchanged for >= min_frozen_days. NO_GO when
+    one-sided 90% (alpha 10%) LOWER bound of that edge > 0 on >= min_events
+    independent events, the contract-weighted (pooled) edge > 0 as well, and a
+    parameter set unchanged for >= min_frozen_days. The standard error is
+    floored at ``min_se_cents`` so a handful of identical events cannot give a
+    zero-width interval. NO_GO when
     the UPPER side cannot reach 0 either (mean + t x SE <= 0) on enough
     events; otherwise INSUFFICIENT (keep collecting; ``events_needed`` says
     how much)."""
@@ -127,7 +138,11 @@ def verdict(stats: dict, *, reward_cents_per_contract: float, frozen_days: float
                     edge_mean_cents=None if mean is None else round(mean + reward, 4))
     edge_mean = mean + reward
     t = t_crit_90(k - 1)
+    se = max(float(se), float(cfg.get("min_se_cents", 0.0)))
     lower, upper = edge_mean - t * se, edge_mean + t * se
+    pooled = stats.get("pooled_cents")
+    pooled_edge = None if pooled is None else pooled + reward
+    out["edge_pooled_cents"] = None if pooled_edge is None else round(pooled_edge, 4)
     out.update({"edge_mean_cents": round(edge_mean, 4), "edge_lower_90_cents": round(lower, 4),
                 "edge_upper_90_cents": round(upper, 4)})
     if k < cfg["min_events"]:
@@ -135,6 +150,8 @@ def verdict(stats: dict, *, reward_cents_per_contract: float, frozen_days: float
     if frozen_days < cfg["min_frozen_days"]:
         return dict(out, verdict="INSUFFICIENT", why="parameters_not_frozen")
     if lower > 0:
+        if pooled_edge is not None and pooled_edge <= 0:
+            return dict(out, verdict="INSUFFICIENT", why="contract_weighted_edge_not_positive")
         return dict(out, verdict="GO", why="lower_bound_positive")
     if upper <= 0:
         return dict(out, verdict="NO_GO", why="upper_bound_not_positive")
@@ -155,7 +172,10 @@ def fingerprint(environ: dict | None = None) -> tuple[str, dict]:
 
 
 def note_params(history: list, now: float, environ: dict | None = None) -> bool:
-    """Append {fp, ts} to ``history`` when the fingerprint changed. True if it did."""
+    """Append {fp, ts} to ``history`` when the fingerprint changed. True if it did.
+
+    The history records CHANGES (an A/B/A switch counts three times), capped at the
+    last 200; it is not a count of distinct parameter sets and does not enter the verdict."""
     fp, _params = fingerprint(environ)
     if history and history[-1].get("fp") == fp:
         return False

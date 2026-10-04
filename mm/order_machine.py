@@ -17,6 +17,9 @@ from mm.types import (
 )
 
 
+_DEAD_STATUS = ("canceled", "cancelled", "expired", "rejected")
+
+
 class IllegalTransition(RuntimeError):
     pass
 
@@ -79,16 +82,22 @@ class OrderBook:
             return order
 
     def reconcile(self, venue_orders: list[VenueOrderView], *,
-                  ts: float) -> ReconcileReport:
+                  ts: float, keep_pending_after: float | None = None) -> ReconcileReport:
         """Make the local book match the venue. Venue wins.
 
         Orders in a terminal local state are left alone. Live orders the
         venue does not list are marked cancelled. Venue orders we have never
         seen are adopted as RESTING with state UNKNOWN origin (client id
         kept when the venue echoes it).
+
+        ``keep_pending_after``: a PENDING_NEW order the venue does not list yet
+        and that was updated at or after this time is left as it is (the venue
+        may simply not show a just-sent order yet); one older is REJECTED.
+        Venue rows that are cancelled/expired are treated as absent.
         """
         report = ReconcileReport()
         with self._lock:
+            venue_orders = [v for v in venue_orders if str(v.status).lower() not in _DEAD_STATUS]
             by_venue = {v.order_id: v for v in venue_orders if v.order_id}
             by_client_echo = {
                 v.client_order_id: v for v in venue_orders if v.client_order_id
@@ -104,6 +113,10 @@ class OrderBook:
                 elif coid in by_client_echo:
                     view = by_client_echo[coid]
                 if view is None:
+                    if (order.state == OrderState.PENDING_NEW and keep_pending_after is not None
+                            and float(order.updated_ts or 0.0) >= keep_pending_after):
+                        report.unchanged.append(coid)
+                        continue
                     if order.state == OrderState.PENDING_NEW:
                         order.state = OrderState.REJECTED
                     else:

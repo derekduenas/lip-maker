@@ -149,11 +149,13 @@ None of this arms anything or changes `policy.conf`. Enable knobs one at a time 
 
 **Selection (opt-in):** `LIP_EMPIRICAL_MARKOUT_ENABLE` (selection blends each series' measured 5-minute markout into its adverse-selection cost after 5 fills; keep OFF while the Oct 10 evaluation runs, because it makes the policy adapt to the fills being judged), `LIP_ACTIVITY_MIN_VOL` (suggested 20: drop known-dead markets), `LIP_MIN_SIDE_PRICE_CENTS` (suggested 10 only if `state_markout_report` shows the <10 bucket adverse), `LIP_EXCLUDE_NEWS_CATEGORIES`, `LIP_CARRY_APY_OFFSET` (net the interest Kalshi pays on cash/collateral; verify the rate first).
 
-**Adverse selection and exits (opt-in):** `LIP_AS_GUARD_ENABLE` (+ `LIP_AS_MIN_OBS` 3, `LIP_AS_WIDEN_CENTS` 1, `LIP_AS_PULL_CENTS` 3, `LIP_AS_TOXIC_COOLDOWN_S` 600, `LIP_AS_BURST_*`, `LIP_AS_GUARD_SAMPLE` to include the sampling group, which is exempt by default). `LIP_EXITS_ENABLE` (+ `LIP_COMP_EWMA_ALPHA` 0.3, `LIP_EXIT_COMP_REL`, `LIP_EXIT_COOLDOWN_S` 3600). `/status adverse_guard`.
+**Adverse selection and exits (opt-in):** `LIP_AS_GUARD_ENABLE` (+ `LIP_AS_MIN_OBS` 3, `LIP_AS_WIDEN_CENTS` 1, `LIP_AS_PULL_CENTS` 3, `LIP_AS_TOXIC_COOLDOWN_S` 600, `LIP_AS_BURST_*`, `LIP_AS_GUARD_SAMPLE` to include the sampling group, which is exempt by default). `LIP_EXITS_ENABLE` (also turns on incumbent rank hysteresis in selection, not only exits; + `LIP_COMP_EWMA_ALPHA` 0.3, `LIP_EXIT_COMP_REL`, `LIP_EXIT_COOLDOWN_S` 3600). `/status adverse_guard`.
 
 **Inventory (opt-in):** `LIP_RESERVATION_ENABLE` (Avellaneda-Stoikov shift instead of the linear tick skew; `LIP_RES_GAMMA` 0.04, `LIP_RES_HORIZON_H` 6, `LIP_RES_MAX_SKEW` 3, `LIP_RES_SIGMA_DEFAULT_CENTS` 5; needs `LIP_SKEW_*` caps as before), `LIP_INV_MAX_AGE_H` (aged unpaired inventory becomes reduce-only; `LIP_INV_AGED_FRAC` 1.0). `/status skew.reservation`, `skew.inventory_age`.
 
-**Clock skew (opt-in):** `LIP_SKEW_OFFSET_AWARE` (baseline = 1 h minimum lag after a 10 min warm-up; `LIP_SKEW_OFFSET_WINDOW_S`, `LIP_SKEW_OFFSET_WARMUP_S`, `LIP_SKEW_SHIFT_S` 2), `LIP_CHRONY_STATUS` (cached `chronyc tracking` in `/status feed.clock_sync`).
+**Go/no-go and reward reconciliation:** `LIP_GO_MIN_SE_CENTS` 0.05 (floor on the standard error), `LIP_RECON_LAG_S` 259200 (an estimate younger than this is not yet due a credit). The measured haircut only ever tightens `LIP_GO_REWARD_HAIRCUT`.
+
+**Clock skew (opt-in):** `LIP_SKEW_OFFSET_AWARE` (baseline = 1 h minimum lag after a 10 min warm-up; `LIP_SKEW_OFFSET_WINDOW_S`, `LIP_SKEW_OFFSET_WARMUP_S`, `LIP_SKEW_SHIFT_S` 2, `LIP_SKEW_OFFSET_MAX_S` 5 = the most offset ever absorbed, `LIP_SKEW_OFFSET_GAP_S` 300 = a feed gap restarts the warm-up), `LIP_CHRONY_STATUS` (cached `chronyc tracking` in `/status feed.clock_sync`).
 
 **Simulator band:** `LIP_SIM_QUEUE_MODEL` (depletion default | risk_averse | prob_power), `LIP_SIM_QUEUE_POWER`, `LIP_SIM_CANCEL_LATENCY_MS`; `python -m mm.replay bench --queue-band`. See `docs/SIMULATOR_VALIDATION.md`.
 

@@ -36,8 +36,10 @@ class ChronyProbe:
     second. ``runner(cmd, timeout)`` returns the command's stdout (injectable
     for tests)."""
 
-    def __init__(self, runner=None, clock=None, ttl_s: float = 30.0) -> None:
+    def __init__(self, runner=None, clock=None, ttl_s: float = 30.0, background: bool = False) -> None:
         import time as _time
+        self.background = bool(background)
+        self._thread = None
         self._runner = runner or self._run
         self._clock = clock or _time.time
         self.ttl_s = float(ttl_s)
@@ -50,11 +52,24 @@ class ChronyProbe:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True).stdout
 
     def read(self) -> dict:
-        import re
         now = self._clock()
         if self._at is not None and now - self._at < self.ttl_s:
             return self._last
+        if self.background:
+            # Never block the caller (the engine reads this under its lock): refresh on a thread
+            # and return the last value meanwhile.
+            import threading
+            if self._thread is None or not self._thread.is_alive():
+                self._at = now
+                self._thread = threading.Thread(target=self._refresh, args=(now,), name="lip-chrony", daemon=True)
+                self._thread.start()
+            return self._last
         self._at = now
+        self._refresh(now)
+        return self._last
+
+    def _refresh(self, now) -> None:
+        import re
         try:
             text = self._runner(["chronyc", "tracking"], 3.0)
             m = re.search(r"System time\s*:\s*([0-9.]+)\s+seconds\s+(fast|slow)", str(text))
@@ -65,7 +80,6 @@ class ChronyProbe:
                 self._last = {"offset_s": val, "error": None, "ts": now}
         except Exception as exc:  # chronyc missing, timeout, non-zero exit
             self._last = {"offset_s": None, "error": f"{type(exc).__name__}: {str(exc)[:80]}", "ts": now}
-        return self._last
 
 
 def redact(text: str) -> str:

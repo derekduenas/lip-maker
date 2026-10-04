@@ -137,7 +137,7 @@ def test_status_carries_the_reconciliation():
     assert "rewards_reconciliation" in status_payload(lp.live_snapshot())
 
 
-def test_go_no_go_uses_the_measured_haircut_only_when_enough_data():
+def test_go_no_go_measured_haircut_only_tightens_the_operators_and_needs_enough_data():
     lp = newloop(bankroll=1500.0)
     assert lp.series_gate_report()["go_no_go"]["verdict"]["criteria"]["reward_haircut"] == 0.5
     for i in range(12):                       # 12 matched periods over 4 distinct days, paid 70% of estimate
@@ -145,9 +145,15 @@ def test_go_no_go_uses_the_measured_haircut_only_when_enough_data():
         lp.period_estimates.append(_est(f"M{i}", f"p{i}", "1.00", start=day))
         lp.ledger.append(dict(_credit(f"M{i}", f"p{i}", "0.70", start=day), entry_id=f"e{i}"))
     gn = lp.series_gate_report()["go_no_go"]
-    assert gn["verdict"]["criteria"]["reward_haircut"] == pytest.approx(0.3)
-    assert gn["haircut_source"] == "measured paid/estimated ratio"
+    # measured 0.3 would LOOSEN the operator's 0.5: never allowed
+    assert gn["verdict"]["criteria"]["reward_haircut"] == pytest.approx(0.5)
     assert lp.rewards_reconciliation()["haircut_recommendation"] == pytest.approx(0.3)
+    lp.ledger.clear()                         # now they were paid only 20%: tighter than the operator's, so it applies
+    for i in range(12):
+        day = f"2026-10-0{1 + i % 4}"
+        lp.ledger.append(dict(_credit(f"M{i}", f"p{i}", "0.20", start=day), entry_id=f"f{i}"))
+    gn = lp.series_gate_report()["go_no_go"]
+    assert gn["verdict"]["criteria"]["reward_haircut"] == pytest.approx(0.8)
 
 
 def test_finish_matches_credits_by_the_real_program_id():
