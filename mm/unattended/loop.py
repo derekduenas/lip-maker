@@ -61,6 +61,13 @@ FILL_MARKS_KEEP = 500
 MARKOUT_GRACE_S = 30.0
 # Events kept in the persisted 5-minute markout accumulator (oldest dropped).
 EVENT_ACC_KEEP = 3000
+PRICE_BUCKETS = ("<10", "10-30", "30-70", "70-90", ">=90")
+
+
+def price_bucket(price_cents: float) -> str:
+    """Fill-price bucket (cents) for the markout-by-price report."""
+    p = float(price_cents)
+    return "<10" if p < 10 else "10-30" if p < 30 else "30-70" if p < 70 else "70-90" if p < 90 else ">=90"
 
 
 def _flag(env: dict, name: str, default: str) -> bool:
@@ -434,6 +441,10 @@ class RunLoop:
         # parameter set seen [{fp, ts}] (trials; the frozen window restarts
         # at the last change).
         self.event_acc: dict[str, list] = {}
+        # Measured 5-minute markout by fill-price bucket (measurement only):
+        # bucket -> [fills, contracts, usd]. Published studies find sub-10c
+        # contracts lose most; this is OUR data for that question.
+        self.price_acc: dict[str, list] = {}
         self.param_history: list = []
         self._params_noted = False
         # Phase 4: multi-horizon fill markouts (measurement only).
@@ -1103,6 +1114,13 @@ class RunLoop:
                              "verdict": go_no_go.verdict(stats, reward_cents_per_contract=reward_cents,
                                                          frozen_days=frozen),
                              "reward_cents_per_measured_contract": round(reward_cents, 4),
+                             "markout_by_price_bucket": {
+                                 b: {"fills": int(self.price_acc.get(b, [0, 0.0, 0.0])[0]),
+                                     "contracts": round(float(self.price_acc.get(b, [0, 0.0, 0.0])[1]), 4),
+                                     "cents_per_contract": (
+                                         None if self.price_acc.get(b, [0, 0.0, 0.0])[1] <= 0 else round(
+                                             self.price_acc[b][2] * 100.0 / self.price_acc[b][1], 4))}
+                                 for b in PRICE_BUCKETS},
                              "trials": len(self.param_history), "params_fingerprint": fp,
                              "frozen_days": round(frozen, 3)}}
 
@@ -1499,6 +1517,7 @@ class RunLoop:
             "fill_marks": self.fill_marks[-FILL_MARKS_KEEP:],
             "series_acc": self.series_acc,
             "event_acc": self.event_acc, "param_history": self.param_history,
+            "price_acc": self.price_acc,
         }
 
     def _restore_checkpoint_counters(self, data: dict) -> None:
@@ -1562,6 +1581,15 @@ class RunLoop:
                 continue
         if "event_acc" in data:
             self.event_acc = ev
+        pa = {}
+        raw_pa = data.get("price_acc")
+        for bucket, r in (raw_pa.items() if isinstance(raw_pa, dict) else []):
+            try:
+                pa[str(bucket)] = [int(r[0]), float(r[1]), float(r[2])]
+            except (IndexError, KeyError, TypeError, ValueError):
+                continue
+        if "price_acc" in data:
+            self.price_acc = pa
         hist = []
         raw_h = data.get("param_history")
         for h in (raw_h if isinstance(raw_h, list) else []):
@@ -2717,6 +2745,11 @@ class RunLoop:
                                 row[0] += 1
                                 row[1] += float(mark["count"])
                                 row[2] += mark[key]
+                                prow = self.price_acc.setdefault(price_bucket(float(mark["price_cents"])),
+                                                                 [0, 0.0, 0.0])
+                                prow[0] += 1
+                                prow[1] += float(mark["count"])
+                                prow[2] += mark[key]
                                 if len(self.event_acc) > EVENT_ACC_KEEP:
                                     for k in list(self.event_acc)[: len(self.event_acc) - EVENT_ACC_KEEP]:
                                         del self.event_acc[k]

@@ -834,3 +834,22 @@ def test_event_markouts_survive_a_restart(monkeypatch, tmp_path):
     lp2 = newloop(bankroll=1500.0)
     lp2.attach_state(str(tmp_path / "state.json"))
     assert lp2.event_acc == lp.event_acc
+
+
+# ------------------------------------------------- 13. markout by fill-price bucket (measurement only)
+def test_price_bucket_edges():
+    assert [L.price_bucket(p) for p in (1, 9.9, 10, 29, 30, 69, 70, 89, 90, 99)] == [
+        "<10", "<10", "10-30", "10-30", "30-70", "30-70", "70-90", "70-90", ">=90", ">=90"]
+
+
+def test_markout_by_price_bucket_is_accumulated_reported_and_persisted(monkeypatch, tmp_path):
+    lp = _campaign(monkeypatch, tmp_path / "state.json")      # one 10-lot fill at 44c
+    row = lp.price_acc["30-70"]
+    assert row[0] == 1 and row[1] == pytest.approx(10.0)
+    rep = lp.series_gate_report()["go_no_go"]["markout_by_price_bucket"]
+    assert rep["30-70"]["fills"] == 1 and rep["30-70"]["cents_per_contract"] is not None
+    assert rep["<10"]["fills"] == 0 and rep["<10"]["cents_per_contract"] is None
+    lp.save_state(force=True)
+    lp2 = newloop(bankroll=1500.0)
+    lp2.attach_state(str(tmp_path / "state.json"))
+    assert lp2.price_acc == lp.price_acc
