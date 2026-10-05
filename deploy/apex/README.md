@@ -153,6 +153,8 @@ None of this arms anything or changes `policy.conf`. Enable knobs one at a time 
 
 **Inventory (opt-in):** `LIP_RESERVATION_ENABLE` (Avellaneda-Stoikov shift instead of the linear tick skew; `LIP_RES_GAMMA` 0.04, `LIP_RES_HORIZON_H` 6, `LIP_RES_MAX_SKEW` 3, `LIP_RES_SIGMA_DEFAULT_CENTS` 5; needs `LIP_SKEW_*` caps as before), `LIP_INV_MAX_AGE_H` (aged unpaired inventory becomes reduce-only; `LIP_INV_AGED_FRAC` 1.0). `/status skew.reservation`, `skew.inventory_age`.
 
+**Capital:** `LIP_PAIR_RELEASE` (1 = a YES+NO pair frees its cost at once, as netted Kalshi positions do; unverified assumption, shown in `/status series_gate.go_no_go.assumptions`), `LIP_STARVED_BELOW_USD` 10 and `LIP_STARVED_ALERT_S` 900 (a WARNING alert when the Kalshi budget stays below that). `/status capital` shows budget, locked paired/unpaired and a hint; `python tools/perf_summary.py` prints the whole scorecard.
+
 **Go/no-go and reward reconciliation:** `LIP_GO_MIN_SE_CENTS` 0.05 (floor on the standard error), `LIP_RECON_LAG_S` 259200 (an estimate younger than this is not yet due a credit). The measured haircut only ever tightens `LIP_GO_REWARD_HAIRCUT`.
 
 **Clock skew (opt-in):** `LIP_SKEW_OFFSET_AWARE` (baseline = 1 h minimum lag after a 10 min warm-up; `LIP_SKEW_OFFSET_WINDOW_S`, `LIP_SKEW_OFFSET_WARMUP_S`, `LIP_SKEW_SHIFT_S` 2, `LIP_SKEW_OFFSET_MAX_S` 5 = the most offset ever absorbed, `LIP_SKEW_OFFSET_GAP_S` 300 = a feed gap restarts the warm-up), `LIP_CHRONY_STATUS` (cached `chronyc tracking` in `/status feed.clock_sync`).

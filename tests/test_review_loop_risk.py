@@ -51,7 +51,8 @@ def test_filled_inventory_counts_in_risk_caps_and_budgets():
     assert not d.allowed and d.reason.startswith("per_market")
 
 
-def test_paired_inventory_is_locked_capital():
+def test_paired_inventory_is_locked_capital(monkeypatch):
+    monkeypatch.setenv("LIP_PAIR_RELEASE", "0")      # the deployed policy opts in to pair release; this is the old model
     lp = newloop()
     lp.on_frame(program(M))
     lp.position[M] = {"yes": 100.0, "no": 100.0, "yes_cost": 45.0, "no_cost": 50.0, "fees": 0.0,

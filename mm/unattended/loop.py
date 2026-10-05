@@ -328,6 +328,8 @@ class RunLoop:
         self._compact_at: float = 0.0
         self.cap_skips: list[dict] = []
         self.alloc_budget_usd: float | None = None
+        self._starved_since: float | None = None
+        self._starved_alerted = False
         self.kill = None
         self.now = 0.0
         self.socket_opened = False
@@ -1437,6 +1439,7 @@ class RunLoop:
                                             for k, v in stats.items()},
                              "verdict": go_no_go.verdict(stats, reward_cents_per_contract=reward_cents,
                                                          frozen_days=frozen, cfg=gcfg),
+                             "assumptions": {"pair_release": _env_num("LIP_PAIR_RELEASE", 0.0) > 0},
                              "haircut_source": (
                                  "operator setting (measured paid/due-estimate ratio is looser: not applied)"
                                  if measured_haircut is not None and measured_haircut < float(go_no_go.config()["reward_haircut"])
@@ -1765,6 +1768,11 @@ class RunLoop:
         pos = self.position.get(market)
         if not pos or market in self.settled or market in self.unresolved:
             return Decimal(0)
+        if _env_num("LIP_PAIR_RELEASE", 0.0) > 0:
+            # OPT-IN: a YES+NO pair is worth exactly $1 and (Kalshi positions are netted per
+            # market) returns that cash at once, so only the UNPAIRED cost is capital at risk.
+            # Unverified against Kalshi's docs: disclosed in the go/no-go report assumptions.
+            return Decimal(str(round(self._unpaired_usd(market), 6)))
         return Decimal(str(round(float(pos["yes_cost"]) + float(pos["no_cost"]), 6)))
 
     def _sync_inventory(self, market: str) -> None:
@@ -1779,6 +1787,52 @@ class RunLoop:
         self.risk.market_usd[market] = Decimal(str(self.risk.market_usd.get(market, 0))) + delta
         self.risk.venue_usd[venue] = Decimal(str(self.risk.venue_usd.get(venue, 0))) + delta
         self.inv_committed[market] = new
+
+    def capital_report(self) -> dict:
+        """Where the Kalshi capital is: budget left, locked inventory (paired vs unpaired), and
+        whether the engine is capital-starved (nothing left to quote with). An engine that is
+        starved earns no rewards and collects no fills, so this is surfaced, not hidden."""
+        lim = self.risk.limits
+        cap = float(lim.per_venue_usd) * alloc_cap_fraction()
+        budget = float(self.venue_budgets().get("kalshi", 0.0))
+        locked = float(self.locked_usd().get("kalshi", 0.0))
+        cost, unpaired = 0.0, 0.0
+        for market, pos in self.position.items():
+            if (pos.get("venue") or self._venue(market)) != "kalshi" or market in self.settled or market in self.unresolved:
+                continue
+            cost += float(pos["yes_cost"]) + float(pos["no_cost"])
+            unpaired += self._unpaired_usd(market)
+        paired_cost = max(0.0, cost - unpaired)
+        release = _env_num("LIP_PAIR_RELEASE", 0.0) > 0
+        starved = budget < _env_num("LIP_STARVED_BELOW_USD", 10.0)
+        hint = ""
+        if starved:
+            hint = ("paired YES+NO inventory is locking capital until settlement; pair release "
+                    "(LIP_PAIR_RELEASE=1) frees it if Kalshi nets pairs (verify first)"
+                    if (paired_cost > 0.5 * max(locked, 1e-9) and not release)
+                    else "inventory fills the venue cap: quoting stops until it settles or is reduced")
+        return {"starved": starved, "pair_release": release, "hint": hint,
+                "starved_since": self._starved_since,
+                "kalshi": {"cap_usd": round(cap, 2), "budget_usd": round(budget, 2), "locked_usd": round(locked, 2),
+                           "locked_paired_usd": round(paired_cost if not release else 0.0, 2),
+                           "locked_unpaired_usd": round(unpaired, 2), "paired_cost_usd": round(paired_cost, 2)}}
+
+    def _note_starvation(self, ts: float) -> None:
+        """Track how long the Kalshi budget has been (nearly) zero and alert once per episode."""
+        starved = float(self.venue_budgets().get("kalshi", 0.0)) < _env_num("LIP_STARVED_BELOW_USD", 10.0)
+        if not starved:
+            self._starved_since = None
+            self._starved_alerted = False
+            return
+        if self._starved_since is None:
+            self._starved_since = float(ts)
+            return
+        if not self._starved_alerted and ts - self._starved_since >= _env_num("LIP_STARVED_ALERT_S", 900.0):
+            self._starved_alerted = True
+            rep = self.capital_report()
+            self._alert("WARNING", f"capital starved for {(ts - self._starved_since) / 60:.0f} min: Kalshi budget "
+                                   f"${rep['kalshi']['budget_usd']:.2f} of ${rep['kalshi']['cap_usd']:.0f}, "
+                                   f"${rep['kalshi']['locked_usd']:.0f} locked in inventory. {rep['hint']}")
 
     def locked_usd(self) -> dict:
         """Inventory capital per venue (see ``_inv_exposure_usd``)."""
@@ -3484,6 +3538,7 @@ class RunLoop:
         budget = sum(venue_budget.values())
         self.alloc_budget_usd = budget
         self.venue_budget = venue_budget
+        self._note_starvation(ts)
         # allocate/optimize_sizes are economics + eligibility passes here. Their
         # own cash pool must not bind, or their raw (unpenalized) $/day greedy
         # truncates the list before the markout-penalized rank pass below,
@@ -4177,6 +4232,7 @@ class RunLoop:
             "suspect_n": sum(1 for row in selected if row["suspect"]),
             "paper_capital_usd": round(float(sum(self.committed.values(), Decimal(0))), 2),
             "alloc_budget_usd": None if self.alloc_budget_usd is None else round(self.alloc_budget_usd, 2),
+            "capital": self.capital_report(),
             "bankroll_usd": self.bankroll,
             "risk_limits": {
                 "per_market_usd": float(self.risk.limits.per_market_usd),
