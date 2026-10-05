@@ -502,6 +502,9 @@ class RunLoop:
         # parameter set seen [{fp, ts}] (trials; the frozen window restarts
         # at the last change).
         self.event_acc: dict[str, list] = {}
+        # Same 5-minute markout table split by where the fill came from: the sampling group (built to
+        # collect fills) vs reward quoting (what would run live). {"sample"|"reward": {event: [n, contracts, usd]}}
+        self.group_event_acc: dict[str, dict] = {"sample": {}, "reward": {}}
         # Measured 5-minute markout by fill-price bucket (measurement only):
         # bucket -> [fills, contracts, usd]. Published studies find sub-10c
         # contracts lose most; this is OUR data for that question.
@@ -1427,6 +1430,12 @@ class RunLoop:
                        if float(a.get("mk5_contracts") or 0.0) > 0}
         measured = sum(measured_by.values())
         reward_cents = (sum(rewards.get(s, 0.0) for s in measured_by) * 100.0 / measured) if measured > 0 else 0.0
+        by_group = {}
+        for gname in ("sample", "reward"):
+            gst = go_no_go.event_stats(self.group_event_acc.get(gname, {}))
+            by_group[gname] = {"statistics": gst,
+                               "verdict": go_no_go.verdict(gst, reward_cents_per_contract=(reward_cents if gname == "reward" else 0.0),
+                                                           frozen_days=go_no_go.frozen_days(self.param_history, now), cfg=gcfg)}
         fp, _params = go_no_go.fingerprint()
         frozen = go_no_go.frozen_days(self.param_history, now)
         return {"label": "estimate (paper): rewards are not paid money; Oct 10 go/no-go inputs",
@@ -1439,6 +1448,10 @@ class RunLoop:
                                             for k, v in stats.items()},
                              "verdict": go_no_go.verdict(stats, reward_cents_per_contract=reward_cents,
                                                          frozen_days=frozen, cfg=gcfg),
+                             "by_group": by_group,
+                             "headline_note": ("the headline verdict pools sampling-group and reward-quoting fills; "
+                                               "by_group splits them (the sampling group is built to collect fills, "
+                                               "so no reward is credited to it)"),
                              "assumptions": {"pair_release": _env_num("LIP_PAIR_RELEASE", 0.0) > 0},
                              "haircut_source": (
                                  "operator setting (measured paid/due-estimate ratio is looser: not applied)"
@@ -1955,7 +1968,7 @@ class RunLoop:
             "campaign_start_ts": self.campaign_start_ts,
             "fill_marks": self.fill_marks[-FILL_MARKS_KEEP:],
             "series_acc": self.series_acc,
-            "event_acc": self.event_acc, "param_history": self.param_history,
+            "event_acc": self.event_acc, "group_event_acc": self.group_event_acc, "param_history": self.param_history,
             "price_acc": self.price_acc, "price_event_acc": self.price_event_acc,
             "reward_ledger": self.ledger[-5000:], "period_estimates": self.period_estimates,
             "mk_ewma": self.mk_ewma, "entry_state": self.entry_state, "comp_ewma": self.comp_ewma,
@@ -2023,6 +2036,17 @@ class RunLoop:
                 continue
         if "event_acc" in data:
             self.event_acc = ev
+        grp = {"sample": {}, "reward": {}}
+        raw_g = data.get("group_event_acc")
+        for name in ("sample", "reward"):
+            sub = raw_g.get(name) if isinstance(raw_g, dict) else None
+            for event, r in (sub.items() if isinstance(sub, dict) else []):
+                try:
+                    grp[name][str(event)] = [int(_fin(r[0])), _fin(r[1]), _fin(r[2])]
+                except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+                    continue
+        if "group_event_acc" in data:
+            self.group_event_acc = grp
         pa = {}
         raw_pa = data.get("price_acc")
         for bucket, r in (raw_pa.items() if isinstance(raw_pa, dict) else []):
@@ -2695,7 +2719,7 @@ class RunLoop:
             "market": market, "side": side, "price_cents": price, "count": count, "ts": ts,
             "mid0": mid, "venue": self._venue(market), "bucket": (getattr(self, "bucket_of", {}) or {}).get(market),
             "markout_60s": None, "markout_300s": None, "markout_1800s": None,
-            "synthetic": bool(fill.get("synthetic")),
+            "synthetic": bool(fill.get("synthetic")), "sample": market in self.sample_markets,
         })
         if len(self.fill_marks) > 2000:
             self.fill_marks = self.fill_marks[-2000:]
@@ -3328,6 +3352,11 @@ class RunLoop:
                                 row[0] += 1
                                 row[1] += float(mark["count"])
                                 row[2] += mark[key]
+                                grow = self.group_event_acc.setdefault("sample" if mark.get("sample") else "reward", {}) \
+                                    .setdefault(self._event_of(str(mark["market"])), [0, 0.0, 0.0])
+                                grow[0] += 1
+                                grow[1] += float(mark["count"])
+                                grow[2] += mark[key]
                                 prow = self.price_acc.setdefault(price_bucket(float(mark["price_cents"])),
                                                                  [0, 0.0, 0.0])
                                 prow[0] += 1
@@ -3339,6 +3368,10 @@ class RunLoop:
                                 if len(self.event_acc) > EVENT_ACC_KEEP:
                                     for k in list(self.event_acc)[: len(self.event_acc) - EVENT_ACC_KEEP]:
                                         del self.event_acc[k]
+                                for tbl in self.group_event_acc.values():
+                                    if len(tbl) > EVENT_ACC_KEEP:
+                                        for k in list(tbl)[: len(tbl) - EVENT_ACC_KEEP]:
+                                            del tbl[k]
                                 self._state_dirty = True
 
     def markout_summary(self) -> dict:

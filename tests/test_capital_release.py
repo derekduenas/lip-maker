@@ -94,3 +94,13 @@ def test_perf_summary_renders_a_status_dict_and_names_the_capital_problem():
     out = perf_summary.render(s)
     assert "STARVED" in out and "idle" in out.lower() and "92" in out
     assert perf_summary.render({}) and "STARVED" not in perf_summary.render({"mode": "paper"})
+
+
+def test_perf_summary_shows_the_group_split():
+    from tools import perf_summary
+    s = {"series_gate": {"go_no_go": {"verdict": {"verdict": "INSUFFICIENT", "why": "events"}, "statistics": {},
+                                      "by_group": {"sample": {"statistics": {"events": 9, "fills": 40, "mean_cents": 0.1, "pooled_cents": 0.2},
+                                                              "verdict": {"verdict": "INSUFFICIENT", "why": "events"}},
+                                                   "reward": {"statistics": {"events": 0, "fills": 0}, "verdict": {"verdict": "INSUFFICIENT", "why": "too_few_events"}}}}}}
+    out = perf_summary.render(s)
+    assert "group sample" in out and "group reward" in out and "9 events" in out

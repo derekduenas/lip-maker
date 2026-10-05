@@ -59,6 +59,10 @@ def render(s: dict) -> str:
                    f"{_f(v.get('edge_mean_cents'))}c, 90% lower {_f(v.get('edge_lower_90_cents'))}c, need ~{v.get('events_needed_for_target')} events; "
                    f"frozen {_f(v.get('frozen_days'), 1)}d of {_g(v, 'criteria', 'min_frozen_days')}d; "
                    f"pair release assumed: {_g(gn, 'assumptions', 'pair_release')}")
+    for gname, gv in (gn.get("by_group") or {}).items():
+        gs, gvv = gv.get("statistics") or {}, gv.get("verdict") or {}
+        out.append(f"  group {gname:7} {gs.get('events')} events, {gs.get('fills')} fills, 5m markout mean {_f(gs.get('mean_cents'))}c, "
+                   f"pooled {_f(gs.get('pooled_cents'))}c, verdict {gvv.get('verdict')} ({gvv.get('why')})")
     for name, r in sorted((_g(s, "series_gate", "series") or {}).items(), key=lambda kv: -float(kv[1].get("net_usd") or 0))[:12]:
         out.append(f"  {name[:22]:22} fills {r.get('settled_fills')}/{r.get('fills')}  net ${_f(r.get('net_usd'))}  "
                    f"reward ${_f(r.get('reward_usd'))}  markout ${_f(r.get('markout_5m_cost_usd'))}  go={r.get('go')} {r.get('why')}")
