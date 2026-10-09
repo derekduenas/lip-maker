@@ -310,18 +310,18 @@ def test_apex_deploy_import_check_does_not_depend_on_the_working_directory(tmp_p
     assert r.returncode == 0, r.stderr[-300:]
 
 
-def test_build_info_reads_the_deploy_written_commit_file_when_git_is_unusable(monkeypatch):
+def test_build_info_reads_the_deploy_written_commit_file_when_git_is_unusable(monkeypatch, tmp_path):
     """On the droplet the engine (user lip) could not run git in a root-owned checkout, so /status
-    said commit=unknown and verify_deploy failed."""
+    said commit=unknown and verify_deploy failed. Hermetic: a fake checkout root in tmp_path, so a
+    BUILD_COMMIT in the real working copy (deploy artefact, gitignored) neither breaks nor leaks in."""
     from mm.unattended import loop as L
-    f = ROOT / "BUILD_COMMIT"
-    assert not f.exists()
+    fake = tmp_path / "mm" / "unattended" / "loop.py"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("")
+    monkeypatch.setattr(L, "__file__", str(fake))
+    (tmp_path / "BUILD_COMMIT").write_text("a" * 40 + "\n")
     monkeypatch.delenv("LIP_BUILD_COMMIT", raising=False)
     monkeypatch.setattr(L, "_BUILD", {})
-    f.write_text("a" * 40 + "\n")
-    try:
-        monkeypatch.setattr("subprocess.run", lambda *a, **k: (_ for _ in ()).throw(OSError("dubious ownership")))
-        assert L.build_info()["commit"] == "a" * 40
-    finally:
-        f.unlink()
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: (_ for _ in ()).throw(OSError("dubious ownership")))
+    assert L.build_info()["commit"] == "a" * 40
     assert "BUILD_COMMIT" in (ROOT / "deploy" / "apex" / "deploy.sh").read_text()

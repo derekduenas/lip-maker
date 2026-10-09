@@ -185,6 +185,13 @@ done < "$APP/deploy/apex/watchdog.env.example"
 sed -i 's/^LIP_WD_LIVE_ARMED=.*/LIP_WD_LIVE_ARMED=false/' "$ENV_FILE"
 
 chown root:lip "$ENV_DIR" "$ENV_FILE"; chmod 0750 "$ENV_DIR"; chmod 0640 "$ENV_FILE"
+# Scheduled-event calendar (policy.conf LIP_EVENT_CALENDAR_FILE). Installed from the repo
+# copy only when absent, so operator edits on the box survive redeploys.
+CAL="$ENV_DIR/event_calendar.json"
+if [[ ! -f "$CAL" && -f "$APP/deploy/apex/event_calendar.apex.json" ]]; then
+  log "installing event calendar -> $CAL"
+  install -m 0640 -o root -g lip "$APP/deploy/apex/event_calendar.apex.json" "$CAL"
+fi
 for pem in "$ENV_DIR"/*.pem "$ENV_DIR"/*.key; do
   [[ -f "$pem" ]] || continue; chown root:lip "$pem"; chmod 0640 "$pem"
 done
