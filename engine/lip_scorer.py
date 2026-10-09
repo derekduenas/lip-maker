@@ -118,19 +118,44 @@ def _score_bids(
     reference_price: int,
     discount_factor: float,
     cutoff_price: int,
+    target_size: Optional[float] = None,
 ) -> tuple[float, float]:
     """Return (our_score, total_score) for one side.
 
     Scoring rule: for each bid level at price ≥ cutoff_price,
       level_score = DiscountFactor^(ReferencePrice - Price) × Size
-    Sum all levels to get total_score. Our levels separately to get our_score.
+
+    ``target_size`` (grok/lip-fixes-20261009, fix f): Kalshi scores only the
+    resting size that "helps reach Target" (help article 13823851). Levels
+    strictly better than the cutoff count in full; at the cutoff level only
+    the remainder ``target - size_above`` counts, shared pro rata across the
+    level (queue order inside a level is not public). Without ``target_size``
+    the old whole-level behaviour is kept (it overcounts the cutoff level and
+    therefore over-states both totals and our share of a deep cutoff level).
     """
     def level_score(price: int, size: float) -> float:
         distance_ticks = max(0, reference_price - price)  # non-negative since price ≤ reference
         return (discount_factor ** distance_ticks) * size
 
-    total = sum(level_score(l.price_cents, l.size) for l in all_bids if l.price_cents >= cutoff_price)
-    ours  = sum(level_score(l.price_cents, l.size) for l in our_bids if l.price_cents >= cutoff_price)
+    if target_size is None:
+        total = sum(level_score(l.price_cents, l.size) for l in all_bids if l.price_cents >= cutoff_price)
+        ours  = sum(level_score(l.price_cents, l.size) for l in our_bids if l.price_cents >= cutoff_price)
+        return ours, total
+
+    above = sum(l.size for l in all_bids if l.price_cents > cutoff_price)
+    at_cut = sum(l.size for l in all_bids if l.price_cents == cutoff_price)
+    remainder = max(0.0, float(target_size) - above)
+    frac_cut = min(1.0, remainder / at_cut) if at_cut > 0 else 0.0
+
+    def counted(price: int, size: float) -> float:
+        if price > cutoff_price:
+            return size
+        if price == cutoff_price:
+            return size * frac_cut
+        return 0.0
+
+    total = sum(level_score(l.price_cents, counted(l.price_cents, l.size)) for l in all_bids)
+    ours = sum(level_score(l.price_cents, counted(l.price_cents, l.size)) for l in our_bids)
     return ours, total
 
 
@@ -174,14 +199,14 @@ def score_snapshot(
 
     # Score yes-side
     ref_yes = _find_cutoff_price(book.yes_bids, target / 5)
-    our_yes, total_yes = _score_bids(book.yes_bids, ours.yes_bids, ref_yes, df, yes_cutoff)
+    our_yes, total_yes = _score_bids(book.yes_bids, ours.yes_bids, ref_yes, df, yes_cutoff, target)
     if total_yes > 0:
         result.our_yes_normalized = our_yes / total_yes
     result.yes_total_qualifying_score = total_yes
 
     # Score no-side
     ref_no = _find_cutoff_price(book.no_bids, target / 5)
-    our_no, total_no = _score_bids(book.no_bids, ours.no_bids, ref_no, df, no_cutoff)
+    our_no, total_no = _score_bids(book.no_bids, ours.no_bids, ref_no, df, no_cutoff, target)
     if total_no > 0:
         result.our_no_normalized = our_no / total_no
     result.no_total_qualifying_score = total_no

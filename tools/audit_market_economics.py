@@ -83,7 +83,7 @@ def side_report(name, bids, target, df, our_price, our_size):
     out["depth_excluded_below_cutoff"] = round(
         total_depth - sum(l.size for l in qual_levels), 2)
     ours = [BookLevel(int(our_price), float(our_size))] if our_size > 0 else []
-    our_score, total_score = _score_bids(bids, ours, ref, df, cutoff)
+    our_score, total_score = _score_bids(bids, ours, ref, df, cutoff, target)
     out["weighted_qualifying_depth"] = round(total_score, 4)
     out["weighting_note"] = (
         f"each level scores {df}^(reference {ref} - price) x size; "

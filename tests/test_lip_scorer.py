@@ -188,9 +188,26 @@ class TestSharedNormalization(unittest.TestCase):
         result = score_snapshot(book, ours, _params(target_size=100, discount_factor=0.5))
         self.assertTrue(result.snapshot_valid)
         self.assertEqual(result.yes_cutoff_price, 49)
-        self.assertAlmostEqual(result.our_yes_normalized, 0.5, places=5)
-        self.assertAlmostEqual(result.our_no_normalized, 0.5, places=5)
-        self.assertAlmostEqual(result.our_total_score, 1.0, places=5)
+        # Fix f: only the 50 lots that complete Target at 49c score.
+        # Total = 50 + 0.5 x 50 = 75; ours = 0.5 x 50 = 25 -> 1/3.
+        self.assertAlmostEqual(result.our_yes_normalized, 1 / 3, places=5)
+        self.assertAlmostEqual(result.our_no_normalized, 1 / 3, places=5)
+        self.assertAlmostEqual(result.our_total_score, 2 / 3, places=5)
+
+    def test_cutoff_level_counts_only_size_that_reaches_target(self):
+        # grok/lip-fixes-20261009 fix f (lip_scorer.py cutoff overcount):
+        # target 100, 80 lots above the cutoff, a 1000-lot cutoff level. Only
+        # 20 lots of the cutoff level help reach Target; the rest must not
+        # inflate the denominator. Our 100 lots there get 100/1000 of 20.
+        book = BookState(market_ticker="TEST")
+        book.yes_bids = [BookLevel(50, 80), BookLevel(48, 1000)]
+        book.no_bids = [BookLevel(50, 80), BookLevel(48, 1000)]
+        ours = OurQuotes(yes_bids=[BookLevel(48, 100)], no_bids=[BookLevel(48, 100)])
+        r = score_snapshot(book, ours, _params(target_size=100, discount_factor=0.5))
+        self.assertEqual(r.yes_cutoff_price, 48)
+        # ref = 50 (target/5 = 20 reached at 50). total = 80 + 0.25*20 = 85; ours = 0.25*2 = 0.5
+        self.assertAlmostEqual(r.yes_total_qualifying_score, 85.0, places=6)
+        self.assertAlmostEqual(r.our_yes_normalized, 0.5 / 85.0, places=6)
 
     def test_below_cutoff_returns_zero_share(self):
         # CRITICAL pin: if competitor at best alone meets target, our quote

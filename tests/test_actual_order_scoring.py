@@ -142,7 +142,8 @@ class TestActualOrderScoring:
         s = runner._score_market(book, params)
         assert s.is_resting
         assert s.result.our_yes_normalized == pytest.approx(30 / 60)
-        assert s.result.yes_total_qualifying_score == pytest.approx(60)
+        # Only size up to Target (50) at the cutoff level scores (fix f).
+        assert s.result.yes_total_qualifying_score == pytest.approx(50)
         assert s.share == pytest.approx(30 / 60)
 
     def test_paper_mode_augments_shadow_orders(self, runner):
@@ -153,7 +154,8 @@ class TestActualOrderScoring:
         s = runner._score_market(book, params)
         assert s.is_resting
         assert s.result.our_yes_normalized == pytest.approx(30 / 90)
-        assert s.result.yes_total_qualifying_score == pytest.approx(90)
+        # Only size up to Target (50) at the cutoff level scores (fix f).
+        assert s.result.yes_total_qualifying_score == pytest.approx(50)
         assert s.share == pytest.approx(30 / 90)
 
     def test_augment_does_not_mutate_source_book(self, runner):
@@ -268,7 +270,8 @@ class TestRewardUnits:
         assert rows[2][5] == 0.0                                        # gap > max ⇒ nothing claimed
         assert all(r[6] == 1 for r in rows)                             # was_resting
         assert all(r[7] == pytest.approx(0.5) for r in rows)            # our_share
-        assert rows[1][0] == pytest.approx(30 + 30)                     # raw score units
+        # raw score units: our 30 of a 60-lot cutoff level, capped at Target 50 (fix f): 2 x 25
+        assert rows[1][0] == pytest.approx(25 + 25)
 
     def test_persist_zero_when_not_resting(self, runner, db):
         params = runner.params_by_ticker[TKR]
