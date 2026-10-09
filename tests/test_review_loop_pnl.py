@@ -18,12 +18,31 @@ M = "KXCPI-26OCT30-T3"
 POLICY = Path(__file__).resolve().parent.parent / "deploy/apex/lip-unattended.service.d/policy.conf"
 
 
-def apply_policy(monkeypatch):
-    """The deployed paper policy (policy.conf Environment= lines)."""
+GROK_MARK = "# grok/lip-fixes-20261009 (Derek approved"
+# Pre-fix values of the two lines grok/lip-fixes-20261009 edited in place.
+GROK_LEGACY = {"LIP_SAMPLE_ENABLE": "1", "LIP_PMUS_PAPER_ENABLE": "1"}
+
+
+def apply_policy(monkeypatch, grok: bool = False):
+    """The deployed paper policy (policy.conf Environment= lines).
+
+    ``grok=False`` (default) applies the policy as it was before
+    grok/lip-fixes-20261009: the many behaviour tests built on this fixture
+    pin the pre-fix behaviour, and the new flags are covered explicitly in
+    tests/test_grok_lip_fixes_20261009.py. ``grok=True`` applies the file as
+    deployed."""
+    in_grok = False
     for line in POLICY.read_text().splitlines():
+        if line.strip().startswith(GROK_MARK):
+            in_grok = True
         m = re.match(r"Environment=(\w+)=(.*)", line.strip())
         if m:
-            monkeypatch.setenv(m.group(1), m.group(2))
+            if in_grok and not grok:
+                continue
+            val = m.group(2)
+            if not grok and m.group(1) in GROK_LEGACY:
+                val = GROK_LEGACY[m.group(1)]
+            monkeypatch.setenv(m.group(1), val)
     for name in ("LIP_PMUS_PAPER_ENABLE", "LIP_FV_ENABLE", "LIP_RECORD_ENABLE"):
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("LIP_SELECTION_DUMP", "off")

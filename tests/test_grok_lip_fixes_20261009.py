@@ -276,3 +276,22 @@ def test_paper_only_interlock_is_unchanged():
     assert L.resolve_mode({"LIP_PAPER": "true"}) == "paper"
     with pytest.raises(Exception):
         L.resolve_mode({"LIP_PAPER": "false"})
+
+
+def test_deployed_policy_loads_and_quotes_only_outside_the_band(monkeypatch):
+    from pathlib import Path
+    from tests.test_review_loop_pnl import apply_policy
+    apply_policy(monkeypatch, grok=True)
+    root = Path(__file__).resolve().parent.parent
+    monkeypatch.setenv("LIP_EVENT_CALENDAR_FILE", str(root / "deploy/apex/event_calendar.apex.json"))
+    for k in ("LIP_FV_ENABLE", "LIP_PMUS_PAPER_ENABLE", "LIP_RECORD_ENABLE"):
+        monkeypatch.setenv(k, "0")
+    import os
+    assert os.environ["LIP_SAMPLE_ENABLE"] == "0" and os.environ["LIP_AVOID_BAND_HI"] == "90"
+    lp = newloop()
+    assert lp.calendar.error is None
+    lp.on_frame(program(M))
+    lp.on_frame(snap(M, T0, [(10, 2000), (9, 2000)], [(85, 2000), (84, 2000)]))
+    lp.on_frame({"type": "clock", "ts": T0 + 1})
+    assert lp._side_blocked(M, "no", T0 + 1) == "price_band"
+    assert lp._side_blocked(M, "yes", T0 + 1) == ""
