@@ -45,7 +45,10 @@ def test_closed_periods_of_ended_markets_fold_into_venue_bucket_aggregates():
     st = lp.live_snapshot(accrual={})
     assert st["closed_periods_n"] == 1
     assert st["closed_periods_raw_usd"] == pytest.approx(raw, abs=1e-6)
-    assert st["pnl_attribution"]["est_rewards_kalshi_usd"] == pytest.approx(raw, abs=1e-6)
+    # grok fix (a): the headline is payable (under $1 -> 0); gross is kept beside it.
+    assert st["pnl_attribution"]["est_rewards_gross_kalshi_usd"] == pytest.approx(raw, abs=1e-6)
+    assert st["pnl_attribution"]["est_rewards_kalshi_usd"] == 0
+    assert lp.closed_periods_payable_agg == {f"kalshi/{bucket}": 0.0}
     assert st["buckets"][bucket]["raw_est_usd"] == pytest.approx(raw, abs=1e-6)
 
 

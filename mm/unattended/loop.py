@@ -390,6 +390,25 @@ class RunLoop:
         # Closed periods of ended markets, folded per "venue/bucket" (bucket
         # "" when unknown) so the persisted map does not grow per market.
         self.closed_periods_agg: dict[str, float] = {}
+        # grok fix (a): PAYABLE twins of closed_periods / closed_periods_agg:
+        # each closed market-period's estimate after the $1/market-period
+        # floor and cent flooring (SecondAccrual.estimate().estimated_usd).
+        self.closed_periods_payable: dict[str, float] = {}
+        self.closed_periods_payable_agg: dict[str, float] = {}
+        self.payable_backfill: dict | None = None
+        # grok fix (c): executable (bid-side) books of held markets that have
+        # no live subscribed book, from read-only REST GET .../orderbook
+        # ("quote_mark" frames), and the last executable book seen for each
+        # held market (persisted so a restart does not fall back to mid).
+        self.exec_book: dict[str, dict] = {}
+        # grok fix (e): public-tape one-sided burst detector state.
+        self._tape: dict = {}
+        self.tape_bursts_n = 0
+        self.payable_select_stats: dict = {}
+        # grok fix (d): paper taker exits of unpaired inventory.
+        self.paper_exits: list[dict] = []
+        self.paper_exit_stats = {"n": 0, "contracts": 0.0, "proceeds_usd": 0.0, "fees_usd": 0.0,
+                                 "cost_usd": 0.0, "by_reason": {}}
         # Settled positions dropped after LIP_SETTLED_KEEP_DAYS: realized
         # markout (all positions) and per-bucket aggregates of their rows.
         self.realized_pruned_usd = 0.0
@@ -688,6 +707,9 @@ class RunLoop:
         if kind == "settlement":
             self.settle(str(row.get("market") or ""), str(row.get("result") or ""),
                         source=str(row.get("source") or "ws_lifecycle"))
+            return
+        if kind == "quote_mark":
+            self.note_quote_mark(row)
             return
         ts = float(row.get("ts") if row.get("ts") is not None else self.now)
         self.now = ts
@@ -1087,11 +1109,15 @@ class RunLoop:
         """Move an ended market's closed-period rewards into the
         ``venue/bucket`` aggregate (status totals unchanged)."""
         usd = self.closed_periods.pop(market, None)
-        if usd is None:
+        pay = self.closed_periods_payable.pop(market, None)
+        if usd is None and pay is None:
             return
         bucket = (getattr(self, "bucket_of", None) or {}).get(market) or ""
         key = f"{venue}/{bucket}"
-        self.closed_periods_agg[key] = self.closed_periods_agg.get(key, 0.0) + float(usd)
+        if usd is not None:
+            self.closed_periods_agg[key] = self.closed_periods_agg.get(key, 0.0) + float(usd)
+        if pay is not None:
+            self.closed_periods_payable_agg[key] = self.closed_periods_payable_agg.get(key, 0.0) + float(pay)
         self._state_dirty = True
 
     def _drop_settled(self, ts: float) -> None:
@@ -1379,14 +1405,26 @@ class RunLoop:
             cost = float(pos["yes_cost"]) + float(pos["no_cost"])
             value = 0.0 if mark is None else (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
             mtm[series_of(market)] = mtm.get(series_of(market), 0.0) + value - cost
+        # grok fix (a): go/no-go rewards are PAYABLE (after Kalshi's $1/market-
+        # period minimum): open windows' floored estimate + every recorded closed
+        # period's floored estimate (period_estimates rows). Gross kept beside it.
         rewards: dict[str, float] = {}
+        rewards_gross: dict[str, float] = {}
         for market, info in (accrual or {}).items():
             if self._venue_of(market) == "kalshi":
-                rewards[series_of(market)] = rewards.get(series_of(market), 0.0) + float(
-                    info.get("capped_raw_usd", info["raw_usd"]))
-        for market, usd in self.closed_periods.items():
-            if self._venue_of(market) == "kalshi":
-                rewards[series_of(market)] = rewards.get(series_of(market), 0.0) + float(usd)
+                sr = series_of(market)
+                rewards[sr] = rewards.get(sr, 0.0) + float(info.get("estimated_usd", 0) or 0)
+                rewards_gross[sr] = rewards_gross.get(sr, 0.0) + float(info.get("capped_raw_usd", info["raw_usd"]))
+        for row in self.period_estimates:
+            market = str(row.get("market") or "")
+            if self._venue_of(market) != "kalshi":
+                continue
+            sr = (str(row.get("series") or "") or series_of(market)).upper()
+            try:
+                rewards[sr] = rewards.get(sr, 0.0) + float(Decimal(str(row.get("estimated_usd") or 0)))
+                rewards_gross[sr] = rewards_gross.get(sr, 0.0) + float(Decimal(str(row.get("raw_usd") or 0)))
+            except Exception:
+                continue
         out, go = {}, []
         for series, acc in sorted(self.series_acc.items()):
             first = acc.get("first_ts")
@@ -1408,6 +1446,7 @@ class RunLoop:
             out[series] = {"days": round(days, 3), "fills": int(acc["fills"]), "settled_fills": fills,
                            "net_usd": round(net, 4), "trading_usd": round(trading, 4),
                            "fees_usd": round(float(acc["fees"]), 4), "reward_usd": round(reward, 4),
+                           "reward_gross_usd": round(rewards_gross.get(series, 0.0), 4),
                            "markout_5m_cost_usd": round(cost_usd, 4), "markout_5m_fills": n5,
                            "markout_5m_cost_per_fill_usd": round(per_fill, 5), "go": ok, "why": why}
         from mm.unattended import go_no_go, reward_recon
@@ -1588,6 +1627,9 @@ class RunLoop:
         self.closed_periods_n += 1
         try:
             est = acc.estimate()
+            # grok fix (a): the payable figure ($1/market-period minimum, cent floor).
+            self.closed_periods_payable[market] = (self.closed_periods_payable.get(market, 0.0)
+                                                   + float(Decimal(str(est.estimated_usd))))
             self.period_estimates.append({
                 "market": market, "program_id": est.program_id, "series": est.series,
                 "period_start": _iso(acc.params.start_ts) if acc.params.start_ts else "",
@@ -1706,25 +1748,42 @@ class RunLoop:
         position is valued at 0 too. Plus the realized markout of settled
         positions already dropped (``realized_pruned_usd``)."""
         markout = 0.0
+        markout_mid = 0.0
         unmarked, unsettled = [], []
+        sources: dict = {}
+        short = 0.0
+        basis = mark_basis()
         for market, pos in self.position.items():
             mark, source = self._yes_mark(market)
             cost = float(pos["yes_cost"]) + float(pos["no_cost"])
             if market in self.unresolved:
                 markout -= cost  # released unresolved: a full loss until settled
+                markout_mid -= cost
                 continue
             if mark is None:
                 value = 0.0
                 unmarked.append(market)
             else:
                 value = (float(pos["yes"]) * mark + float(pos["no"]) * (100.0 - mark)) / 100.0
-            markout += value - cost
+            markout_mid += value - cost
+            if basis == "executable" and source != "settled":
+                # grok fix (c): what the position could be sold for now.
+                xv, xsrc, xshort = self._exec_value(market, pos)
+                sources[xsrc] = sources.get(xsrc, 0) + 1
+                short += xshort
+                markout += xv - cost
+            else:
+                sources[source] = sources.get(source, 0) + 1
+                markout += value - cost
             prog = self.programs.get(market)
             close = None if prog is None else prog.close_ts
             if source != "settled" and (prog is None or (close is not None and self.now and self.now >= close)):
                 unsettled.append(market)
         markout += self.realized_pruned_usd
-        return {"markout_usd": markout, "fees_usd": self.fees_usd_total,
+        markout_mid += self.realized_pruned_usd
+        return {"markout_usd": markout, "markout_mid_usd": markout_mid, "mark_basis": basis,
+                "mark_sources": sources, "exec_depth_short_contracts": round(short, 2),
+                "fees_usd": self.fees_usd_total,
                 "rebates_usd": self.pm_rebate_usd, "unmarked": unmarked, "unsettled": unsettled}
 
     def session_mtm_usd(self) -> float:
@@ -1788,6 +1847,314 @@ class RunLoop:
         self.risk.venue_usd[venue] = Decimal(str(self.risk.venue_usd.get(venue, 0))) + delta
         self.inv_committed[market] = new
 
+    # ------------------------------------------------------------ grok fixes a/c/d/e helpers
+    def _backfill_payable(self) -> None:
+        """State files written before fix (a) have raw closed-period totals
+        only. Rebuild the payable twins from ``period_estimates`` (each row
+        carries both ``raw_usd`` and the floored ``estimated_usd``): markets
+        still in ``closed_periods`` get their own rows, the rest is folded
+        into "<venue>/backfill". Rows dropped by the 5000-row cap cannot be
+        recovered; the scale of the gap is reported (payable_backfill)."""
+        per: dict = {}
+        raw_rows = 0.0
+        for row in self.period_estimates:
+            try:
+                m = str(row.get("market") or "")
+                per.setdefault(m, [0.0, 0.0])
+                per[m][0] += float(Decimal(str(row.get("estimated_usd") or 0)))
+                per[m][1] += float(Decimal(str(row.get("raw_usd") or 0)))
+                raw_rows += float(Decimal(str(row.get("raw_usd") or 0)))
+            except Exception:
+                continue
+        self.closed_periods_payable = {}
+        self.closed_periods_payable_agg = {}
+        for m, (pay, _raw) in per.items():
+            if m in self.closed_periods:
+                self.closed_periods_payable[m] = pay
+            else:
+                key = f"{self._venue_of(m)}/backfill"
+                self.closed_periods_payable_agg[key] = self.closed_periods_payable_agg.get(key, 0.0) + pay
+        raw_total = sum(self.closed_periods.values()) + sum(self.closed_periods_agg.values())
+        self.payable_backfill = {"source": "period_estimates", "rows": len(self.period_estimates),
+                                 "raw_in_rows_usd": round(raw_rows, 4), "raw_closed_total_usd": round(raw_total, 4),
+                                 "payable_usd": round(sum(p for p, _r in per.values()), 4),
+                                 "note": "raw closed periods not covered by period_estimates rows count 0 payable"}
+        self._state_dirty = True
+
+    def _exec_levels(self, market: str, *, max_age_s: float | None = None):
+        """Executable bid books {"yes": [(cents, size)], "no": [...], "ts", "src"}:
+        the live subscribed book when usable, else the last REST/remembered
+        book (``exec_book``) if not older than ``max_age_s``. None if neither."""
+        acc = self.accruals.get(market)
+        now = float(self.now or 0.0)
+        if acc is not None:
+            book = acc.book.book
+            try:
+                usable = book.is_usable()
+            except Exception:
+                usable = False
+            if usable:
+                yes = [(int(l.price_cents), float(l.size)) for l in book.yes_bids if float(l.size) > 0]
+                no = [(int(l.price_cents), float(l.size)) for l in book.no_bids if float(l.size) > 0]
+                if yes or no:
+                    row = {"yes": sorted(yes, key=lambda r: -r[0])[:10],
+                           "no": sorted(no, key=lambda r: -r[0])[:10], "ts": now, "src": "book"}
+                    if market in self.position:
+                        self.exec_book[market] = row
+                    return row
+        row = self.exec_book.get(market)
+        if row is None:
+            return None
+        if max_age_s is not None and now - float(row.get("ts") or 0.0) > max_age_s:
+            return None
+        return row
+
+    def _exec_book_snapshot(self) -> dict:
+        out = {}
+        for m in self.position:
+            if m in self.settled:
+                continue
+            row = self.exec_book.get(m)
+            if row:
+                out[m] = {"yes": [list(x) for x in row.get("yes") or []][:10],
+                          "no": [list(x) for x in row.get("no") or []][:10],
+                          "ts": row.get("ts"), "src": row.get("src")}
+        return out
+
+    def note_quote_mark(self, row: dict) -> None:
+        """A read-only REST order book for a held market with no live book
+        (frame kind "quote_mark": {market, ts, yes: [[cents, size]], no: [...]})."""
+        market = str(row.get("market") or "")
+        if not market or market not in self.position or market in self.settled:
+            return
+        cur = self.exec_book.get(market)
+        ts = float(row.get("ts") or self.now or 0.0)
+        if cur is not None and cur.get("src") == "book" and float(cur.get("ts") or 0.0) >= ts - 60.0:
+            return  # a live book is fresher
+        try:
+            yes = [(int(p), float(q)) for p, q in row.get("yes") or [] if float(q) > 0]
+            no = [(int(p), float(q)) for p, q in row.get("no") or [] if float(q) > 0]
+        except (TypeError, ValueError):
+            return
+        self.exec_book[market] = {"yes": sorted(yes, key=lambda r: -r[0])[:10],
+                                  "no": sorted(no, key=lambda r: -r[0])[:10], "ts": ts, "src": "rest"}
+        self.quote_marks_n = getattr(self, "quote_marks_n", 0) + 1
+        self._state_dirty = True
+
+    def mark_candidates(self) -> list:
+        """Held, unsettled Kalshi markets with unpaired contracts and no usable
+        live book: the read-only REST order-book poll (_mark_backfill) keeps
+        their executable marks fresh."""
+        out = []
+        for market, pos in self.position.items():
+            if market in self.settled or market in self.unresolved:
+                continue
+            if (pos.get("venue") or self._venue(market)) != "kalshi":
+                continue
+            if abs(float(pos["yes"]) - float(pos["no"])) < 1e-9:
+                continue
+            acc = self.accruals.get(market)
+            try:
+                live = acc is not None and acc.book.book.is_usable()
+            except Exception:
+                live = False
+            if not live:
+                out.append(market)
+        return out
+
+    def _exec_value(self, market: str, pos: dict):
+        """(value_usd, source, short_contracts): pairs at $1 + unpaired legs
+        sold into the held side's bids (depth-walked) minus the taker fee.
+        No executable book: falls back to the mid mark (source "mid_fallback")."""
+        y, n = float(pos["yes"]), float(pos["no"])
+        pairs = min(y, n)
+        uy, un = y - pairs, n - pairs
+        value = pairs * 1.0
+        if uy <= 1e-9 and un <= 1e-9:
+            return value, "paired", 0.0
+        lv = self._exec_levels(market)
+        if lv is None:
+            mark, _src = self._yes_mark(market)
+            if mark is None:
+                return value, "none", uy + un
+            return value + (uy * mark + un * (100.0 - mark)) / 100.0, "mid_fallback", 0.0
+        side, cnt = ("yes", uy) if uy > 1e-9 else ("no", un)
+        proceeds, _filled, fills, short = walk_bids(lv.get(side) or [], cnt)
+        fee = sum(kalshi_taker_fee_usd(p, q) for p, q in fills) if _env_num("LIP_MARK_EXIT_FEES", 1.0) > 0 else 0.0
+        return value + proceeds - fee, "exec_" + str(lv.get("src") or "book"), short
+
+    def _total_unpaired_usd(self) -> float:
+        return sum(self._unpaired_usd(m) for m in self.position
+                   if m not in self.settled and m not in self.unresolved)
+
+    def _resolution_anchor(self, market: str):
+        prog = self.programs.get(market)
+        pos = self.position.get(market) or {}
+        vals = [v for v in (ticker_event_day_ts(market),
+                            None if prog is None else prog.occurrence_ts,
+                            (None if prog is None else prog.close_ts) or pos.get("close_ts")) if v is not None]
+        return min(vals) if vals else None
+
+    def _near_resolution(self, market: str, ts: float) -> bool:
+        """grok fix (d): within LIP_FLATTEN_BEFORE_EVENT_H (default 6 h, 0 = off)
+        of the market's event day / occurrence / close, whichever is first."""
+        hours = _env_num("LIP_FLATTEN_BEFORE_EVENT_H", 0.0)
+        if hours <= 0:
+            return False
+        anchor = self._resolution_anchor(market)
+        return anchor is not None and ts >= anchor - hours * 3600.0
+
+    def _side_band_block(self, market: str, side: str) -> str:
+        """grok fix (d): do not ADD inventory on a side whose price is inside
+        [LIP_AVOID_BAND_LO, LIP_AVOID_BAND_HI) cents (default off; preregistered
+        30-90 in CHANGES.md: the measured 5-min markout is negative there)."""
+        lo, hi = _env_num("LIP_AVOID_BAND_LO", 0.0), _env_num("LIP_AVOID_BAND_HI", 0.0)
+        if hi <= lo:
+            return ""
+        quote = self.resting.get(market) or {}
+        price = quote.get(f"{side}_cents")
+        if price is None:
+            try:
+                yb, nb = self._best(market)
+            except Exception:
+                yb, nb = None, None
+            price = yb if side == "yes" else nb
+        if price is None:
+            return ""
+        return "price_band" if lo <= float(price) < hi else ""
+
+    def _tape_burst(self, market: str, trade: dict, ts: float) -> None:
+        """grok fix (e): one-sided PUBLIC-tape burst. Same-side taker contracts
+        >= LIP_TAPE_BURST_CONTRACTS (250) inside LIP_TAPE_BURST_WINDOW_S (60 s),
+        with >= LIP_TAPE_BURST_ONESIDED (0.8) of the window's taker volume on
+        that side, pulls our quote for LIP_TAPE_BURST_COOLDOWN_S (300 s).
+        Fills on the triggering print are already booked (no look-ahead).
+        Off unless LIP_TAPE_BURST_ENABLE."""
+        if _env_num("LIP_TAPE_BURST_ENABLE", 0.0) <= 0 or market not in self.programs:
+            return
+        side = str(trade.get("taker_side") or "").lower()
+        if side not in ("yes", "no"):
+            return
+        try:
+            qty = float(trade.get("count_fp") or trade.get("count") or 0)
+        except (TypeError, ValueError):
+            return
+        window = _env_num("LIP_TAPE_BURST_WINDOW_S", 60.0)
+        rows = self._tape.setdefault(market, [])
+        rows.append((float(ts), side, qty))
+        while rows and ts - rows[0][0] > window:
+            rows.pop(0)
+        if len(self._tape) > 3000:
+            for k in [k for k, v in self._tape.items() if not v or ts - v[-1][0] > window][:1000]:
+                del self._tape[k]
+        same = sum(q for _t, sd, q in rows if sd == side)
+        tot = sum(q for _t, _sd, q in rows)
+        if (same >= _env_num("LIP_TAPE_BURST_CONTRACTS", 250.0) and tot > 0
+                and same / tot >= _env_num("LIP_TAPE_BURST_ONESIDED", 0.8)):
+            rows.clear()
+            self.tape_bursts_n += 1
+            if market in self.resting:
+                self._pull_one(market, "tape_burst", ts, _env_num("LIP_TAPE_BURST_COOLDOWN_S", 300.0))
+            else:
+                self.cooldown[(market, "*")] = max(self.cooldown.get((market, "*"), 0.0),
+                                                   ts + _env_num("LIP_TAPE_BURST_COOLDOWN_S", 300.0))
+
+    def _exit_reason(self, market: str, ts: float) -> str:
+        age_h = _env_num("LIP_FLATTEN_AGE_H", 0.0)
+        since = self.inv_since.get(market)
+        if age_h > 0 and since is not None and ts - since >= age_h * 3600.0:
+            return "aged"
+        if self._near_resolution(market, ts):
+            return "pre_resolution"
+        return ""
+
+    def _inventory_exits(self, ts: float) -> int:
+        """grok fix (d): PAPER taker exit of unpaired Kalshi inventory that is
+        older than LIP_FLATTEN_AGE_H or inside LIP_FLATTEN_BEFORE_EVENT_H of
+        resolution. Paper only: books a simulated sale of the unpaired leg into
+        the held side's bids from a book no older than LIP_EXIT_MAX_BOOK_AGE_S
+        (300 s), depth-walked, at most LIP_EXIT_MAX_SLIPPAGE_CENTS (5) below the
+        best bid, Kalshi taker fee charged. Never sends an order (no order path
+        exists here). Returns the number of markets exited."""
+        if self.mode != "paper" or _env_num("LIP_EXITS_PAPER_TAKER", 0.0) <= 0:
+            return 0
+        n = 0
+        for market in list(self.position):
+            pos = self.position.get(market)
+            if not pos or market in self.settled or market in self.unresolved:
+                continue
+            if (pos.get("venue") or self._venue(market)) != "kalshi":
+                continue
+            why = self._exit_reason(market, ts)
+            if not why:
+                continue
+            if self._paper_exit(market, why, ts):
+                n += 1
+        return n
+
+    def _paper_exit(self, market: str, why: str, ts: float) -> bool:
+        pos = self.position[market]
+        y, nn = float(pos["yes"]), float(pos["no"])
+        side = "yes" if y > nn else "no"
+        cnt = abs(y - nn)
+        if cnt < 1.0:
+            return False
+        lv = self._exec_levels(market, max_age_s=_env_num("LIP_EXIT_MAX_BOOK_AGE_S", 300.0))
+        if lv is None or not lv.get(side):
+            self.paper_exit_stats["no_book_n"] = int(self.paper_exit_stats.get("no_book_n", 0)) + 1
+            return False
+        best = max(p for p, _q in lv[side])
+        floor = best - _env_num("LIP_EXIT_MAX_SLIPPAGE_CENTS", 5.0)
+        levels = [(p, q) for p, q in lv[side] if p >= floor]
+        proceeds, filled, fills, _short = walk_bids(levels, float(int(cnt)))
+        if filled < 1.0:
+            return False
+        fee = sum(kalshi_taker_fee_usd(p, q) for p, q in fills)
+        # Cost basis of the sold contracts at the leg's average price.
+        avg = float(pos[f"{side}_cost"]) / float(pos[side]) if float(pos[side]) > 0 else 0.0
+        cost = avg * filled
+        pos[side] -= filled
+        pos[f"{side}_cost"] -= cost
+        pos["fees"] = float(pos.get("fees", 0.0)) + fee
+        # The sale returns cash: realized = proceeds - cost (booked through
+        # realized_pruned_usd, which pnl_parts already adds to markout).
+        self.realized_pruned_usd += proceeds - cost
+        self.fees_usd_total += fee
+        bucket = (getattr(self, "bucket_of", {}) or {}).get(market) or "short"
+        bpos = (self.bucket_pos.get(bucket) or {}).get(market)
+        if bpos is not None and float(bpos.get(side, 0.0)) > 0:
+            bavg = float(bpos[f"{side}_cost"]) / float(bpos[side])
+            q = min(filled, float(bpos[side]))
+            bpos[side] -= q
+            bpos[f"{side}_cost"] -= bavg * q
+            bpos["fees"] = float(bpos.get("fees", 0.0)) + fee
+            agg = self.bucket_closed.setdefault(bucket, {})
+            agg["markout_usd"] = float(agg.get("markout_usd", 0.0)) + (proceeds - bavg * q)
+        acc = self._series_acc(market)
+        if acc is not None:
+            acc["fees"] += fee
+            acc["settled_usd"] += proceeds - cost
+        st = self.paper_exit_stats
+        st["n"] = int(st.get("n", 0)) + 1
+        st["contracts"] = float(st.get("contracts", 0.0)) + filled
+        st["proceeds_usd"] = float(st.get("proceeds_usd", 0.0)) + proceeds
+        st["fees_usd"] = float(st.get("fees_usd", 0.0)) + fee
+        st["cost_usd"] = float(st.get("cost_usd", 0.0)) + cost
+        st.setdefault("by_reason", {})[why] = int(st.get("by_reason", {}).get(why, 0)) + 1
+        self.paper_exits.append({"market": market, "side": side, "count": round(filled, 4),
+                                 "proceeds_usd": round(proceeds, 4), "cost_usd": round(cost, 4),
+                                 "fee_usd": round(fee, 4), "why": why, "ts": ts, "src": lv.get("src"),
+                                 "levels": [[p, round(q, 2)] for p, q in fills]})
+        del self.paper_exits[:-200]
+        if market in self.resting:
+            self._cancel(market, f"paper_exit_{why}")
+        self._sync_inventory(market)
+        self._note_inventory_age(market, ts)
+        self._state_dirty = True
+        logging.getLogger("lip.risk").info("PAPER exit %s sell %s %.0f proceeds $%.2f cost $%.2f fee $%.2f (%s)",
+                                           market, side, filled, proceeds, cost, fee, why)
+        return True
+
     def capital_report(self) -> dict:
         """Where the Kalshi capital is: budget left, locked inventory (paired vs unpaired), and
         whether the engine is capital-starved (nothing left to quote with). An engine that is
@@ -1804,7 +2171,8 @@ class RunLoop:
             unpaired += self._unpaired_usd(market)
         paired_cost = max(0.0, cost - unpaired)
         release = _env_num("LIP_PAIR_RELEASE", 0.0) > 0
-        starved = budget < _env_num("LIP_STARVED_BELOW_USD", 10.0)
+        reward_budget = max(0.0, budget - float(getattr(self, "sample_reserve_usd", 0.0) or 0.0))
+        starved = reward_budget < starved_below_usd(cap)
         hint = ""
         if starved:
             hint = ("paired YES+NO inventory is locking capital until settlement; pair release "
@@ -1813,13 +2181,26 @@ class RunLoop:
                     else "inventory fills the venue cap: quoting stops until it settles or is reduced")
         return {"starved": starved, "pair_release": release, "hint": hint,
                 "starved_since": self._starved_since,
+                "starved_rule": {"below_usd": round(starved_below_usd(cap), 2),
+                                 "frac_of_cap": _env_num("LIP_STARVED_BELOW_FRAC", 0.25),
+                                 "floor_usd": _env_num("LIP_STARVED_BELOW_USD", 10.0),
+                                 "reward_budget_usd": round(reward_budget, 2),
+                                 "sample_reserve_usd": round(float(getattr(self, "sample_reserve_usd", 0.0) or 0.0), 2)},
+                "inventory_soft_cap_usd": inv_soft_cap_usd(),
+                "unpaired_total_usd": round(self._total_unpaired_usd(), 2),
                 "kalshi": {"cap_usd": round(cap, 2), "budget_usd": round(budget, 2), "locked_usd": round(locked, 2),
                            "locked_paired_usd": round(paired_cost if not release else 0.0, 2),
                            "locked_unpaired_usd": round(unpaired, 2), "paired_cost_usd": round(paired_cost, 2)}}
 
-    def _note_starvation(self, ts: float) -> None:
-        """Track how long the Kalshi budget has been (nearly) zero and alert once per episode."""
-        starved = float(self.venue_budgets().get("kalshi", 0.0)) < _env_num("LIP_STARVED_BELOW_USD", 10.0)
+    def _note_starvation(self, ts: float, reward_budget: float | None = None) -> None:
+        """Track how long the Kalshi REWARD budget (after the sampling reserve) has been below
+        LIP_STARVED_BELOW_FRAC (0.25) of the Kalshi cap (floor LIP_STARVED_BELOW_USD, $10) and
+        alert once per episode. grok fix (b): relative, not a fixed $10."""
+        lim = self.risk.limits
+        cap = float(lim.per_venue_usd) * alloc_cap_fraction()
+        if reward_budget is None:
+            reward_budget = float(self.venue_budgets().get("kalshi", 0.0))
+        starved = float(reward_budget) < starved_below_usd(cap)
         if not starved:
             self._starved_since = None
             self._starved_alerted = False
@@ -1940,6 +2321,12 @@ class RunLoop:
             "premium_usd_total": self.premium_usd_total, "fees_usd_total": self.fees_usd_total,
             "pm_rebate_usd": self.pm_rebate_usd, "closed_periods": self.closed_periods,
             "closed_periods_n": self.closed_periods_n, "closed_periods_agg": self.closed_periods_agg,
+            "closed_periods_payable": self.closed_periods_payable,
+            "closed_periods_payable_agg": self.closed_periods_payable_agg,
+            "payable_backfill": self.payable_backfill,
+            "mark_basis": mark_basis(),
+            "exec_book": self._exec_book_snapshot(),
+            "paper_exit_stats": self.paper_exit_stats, "paper_exits": self.paper_exits[-200:],
             "realized_pruned_usd": self.realized_pruned_usd, "bucket_closed": self.bucket_closed,
             "settled_lifetime": self.settled_lifetime,
             "cooldown": [[k[0], k[1], v] for k, v in self.cooldown.items()],
@@ -2198,6 +2585,24 @@ class RunLoop:
         self.closed_periods = {str(m): float(v) for m, v in dict(data.get("closed_periods") or {}).items()}
         self.closed_periods_n = int(data.get("closed_periods_n") or 0)
         self.closed_periods_agg = {str(k): float(v) for k, v in dict(data.get("closed_periods_agg") or {}).items()}
+        self.closed_periods_payable = {str(m): float(v) for m, v in
+                                       dict(data.get("closed_periods_payable") or {}).items()}
+        self.closed_periods_payable_agg = {str(k): float(v) for k, v in
+                                           dict(data.get("closed_periods_payable_agg") or {}).items()}
+        self.payable_backfill = data.get("payable_backfill") if isinstance(data.get("payable_backfill"), dict) else None
+        self._payable_restored = "closed_periods_payable" in data
+        self._mark_basis_restored = data.get("mark_basis")
+        try:
+            self.exec_book = {str(m): {"yes": [(int(p), float(q)) for p, q in r.get("yes") or []],
+                                       "no": [(int(p), float(q)) for p, q in r.get("no") or []],
+                                       "ts": float(r.get("ts") or 0.0), "src": str(r.get("src") or "state")}
+                              for m, r in dict(data.get("exec_book") or {}).items() if isinstance(r, dict)}
+        except (TypeError, ValueError):
+            self.exec_book = {}
+        if isinstance(data.get("paper_exit_stats"), dict):
+            self.paper_exit_stats.update(data["paper_exit_stats"])
+        if isinstance(data.get("paper_exits"), list):
+            self.paper_exits = [dict(x) for x in data["paper_exits"] if isinstance(x, dict)][-200:]
         self.realized_pruned_usd = float(data.get("realized_pruned_usd") or 0.0)
         self.settled_lifetime = settled_lifetime
         self.bucket_closed = {str(b): {str(k): float(v) for k, v in dict(r).items()}
@@ -2212,6 +2617,16 @@ class RunLoop:
         self.fv_calib_watch = watch
         self.fv_calib_view = frozenset(watch)
         self._restore_checkpoint_counters(data)
+        if not getattr(self, "_payable_restored", True):
+            self._backfill_payable()
+        if getattr(self, "_mark_basis_restored", None) != mark_basis():
+            # grok fix (c): the P&L mark basis changed (mid -> executable). Re-base
+            # today's MTM so the switch is not booked as a same-day loss (it would
+            # trip the watchdog's daily-loss check on restart). Reported in status.
+            self._pnl_day = None
+            self._pnl_day_unknown = bool(self.position)
+            self.mark_basis_rebased = {"from": getattr(self, "_mark_basis_restored", None),
+                                       "to": mark_basis()}
         for market in self.position:
             self._sync_inventory(market)
         if kill is not None:
@@ -2580,6 +2995,7 @@ class RunLoop:
         self._note_trade_volume(str(trade.get("ticker") or ""), trade, ts)
         for fill in self.sim.apply_trades([trade]):
             self._record_fill(fill, ts)
+        self._tape_burst(str(trade.get("ticker") or ""), trade, ts)
 
     def _note_trade_volume(self, market: str, trade: dict, ts: float) -> None:
         if market not in self.programs:
@@ -2894,6 +3310,16 @@ class RunLoop:
             return "fill_cooldown"
         if self._inv_aged(market, ts) and self._unpaired(market, side) > 0:
             return "inventory_age"      # aged inventory: reduce-only, never add risk
+        adds = self._unpaired(market, side) >= 0    # buying this side adds (or opens) unpaired inventory
+        if adds:
+            soft = inv_soft_cap_usd()
+            if soft > 0 and self._total_unpaired_usd() >= soft:
+                return "inventory_soft_cap"   # grok: global reduce-only below the watchdog limit
+            if self._near_resolution(market, ts):
+                return "near_resolution"      # grok fix (d): no new inventory into resolution
+            band = self._side_band_block(market, side)
+            if band:
+                return band
         cap_m = _env_num("LIP_MARKET_INV_CAP_USD", 0.0)
         if cap_m > 0 and self._unpaired(market, side) > 0 and self._unpaired_usd(market) >= cap_m:
             return "market_inventory"
@@ -3378,11 +3804,55 @@ class RunLoop:
                 break
             if capital > per_market + 1e-9:
                 break
+            net = self._payable_net(km, float(size), sides_on, net, share2)
             value = net - penalty_100 * float(size) / RANK_PENALTY_UNIT * (len(sides_on) / 2.0)
             out.append((float(size), value, capital, int(yc), int(nc)))
             if float(size) not in [float(x) for x in ladder]:
                 break
         return out
+
+    def _payable_net(self, km, size: float, sides_on: tuple, net: float, share2: float) -> float:
+        """grok fix (g): rank Kalshi quotes by PAYABLE reward per $ of risk.
+
+        quote_economics prices the reward as if we kept today's snapshot share
+        for the whole rest of the period. Measured paper uptime is far lower
+        (pulls, rotation, both-sides-under-target seconds), and Kalshi pays
+        nothing for a market-period under $1. So:
+          expected period payout E = reward already accrued this period
+              + share x pool x (seconds left / period) x LIP_PAYABLE_UPTIME (0.5);
+          E < LIP_MIN_PAYABLE_PER_PERIOD_USD (1.50: the $1 floor plus margin)
+              -> the reward component is worth 0 (value = costs only, < 0);
+          otherwise the reward component is scaled by LIP_PAYABLE_UPTIME.
+        Costs (adverse selection, fees, holding) are unchanged, so the hull's
+        value/capital ratio is payable reward net of expected adverse cost per $.
+        Off when LIP_PAYABLE_SELECT=0. PM US is unchanged (pool rules differ)."""
+        if km.venue != "kalshi" or _env_num("LIP_PAYABLE_SELECT", 0.0) <= 0:
+            return net
+        from mm.selector import quote_economics
+        net0 = quote_economics(km, float(size), sides=sides_on, reward_factor=0.0)[0]
+        reward = net - net0
+        if reward <= 0:
+            return net
+        up = min(1.0, max(0.0, _env_num("LIP_PAYABLE_UPTIME", 0.5)))
+        pool = float(km.period_reward_usd or 0.0)
+        period = float(km.period_seconds or 0.0)
+        left = max(0.0, float(km.seconds_left or 0.0))
+        acc = self.accruals.get(km.market)
+        accrued = 0.0
+        if acc is not None:
+            try:
+                accrued = float(acc.raw_usd())
+            except Exception:
+                accrued = 0.0
+        share = float(share2) * (len(sides_on) / 2.0)
+        expect = accrued + (share * pool * left / period * up if period > 0 else 0.0)
+        if km.max_reward_usd is not None:
+            expect = min(expect, float(km.max_reward_usd))
+        self.payable_select_stats["checked"] = self.payable_select_stats.get("checked", 0) + 1
+        if expect < _env_num("LIP_MIN_PAYABLE_PER_PERIOD_USD", 1.5):
+            self.payable_select_stats["below_floor"] = self.payable_select_stats.get("below_floor", 0) + 1
+            return net0
+        return net0 + reward * up
 
     def _reduce_resting(self, fill: dict) -> None:
         market = fill["market_ticker"]
@@ -3538,7 +4008,14 @@ class RunLoop:
         budget = sum(venue_budget.values())
         self.alloc_budget_usd = budget
         self.venue_budget = venue_budget
-        self._note_starvation(ts)
+        # grok fix (d): paper taker exits of aged / near-resolution unpaired
+        # inventory run before the budget is computed (an exit frees capital).
+        self.mark_view = tuple(self.mark_candidates())
+        if self._inventory_exits(ts):
+            venue_budget = self.venue_budgets()
+            budget = sum(venue_budget.values())
+            self.alloc_budget_usd = budget
+            self.venue_budget = venue_budget
         # allocate/optimize_sizes are economics + eligibility passes here. Their
         # own cash pool must not bind, or their raw (unpenalized) $/day greedy
         # truncates the list before the markout-penalized rank pass below,
@@ -3569,10 +4046,13 @@ class RunLoop:
         # Reserved even while the group is empty: it forms later (trade
         # counts arrive after the restart) and must find room in the caps.
         if self.sample_markets or (scfg["enabled"] and self.mode == "paper" and scfg["n"] > 0):
-            reserve = min(scfg["budget"], venue_budget.get("kalshi", 0.0))
+            # grok fix (b): the probe may take at most LIP_SAMPLE_MAX_FRAC (0.2) of the
+            # Kalshi budget, so it can never starve the reward strategy.
+            reserve = min(scfg["budget"], venue_budget.get("kalshi", 0.0) * _env_num("LIP_SAMPLE_MAX_FRAC", 0.2))
             venue_budget["kalshi"] = venue_budget.get("kalshi", 0.0) - reserve
             self.sample_reserve_usd = reserve
             budget = sum(venue_budget.values())
+        self._note_starvation(ts, venue_budget.get("kalshi", 0.0))
         # per_event_usd=pool: optimize_sizes groups by series and would cut a
         # series by RAW objective before the markout-penalised rank pass. The
         # per-series cap is enforced below (alloc_series) in rank order.
@@ -4364,35 +4844,65 @@ class RunLoop:
         max_reward, plus rolled-over periods) + PM US rebates - Kalshi maker
         fees. ``premium_paid_usd`` is what paper fills cost."""
         parts = self.pnl_parts()
-        by_venue = {"kalshi": 0.0, "pmus": 0.0}
+        by_venue = {"kalshi": 0.0, "pmus": 0.0}          # gross (raw, capped at max_reward)
+        pay_venue = {"kalshi": 0.0, "pmus": 0.0}         # payable: after the $1/market-period floor
         for market, v in (accrual or {}).items():
             vn = self._venue_of(market)
             by_venue[vn] = by_venue.get(vn, 0.0) + float(v.get("capped_raw_usd", v["raw_usd"]))
+            pay_venue[vn] = pay_venue.get(vn, 0.0) + float(v.get("estimated_usd", 0) or 0)
         for market, usd in self.closed_periods.items():
             vn = self._venue_of(market)
             by_venue[vn] = by_venue.get(vn, 0.0) + float(usd)
         for key, usd in self.closed_periods_agg.items():
             vn = key.split("/", 1)[0]
             by_venue[vn] = by_venue.get(vn, 0.0) + float(usd)
-        rewards = sum(by_venue.values())
-        pnl = parts["markout_usd"] + rewards + parts["rebates_usd"] - parts["fees_usd"]
+        for market, usd in self.closed_periods_payable.items():
+            vn = self._venue_of(market)
+            pay_venue[vn] = pay_venue.get(vn, 0.0) + float(usd)
+        for key, usd in self.closed_periods_payable_agg.items():
+            vn = key.split("/", 1)[0]
+            pay_venue[vn] = pay_venue.get(vn, 0.0) + float(usd)
+        gross = sum(by_venue.values())
+        rewards = sum(pay_venue.values())
+        base = parts["rebates_usd"] - parts["fees_usd"]
+        pnl = parts["markout_usd"] + rewards + base
+        pnl_gross = parts["markout_usd"] + gross + base
+        pnl_mid_gross = parts["markout_mid_usd"] + gross + base
         return {
+            # grok fix (a)+(c): headline = executable marks + PAYABLE rewards.
             "pnl_usd": format(Decimal(str(round(pnl, 6))), "f"),
-            "pnl_usd_note": ("ESTIMATE: markout (MTM at mid / one-sided / last mark / settlement) "
-                             "+ estimated raw LIP rewards (not paid) + PM US rebates - Kalshi maker fees"),
+            "pnl_usd_note": ("ESTIMATE: markout (unpaired inventory at executable bid, depth-walked, "
+                             "minus taker fee; pairs at $1; settlement when known) + estimated PAYABLE "
+                             "LIP rewards (each market-period after Kalshi's $1 minimum and cent floor; "
+                             "not paid money) + PM US rebates - Kalshi fees"),
+            "pnl_gross_usd": format(Decimal(str(round(pnl_gross, 6))), "f"),
+            "pnl_gross_note": "same marks + GROSS (raw, pre-$1-floor) rewards: NOT what Kalshi pays",
+            "pnl_mid_gross_usd": format(Decimal(str(round(pnl_mid_gross, 6))), "f"),
+            "pnl_mid_gross_note": "the pre-fix headline: mid marks + gross rewards (comparison only)",
             "pnl_parts": {"markout_usd": round(parts["markout_usd"], 6),
+                          "markout_mid_usd": round(parts["markout_mid_usd"], 6),
+                          "mark_basis": parts["mark_basis"], "mark_sources": parts["mark_sources"],
+                          "exec_depth_short_contracts": parts["exec_depth_short_contracts"],
                           "est_rewards_usd": round(rewards, 6),
+                          "est_rewards_gross_usd": round(gross, 6),
                           "rebates_usd": round(parts["rebates_usd"], 6),
                           "fees_usd": round(parts["fees_usd"], 6),
                           "rewards_partial": accrual is None},
+            "payable_backfill": self.payable_backfill,
+            "mark_basis_rebased": getattr(self, "mark_basis_rebased", None),
+            "paper_exits": dict(self.paper_exit_stats, recent=self.paper_exits[-10:]),
+            "tape_bursts_n": self.tape_bursts_n,
+            "payable_select": dict(self.payable_select_stats),
+            "quote_marks_n": getattr(self, "quote_marks_n", 0),
             "premium_paid_usd": format(Decimal(str(round(self.premium_usd_total, 6))), "f"),
             "daily_mtm_pnl_usd": format(self.daily_pnl_usd(), "f"),
             "unsettled_positions": parts["unsettled"][:50],
             "unmarked_positions": parts["unmarked"][:50],
-            "pnl_attribution": self.pnl_attribution(parts, by_venue, pnl),
+            "pnl_attribution": self.pnl_attribution(parts, pay_venue, pnl, gross_by_venue=by_venue),
         }
 
-    def pnl_attribution(self, parts: dict, rewards_by_venue: dict, pnl: float) -> dict:
+    def pnl_attribution(self, parts: dict, rewards_by_venue: dict, pnl: float,
+                        gross_by_venue: dict | None = None) -> dict:
         """Split the estimated ``pnl_usd`` into parts that sum to it.
 
         spread_capture_usd    sum of count x (side mark at fill - fill price)
@@ -4417,6 +4927,9 @@ class RunLoop:
             "inventory_mtm_usd": round(parts["markout_usd"] - spread - adverse, 6),
             "est_rewards_kalshi_usd": round(float(rewards_by_venue.get("kalshi", 0.0)), 6),
             "est_rewards_pmus_usd": round(float(rewards_by_venue.get("pmus", 0.0)), 6),
+            "est_rewards_basis": "payable (after $1/market-period minimum)",
+            "est_rewards_gross_kalshi_usd": round(float((gross_by_venue or {}).get("kalshi", 0.0)), 6),
+            "est_rewards_gross_pmus_usd": round(float((gross_by_venue or {}).get("pmus", 0.0)), 6),
             "rebates_usd": round(parts["rebates_usd"], 6),
             "fees_usd": round(-parts["fees_usd"], 6),
             "total_usd": round(pnl, 6),
@@ -4546,6 +5059,7 @@ class RunLoop:
             raw = Decimal(est.raw_usd)
             out[market] = {"raw_usd": raw,
                            "capped_raw_usd": raw if acc.max_reward_usd is None else min(raw, acc.max_reward_usd),
+                           "estimated_usd": Decimal(str(est.estimated_usd)),
                            "known": est.known_seconds,
                            "unknown": est.unknown_seconds, "forfeited": est.forfeited_seconds,
                            "idle": idle, "share": None if last is None else last.share}
@@ -4756,6 +5270,64 @@ def alloc_cap_fraction() -> float:
         return 0.95
 
 
+# ---------------------------------------------------------------- grok/lip-fixes-20261009
+def mark_basis() -> str:
+    """LIP_MARK_BASIS: "executable" (default; grok fix c) values unpaired
+    inventory at what it could be sold for now (walk the held side's bids,
+    minus the Kalshi taker fee); "mid" is the old book-mid mark."""
+    v = str(os.environ.get("LIP_MARK_BASIS", "executable")).strip().lower()
+    return "mid" if v == "mid" else "executable"
+
+
+def inv_soft_cap_usd() -> float:
+    """Engine-side global reduce-only threshold on total UNPAIRED inventory
+    cost: LIP_INV_SOFT_CAP_USD, default 0.8 x LIP_WD_MAX_INVENTORY_USD (the
+    watchdog's hard trip). 0 = off. Keeps the engine from walking into the
+    watchdog limit instead of raising it."""
+    raw = os.environ.get("LIP_INV_SOFT_CAP_USD")
+    if raw not in (None, ""):
+        return _env_num("LIP_INV_SOFT_CAP_USD", 0.0)
+    wd = _env_num("LIP_WD_MAX_INVENTORY_USD", 0.0)
+    return 0.8 * wd if wd > 0 else 0.0
+
+
+def starved_below_usd(cap_usd: float) -> float:
+    """Capital-starved threshold: LIP_STARVED_BELOW_FRAC (0.25) of the Kalshi
+    allocation cap, never below LIP_STARVED_BELOW_USD ($10)."""
+    return max(_env_num("LIP_STARVED_BELOW_USD", 10.0),
+               _env_num("LIP_STARVED_BELOW_FRAC", 0.25) * max(0.0, float(cap_usd)))
+
+
+def kalshi_taker_fee_usd(price_cents: float, count: float) -> float:
+    """Kalshi general taker fee ceil_cent(0.07 x C x P x (1-P)) via mm.accounting."""
+    from mm.accounting import kalshi_fee_usd
+    try:
+        return float(kalshi_fee_usd(int(round(price_cents)), Decimal(str(round(float(count), 6))),
+                                    fee_type="quadratic", is_taker=True))
+    except Exception:
+        p = float(price_cents) / 100.0
+        return 0.07 * float(count) * p * (1.0 - p)
+
+
+def walk_bids(levels, count: float) -> tuple:
+    """Sell ``count`` into bid ``levels`` [(price_cents, size), ...] best first.
+    Returns (proceeds_usd, filled, fills[(price, qty)], short). Depth beyond
+    the book is NOT assumed: ``short`` contracts are left unfilled."""
+    left = float(count)
+    proceeds = 0.0
+    out = []
+    for price, size in sorted(levels or (), key=lambda r: -r[0]):
+        if left <= 1e-9:
+            break
+        q = min(left, float(size))
+        if q <= 0 or price <= 0:
+            continue
+        proceeds += q * float(price) / 100.0
+        out.append((int(price), q))
+        left -= q
+    return proceeds, float(count) - max(0.0, left), out, max(0.0, left)
+
+
 def default_fill_cap_usd() -> float:
     """Per-order single-fill cap. LIP_SINGLE_FILL_CAP_USD when set; unset, the
     session default ($100) lowered to LIP_MARKET_INV_CAP_USD when that cap is
@@ -4883,7 +5455,8 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
                                refresh_s: float = PROGRAM_REFRESH_S,
                                cache: "ExchangeIndexCache | None" = None,
                                meta=None, settle_candidates: Callable | None = None,
-                               paper: bool = False, pinned: Callable | None = None) -> None:
+                               paper: bool = False, pinned: Callable | None = None,
+                               mark_candidates: Callable | None = None) -> None:
     """Production books and public trades. The reader cannot place an order.
     ``paper`` (False: fail closed) lets the screen feed model families early
     (screen.fv_early_feed); the service passes True only in paper mode.
@@ -4912,7 +5485,7 @@ async def drive_readonly_books(source: dict, on_frame: Callable[[dict], None], *
     ctx = {"cache": cache or ExchangeIndexCache(), "meta": meta or MetaCache().load(),
            "fed": {}, "refresh_s": float(refresh_s), "programs": [],
            "lock": threading.Lock(), "settle_candidates": settle_candidates, "paper": bool(paper),
-           "pinned": pinned}
+           "pinned": pinned, "mark_candidates": mark_candidates}
     backoff = READONLY_BACKOFF_START_S
     attempts = 0
     last_wall = None
@@ -5548,6 +6121,77 @@ def _backfill_fetch(reader, tickers: list[str]) -> list[tuple[str, str]]:
     return out
 
 
+def parse_kalshi_orderbook(payload: dict) -> tuple:
+    """(yes_bids, no_bids) [(cents, size)] from GET /markets/{t}/orderbook.
+    Accepts ``orderbook_fp`` {yes_dollars, no_dollars: [["0.4500", "12.00"]]}
+    and ``orderbook`` {yes, no: [[45, 12]]} / {yes_dollars, no_dollars}."""
+    def _lv(rows, dollars: bool):
+        out = []
+        for r in rows or []:
+            try:
+                p, q = r[0], r[1]
+                cents = int(round(float(p) * 100)) if dollars else int(p)
+                if 0 < cents < 100 and float(q) > 0:
+                    out.append((cents, float(q)))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return sorted(out, key=lambda x: -x[0])
+    ob = payload.get("orderbook_fp") if isinstance(payload.get("orderbook_fp"), dict) else None
+    if ob and (ob.get("yes_dollars") or ob.get("no_dollars")):
+        return _lv(ob.get("yes_dollars"), True), _lv(ob.get("no_dollars"), True)
+    ob = payload.get("orderbook") if isinstance(payload.get("orderbook"), dict) else {}
+    if ob.get("yes_dollars") or ob.get("no_dollars"):
+        return _lv(ob.get("yes_dollars"), True), _lv(ob.get("no_dollars"), True)
+    return _lv(ob.get("yes"), False), _lv(ob.get("no"), False)
+
+
+def _mark_fetch(reader, tickers: list) -> list:
+    """Thread body: read-only GET /markets/{ticker}/orderbook per ticker."""
+    from urllib.parse import quote
+    from mm.venues.readonly import ReadOnlyHTTPError
+    log = logging.getLogger("lip.readonly")
+    out = []
+    for ticker in tickers:
+        try:
+            payload = reader.get(f"/markets/{quote(ticker, safe='')}/orderbook")
+        except ReadOnlyHTTPError as exc:
+            log.warning("mark backfill %s HTTP %s", ticker, exc.status)
+            continue
+        yes, no = parse_kalshi_orderbook(payload if isinstance(payload, dict) else {})
+        out.append((ticker, yes, no))
+    return out
+
+
+async def _mark_backfill(reader, ctx: dict, on_frame, now: float | None = None) -> int:
+    """grok fix (c): executable marks for held markets with no live book.
+    At most LIP_MARK_BACKFILL_MAX (60) tickers per call, each at most once per
+    LIP_MARK_POLL_S (300 s); read-only GETs, fed as "quote_mark" frames."""
+    import asyncio
+    fn = ctx.get("mark_candidates")
+    if fn is None or _env_num("LIP_MARK_POLL_S", 300.0) <= 0:
+        return 0
+    now = time.time() if now is None else float(now)
+    seen = ctx.setdefault("mark_checked", {})
+    every = _env_num("LIP_MARK_POLL_S", 300.0)
+    try:
+        cands = list(fn() or [])
+    except Exception:
+        return 0
+    due = [t for t in dict.fromkeys(cands) if t and now - seen.get(t, -1e18) >= every]
+    due = due[: max(1, int(_env_num("LIP_MARK_BACKFILL_MAX", 60)))]
+    if not due:
+        return 0
+    for t in due:
+        seen[t] = now
+    for t in [t for t, at in seen.items() if now - at > 86400.0]:
+        del seen[t]
+    found = await asyncio.to_thread(_mark_fetch, reader, due)
+    for ticker, yes, no in found:
+        on_frame({"type": "quote_mark", "market": ticker, "ts": time.time(),
+                  "yes": [list(x) for x in yes[:10]], "no": [list(x) for x in no[:10]]})
+    return len(found)
+
+
 async def _settlement_backfill(reader, ctx: dict, on_frame, now: float | None = None) -> int:
     """Kalshi settlements missed while the socket was down or disconnected:
     ask GET /markets/{ticker} (read-only, GET only) for held positions past
@@ -5596,6 +6240,7 @@ async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
                 try:
                     await _refresh_activity(reader, ctx, on_frame)
                     await _apply_subscriptions(sock, ctx, on_frame)
+                    await _mark_backfill(reader, ctx, on_frame)
                 except asyncio.CancelledError:
                     raise
                 except transient as exc:
@@ -5624,6 +6269,7 @@ async def _background(reader, ctx: dict, on_frame, sock, state: dict) -> None:
             elif new:
                 await _subscribe(sock, new)
             await _settlement_backfill(reader, ctx, on_frame)
+            await _mark_backfill(reader, ctx, on_frame)
             log.info("background refresh %.1fs; fed %d new; subscribed %d", time.time() - t0, len(new),
                      len(ctx.get("subscribed") or ctx["fed"]))
         except asyncio.CancelledError:

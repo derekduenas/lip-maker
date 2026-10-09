@@ -19,6 +19,11 @@ LIVE_STATUS_FIELDS = (
     "fills_detail", "markouts", "policy_skips", "pulls", "repegs_n", "skew", "recorder", "pmus", "venues", "fair_value", "select_ms", "size_ladder",
     # Review fixes: honest P&L, rolled-over periods, feed state.
     "premium_paid_usd", "pnl_usd_note", "pnl_parts",
+    # grok/lip-fixes-20261009: payable headline, gross/mid comparison lines,
+    # executable marks, paper exits, tape bursts, payable selection.
+    "pnl_gross_usd", "pnl_gross_note", "pnl_mid_gross_usd", "pnl_mid_gross_note",
+    "payable_backfill", "mark_basis_rebased", "paper_exits", "tape_bursts_n",
+    "quote_marks_n", "payable_select",
     "unsettled_positions", "unmarked_positions",
     "closed_periods_n", "closed_periods_raw_usd", "feed",
     # Review fixes: inventory risk, daily MTM, engine alerts, capital check.

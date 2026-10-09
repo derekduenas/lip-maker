@@ -221,7 +221,8 @@ def test_estimated_rewards_in_pnl_are_capped_at_max_reward():
     acc = lp.live_accrual([M])
     assert acc[M]["raw_usd"] > Decimal("0.000001")
     rep = lp.pnl_report(acc)
-    assert rep["pnl_parts"]["est_rewards_usd"] == pytest.approx(0.000001)
+    assert rep["pnl_parts"]["est_rewards_gross_usd"] == pytest.approx(0.000001)
+    assert rep["pnl_parts"]["est_rewards_usd"] == 0      # payable: under the $1 minimum
 
 
 # ------------------------------------------------------------------ 5. status pnl
@@ -231,10 +232,12 @@ def test_status_pnl_is_not_minus_premium():
     snap_ = lp.live_snapshot(accrual=lp.live_accrual([M]))
     assert Decimal(snap_["premium_paid_usd"]) == Decimal("40")
     parts = snap_["pnl_parts"]
-    assert parts["markout_usd"] == pytest.approx(100 * (39 - 40) / 100.0)
+    assert parts["markout_mid_usd"] == pytest.approx(100 * (39 - 40) / 100.0)
+    # grok fix (c): executable mark = the 38c bid minus the taker fee.
+    assert parts["markout_usd"] == pytest.approx(100 * (38 - 40) / 100.0 - 0.07 * 100 * 0.38 * 0.62, abs=1e-6)
     expected = parts["markout_usd"] + parts["est_rewards_usd"] + parts["rebates_usd"] - parts["fees_usd"]
     assert float(snap_["pnl_usd"]) == pytest.approx(expected, abs=1e-6)
-    assert float(snap_["pnl_usd"]) > -2.0  # not -40 (minus the premium)
+    assert float(snap_["pnl_usd"]) > -5.0  # not -40 (minus the premium); bid-marked incl. taker fee
     assert "ESTIMATE" in snap_["pnl_usd_note"]
     from mm.status_page import status_payload
     out = status_payload(snap_)
@@ -254,6 +257,7 @@ def test_rolled_over_periods_stay_in_status_totals():
     snap_ = lp.live_snapshot(accrual=lp.live_accrual([M]))
     assert snap_["closed_periods_n"] == 1
     assert snap_["closed_periods_raw_usd"] == pytest.approx(before, abs=1e-6)
-    assert snap_["pnl_parts"]["est_rewards_usd"] >= before - 1e-9
+    assert snap_["pnl_parts"]["est_rewards_gross_usd"] >= before - 1e-9
+    assert snap_["pnl_parts"]["est_rewards_usd"] == 0    # payable: one minute is under $1
     b = snap_["buckets"]
     assert b["short"]["raw_est_usd"] + b["durable"]["raw_est_usd"] >= before - 1e-9

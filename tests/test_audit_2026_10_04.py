@@ -487,6 +487,9 @@ def test_series_gate_report_passes_a_series_that_earns_and_has_no_adverse_markou
     _gate_env(monkeypatch)
     lp = _filled_and_marked(monkeypatch, mid_after_cents=47)        # +3c after 5 min
     lp.settle(M, "yes")
+    # grok fix (a): only PAYABLE rewards count (a few seconds of raw accrual are
+    # under Kalshi's $1/market-period minimum): see the next test.
+    lp.period_estimates.append({"market": M, "series": "KXCPI", "estimated_usd": "1.00", "raw_usd": "1.0"})
     rep = lp.series_gate_report(accrual=lp.live_accrual())
     row = rep["series"]["KXCPI"]
     assert row["settled_fills"] == 1 and row["fills"] == 1
@@ -494,6 +497,18 @@ def test_series_gate_report_passes_a_series_that_earns_and_has_no_adverse_markou
     assert row["trading_usd"] == pytest.approx(10 * (1.0 - 0.44))   # payout - cost
     assert row["go"] is True and row["why"] == "go"
     assert "KXCPI" in rep["go_series"]
+
+
+def test_series_gate_counts_only_payable_rewards(monkeypatch):
+    """grok fix (a): raw accrual under the $1/market-period minimum pays 0."""
+    _gate_env(monkeypatch)
+    lp = _filled_and_marked(monkeypatch, mid_after_cents=47)
+    lp.settle(M, "yes")
+    lp.period_estimates.append({"market": M, "series": "KXCPI", "estimated_usd": "0", "raw_usd": "0.9"})
+    row = lp.series_gate_report(accrual=lp.live_accrual())["series"]["KXCPI"]
+    assert row["reward_usd"] == 0
+    assert row["reward_gross_usd"] >= 0.9
+    assert row["go"] is False
 
 
 def test_series_gate_report_charges_adverse_markout_as_a_positive_cost(monkeypatch):
@@ -878,12 +893,13 @@ def test_go_no_go_reward_comes_only_from_series_with_measured_markouts(monkeypat
     _gate_env(monkeypatch)
     lp = _filled_and_marked(monkeypatch, mid_after_cents=47)    # KXCPI: 10 measured contracts
     base = lp.series_gate_report()["go_no_go"]["reward_cents_per_measured_contract"]
-    lp.closed_periods[M2] = 50.0                                 # KXGDP: $50 reward, no fills
+    # grok fix (a): closed-period rewards come from the payable period_estimates rows.
+    lp.period_estimates.append({"market": M2, "series": "KXGDP", "estimated_usd": "50", "raw_usd": "50"})
     assert lp._venue_of(M2) == "kalshi"
     rep = lp.series_gate_report()
     assert "KXGDP" not in lp.series_acc
     assert rep["go_no_go"]["reward_cents_per_measured_contract"] == pytest.approx(base)
-    lp.closed_periods[M] = 1.0                                   # KXCPI's own reward does count
+    lp.period_estimates.append({"market": M, "series": "KXCPI", "estimated_usd": "1", "raw_usd": "1"})
     rep = lp.series_gate_report()
     assert rep["go_no_go"]["reward_cents_per_measured_contract"] == pytest.approx(base + 100.0 / 10.0)
 

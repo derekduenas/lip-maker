@@ -35,9 +35,16 @@ def test_components_match_the_scenario_and_sum_to_pnl():
     assert "estimate (paper)" in attr["label"]
     assert attr["spread_capture_usd"] == pytest.approx(100 * (42.5 - 40) / 100.0)
     assert attr["adverse_selection_usd"] == pytest.approx(100 * (12.5 - 42.5) / 100.0)
-    assert attr["inventory_mtm_usd"] == pytest.approx(0.0, abs=1e-6)
+    # grok fix (c): executable marks. The held 100 YES are worth the 10c bid
+    # minus the taker fee, not the 12.5c mid: inventory_mtm carries that gap.
+    fee = 0.07 * 100 * 0.10 * 0.90
+    assert st["pnl_parts"]["markout_mid_usd"] == pytest.approx(100 * (12.5 - 40) / 100.0)
+    assert st["pnl_parts"]["markout_usd"] == pytest.approx(100 * (10 - 40) / 100.0 - fee, abs=1e-6)
+    assert attr["inventory_mtm_usd"] == pytest.approx(-(2.5 + fee), abs=1e-6)
     assert attr["fees_usd"] < 0                      # Kalshi maker fee is a cost
-    assert attr["est_rewards_kalshi_usd"] > 0
+    # grok fix (a): headline rewards are payable (10 min of accrual < $1 -> 0); gross kept.
+    assert attr["est_rewards_kalshi_usd"] == 0
+    assert attr["est_rewards_gross_kalshi_usd"] > 0
     assert attr["est_rewards_pmus_usd"] == 0
     assert _sum(attr) == pytest.approx(float(Decimal(st["pnl_usd"])), abs=1e-5)
     assert attr["total_usd"] == pytest.approx(float(Decimal(st["pnl_usd"])), abs=1e-6)
@@ -77,3 +84,12 @@ def test_daily_summary_prints_the_attribution_as_an_estimate():
     for key in ("spread_capture_usd", "adverse_selection_usd", "inventory_mtm_usd",
                 "est_rewards_kalshi_usd", "est_rewards_pmus_usd", "rebates_usd", "fees_usd"):
         assert key in line
+
+
+def test_mid_basis_keeps_the_old_attribution(monkeypatch):
+    monkeypatch.setenv("LIP_MARK_BASIS", "mid")
+    lp = _kalshi_scenario()
+    st = lp.live_snapshot(accrual=lp.live_accrual())
+    attr = st["pnl_attribution"]
+    assert attr["inventory_mtm_usd"] == pytest.approx(0.0, abs=1e-6)
+    assert _sum(attr) == pytest.approx(float(Decimal(st["pnl_usd"])), abs=1e-5)

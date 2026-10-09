@@ -373,6 +373,11 @@ class _Engine:
         ``pinned_view``, an immutable frozenset replaced whole: no lock)."""
         return getattr(self.loop, "pinned_view", frozenset())
 
+    def mark_candidates(self) -> list:
+        """Held Kalshi markets with unpaired contracts and no live book (the
+        loop's ``mark_view``, an immutable tuple replaced whole: no lock)."""
+        return list(getattr(self.loop, "mark_view", ()))
+
     def settle_candidates(self) -> list:
         """Kalshi markets due a settlement check: held positions first (the
         loop's ``settle_view``), then markets with pending fair-value
@@ -780,7 +785,8 @@ def main(argv: list[str] | None = None) -> int:
                         if plan.get("reader"):
                             stopped = asyncio.run(_until_sigterm(drive_readonly_books(
                                 books, engine.on_frame, settle_candidates=engine.settle_candidates,
-                                paper=mode == "paper", pinned=getattr(engine, "pinned", None))))
+                                paper=mode == "paper", pinned=getattr(engine, "pinned", None),
+                                mark_candidates=getattr(engine, "mark_candidates", None))))
                         else:
                             stopped = asyncio.run(_until_sigterm(drive_socket(plan["url"], engine.on_frame)))
                     finally:

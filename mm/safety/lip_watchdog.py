@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -123,6 +124,16 @@ class Config:
         self.daily_loss = -abs(_num(env, "LIP_WD_DAILY_LOSS", 50))
         self.include_rewards = _truthy(env.get("LIP_WD_PNL_INCLUDE_REWARDS"))
         self.max_inventory = _num(env, "LIP_WD_MAX_INVENTORY_USD", 500)
+        # grok/lip-fixes-20261009: the inventory trip measures UNPAIRED exposure.
+        # The locked loss on pairs bought for > $1 is already realized (a pair
+        # settles at exactly $1) and sits in P&L; it only ever grows, so counting
+        # it here would eventually trip on history, not on risk. Opt back in with
+        # LIP_WD_INVENTORY_INCLUDE_LOCKED_LOSS=1. It is still reported.
+        self.inv_include_locked_loss = _truthy(env.get("LIP_WD_INVENTORY_INCLUDE_LOCKED_LOSS"))
+        self.inventory_warn_frac = _num(env, "LIP_WD_INVENTORY_WARN_FRAC", 0.8)
+        # Engine alert forwarding (alerts-engine.log -> this watchdog's channels).
+        self.engine_alert_log = Path(env.get("LIP_ENGINE_ALERT_LOG", sd / "alerts-engine.log"))
+        self.forward_engine_alerts = not _truthy(env.get("LIP_WD_NO_ENGINE_ALERTS"))
         self.max_capital = _num(env, "LIP_WD_MAX_CAPITAL_USD", 1500)
         self.max_resting = _num(env, "LIP_WD_MAX_RESTING", 200)
         # Patch 21: per-venue coverage (status `venues` / `pmus`).
@@ -316,6 +327,7 @@ def inventory_breakdown(status: dict):
             u, lk, ll = _market_worst_case(y, n, yc, nc)
             unpaired += u; locked += lk; locked_loss += ll
         return {"basis": basis, "inventory_usd": round(unpaired + locked_loss, 6),
+                "inventory_with_locked_loss_usd": round(unpaired + locked_loss, 6),
                 "unpaired_usd": round(unpaired, 6), "paired_locked_usd": round(locked, 6),
                 "paired_locked_loss_usd": round(locked_loss, 6)}
     mk = status.get("markouts")
@@ -432,10 +444,16 @@ def evaluate(cfg: Config, state: dict, now: float, status, status_err, hb_ts):
     # inventory / capital / resting
     invb = inventory_breakdown(status)
     inv = None if invb is None else invb["inventory_usd"]
+    if (invb is not None and not cfg.inv_include_locked_loss
+            and invb.get("unpaired_usd") is not None):
+        inv = invb["unpaired_usd"]
+        invb = dict(invb, inventory_usd=round(inv, 6), inventory_basis="unpaired_only")
     info["inventory_usd"] = inv
     info["inventory"] = invb
     if inv is not None and inv > cfg.max_inventory:
         reasons.append(f"inventory:{inv:.2f}>{cfg.max_inventory:.2f}")
+    elif inv is not None and cfg.inventory_warn_frac > 0 and inv > cfg.inventory_warn_frac * cfg.max_inventory:
+        info["inventory_warn"] = f"inventory:{inv:.2f}>{cfg.inventory_warn_frac:.0%} of {cfg.max_inventory:.2f}"
     cap = _f(status.get("paper_capital_usd"))
     info["capital_usd"] = cap
     if cap is not None and cap > cfg.max_capital:
@@ -789,6 +807,49 @@ def auto_recover_step(cfg: Config, state: dict, now: float, reasons_now, runner=
 
 
 # ----------------------------------------------------------------- main tick
+def forward_engine_alerts(cfg: Config, state: dict, now: float) -> int:
+    """Forward new WARN/CRITICAL lines of the engine's alerts-engine.log
+    (monitor/alerts.py) through ``alert`` (alerts.log + alert.json + ntfy when
+    configured), so one channel carries both. Reads from a saved byte offset;
+    a shrunk (rotated) file restarts at 0. First run starts at the end (no
+    replay of history). Returns lines forwarded."""
+    if not cfg.forward_engine_alerts:
+        return 0
+    path = cfg.engine_alert_log
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    off = state.get("engine_alert_offset")
+    if off is None or off > size:
+        state["engine_alert_offset"] = size if off is None else 0
+        if off is None:
+            return 0
+        off = 0
+    n = 0
+    try:
+        with path.open("rb") as fh:
+            fh.seek(int(off))
+            data = fh.read(256 * 1024)
+        state["engine_alert_offset"] = int(off) + len(data.rsplit(b"\n", 1)[0]) + (1 if b"\n" in data else 0)
+        for raw in data.split(b"\n")[:-1] if b"\n" in data else []:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            parts = line.split()
+            tok = parts[1].upper() if len(parts) > 1 else ""
+            level = "CRITICAL" if tok == "CRITICAL" else ("WARN" if tok.startswith("WARN") else None)
+            if level is None:
+                continue
+            body = " ".join(parts[3:]) if len(parts) > 3 else line
+            key = "engine_alert:" + hashlib.sha1(body[:60].encode()).hexdigest()[:10]
+            if alert(cfg, state, key, f"ENGINE_{level}", line[:600], None, now):
+                n += 1
+    except Exception as exc:
+        log.error("engine alert forward failed: %s", exc)
+    return n
+
+
 def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> dict:
     now = time.time() if now is None else now
     state = load_state(cfg)
@@ -843,6 +904,10 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> 
               + " | reset: python -m mm.safety.lip_watchdog --reset", None, now)
     elif info.get("engine_kill") and not cfg.trip_on_engine_kill:
         alert(cfg, state, "engine_kill", "WARN", f"engine reports kill: {info['engine_kill']}", None, now)
+    if info.get("inventory_warn") and not state.get("latched"):
+        alert(cfg, state, "inventory_warn", "WARN",
+              f"inventory early warning (no trip): {info['inventory_warn']}", None, now)
+    info["engine_alerts_forwarded"] = forward_engine_alerts(cfg, state, now)
     state["last_check"] = now
     save_state(cfg, state)
     health = {"ts": now, "ok": not state.get("latched"), "latched": bool(state.get("latched")),
@@ -858,7 +923,11 @@ def tick(cfg: Config, now=None, status_fn=None, canceller=None, runner=None) -> 
               "limits": {"heartbeat_stale_s": cfg.hb_stale_s, "feed_stale_s": cfg.feed_stale_s,
                          "daily_loss_usd": cfg.daily_loss, "max_inventory_usd": cfg.max_inventory,
                          "max_capital_usd": cfg.max_capital, "max_resting": cfg.max_resting},
-              "ntfy": bool(cfg.ntfy_topic)}
+              "ntfy": bool(cfg.ntfy_topic),
+              "alert_channels": {"files": [str(cfg.alerts_log), str(cfg.alert_json)],
+                                 "push": ("ntfy" if cfg.ntfy_topic else None),
+                                 "engine_alerts_forwarded_from": (str(cfg.engine_alert_log)
+                                                                  if cfg.forward_engine_alerts else None)}}
     try:
         _atomic_write(cfg.health_file, json.dumps(health, indent=1, default=str))
     except Exception as exc:
