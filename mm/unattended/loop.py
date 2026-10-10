@@ -2004,6 +2004,29 @@ class RunLoop:
         anchor = self._resolution_anchor(market)
         return anchor is not None and ts >= anchor - hours * 3600.0
 
+    def _series_denied(self, market: str) -> bool:
+        from mm.selector import series_denylist, series_of_ticker
+        deny = series_denylist()
+        if not deny:
+            return False
+        prog = self.programs.get(market)
+        return series_of_ticker(prog.series if prog is not None else None, market) in deny
+
+    def _band_sides(self, market: str, yes_cents: int, no_cents: int, sides: tuple) -> tuple:
+        """Sides whose PLACED price is outside [LIP_AVOID_BAND_LO,
+        LIP_AVOID_BAND_HI) cents. A side inside the band is dropped, unless it
+        only reduces unpaired inventory and LIP_AVOID_BAND_REDUCE allows that."""
+        lo, hi = _env_num("LIP_AVOID_BAND_LO", 0.0), _env_num("LIP_AVOID_BAND_HI", 0.0)
+        if hi <= lo:
+            return tuple(sides)
+        out = []
+        for sd in sides:
+            price = float(yes_cents if sd == "yes" else no_cents)
+            if lo <= price < hi and (self._unpaired(market, sd) >= 0 or not avoid_band_reduce_ok()):
+                continue
+            out.append(sd)
+        return tuple(out)
+
     def _side_band_block(self, market: str, side: str) -> str:
         """grok fix (d): do not ADD inventory on a side whose price is inside
         [LIP_AVOID_BAND_LO, LIP_AVOID_BAND_HI) cents (default off; preregistered
@@ -3320,6 +3343,10 @@ class RunLoop:
             band = self._side_band_block(market, side)
             if band:
                 return band
+        elif not avoid_band_reduce_ok():
+            band = self._side_band_block(market, side)
+            if band:
+                return band     # lipforge: strict band, no reducing quotes inside it either
         cap_m = _env_num("LIP_MARKET_INV_CAP_USD", 0.0)
         if cap_m > 0 and self._unpaired(market, side) > 0 and self._unpaired_usd(market) >= cap_m:
             return "market_inventory"
@@ -3786,11 +3813,19 @@ class RunLoop:
         if km.venue == "pmus":
             per_market = min(per_market, pmus_market_cap_usd())
         out = []
+        # The rank-penalty increment is fill-driven too: same uptime scale as
+        # the costs in _payable_net (only when that scaling is on).
+        pen_scale = 1.0
+        if (km.venue == "kalshi" and _env_num("LIP_PAYABLE_SELECT", 0.0) > 0 and payable_uptime_costs()):
+            pen_scale = min(1.0, max(0.0, _env_num("LIP_PAYABLE_UPTIME", 0.5)))
         for size in ladder:
             # sides_on prices one-sided quotes (quote_economics ``sides``).
             net, capital, share2, yc, nc = quote_economics(km, float(size), sides=sides_on)
             if yc > 0 and nc > 0:
-                legal = min(max_contracts_for_fill(yc, self.fill_cap), max_contracts_for_fill(nc, self.fill_cap))
+                # lipforge 2026-10-10: the single-fill cap bounds each RESTING
+                # order; a one-sided quote was clamped by the side it does not
+                # rest (8c YES capped at $25/88c = 28 contracts by the NO price).
+                legal = _legal_size(yc, nc, sides_on, self.fill_cap)
                 if 0 < legal < size:
                     # The last rung is the size the order clamp would rest
                     # (single-fill cap), valued at that size.
@@ -3800,12 +3835,12 @@ class RunLoop:
                         break
             if yc <= 0 or nc <= 0:
                 break
-            if size > max_contracts_for_fill(yc, self.fill_cap) or size > max_contracts_for_fill(nc, self.fill_cap):
+            if size > _legal_size(yc, nc, sides_on, self.fill_cap):
                 break
             if capital > per_market + 1e-9:
                 break
             net = self._payable_net(km, float(size), sides_on, net, share2)
-            value = net - penalty_100 * float(size) / RANK_PENALTY_UNIT * (len(sides_on) / 2.0)
+            value = net - pen_scale * penalty_100 * float(size) / RANK_PENALTY_UNIT * (len(sides_on) / 2.0)
             out.append((float(size), value, capital, int(yc), int(nc)))
             if float(size) not in [float(x) for x in ladder]:
                 break
@@ -3844,7 +3879,14 @@ class RunLoop:
                 accrued = float(acc.raw_usd())
             except Exception:
                 accrued = 0.0
-        share = float(share2) * (len(sides_on) / 2.0)
+        # lipforge 2026-10-10: quote_economics' share is ALREADY our fraction
+        # of the snapshot's total credit, in [0, 1], for one side
+        # (kalshi_one_sided_share) and for both (kalshi_share); both go through
+        # lip_scorer.snapshot_share. The old ``share2 x len(sides)/2`` halved
+        # every one-sided quote's expected payout, so with the 30-90c band
+        # (most quotes one-sided) nearly every market fell under the $1.50
+        # floor: 0 short-bucket selections, 51 alloc_no_positive_step.
+        share = float(share2)
         expect = accrued + (share * pool * left / period * up if period > 0 else 0.0)
         if km.max_reward_usd is not None:
             expect = min(expect, float(km.max_reward_usd))
@@ -3852,6 +3894,13 @@ class RunLoop:
         if expect < _env_num("LIP_MIN_PAYABLE_PER_PERIOD_USD", 1.5):
             self.payable_select_stats["below_floor"] = self.payable_select_stats.get("below_floor", 0) + 1
             return net0
+        if payable_uptime_costs():
+            # lipforge 2026-10-10: the uptime haircut is time NOT resting
+            # (pulls, rotation, under-target seconds). Fills, adverse
+            # selection, fees and carry only happen while resting, so they
+            # scale with the same uptime; charging them at 100% against a 50%
+            # reward made a market that pays for itself look negative.
+            return (net0 + reward) * up
         return net0 + reward * up
 
     def _reduce_resting(self, fill: dict) -> None:
@@ -4219,6 +4268,7 @@ class RunLoop:
                 ratio = dv / dc
                 if ratio <= 0:
                     continue
+                ratio *= low_price_boost(curve[j][3], curve[j][4], sides_of.get(market, ("yes", "no")))
                 if best is None or ratio > best[0] + 1e-12:
                     best = (ratio, j, dc)
             return best
@@ -4420,13 +4470,16 @@ class RunLoop:
         if why:
             self._cancel(market, why)
             return False
+        if self._series_denied(market):
+            self._cancel(market, "series_denylist")
+            return False
         if self._inside_close(market, ts):
             self._cancel(market, "close_cutoff")
             return False
-        size = float(min(
-            clamp_contracts(yes_cents, size, self.fill_cap),
-            clamp_contracts(no_cents, size, self.fill_cap),
-        ))
+        # Single-fill cap per resting order: only the requested sides bind
+        # (a side dropped below only loosens nothing; the kept ones are capped).
+        size = float(min(clamp_contracts(yes_cents if sd == "yes" else no_cents, size, self.fill_cap)
+                         for sd in (tuple(sd for sd in ("yes", "no") if sd in sides) or ("yes", "no"))))
         if size <= 0:
             self._cancel(market, "fill_cap")
             return False
@@ -4437,6 +4490,15 @@ class RunLoop:
             sides = tuple(sd for sd in sides
                           if not ((sd == "yes" and nb0 is not None and int(yes_cents) + nb0 >= 100)
                                   or (sd == "no" and yb0 is not None and int(no_cents) + yb0 >= 100)))
+        if sides:
+            # lipforge 2026-10-10: final price-band gate on the price actually
+            # placed (after skew, AS back-off, join-touch); every path quotes here.
+            kept = self._band_sides(market, int(yes_cents), int(no_cents), sides)
+            if not kept:
+                self.band_quote_drops_n = getattr(self, "band_quote_drops_n", 0) + 1
+                self._cancel(market, "price_band")
+                return False
+            sides = kept
         fv_row = self._fv_quote_row(market)
         if fv_row is None and self._fv_fail_closed(market):
             self._fv_count("unavailable")
@@ -4754,6 +4816,14 @@ class RunLoop:
             "fv_calibration": dict(self.fv_calib.report(), watching_n=len(self.fv_calib_watch)),
             "event_calendar": self.calendar.summary(self.now or None),
             "policy_skips": dict(__import__("collections").Counter(w for _m, w in self.policy_skips)),
+            "selection_policy": {
+                "series_denylist": sorted(__import__("mm.selector", fromlist=["x"]).series_denylist()),
+                "avoid_band_cents": [_env_num("LIP_AVOID_BAND_LO", 0.0), _env_num("LIP_AVOID_BAND_HI", 0.0)],
+                "avoid_band_reduce": avoid_band_reduce_ok(),
+                "band_quote_drops_n": int(getattr(self, "band_quote_drops_n", 0)),
+                "favor_low_cents": _env_num("LIP_FAVOR_LOW_CENTS", 0.0),
+                "favor_low_boost": _env_num("LIP_FAVOR_LOW_BOOST", 0.0),
+                "payable_uptime_costs": payable_uptime_costs()},
             "pulls": dict(self.pulls),
             "clock_skew_pulls_24h": self.skew_pulls_24h(),
             "fills_by_source": dict(self.fills_by_source),
@@ -5759,6 +5829,43 @@ def durable_reserve() -> float:
         return min(1.0, max(0.0, float(os.environ.get("LIP_DURABLE_RESERVE", 0.0))))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _legal_size(yes_cents: int, no_cents: int, sides, fill_cap) -> int:
+    """Largest size every RESTING side may carry under the single-fill cap."""
+    from mm.session_gates import max_contracts_for_fill
+    px = {"yes": int(yes_cents), "no": int(no_cents)}
+    sides = tuple(sd for sd in ("yes", "no") if sd in (sides or ())) or ("yes", "no")
+    return min(max_contracts_for_fill(px[sd], fill_cap) for sd in sides)
+
+
+def payable_uptime_costs() -> bool:
+    """LIP_PAYABLE_UPTIME_COSTS (default 0 = grok/lip-fixes behaviour): with
+    payable selection on, scale costs and the rank penalty by the same
+    LIP_PAYABLE_UPTIME as the reward (lipforge 2026-10-10)."""
+    return _env_num("LIP_PAYABLE_UPTIME_COSTS", 0.0) > 0
+
+
+def avoid_band_reduce_ok() -> bool:
+    """LIP_AVOID_BAND_REDUCE (default 1): a side inside the avoid band may
+    still rest when it only reduces unpaired inventory. 0 = strict: nothing
+    rests inside the band (paper taker exits handle aged inventory)."""
+    return _env_num("LIP_AVOID_BAND_REDUCE", 1.0) > 0
+
+
+def low_price_boost(yes_cents, no_cents, sides) -> float:
+    """Allocation-order multiplier for quotes resting a side under
+    LIP_FAVOR_LOW_CENTS (default 0 = off): 1 + LIP_FAVOR_LOW_BOOST. Only the
+    greedy ORDER changes; a non-positive value is never made positive.
+    Measured 5-min markout: <10c +1.06c/contract, 30-90c -0.55 to -0.86c."""
+    cents = _env_num("LIP_FAVOR_LOW_CENTS", 0.0)
+    boost = _env_num("LIP_FAVOR_LOW_BOOST", 0.0)
+    if cents <= 0 or boost <= 0:
+        return 1.0
+    px = {"yes": yes_cents, "no": no_cents}
+    if any(px.get(sd) is not None and 0 < float(px[sd]) < cents for sd in sides):
+        return 1.0 + boost
+    return 1.0
 
 
 def durable_min_days() -> float:

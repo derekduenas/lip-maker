@@ -79,3 +79,44 @@ See the final report for exact line numbers. In summary:
 - **Exit depth.** Executable marks and exits only use the visible bid depth. Depth beyond the book is not assumed: contracts the book can't absorb are left unfilled and reported as `exec_depth_short_contracts`.
 - **Uptime haircut.** `LIP_PAYABLE_UPTIME`=0.5 is a prior, not a fit. Revisit it with reward reconciliation once Kalshi pays.
 - **Calendar maintenance.** The calendar needs 2027 dates before 2026-12-10.
+
+---
+
+# lipforge/oct10-nogo-fix (on d7426ca) — COMMAND 2026-10-10, Oct 10 gate = NO-GO
+
+PAPER ONLY. One bundled change, then the build is FROZEN for 3 days (gate re-run ~Oct 14-15).
+No live path, `resolve_mode`, `LIP_FORCE_PAPER`, kill switch or risk caps touched.
+
+## Root causes (short bucket 0 selected, 51 `alloc_no_positive_step`)
+Reproduced on a 3 h replay of the Oct 10 APEX recordings (d7426ca: 0.28 short / 0.17 durable
+markets resting per selection).
+1. `_size_curve` / `_quote` clamped a ONE-sided quote by the single-fill cap of the side it does
+   not rest: an 8c YES quote next to an 88c NO book was capped at $25/0.88 = 28 contracts. With the
+   30-90c band most quotes are one-sided, so every curve had one tiny rung, a tiny share, and fell
+   under the payable floor. Now only resting sides bind (`_legal_size`).
+2. `_payable_net` computed share = `share2 x len(sides)/2`, but `quote_economics` already returns our
+   fraction of the snapshot credit ([0,1]) for one side and both: one-sided expected payouts were
+   halved (e.g. $2.40 -> $1.20 < $1.50 floor -> reward valued 0).
+3. The 0.5 uptime haircut cut the reward but not the fill-driven costs (adverse selection, fees,
+   carry, rank-penalty increment), which only occur while resting. `LIP_PAYABLE_UPTIME_COSTS=1`
+   scales both. Below the floor nothing changes (costs only, full rate).
+After the fix the same replay rests 1.78 short / 6.33 durable markets per selection; 0 in-band sides.
+
+## Other changes
+| Flag (policy.conf) | Value | Code default | What |
+|---|---|---|---|
+| `LIP_SERIES_DENYLIST` | KXHURCAT,KXHURPATHAL,KXTRUMPENDORSEMENTS,KXNEXTTEAMNFL | empty | Excluded in `exclusion_reason` (`series_denylist`) and refused in `_quote`. Worst series by measured net. Held inventory still exits via paper exits. |
+| `LIP_AVOID_BAND_LO/HI` | 30 / 90 (unchanged) | off | Band now also enforced on the PLACED price inside `_quote` (skew, AS back-off, join-touch, repeg, sampling): d7426ca still placed in-band sides on re-quotes (4 in the replay). Choice: STOP quoting 30-89c rather than widen, because widening keeps paying the measured -0.55 to -0.86c/contract markout for a reward that is mostly under the $1 floor. Bucket edges match `price_bucket` (70-90 = [70,90)). |
+| `LIP_AVOID_BAND_REDUCE` | 0 | 1 | 0 = strict: reducing quotes are not rested inside the band either; aged / near-event inventory exits via the paper taker exits. |
+| `LIP_FAVOR_LOW_CENTS` / `LIP_FAVOR_LOW_BOOST` | 10 / 1.0 | 0 / 0 (off) | Allocation order: a quote resting a side < 10c gets 2x priority in the greedy budget pass (never turns a non-positive value positive). The one-sided fill-cap fix also lets cheap sides carry their real size. |
+| `LIP_PAYABLE_UPTIME_COSTS` | 1 | 0 | See root cause 3. |
+
+/status gains `selection_policy` (denylist, band, reduce flag, band drops in `_quote`, favour, uptime-costs).
+
+## KXBROSFT-26OCT08-T106 (unsettled ~40 h+ past close)
+Exchange-side, not ours. Kalshi API (checked 2026-10-10 07:30 PT): status `closed`, `result` "",
+`expected_expiration_time` = `latest_expiration_time` = 2026-10-15T05:30Z (Oct 14 22:30 PT); the source
+(Carbon Arc September foot traffic) has not been reported. Close time 2026-10-08T03:59Z was the trading
+close, not settlement. Our position: 36 NO @5c ($1.80 cost); last trade 99c YES. The engine keeps it
+open and will book it when the settlement arrives; no code change. The "unsettled Nh past close"
+alert is expected noise until Oct 15.

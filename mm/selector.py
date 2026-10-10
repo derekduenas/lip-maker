@@ -104,6 +104,18 @@ def sports_denylist() -> str:
     return _os.environ.get("LIP_SPORTS_DENYLIST") or DEFAULT_SPORTS_DENYLIST
 
 
+def series_denylist() -> set[str]:
+    """LIP_SERIES_DENYLIST: comma-separated Kalshi/PM US series tickers that are
+    never quoted (exact match, case-insensitive; empty = none). lipforge
+    2026-10-10 (Oct 10 NO-GO): the four worst series by measured net."""
+    raw = _os.environ.get("LIP_SERIES_DENYLIST") or ""
+    return {part.strip().upper() for part in raw.split(",") if part.strip()}
+
+
+def series_of_ticker(series: str | None, market: str) -> str:
+    return (series or str(market).split("-", 1)[0]).upper()
+
+
 def sports_categories() -> set[str]:
     raw = _os.environ.get("LIP_SPORTS_CATEGORIES") or DEFAULT_SPORTS_CATEGORIES
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
@@ -670,6 +682,9 @@ def sports_reason(market: KalshiMarket) -> str:
 
 
 def exclusion_reason(market: KalshiMarket, *, allow_intraday: bool = False) -> str:
+    deny = series_denylist()
+    if deny and series_of_ticker(market.series, market.market) in deny:
+        return "series_denylist"
     if not allow_intraday:
         short = intraday_reason(market.series, market.market)
         if short:
