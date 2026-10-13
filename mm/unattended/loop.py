@@ -3446,6 +3446,15 @@ class RunLoop:
                 continue
             if self._inside_close(km.market, ts):
                 continue
+            if cfg["max_days"] > 0:
+                prog = self.programs.get(km.market)
+                close = None if prog is None else prog.close_ts
+                days = ((close - ts) / 86400.0 if close is not None
+                        else (None if prog is None else prog.days_to_settle))
+                if days is None or days >= cfg["max_days"]:
+                    continue
+            if cfg["min_vol"] > 0 and (self.activity_volume(km.market) or 0.0) < cfg["min_vol"]:
+                continue
             book = self.accruals[km.market].book.book
             if not book.is_usable():
                 continue
@@ -5770,7 +5779,12 @@ def sample_cfg() -> dict:
             "budget": max(0.0, _env_num("LIP_SAMPLE_BUDGET_USD", 60.0)),
             "per_event": max(1, int(_env_num("LIP_SAMPLE_PER_EVENT", 2))),
             "min_cents": int(_env_num("LIP_SAMPLE_MIN_CENTS", 3)),
-            "max_cents": int(_env_num("LIP_SAMPLE_MAX_CENTS", 97))}
+            "max_cents": int(_env_num("LIP_SAMPLE_MAX_CENTS", 97)),
+            # lipforge oct13 (fill drought): restrict the group to markets
+            # closing within LIP_SAMPLE_MAX_DAYS (0 = any; 14 = the short
+            # bucket) with >= LIP_SAMPLE_MIN_VOL_24H contracts of 24 h volume.
+            "max_days": max(0.0, _env_num("LIP_SAMPLE_MAX_DAYS", 0.0)),
+            "min_vol": max(0.0, _env_num("LIP_SAMPLE_MIN_VOL_24H", 0.0))}
 
 
 def size_ladder(chunk: float = 100.0) -> list[float]:

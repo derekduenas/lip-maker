@@ -109,7 +109,7 @@ def test_short_bucket_one_sided_market_is_selected_under_the_deployed_policy(mon
 def test_series_denylist_excludes_and_blocks_quotes(monkeypatch):
     _deployed(monkeypatch)
     from mm.selector import series_denylist
-    assert series_denylist() == {"KXHURCAT", "KXHURPATHAL", "KXTRUMPENDORSEMENTS", "KXNEXTTEAMNFL"}
+    assert series_denylist() == {"KXHURCAT", "KXHURPATHAL", "KXTRUMPENDORSEMENTS", "KXNEXTTEAMNFL", "KXRT"}
     bad = "KXTRUMPENDORSEMENTS-26OCT20-A15"
     lp = newloop(bankroll=1500.0)
     lp.on_frame(program(bad))

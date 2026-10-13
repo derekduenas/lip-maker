@@ -120,3 +120,17 @@ Exchange-side, not ours. Kalshi API (checked 2026-10-10 07:30 PT): status `close
 close, not settlement. Our position: 36 NO @5c ($1.80 cost); last trade 99c YES. The engine keeps it
 open and will book it when the settlement arrives; no code change. The "unsettled Nh past close"
 alert is expected noise until Oct 15.
+
+## lipforge oct13 (COMMAND 2026-10-13; PAPER ONLY) — on lipforge/oct10-nogo-fix
+- Oct 12 day loss (-$51.43, watchdog daily_loss latched 14:29 PT): accounting verified
+  (offline reload of the live state reproduces the engine's session MTM to the cent).
+  ~-$38 is real adverse selection on 4 of 9 new fills (KXRT-STRA-60 86@29c -> 8c,
+  KXTRUMPPHOTO-26OCT18-4 100@12c -> 1c, KXDIESELW-26OCT19-T6.14 100 NO@10c -> 4c,
+  KXTRUTHSOCIAL-26OCT17-B89), the rest drift on the held book incl. ~$7 exec-vs-mid
+  (KXC4POS, KXACQANNOUNCESBUX). No accounting bug; no code change for it.
+- KXRT added to LIP_SERIES_DENYLIST.
+- Fill drought: fill-sampling group re-enabled, narrowed by new knobs
+  LIP_SAMPLE_MAX_DAYS (close within N days; 0 = off, default) and
+  LIP_SAMPLE_MIN_VOL_24H (24 h volume floor; 0 = off, default); policy: 1-9c sides at
+  the touch, <14 d, >=20 trades and >=500 contracts/24 h, 20 contracts, $25 reserve.
+  The 30-89c band and denylist still apply. Tests: tests/test_lipforge_oct13_drought.py.

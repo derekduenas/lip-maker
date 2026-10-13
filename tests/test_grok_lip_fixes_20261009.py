@@ -287,7 +287,9 @@ def test_deployed_policy_loads_and_quotes_only_outside_the_band(monkeypatch):
     for k in ("LIP_FV_ENABLE", "LIP_PMUS_PAPER_ENABLE", "LIP_RECORD_ENABLE"):
         monkeypatch.setenv(k, "0")
     import os
-    assert os.environ["LIP_SAMPLE_ENABLE"] == "0" and os.environ["LIP_AVOID_BAND_HI"] == "90"
+    # lipforge oct13: sampling re-enabled, narrowed to <=9c short-bucket sides
+    assert os.environ["LIP_SAMPLE_ENABLE"] == "1" and os.environ["LIP_SAMPLE_MAX_CENTS"] == "9"
+    assert os.environ["LIP_AVOID_BAND_HI"] == "90"
     lp = newloop()
     assert lp.calendar.error is None
     lp.on_frame(program(M))
