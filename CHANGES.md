@@ -134,3 +134,11 @@ alert is expected noise until Oct 15.
   LIP_SAMPLE_MIN_VOL_24H (24 h volume floor; 0 = off, default); policy: 1-9c sides at
   the touch, <14 d, >=20 trades and >=500 contracts/24 h, 20 contracts, $25 reserve.
   The 30-89c band and denylist still apply. Tests: tests/test_lipforge_oct13_drought.py.
+
+## lipforge oct14 BUG-ONLY (PAPER; inside the freeze, no strategy/env/policy change)
+- KeyError 'fees_usd' crash in _drop_settled (4 crashes Oct 13 13:59-14:00 PT and 21:51 PT):
+  _paper_exit created bucket_closed[bucket] = {"markout_usd": x}; pruning a settled position
+  then did agg["fees_usd"] += ... on that bare row. Fixed at the source (_bucket_closed_agg
+  always returns a complete row), on load (bucket_closed / bucket_pos rows get missing keys;
+  series_acc rows no longer silently dropped when an older-schema key is missing).
+  Tests: tests/test_lipforge_oct14_fees_keyerror.py (reproduces the KeyError on f6fc39b).

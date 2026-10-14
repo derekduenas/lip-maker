@@ -1120,6 +1120,12 @@ class RunLoop:
             self.closed_periods_payable_agg[key] = self.closed_periods_payable_agg.get(key, 0.0) + float(pay)
         self._state_dirty = True
 
+    def _bucket_closed_agg(self, bucket: str) -> dict:
+        """The ``bucket_closed`` aggregate of ``bucket`` with every key present.
+        lipforge oct13 bug fix: paper exits created a bare {"markout_usd"} row,
+        and _drop_settled then raised KeyError 'fees_usd' (crash loop)."""
+        return _fill_defaults(self.bucket_closed.setdefault(bucket, {}), BUCKET_CLOSED_KEYS)
+
     def _drop_settled(self, ts: float) -> None:
         """Forget positions settled more than LIP_SETTLED_KEEP_DAYS (7) ago
         (and settled rows with no position). Their realized markout, fees,
@@ -1140,9 +1146,7 @@ class RunLoop:
                     continue
                 cost = float(row["yes_cost"]) + float(row["no_cost"])
                 value = (float(row["yes"]) * mark + float(row["no"]) * (100.0 - mark)) / 100.0
-                agg = self.bucket_closed.setdefault(bucket, {"markout_usd": 0.0, "fees_usd": 0.0,
-                                                             "rebates_usd": 0.0, "premium_usd": 0.0,
-                                                             "fills_n": 0.0, "synthetic_n": 0.0})
+                agg = self._bucket_closed_agg(bucket)
                 agg["markout_usd"] += value - cost
                 agg["fees_usd"] += float(row.get("fees", 0.0))
                 agg["rebates_usd"] += float(row.get("rebates", 0.0))
@@ -2151,8 +2155,8 @@ class RunLoop:
             bpos[side] -= q
             bpos[f"{side}_cost"] -= bavg * q
             bpos["fees"] = float(bpos.get("fees", 0.0)) + fee
-            agg = self.bucket_closed.setdefault(bucket, {})
-            agg["markout_usd"] = float(agg.get("markout_usd", 0.0)) + (proceeds - bavg * q)
+            agg = self._bucket_closed_agg(bucket)
+            agg["markout_usd"] += proceeds - bavg * q
         acc = self._series_acc(market)
         if acc is not None:
             acc["fees"] += fee
@@ -2413,9 +2417,12 @@ class RunLoop:
         raw_acc = data.get("series_acc")
         for series, a in (raw_acc.items() if isinstance(raw_acc, dict) else []):
             try:
-                row = {"fills": int(a["fills"]), "fees": float(a["fees"]),
-                       "settled_fills": int(a["settled_fills"]), "settled_usd": float(a["settled_usd"]),
-                       "mk5_usd": float(a["mk5_usd"]), "mk5_n": int(a["mk5_n"]),
+                # Missing keys default to 0 (older schemas) instead of
+                # silently dropping the whole series row.
+                row = {"fills": int(a.get("fills") or 0), "fees": float(a.get("fees") or 0.0),
+                       "settled_fills": int(a.get("settled_fills") or 0),
+                       "settled_usd": float(a.get("settled_usd") or 0.0),
+                       "mk5_usd": float(a.get("mk5_usd") or 0.0), "mk5_n": int(a.get("mk5_n") or 0),
                        "mk5_contracts": float(a.get("mk5_contracts") or 0.0)}
                 if a.get("first_ts") is not None:
                     row["first_ts"] = float(a["first_ts"])
@@ -2542,7 +2549,8 @@ class RunLoop:
             position[str(market)] = row
         bucket_pos = {}
         for bucket, rows in dict(data.get("bucket_pos") or {}).items():
-            bucket_pos[str(bucket)] = {str(m): {k: float(v) for k, v in dict(r).items()}
+            bucket_pos[str(bucket)] = {str(m): _fill_defaults({k: float(v) for k, v in dict(r).items()},
+                                                              BUCKET_POS_KEYS)
                                        for m, r in dict(rows).items()}
         settled = {str(m): {"result": str(v["result"]), "ts": v.get("ts"),
                             "source": str(v.get("source") or "ws_lifecycle")}
@@ -2628,7 +2636,8 @@ class RunLoop:
             self.paper_exits = [dict(x) for x in data["paper_exits"] if isinstance(x, dict)][-200:]
         self.realized_pruned_usd = float(data.get("realized_pruned_usd") or 0.0)
         self.settled_lifetime = settled_lifetime
-        self.bucket_closed = {str(b): {str(k): float(v) for k, v in dict(r).items()}
+        self.bucket_closed = {str(b): _fill_defaults({str(k): float(v) for k, v in dict(r).items()},
+                                                     BUCKET_CLOSED_KEYS)
                               for b, r in dict(data.get("bucket_closed") or {}).items()}
         self.cooldown.update(cooldown)
         self._pnl_day = data.get("pnl_day") if isinstance(data.get("pnl_day"), dict) else None
@@ -3096,8 +3105,7 @@ class RunLoop:
         if prog is not None and prog.close_ts is not None:
             pos["close_ts"] = float(prog.close_ts)
         bucket = (getattr(self, "bucket_of", {}) or {}).get(market) or "short"
-        bpos = self.bucket_pos.setdefault(bucket, {}).setdefault(
-            market, {"yes": 0.0, "no": 0.0, "yes_cost": 0.0, "no_cost": 0.0, "fees": 0.0, "fills_n": 0.0})
+        bpos = _fill_defaults(self.bucket_pos.setdefault(bucket, {}).setdefault(market, {}), BUCKET_POS_KEYS)
         fee = self._fill_fee_usd(market, price, count) if side in ("yes", "no") else 0.0
         if side in ("yes", "no"):
             pos[side] += count
@@ -5880,6 +5888,17 @@ def low_price_boost(yes_cents, no_cents, sides) -> float:
     if any(px.get(sd) is not None and 0 < float(px[sd]) < cents for sd in sides):
         return 1.0 + boost
     return 1.0
+
+
+BUCKET_CLOSED_KEYS = ("markout_usd", "fees_usd", "rebates_usd", "premium_usd", "fills_n", "synthetic_n")
+BUCKET_POS_KEYS = ("yes", "no", "yes_cost", "no_cost", "fees", "fills_n")
+
+
+def _fill_defaults(row: dict, keys) -> dict:
+    """Add any missing numeric ``keys`` (0.0) to ``row`` in place; return it."""
+    for k in keys:
+        row.setdefault(k, 0.0)
+    return row
 
 
 def durable_min_days() -> float:
